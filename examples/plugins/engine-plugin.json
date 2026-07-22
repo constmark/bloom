@@ -1,0 +1,30 @@
+{
+  "metadata": {
+    "name": "org.community.llama-cpp-engine",
+    "version": "0.1.0",
+    "description": "llama.cpp-based engine plugin for GGUF models",
+    "author": "Bloom Community",
+    "license": "Apache-2.0",
+    "homepage": "https://github.com/bloom-community/llama-engine",
+    "platforms": ["linux-x86_64", "linux-aarch64", "macos-aarch64", "windows-x86_64"],
+    "min_runtime_version": "0.2.0"
+  },
+  "entry_point": {
+    "type": "native",
+    "path": "libllama_engine.so"
+  },
+  "supported_families": ["Llama", "Qwen", "Gemma"],
+  "supported_dtypes": ["F16", "Q8", "Q4"],
+  "supported_formats": ["Gguf"],
+  "supported_devices": ["Cpu", "DiscreteGpu", "IntegratedGpu"],
+  "supported_modalities": ["Text"],
+  "supports_streaming": true,
+  "supports_quantized_models": true,
+  "max_context_tokens": 8192,
+  "required_backends": ["cpu"],
+  "example_models": [
+    "llama-3-8b-instruct",
+    "qwen2-7b-chat",
+    "gemma-2-9b-it"
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "metadata": {
+    "name": "com.example.remote-gpu-backend",
+    "version": "1.0.0",
+    "description": "Example remote accelerator backend plugin for network-attached GPU/NPU devices",
+    "author": "Example Corp",
+    "license": "Apache-2.0",
+    "homepage": "https://github.com/example/bloom-remote-backend",
+    "platforms": ["linux-x86_64", "linux-aarch64", "macos-aarch64", "windows-x86_64"],
+    "min_runtime_version": "0.2.0"
+  },
+  "entry_point": {
+    "type": "native",
+    "path": "libremote_gpu_backend.so"
+  },
+  "device_class": "Remote",
+  "supported_dtypes": ["F32", "F16", "BF16", "I8", "I4", "Q8", "Q4"],
+  "supported_formats": ["Safetensors", "Gguf", "Onnx"],
+  "supports_mmap": false,
+  "has_quantization_kernels": false,
+  "supports_streaming": true,
+  "memory_overhead_bytes": 134217728,
+  "probe_script": "python3 -c 'import remote_backend; remote_backend.check_connectivity()'"
+}

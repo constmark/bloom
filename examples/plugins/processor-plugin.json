@@ -1,0 +1,28 @@
+{
+  "metadata": {
+    "name": "com.example.image-preprocessor",
+    "version": "1.0.0",
+    "description": "Image preprocessor plugin for VLM and vision encoder models (resize, normalize, patch embedding)",
+    "author": "Example Corp",
+    "license": "MIT",
+    "homepage": "https://github.com/example/bloom-image-preprocessor",
+    "platforms": ["linux-x86_64", "linux-aarch64", "macos-aarch64", "windows-x86_64"],
+    "min_runtime_version": "0.2.0"
+  },
+  "entry_point": {
+    "type": "native",
+    "path": "libimage_preprocessor.so"
+  },
+  "input_modalities": ["Vision"],
+  "output_modalities": ["Vision"],
+  "input_schema": "Raw image bytes (JPEG/PNG/WebP), any resolution",
+  "output_schema": "Resized and normalized image tensor (3x224x224 float32)",
+  "dependencies": [
+    {
+      "name": "image",
+      "version": "0.25",
+      "kind": "rust_crate"
+    }
+  ],
+  "deterministic": true
+}

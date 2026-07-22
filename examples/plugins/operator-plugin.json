@@ -1,0 +1,37 @@
+{
+  "metadata": {
+    "name": "com.example.flash-attention",
+    "version": "1.0.0",
+    "description": "Flash attention operator plugin — optimised scaled dot-product attention for long-context LLMs",
+    "author": "Example Corp",
+    "license": "Apache-2.0",
+    "homepage": "https://github.com/example/bloom-flash-attention",
+    "platforms": ["linux-x86_64", "macos-aarch64"],
+    "min_runtime_version": "0.2.0"
+  },
+  "entry_point": {
+    "type": "native",
+    "path": "libflash_attention.so"
+  },
+  "operator_name": "flash_attention",
+  "supported_shapes": [],
+  "supported_dtypes": ["F16", "BF16"],
+  "target_backends": ["cuda", "metal"],
+  "benchmarks": [
+    {
+      "backend": "cuda",
+      "shape": [1, 32, 4096, 128],
+      "latency_ms": 2.3,
+      "throughput_gflops": 1200.0,
+      "notes": "NVIDIA A100, seq_len=4096"
+    },
+    {
+      "backend": "metal",
+      "shape": [1, 16, 2048, 64],
+      "latency_ms": 5.1,
+      "throughput_gflops": 450.0,
+      "notes": "Apple M2 Max, seq_len=2048"
+    }
+  ],
+  "fallback": "standard_attention"
+}

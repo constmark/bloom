@@ -1,0 +1,15 @@
+target
+.git
+.venv*
+*.safetensors
+*.gguf
+*.onnx
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.engine
+*.ir
+*.log
+benchmark_results.json
+npu_benchmark_dashboard.html

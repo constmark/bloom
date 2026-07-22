@@ -1,0 +1,20 @@
+[package]
+name = "bloomai-tilelang"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+
+[features]
+# Opt-in integration tests that JIT-compile kernels via the TileLang Python
+# toolchain (requires numpy etc.). Excluded from default CI; enable with
+# `cargo test -p bloomai-tilelang --features hardware-tests`.
+hardware-tests = []
+
+[dependencies]
+anyhow.workspace = true
+libloading.workspace = true

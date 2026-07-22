@@ -1,0 +1,56 @@
+{
+  "metadata": {
+    "name": "models.qwen2-7b-instruct",
+    "version": "1.0.0",
+    "description": "Qwen2 7B Instruct model package for Bloom runtime",
+    "author": "Alibaba Cloud",
+    "license": "Apache-2.0",
+    "homepage": "https://huggingface.co/Qwen/Qwen2-7B-Instruct",
+    "platforms": [],
+    "min_runtime_version": "0.2.0"
+  },
+  "family": "Qwen",
+  "model_version": "7b-instruct",
+  "primary_dtype": "F16",
+  "quantizations": [
+    {
+      "name": "F16",
+      "dtype": "F16",
+      "size_bytes": 15032385536,
+      "quality_score": 1.0
+    },
+    {
+      "name": "Q8_0",
+      "dtype": "Q8",
+      "size_bytes": 7700000000,
+      "quality_score": 0.99
+    },
+    {
+      "name": "Q4_K_M",
+      "dtype": "Q4",
+      "size_bytes": 4400000000,
+      "quality_score": 0.95
+    }
+  ],
+  "files": [
+    {
+      "path": "model-q4_k_m.gguf",
+      "format": "Gguf",
+      "size_bytes": 4400000000,
+      "sha256": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+    },
+    {
+      "path": "model-f16.safetensors",
+      "format": "Safetensors",
+      "size_bytes": 15032385536,
+      "sha256": "b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3"
+    }
+  ],
+  "recommended_backends": ["cpu", "cuda", "metal"],
+  "required_processors": ["qwen2-tokenizer"],
+  "total_size_bytes": 4400000000,
+  "source_url": "https://huggingface.co/Qwen/Qwen2-7B-Instruct-GGUF/resolve/main/qwen2-7b-instruct-q4_k_m.gguf",
+  "package_hash": "sha256:e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6",
+  "license_file": "LICENSE",
+  "io_description": "Text generation model. Input: text prompt. Output: text completion with streaming support."
+}

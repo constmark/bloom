@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  linux:
+    name: Rust (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Check
+        run: cargo check --workspace --all-targets
+      - name: Clippy
+        # -D warnings keeps CI strict; -A missing_docs opts out of the
+        # documentation lint so it does not block PRs while docs catch up.
+        run: cargo clippy --workspace --all-targets -- -D warnings -A missing_docs
+      - name: Test
+        run: cargo test --workspace
+      - name: Package
+        run: cargo package --workspace --allow-dirty
+      - name: Check CUDA features when nvcc is available
+        run: |
+          if command -v nvcc >/dev/null 2>&1; then
+            cargo check --workspace --all-targets --features cuda
+            cargo clippy --workspace --all-targets --features cuda -- -D warnings -A missing_docs
+          else
+            echo "SKIP: nvcc not found; CUDA feature checks require a CUDA runner"
+          fi
+      - name: Validate JSON artifacts
+        run: ./scripts/validate_json_artifacts.py
+      - name: Benchmark smoke
+        # Script SKIPs gracefully (exit 0) when no model is present.
+        run: ./scripts/ci_smoke_test.sh
+      - name: OpenAI API smoke
+        # Script SKIPs gracefully (exit 0) when no model is present.
+        run: ./scripts/openai_compat_smoke.py
+      - name: llama.cpp comparison smoke
+        # Script SKIPs gracefully (exit 0) when model or llama.cpp is missing.
+        run: ./scripts/compare_llamacpp.py
+      - name: Docker build smoke
+        run: docker build -t bloom:ci .
+
+  macos:
+    name: Rust (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check (Metal features)
+        run: cargo check --workspace --all-targets --features metal
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --features metal -- -D warnings -A missing_docs
+      - name: Test
+        run: cargo test --workspace --features metal
+
+  docs:
+    name: Documentation lint (non-blocking)
+    runs-on: ubuntu-latest
+    # Advisory only: surfaces missing rustdoc without blocking PRs.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Missing docs (advisory)
+        run: cargo clippy --workspace --all-targets -- -W missing_docs
+      - name: rustdoc build
+        run: cargo doc --workspace --no-deps
+
+  audit:
+    name: Security audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

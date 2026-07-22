@@ -1,0 +1,30 @@
+{
+  "world_state_schema": {
+    "scalar_ranges": {
+      "temperature_c": [-40.0, 125.0],
+      "battery_percent": [0.0, 100.0]
+    },
+    "allowed_image_mimes": ["image/png", "image/jpeg"],
+    "tensor_shapes": [[1, 3, 224, 224]],
+    "allow_text": true,
+    "allow_audio": false
+  },
+  "action_schema": {
+    "allowed_action_spaces": ["robot_velocity"],
+    "action_dimensions": {
+      "robot_velocity": 2
+    },
+    "value_range": [-1.0, 1.0]
+  },
+  "example": {
+    "observation": {
+      "kind": "Scalar",
+      "name": "battery_percent",
+      "value": 87.0
+    },
+    "action": {
+      "action_space": "robot_velocity",
+      "values": [0.2, 0.0]
+    }
+  }
+}

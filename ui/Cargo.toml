@@ -1,0 +1,54 @@
+[package]
+name = "bloom-ui"
+version = "0.1.0"
+edition = "2021"
+authors = ["Bloom Contributors"]
+license = "Apache-2.0"
+description = "Dioxus UI for the Bloom inference server (decoupled frontend; web today, desktop-ready)."
+repository = "https://github.com/constmark/bloom"
+homepage = "https://github.com/constmark/bloom"
+publish = false
+
+# Standalone crate, intentionally outside the engine workspace: it targets
+# wasm32 and is built with `dx`, not with the native `cargo` workspace.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+path = "src/main.rs"
+
+[dependencies]
+dioxus = { version = "0.7.9", features = ["web"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+  "console",
+  "Storage",
+  "Window",
+  "Location",
+  "Document",
+  "Headers",
+  "Request",
+  "RequestInit",
+  "Response",
+  "ReadableStream",
+  "ReadableStreamDefaultReader",
+  "TextDecoder",
+  "HtmlElement",
+  "HtmlTextAreaElement",
+  "Element",
+  "ScrollBehavior",
+  "ScrollToOptions",
+] }
+gloo-net = { version = "0.6", features = ["http"] }
+gloo-timers = "0.3"
+futures-util = "0.3"
+js-sys = "0.3"
+tracing = "0.1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1

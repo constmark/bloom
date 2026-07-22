@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build binaries
+        run: |
+          cargo build --release --bin bloom_infer --bin bloom_server --bin bloom_bench --bin inspect_gguf
+          mkdir -p dist
+          cp target/release/bloom_infer dist/
+          cp target/release/bloom_server dist/
+          cp target/release/bloom_bench dist/
+          cp target/release/inspect_gguf dist/
+      - name: Archive
+        shell: bash
+        run: |
+          name="bloom-${GITHUB_REF_NAME}-${{ matrix.os }}"
+          tar -C dist -czf "${name}.tar.gz" .
+          shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bloom-${{ matrix.os }}
+          path: |
+            bloom-*.tar.gz
+            bloom-*.sha256
+
+  github-release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.sha256
+          draft: true
+          generate_release_notes: true

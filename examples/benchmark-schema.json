@@ -1,0 +1,125 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Bloom Benchmark Result",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "backend",
+    "model_id",
+    "dtype",
+    "tokens_per_second",
+    "avg_latency_ms",
+    "peak_memory_bytes",
+    "tokens_generated",
+    "duration_secs",
+    "timestamp"
+  ],
+  "properties": {
+    "backend": { "type": "string", "minLength": 1 },
+    "model_id": { "type": "string", "minLength": 1 },
+    "dtype": { "enum": ["F32", "F16", "BF16", "Q8", "Q4", "I8", "U8", "I4", "NF4", "Unknown"] },
+    "quantization": { "type": ["string", "null"] },
+    "tokens_per_second": { "type": "number", "minimum": 0 },
+    "ttft_ms": { "type": ["number", "null"], "minimum": 0 },
+    "avg_latency_ms": { "type": "number", "minimum": 0 },
+    "peak_memory_bytes": { "type": "integer", "minimum": 0 },
+    "memory_breakdown": {
+      "type": ["object", "null"],
+      "additionalProperties": true,
+      "required": [
+        "weight_bytes",
+        "host_weight_bytes",
+        "device_weight_bytes",
+        "kv_cache_bytes",
+        "kv_cache_bytes_per_token",
+        "temp_tensor_bytes",
+        "total_bytes",
+        "weight_dtype",
+        "kv_cache_dtype",
+        "mmap_residency_applied",
+        "memory_scope"
+      ],
+      "properties": {
+        "weight_bytes": { "type": "integer", "minimum": 0 },
+        "host_weight_bytes": { "type": "integer", "minimum": 0 },
+        "device_weight_bytes": { "type": "integer", "minimum": 0 },
+        "kv_cache_bytes": { "type": "integer", "minimum": 0 },
+        "kv_cache_bytes_per_token": { "type": "integer", "minimum": 0 },
+        "temp_tensor_bytes": { "type": "integer", "minimum": 0 },
+        "total_bytes": { "type": "integer", "minimum": 0 },
+        "weight_dtype": { "enum": ["F32", "F16", "BF16", "Q8", "Q4", "I8", "U8", "I4", "NF4", "Unknown"] },
+        "quantization": { "type": ["object", "null"] },
+        "kv_cache_dtype": { "enum": ["F32", "F16", "BF16", "Q8", "Q4", "I8", "U8", "I4", "NF4", "Unknown"] },
+        "num_layers": { "type": ["integer", "null"], "minimum": 0 },
+        "offloaded_layers": { "type": ["integer", "null"], "minimum": 0 },
+        "mmap_residency_applied": { "type": "boolean" },
+        "memory_scope": { "type": "string", "minLength": 1 }
+      }
+    },
+    "tokens_generated": { "type": "integer", "minimum": 0 },
+    "duration_secs": { "type": "number", "minimum": 0 },
+    "timestamp": { "type": "string", "minLength": 1 },
+    "notes": { "type": ["string", "null"] },
+    "tbt_ms": { "type": ["number", "null"], "minimum": 0 },
+    "prompt_processing_speed": { "type": ["number", "null"], "minimum": 0 },
+    "hardware": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "device": { "type": "string" },
+        "backend": { "type": "string" },
+        "os": { "type": "string" }
+      }
+    },
+    "timing_breakdown": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "model_load_secs": { "type": "number", "minimum": 0 },
+        "avg_ttft_ms": { "type": ["number", "null"], "minimum": 0 },
+        "avg_tbt_ms": { "type": ["number", "null"], "minimum": 0 },
+        "avg_latency_ms": { "type": "number", "minimum": 0 },
+        "throughput_tokens_per_sec": { "type": "number", "minimum": 0 },
+        "prompt_processing_tokens_per_sec": { "type": ["number", "null"], "minimum": 0 }
+      }
+    },
+    "cache_metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "total_blocks", "free_blocks", "active_blocks", "cached_blocks", "hits", "misses", "evictions", "reuses", "utilization"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "total_blocks": { "type": "integer", "minimum": 0 },
+        "free_blocks": { "type": "integer", "minimum": 0 },
+        "active_blocks": { "type": "integer", "minimum": 0 },
+        "cached_blocks": { "type": "integer", "minimum": 0 },
+        "hits": { "type": "integer", "minimum": 0 },
+        "misses": { "type": "integer", "minimum": 0 },
+        "evictions": { "type": "integer", "minimum": 0 },
+        "reuses": { "type": "integer", "minimum": 0 },
+        "utilization": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "speculative_mode": {
+      "type": ["string", "null"],
+      "description": "Speculative decoding mode requested for this run: ngram, draft, or mtp. Omitted/null when speculative decoding is disabled.",
+      "enum": ["ngram", "draft", "mtp", null]
+    },
+    "speculative_draft_tokens": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Total draft tokens proposed across all runs (sum). Null when speculative decoding is disabled or the engine did not report metrics."
+    },
+    "speculative_accepted_tokens": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Total draft tokens accepted by the verifier across all runs (sum). Null when speculative decoding is disabled or the engine did not report metrics."
+    },
+    "speculative_acceptance_rate": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "maximum": 1,
+      "description": "accepted / draft aggregated across all runs. Null when no draft tokens were proposed."
+    }
+  }
+}

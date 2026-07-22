@@ -1,0 +1,39 @@
+[workspace]
+members = [
+  "crates/backend",
+  "crates/core",
+  "crates/engine",
+  "crates/ffi",
+  "crates/tilelang",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Bloom Contributors"]
+license = "Apache-2.0"
+repository = "https://github.com/constmark/bloom"
+readme = "README.md"
+description = "Standalone multimodal inference engine for edge AI."
+homepage = "https://github.com/constmark/bloom"
+documentation = "https://github.com/constmark/bloom/tree/main/docs"
+keywords = ["inference", "edge-ai", "multimodal", "llm"]
+categories = ["science", "command-line-utilities"]
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
+libloading = "0.8"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "request-id", "timeout"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bloomai-core = { version = "0.1.0", path = "crates/core" }
+bloomai-backend = { version = "0.1.0", path = "crates/backend" }
+bloomai-tilelang = { version = "0.1.0", path = "crates/tilelang" }
+bloomai-engine = { version = "0.1.0", path = "crates/engine" }
+

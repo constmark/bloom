@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720" viewBox="0 0 1200 720" role="img" aria-labelledby="title desc">
+  <title id="title">Bloom architecture</title>
+  <desc id="desc">Requests enter through the CLI, HTTP server, UI, Python SDK, or C ABI. The inference pipeline resolves manifests and processors, selects an engine and backend, schedules work and KV cache, then executes through native or external runtimes.</desc>
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .group { fill: #ffffff; stroke: #94a3b8; stroke-width: 2; }
+      .box { fill: #eff6ff; stroke: #3b82f6; stroke-width: 2; }
+      .box-alt { fill: #f0fdf4; stroke: #22c55e; stroke-width: 2; }
+      .box-warn { fill: #fff7ed; stroke: #f97316; stroke-width: 2; }
+      .label { fill: #0f172a; font: 600 18px system-ui, sans-serif; }
+      .text { fill: #334155; font: 15px system-ui, sans-serif; }
+      .small { fill: #475569; font: 13px system-ui, sans-serif; }
+      .line { stroke: #64748b; stroke-width: 2.5; fill: none; }
+      .arrow { stroke: #64748b; stroke-width: 2.5; fill: none; marker-end: url(#arrow); }
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" width="1200" height="720" rx="18"/>
+
+  <text class="label" x="48" y="54">Entry points</text>
+  <rect class="box" x="48" y="72" width="188" height="68" rx="10"/>
+  <text class="text" x="142" y="101" text-anchor="middle">bloom_infer</text>
+  <text class="small" x="142" y="124" text-anchor="middle">CLI / interactive mode</text>
+  <rect class="box" x="268" y="72" width="188" height="68" rx="10"/>
+  <text class="text" x="362" y="101" text-anchor="middle">bloom_server</text>
+  <text class="small" x="362" y="124" text-anchor="middle">OpenAI-compatible API</text>
+  <rect class="box" x="488" y="72" width="188" height="68" rx="10"/>
+  <text class="text" x="582" y="101" text-anchor="middle">Bloom UI</text>
+  <text class="small" x="582" y="124" text-anchor="middle">Dioxus web client</text>
+  <rect class="box" x="708" y="72" width="188" height="68" rx="10"/>
+  <text class="text" x="802" y="101" text-anchor="middle">Python SDK</text>
+  <text class="small" x="802" y="124" text-anchor="middle">FFI wrapper</text>
+  <rect class="box" x="928" y="72" width="188" height="68" rx="10"/>
+  <text class="text" x="1022" y="101" text-anchor="middle">C ABI</text>
+  <text class="small" x="1022" y="124" text-anchor="middle">Native integration</text>
+
+  <path class="line" d="M 142 140 V 180 H 582"/>
+  <path class="line" d="M 362 140 V 180 H 582"/>
+  <path class="arrow" d="M 582 140 V 208"/>
+  <path class="line" d="M 802 140 V 180 H 582"/>
+  <path class="line" d="M 1022 140 V 180 H 582"/>
+
+  <rect class="group" x="48" y="208" width="1068" height="156" rx="14"/>
+  <text class="label" x="72" y="242">Inference pipeline</text>
+  <rect class="box-alt" x="72" y="260" width="220" height="72" rx="10"/>
+  <text class="text" x="182" y="290" text-anchor="middle">Manifest + processor</text>
+  <text class="small" x="182" y="314" text-anchor="middle">Validate model and input</text>
+  <rect class="box-alt" x="326" y="260" width="220" height="72" rx="10"/>
+  <text class="text" x="436" y="290" text-anchor="middle">Engine registry</text>
+  <text class="small" x="436" y="314" text-anchor="middle">Capability-based routing</text>
+  <rect class="box-alt" x="580" y="260" width="220" height="72" rx="10"/>
+  <text class="text" x="690" y="290" text-anchor="middle">Memory + security</text>
+  <text class="small" x="690" y="314" text-anchor="middle">Admission and trust checks</text>
+  <rect class="box-alt" x="834" y="260" width="258" height="72" rx="10"/>
+  <text class="text" x="963" y="290" text-anchor="middle">Scheduler + KV cache</text>
+  <text class="small" x="963" y="314" text-anchor="middle">IFB, paging, CacheMesh</text>
+
+  <path class="arrow" d="M 292 296 H 326"/>
+  <path class="arrow" d="M 546 296 H 580"/>
+  <path class="arrow" d="M 800 296 H 834"/>
+  <path class="arrow" d="M 963 332 V 406"/>
+
+  <text class="label" x="48" y="412">Execution</text>
+  <rect class="box" x="48" y="430" width="324" height="112" rx="12"/>
+  <text class="text" x="210" y="463" text-anchor="middle">Native Candle engine</text>
+  <text class="small" x="210" y="490" text-anchor="middle">Safetensors / GGUF</text>
+  <text class="small" x="210" y="514" text-anchor="middle">Text and multimodal executors</text>
+  <rect class="box-warn" x="438" y="430" width="324" height="112" rx="12"/>
+  <text class="text" x="600" y="463" text-anchor="middle">External runtimes</text>
+  <text class="small" x="600" y="490" text-anchor="middle">OpenVINO / FunASR / llama.cpp</text>
+  <text class="small" x="600" y="514" text-anchor="middle">Explicit process or SDK boundary</text>
+  <rect class="box-warn" x="828" y="430" width="288" height="112" rx="12"/>
+  <text class="text" x="972" y="463" text-anchor="middle">Plugins and skeletons</text>
+  <text class="small" x="972" y="490" text-anchor="middle">ONNX / CoreML / MLX / Vulkan</text>
+  <text class="small" x="972" y="514" text-anchor="middle">Capability probing until wired</text>
+
+  <path class="arrow" d="M 963 406 H 210 V 430"/>
+  <path class="arrow" d="M 963 406 H 600 V 430"/>
+  <path class="arrow" d="M 963 406 V 430"/>
+
+  <rect class="group" x="48" y="592" width="1068" height="82" rx="14"/>
+  <text class="label" x="72" y="625">Device layer</text>
+  <text class="text" x="220" y="650" text-anchor="middle">CPU</text>
+  <text class="text" x="420" y="650" text-anchor="middle">Metal</text>
+  <text class="text" x="620" y="650" text-anchor="middle">CUDA</text>
+  <text class="text" x="820" y="650" text-anchor="middle">Intel NPU</text>
+  <text class="text" x="1020" y="650" text-anchor="middle">Remote / vendor</text>
+  <path class="arrow" d="M 210 542 V 592"/>
+  <path class="arrow" d="M 600 542 V 592"/>
+  <path class="arrow" d="M 972 542 V 592"/>
+</svg>

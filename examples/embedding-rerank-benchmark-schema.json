@@ -1,0 +1,68 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Bloom Embedding & Reranker Benchmark Result",
+  "type": "object",
+  "required": [
+    "backend",
+    "model_id",
+    "dtype",
+    "queries_per_second",
+    "tokens_processed_per_second",
+    "avg_latency_ms",
+    "peak_memory_bytes",
+    "duration_secs",
+    "timestamp"
+  ],
+  "properties": {
+    "backend": {
+      "type": "string",
+      "minLength": 1
+    },
+    "model_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "dtype": {
+      "enum": ["F32", "F16", "BF16", "Q8", "Q4", "I8", "U8", "Unknown"]
+    },
+    "quantization": {
+      "type": ["string", "null"]
+    },
+    "queries_per_second": {
+      "type": "number",
+      "minimum": 0
+    },
+    "tokens_processed_per_second": {
+      "type": "number",
+      "minimum": 0
+    },
+    "avg_latency_ms": {
+      "type": "number",
+      "minimum": 0
+    },
+    "peak_memory_bytes": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "duration_secs": {
+      "type": "number",
+      "minimum": 0
+    },
+    "timestamp": {
+      "type": "string",
+      "minLength": 1
+    },
+    "hardware": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "device": { "type": "string" },
+        "backend": { "type": "string" },
+        "os": { "type": "string" }
+      }
+    },
+    "notes": {
+      "type": ["string", "null"]
+    }
+  }
+}

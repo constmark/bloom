@@ -1,0 +1,30 @@
+//! Inference engine implementations.
+
+#[cfg(feature = "candle-engine")]
+pub mod batch_executor;
+#[cfg(feature = "candle-engine")]
+pub mod candle;
+pub mod coreml;
+pub mod funasr;
+#[cfg(feature = "candle-engine")]
+pub mod gemma4;
+#[cfg(feature = "candle-engine")]
+pub mod gemma4_streaming;
+pub mod intel_npu;
+pub mod llamacpp;
+pub mod longcat_image_edit;
+#[cfg(feature = "candle-engine")]
+pub mod longcat_native;
+#[cfg(feature = "candle-engine")]
+pub mod metal_quant;
+pub mod mlx;
+pub mod npu_tts;
+pub mod onnx;
+pub mod openvino;
+pub mod qwen3_vl;
+#[cfg(feature = "candle-engine")]
+pub mod qwen_streaming;
+pub mod speculative;
+pub mod vulkan;
+#[cfg(feature = "candle-engine")]
+pub mod wan;

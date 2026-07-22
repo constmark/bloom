@@ -1,0 +1,24 @@
+{
+  "metadata": {
+    "name": "com.example.custom-npu",
+    "version": "1.0.0",
+    "description": "Example NPU backend plugin for custom AI accelerator chips",
+    "author": "Example Corp",
+    "license": "MIT",
+    "homepage": "https://github.com/example/bloom-npu-plugin",
+    "platforms": ["linux-x86_64", "linux-aarch64"],
+    "min_runtime_version": "0.2.0"
+  },
+  "entry_point": {
+    "type": "native",
+    "path": "libcustom_npu.so"
+  },
+  "device_class": "Npu",
+  "supported_dtypes": ["F16", "Q8", "Q4"],
+  "supported_formats": ["OpenVinoIr", "Onnx"],
+  "supports_mmap": true,
+  "has_quantization_kernels": true,
+  "supports_streaming": false,
+  "memory_overhead_bytes": 67108864,
+  "probe_script": "python3 -c 'import custom_npu; custom_npu.check_device()'"
+}

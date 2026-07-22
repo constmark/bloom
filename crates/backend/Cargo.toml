@@ -1,0 +1,24 @@
+[package]
+name = "bloomai-backend"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+
+[features]
+default = ["cpu"]
+cpu = []
+cuda = []
+metal = []
+coreml = []
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bloomai-core = { workspace = true }

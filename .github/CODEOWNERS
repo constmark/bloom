@@ -1,0 +1,24 @@
+# Code owners for the Bloom workspace.
+# These owners are requested for review when someone opens a pull request
+# that modifies the paths they own. Order is irrelevant; the last matching
+# pattern takes the highest precedence.
+
+# Default owner for the whole workspace
+* @constmark
+
+# Crate-level ownership
+/crates/core/       @constmark
+/crates/backend/    @constmark
+/crates/engine/     @constmark
+/crates/ffi/        @constmark
+/crates/tilelang/   @constmark
+
+# Python SDK
+/python/            @constmark
+
+# CI, release and governance
+/.github/           @constmark
+/justfile           @constmark
+/Dockerfile         @constmark
+/RELEASE.md         @constmark
+/CHANGELOG.md       @constmark

@@ -1,0 +1,61 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Bloom World Model Schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["world_state_schema", "action_schema"],
+  "properties": {
+    "world_state_schema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "scalar_ranges": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "items": { "type": "number" }
+          }
+        },
+        "allowed_image_mimes": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "tensor_shapes": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "allow_text": { "type": "boolean" },
+        "allow_audio": { "type": "boolean" }
+      }
+    },
+    "action_schema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "allowed_action_spaces": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "action_dimensions": {
+          "type": "object",
+          "additionalProperties": { "type": "integer", "minimum": 0 }
+        },
+        "value_range": {
+          "type": ["array", "null"],
+          "minItems": 2,
+          "maxItems": 2,
+          "items": { "type": "number" }
+        }
+      }
+    },
+    "example": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  }
+}
