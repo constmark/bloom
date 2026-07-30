@@ -69,7 +69,7 @@ The current maturity of each path is recorded in the
 
 Bloom schedules work within one loaded model instance: prefill, decode,
 chunking, batching, KV allocation, and cache eviction. A higher-level runtime
-such as Elderwand may handle cross-model routing, device placement, residency,
+or orchestrator may handle cross-model routing, device placement, residency,
 and fleet-level policy.
 
 See [scheduler.md](scheduler.md) for scheduling behavior and

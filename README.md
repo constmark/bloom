@@ -10,8 +10,7 @@ Bloom is a standalone, multimodal inference engine written in Rust. It loads
 local models directly, runs inference without an external scheduler, and
 provides both a command-line interface and an OpenAI-compatible HTTP API.
 
-Bloom can run on its own or as the inference engine used by
-[Elderwand](https://github.com/constmark/elderwand).
+Bloom can run on its own or serve as an inference engine integrated into larger runtime systems.
 
 > [!IMPORTANT]
 > Bloom is pre-1.0 software. The default Candle paths are currently

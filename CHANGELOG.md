@@ -10,10 +10,10 @@ called out in release notes.
 
 ### Breaking
 
-- Rename `ElderwandConfig` to `BloomConfig` in `bloomai-core`. The struct
-  lives in the Bloom workspace, so the previous name leaked the upstream
+- Rename legacy core config struct to `BloomConfig` in `bloomai-core`. The struct
+  lives in the Bloom workspace, so the previous name leaked an external
   runtime's brand into Bloom's public API. Callers using
-  `bloomai_core::ElderwandConfig` must update to `bloomai_core::BloomConfig`.
+  the legacy config struct name must update to `bloomai_core::BloomConfig`.
   No JSON field names changed (the struct never carried a serde rename).
 
 ### UI
@@ -48,8 +48,8 @@ called out in release notes.
 - Ignore `test_batch_executor_grammar_filtering_decode_chain` as a known
   issue: the JSON grammar mask uses stale state in the decode chain, so an
   invalid token is sampled. Re-enable once the decode-chain state is fixed.
-- Update CONTRIBUTING to reflect the `bloomai-*` namespace (drop the stale
-  `elderwand-*` compatibility note).
+- Update CONTRIBUTING to reflect the `bloomai-*` namespace (drop stale
+  namespace compatibility notes).
 - Remove `continue-on-error` from the four CI smoke steps (benchmark, OpenAI
   API, llama.cpp comparison, Docker build). All three scripts already SKIP
   gracefully (exit 0) when models or external binaries are absent, so the

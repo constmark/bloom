@@ -1,9 +1,8 @@
 # Bloom Scheduler
 
 This directory owns Bloom's engine-local scheduling logic. It is intentionally
-kept below `bloomai-engine` instead of the Elderwand runtime scheduler: Bloom
-decides how a loaded model advances token work, while Elderwand decides
-cross-model routing, residency, and global resource policy.
+kept below `bloomai-engine`: Bloom decides how a loaded model advances token work,
+while external runtime schedulers decide cross-model routing, residency, and global resource policy.
 
 ## Module Map
 

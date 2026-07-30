@@ -108,7 +108,7 @@ local explanation.
 `crates/core` contains runtime, scheduler, VRAM, token scheduling, unified
 memory, KV overlay, and online-switching modules, while `crates/engine` also has
 an engine-level scheduler. The ownership boundary between those layers, and
-between Bloom and Elderwand, should be documented explicitly.
+between Bloom and external runtimes, should be documented explicitly.
 
 ## 3. MVP Usability
 
@@ -162,7 +162,7 @@ real-model evidence, `experimental` is the appropriate public status.
 | P0 | Add a reproducible real-model golden test or keep support claims experimental | Make MVP correctness independently verifiable |
 | P1 | Split the largest CLI, server, executor, and scheduler files by responsibility | Improve readability, testing, and onboarding |
 | P1 | Introduce a shared streaming abstraction | Reduce duplicated backend logic |
-| P1 | Clarify scheduler, runtime, memory, and Elderwand ownership boundaries | Reduce architectural ambiguity |
+| P1 | Clarify scheduler, runtime, memory, and external runtime ownership boundaries | Reduce architectural ambiguity |
 | P2 | Review lockfile policy and keep repository layout documentation current | Improve release reproducibility and trust |
 | P2 | Narrow crate-level Clippy allowances | Strengthen the lint gate |
 
