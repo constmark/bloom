@@ -8,16 +8,44 @@ well-scoped changes are easiest to review.
 Install Rust using rustup, then run:
 
 ```bash
-cargo check --workspace
-cargo test --workspace
-cargo fmt --all
-cargo clippy --workspace --all-targets -- -D warnings
+python3 -m pip install -r requirements/schema-validation.txt
+cargo fmt --all -- --check
+cargo check --workspace --all-targets --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+python3 scripts/check_markdown_links.py
+python3 scripts/check_community_metadata.py
+python3 scripts/test_community_metadata.py
+python3 scripts/check_github_action_pins.py
+python3 scripts/check_release_workflow_security.py
+python3 scripts/test_release_workflow_security.py
+python3 scripts/test_create_release_archive.py
+python3 scripts/check_toolchain_consistency.py
+```
+
+`rust-toolchain.toml` pins the compiler used for current development and release
+validation. This is not an MSRV declaration. Update the toolchain file, every
+`dtolnay/rust-toolchain` workflow reference, and the Docker builder tag in one
+change; the consistency check rejects partial updates.
+
+Every external Action must use a full 40-character commit SHA plus an inline
+release or branch comment. Resolve the SHA from the action's upstream
+repository; do not copy it from an untrusted fork. Dependabot preserves and
+updates same-line version comments when proposing reviewed Action upgrades.
+
+The browser UI is a separate locked Cargo workspace:
+
+```bash
+cargo fmt --manifest-path ui/Cargo.toml -- --check
+cargo check --manifest-path ui/Cargo.toml --target wasm32-unknown-unknown --all-targets --locked
+cargo test --manifest-path ui/Cargo.toml --locked
+cargo clippy --manifest-path ui/Cargo.toml --all-targets --locked -- -D warnings
 ```
 
 CUDA checks are intentionally separate because they require `nvcc`:
 
 ```bash
-cargo clippy --workspace --all-targets --features cuda -- -D warnings
+cargo clippy --workspace --all-targets --features cuda --locked -- -D warnings
 ```
 
 ## Pull Request Expectations
@@ -27,6 +55,14 @@ cargo clippy --workspace --all-targets --features cuda -- -D warnings
 - Keep generated models, downloaded weights, local virtualenvs, and build
   artifacts out of git.
 - Prefer small PRs that touch one area: backend, model, CLI/server, or docs.
+
+## Reporting Issues
+
+Use the structured bug, feature, or model/backend support form in GitHub's issue
+chooser. Reports and requests must be written in English. Never include API
+keys, Authorization headers, signed URLs, local paths, private model data, or
+private prompts and responses. Send suspected vulnerabilities through a private
+GitHub security advisory as described in [the security policy](SECURITY.md).
 
 ## Project Boundaries
 

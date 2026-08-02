@@ -16,6 +16,11 @@ model instance. It does not choose between models or devices.
 Decode receives budget before prefill. This keeps streaming requests moving
 while allowing new prompts into the active batch.
 
+All prefill, decode, and shared admission counters compare against their
+remaining budget without unchecked addition. Corrupt or oversized accounting
+state therefore fails closed instead of wrapping in release builds or panicking
+in debug builds.
+
 ## Chunked prefill
 
 ```rust
@@ -26,6 +31,8 @@ config.chunked_prefill.interleave_with_decode = true;
 ```
 
 - Prompts are split to fit the available step budget.
+- An enabled chunk size must be at least one token; startup and doctor reject
+  zero instead of silently changing the configured value.
 - If `interleave_with_decode` is false, a step that schedules decode work does
   not schedule prefill work.
 - The final prefill chunk produces the first token; later steps continue decode.

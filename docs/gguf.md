@@ -48,6 +48,39 @@ cargo run --release --bin bloom_infer -- \
   --prompt "Hello"
 ```
 
+When a GGUF file does not sit beside a Hugging Face `tokenizer.json`, Bloom
+synthesizes the tokenizer from the embedded `tokenizer.ggml.*` metadata. The
+synthesis preserves vocabulary, merges, token types, special-token IDs, and the
+pre-tokenizer identifier. Qwen2 metadata receives its matching NFC, regex split,
+and ByteLevel configuration instead of the generic BPE fallback.
+
+Mixed-dtype files are normal: a nominal Q4 model can contain F32 normalization,
+Q8 embedding, or Q4_1 projection tensors. Bloom derives the manifest's primary
+dtype from the transformer-weight format covering the most elements; it does
+not depend on unordered header iteration or reject a whole model because one
+supported auxiliary tensor uses a different format.
+
+The pinned trained-model acceptance profiles use official Qwen2 0.5B Instruct
+Q4_0, Qwen3 0.6B Q8_0, and SmolLM2 360M Instruct Q8_0 GGUF files. They verify
+architecture routing, deterministic CLI output, benchmarking, and exact
+buffered and streamed OpenAI- and Ollama-compatible chat output on CPU:
+
+```bash
+./scripts/test_trained_qwen2_runtime.sh
+./scripts/test_trained_qwen3_runtime.sh
+./scripts/test_trained_llama_runtime.sh
+```
+
+See [Trained Model Validation](trained-model-validation.md) for the immutable
+revision, checksums, measured result, cache controls, and proof boundaries. The
+model weights are downloaded to an external cache and are never committed to or
+packaged with Bloom.
+
+Bloom reads `tokenizer.chat_template` as bounded, inert metadata. It recognizes
+known token contracts and selects a hard-coded formatter for SmolLM2, generic
+ChatML, Llama 2, Llama 3, or Gemma. It never evaluates model-provided Jinja;
+unknown templates use the conservative family fallback.
+
 ## OpenAI-Compatible Service Acceptance
 
 ```bash
