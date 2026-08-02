@@ -11,7 +11,7 @@
 ## Support Matrix Impact
 
 - [ ] No user-facing support matrix change
-- [ ] Updated `docs/en/support-matrix.md`
+- [ ] Updated [the support matrix](../docs/support-matrix.md)
 - [ ] Added benchmark or smoke evidence for any `stable` claim
 
 ## Notes

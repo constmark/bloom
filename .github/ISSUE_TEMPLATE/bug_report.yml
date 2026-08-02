@@ -1,0 +1,128 @@
+name: Bug report
+description: Report a reproducible Bloom failure without sharing private data.
+title: "[Bug]: "
+labels: ["bug"]
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Bloom. Search existing issues first.
+
+        Do not include API keys, Authorization headers, signed URLs, local paths,
+        private model data, or private prompts and responses. Report security
+        vulnerabilities through the private advisory link below, not this form.
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Affected surface
+      description: Select the narrowest surface that reproduces the problem.
+      options:
+        - Browser UI
+        - OpenAI-compatible API
+        - Ollama-compatible API
+        - Model management or acquisition
+        - Native runtime or scheduler
+        - CLI, packaging, or deployment
+        - Documentation or another surface
+    validations:
+      required: true
+  - type: textarea
+    id: current_behavior
+    attributes:
+      label: Current behavior
+      description: Describe the observed failure and whether it is repeatable.
+    validations:
+      required: true
+  - type: textarea
+    id: expected_behavior
+    attributes:
+      label: Expected behavior
+      description: Describe the result Bloom should produce instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Provide the smallest ordered steps or command that triggers the problem.
+      placeholder: |
+        1. Start Bloom with a safe, redacted command.
+        2. Perform one action.
+        3. Observe the failure.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Do not include hostnames, usernames, or absolute paths.
+      placeholder: |
+        OS and version:
+        CPU/GPU/NPU:
+        Backend:
+        Browser or SDK version:
+        Model family, format, and quantization:
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Bloom version
+      description: Provide a release version or full Git commit SHA.
+      placeholder: "Example: v0.1.0 or 0123456789abcdef..."
+    validations:
+      required: true
+  - type: input
+    id: model_reference
+    attributes:
+      label: Public model reference
+      description: Optional public repository and immutable revision; never provide a local path.
+      placeholder: "Example: publisher/model at commit 012345..."
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted logs
+      description: Include only the smallest relevant excerpt after removing secrets and private data.
+      render: shell
+    validations:
+      required: false
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: I removed credentials, signed URLs, local paths, private model data, prompts, and responses.
+          required: true
+    validations:
+      required: true
+  - type: checkboxes
+    id: security
+    attributes:
+      label: Security routing
+      description: Use a [private security advisory](https://github.com/constmark/bloom/security/advisories/new) for vulnerabilities.
+      options:
+        - label: This report does not disclose a security vulnerability.
+          required: true
+    validations:
+      required: true
+  - type: checkboxes
+    id: english
+    attributes:
+      label: Project language
+      options:
+        - label: This report is written in English.
+          required: true
+    validations:
+      required: true
+  - type: checkboxes
+    id: conduct
+    attributes:
+      label: Code of Conduct
+      options:
+        - label: I agree to follow the [Code of Conduct](https://github.com/constmark/bloom/blob/main/CODE_OF_CONDUCT.md).
+          required: true
+    validations:
+      required: true

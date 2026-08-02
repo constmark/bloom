@@ -1,6 +1,9 @@
-target
+**/target
 .git
 .venv*
+.bloom-downloads
+.bloom-imports
+.bloom-metadata
 *.safetensors
 *.gguf
 *.onnx
