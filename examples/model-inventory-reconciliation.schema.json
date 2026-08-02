@@ -1,0 +1,82 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Bloom Model Inventory Reconciliation",
+  "description": "Deterministic, value-redacted drift preview for a Bloom model inventory.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "object", "in_sync", "truncated", "summary", "drift"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "object": { "const": "bloom.model_inventory_reconciliation" },
+    "in_sync": { "type": "boolean" },
+    "truncated": { "type": "boolean" },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "expected_model_count",
+        "current_model_count",
+        "matching_count",
+        "missing_count",
+        "unexpected_count",
+        "changed_count",
+        "blocking_count",
+        "restorable_count",
+        "drift_count"
+      ],
+      "properties": {
+        "expected_model_count": { "type": "integer", "minimum": 0, "maximum": 20000 },
+        "current_model_count": { "type": "integer", "minimum": 0 },
+        "matching_count": { "type": "integer", "minimum": 0 },
+        "missing_count": { "type": "integer", "minimum": 0 },
+        "unexpected_count": { "type": "integer", "minimum": 0 },
+        "changed_count": { "type": "integer", "minimum": 0 },
+        "blocking_count": { "type": "integer", "minimum": 0 },
+        "restorable_count": { "type": "integer", "minimum": 0 },
+        "drift_count": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "drift": {
+      "type": "array",
+      "maxItems": 200,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "status", "severity", "changes", "restore_available"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1, "maxLength": 255 },
+          "status": { "enum": ["missing", "unexpected", "changed"] },
+          "severity": { "enum": ["blocking", "warning"] },
+          "restore_available": { "type": "boolean" },
+          "changes": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "enum": [
+                "model_missing",
+                "model_unexpected",
+                "kind",
+                "format",
+                "size_bytes",
+                "size_complete",
+                "provenance_status",
+                "acquisition",
+                "model_index_id",
+                "source_url",
+                "source_host",
+                "source_revision",
+                "source_lock",
+                "sha256",
+                "license",
+                "installed_at",
+                "last_verified_at",
+                "integrity"
+              ]
+            }
+          }
+        }
+      }
+    }
+  }
+}

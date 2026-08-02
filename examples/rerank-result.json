@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "object": "bloom.rerank_result",
+  "id": "rerank-example-1",
+  "model": "all-MiniLM-L6-v2",
+  "query": "local AI runtime",
+  "prompt_tokens": 12,
+  "results": [
+    {
+      "index": 1,
+      "relevance_score": 0.82,
+      "document": "Bloom runs supported models on local hardware."
+    },
+    {
+      "index": 0,
+      "relevance_score": 0.31,
+      "document": "A document about an unrelated subject."
+    }
+  ]
+}

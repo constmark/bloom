@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "object": "bloom.model_catalog",
+  "root": "/srv/bloom/models",
+  "root_exists": true,
+  "data": [],
+  "active_model": null,
+  "download": {
+    "enabled": false,
+    "license_policy": {
+      "enforced": false,
+      "allowed": []
+    },
+    "status": {
+      "phase": "idle",
+      "filename": null,
+      "source_host": null,
+      "downloaded_bytes": 0,
+      "total_bytes": null,
+      "resumable": false,
+      "error": null
+    },
+    "staged": []
+  },
+  "import": {
+    "enabled": false,
+    "max_bytes": 0,
+    "max_chunk_bytes": 0,
+    "license_policy": {
+      "enforced": false,
+      "allowed": []
+    },
+    "status": {
+      "phase": "idle",
+      "filename": null,
+      "uploaded_bytes": 0,
+      "total_bytes": null,
+      "error": null
+    },
+    "staged": []
+  },
+  "index": {
+    "enabled": false,
+    "key_id": null,
+    "trust_id": null,
+    "trusted_key_count": 0,
+    "refresh_seconds": 0,
+    "persistent_rollback_protection": false
+  },
+  "storage": {
+    "quota_enabled": false,
+    "max_bytes": null,
+    "used_bytes": 0,
+    "committed_bytes": 0,
+    "available_bytes": null,
+    "installed_bytes": 0,
+    "staged_download_bytes": 0,
+    "staged_import_bytes": 0,
+    "reserved_bytes": 0,
+    "staged_retention_seconds": 0,
+    "last_cleanup_at": null,
+    "last_cleanup_removed_sessions": 0
+  },
+  "integrity": {
+    "phase": "idle",
+    "model_id": null,
+    "checked_bytes": 0,
+    "total_bytes": null,
+    "expected_sha256": null,
+    "actual_sha256": null,
+    "matches_expected": null,
+    "verified_at": null,
+    "error": null
+  },
+  "load": {
+    "phase": "idle",
+    "progress": 0,
+    "requested_model": null,
+    "error": null
+  }
+}

@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "object": "bloom.model_preflight",
+  "data": {
+    "model_id": "local-model",
+    "inspected_at": 1700000000,
+    "loadable": true,
+    "load_blocker": null,
+    "manifest": {
+      "id": "local-model",
+      "family": "llama",
+      "version": "1",
+      "model_tasks": ["generation"],
+      "description": "Example local generation model",
+      "license": "Apache-2.0",
+      "input_modalities": ["text"],
+      "output_modalities": ["text"],
+      "formats": ["gguf"],
+      "primary_dtype": "q4",
+      "quantization": "q4_k_m",
+      "quantization_bits": 4,
+      "parameter_count": 500000000,
+      "context_length": 4096,
+      "num_layers": 24,
+      "hidden_size": 896,
+      "vocab_size": 151936,
+      "supports_mmap": true,
+      "requires_streaming": false
+    },
+    "runtime": {
+      "configured_engine": "candle",
+      "selected_engine": "candle",
+      "engine_maturity": "experimental",
+      "device": "cpu",
+      "device_backend": "cpu",
+      "backend_available": true,
+      "backend_reason": null,
+      "support": "native",
+      "support_reason": null,
+      "diagnostic_tips": []
+    },
+    "memory": {
+      "per_request_context_tokens": 2048,
+      "max_concurrent": 1,
+      "planned_context_tokens": 2048,
+      "weight_bytes": 1000000000,
+      "host_weight_bytes": 1000000000,
+      "device_weight_bytes": 0,
+      "kv_cache_bytes": 100000000,
+      "kv_cache_bytes_per_token": 48828,
+      "temp_tensor_bytes": 50000000,
+      "total_bytes": 1150000000,
+      "available_bytes": 8000000000,
+      "budget_bytes": 6000000000,
+      "reserve_bytes": 150000000,
+      "memory_utilization": 0.75,
+      "preallocation_enabled": true,
+      "fits_budget": true,
+      "scope": "host-resident estimate"
+    },
+    "warnings": [
+      "The selected 'candle' engine is marked experimental."
+    ]
+  }
+}

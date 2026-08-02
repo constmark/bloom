@@ -1,0 +1,35 @@
+{
+  "schema_version": 2,
+  "object": "bloom.model_inventory",
+  "summary": {
+    "model_count": 1,
+    "provenance_count": 1,
+    "source_locked_count": 1,
+    "quarantined_count": 0,
+    "invalid_provenance_count": 0
+  },
+  "models": [
+    {
+      "id": "tiny-q4.gguf",
+      "kind": "file",
+      "format": "gguf",
+      "size_bytes": 2147483648,
+      "size_complete": true,
+      "provenance_status": "recorded",
+      "acquisition": "download",
+      "model_index_id": "tiny-q4",
+      "source": {
+        "url": "https://huggingface.co/example/tiny/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/tiny-q4.gguf",
+        "host": "huggingface.co",
+        "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "immutable_revision": true
+      },
+      "sha256": "abababababababababababababababababababababababababababababababab",
+      "license": "Apache-2.0",
+      "installed_at": 1785531600,
+      "last_verified_at": 1785531700,
+      "integrity": "verified",
+      "source_locked": true
+    }
+  ]
+}

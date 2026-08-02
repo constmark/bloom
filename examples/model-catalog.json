@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "object": "bloom.model_catalog",
+  "root": "/srv/bloom/models",
+  "root_exists": true,
+  "data": [
+    {
+      "id": "tiny.gguf",
+      "name": "tiny",
+      "kind": "file",
+      "format": "gguf",
+      "size_bytes": 100,
+      "size_complete": true,
+      "modified_at": 1700000000,
+      "active": true,
+      "provenance": {
+        "acquisition": "download",
+        "model_index_id": "tiny-q4",
+        "source_url": "https://huggingface.co/acme/tiny/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/tiny.gguf",
+        "source_host": "huggingface.co",
+        "sha256": "abababababababababababababababababababababababababababababababab",
+        "license": "Apache-2.0",
+        "installed_at": 1700000000,
+        "last_verified_at": 1700000100,
+        "integrity_mismatch_at": null
+      },
+      "provenance_error": null
+    }
+  ],
+  "active_model": {
+    "id": "tiny-model",
+    "catalog_id": "tiny.gguf",
+    "source": "catalog",
+    "input_modalities": ["text"]
+  },
+  "download": {
+    "enabled": true,
+    "license_policy": {
+      "enforced": true,
+      "allowed": ["Apache-2.0", "MIT"]
+    },
+    "status": {
+      "phase": "downloading",
+      "filename": "pending.gguf",
+      "source_host": "huggingface.co",
+      "downloaded_bytes": 50,
+      "total_bytes": 100,
+      "resumable": true,
+      "error": null
+    },
+    "staged": [
+      {
+        "filename": "pending.gguf",
+        "source_host": "huggingface.co",
+        "downloaded_bytes": 50,
+        "modified_at": 1700000200
+      }
+    ]
+  },
+  "import": {
+    "enabled": true,
+    "max_bytes": 1000,
+    "max_chunk_bytes": 100,
+    "license_policy": {
+      "enforced": true,
+      "allowed": ["Apache-2.0", "MIT"]
+    },
+    "status": {
+      "phase": "uploading",
+      "filename": "local.gguf",
+      "uploaded_bytes": 25,
+      "total_bytes": 100,
+      "error": null
+    },
+    "staged": [
+      {
+        "filename": "local.gguf",
+        "uploaded_bytes": 25,
+        "total_bytes": 100,
+        "modified_at": 1700000200
+      }
+    ]
+  },
+  "index": {
+    "enabled": true,
+    "key_id": null,
+    "trust_id": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+    "trusted_key_count": 2,
+    "refresh_seconds": 300,
+    "persistent_rollback_protection": true
+  },
+  "storage": {
+    "quota_enabled": true,
+    "max_bytes": 2000,
+    "used_bytes": 500,
+    "committed_bytes": 750,
+    "available_bytes": 1250,
+    "installed_bytes": 400,
+    "staged_download_bytes": 50,
+    "staged_import_bytes": 50,
+    "reserved_bytes": 250,
+    "staged_retention_seconds": 604800,
+    "last_cleanup_at": 1700000300,
+    "last_cleanup_removed_sessions": 2
+  },
+  "integrity": {
+    "phase": "complete",
+    "model_id": "tiny.gguf",
+    "checked_bytes": 100,
+    "total_bytes": 100,
+    "expected_sha256": "abababababababababababababababababababababababababababababababab",
+    "actual_sha256": "abababababababababababababababababababababababababababababababab",
+    "matches_expected": true,
+    "verified_at": 1700000100,
+    "error": null
+  },
+  "load": {
+    "phase": "ready",
+    "progress": 100,
+    "requested_model": "tiny.gguf",
+    "error": null
+  }
+}

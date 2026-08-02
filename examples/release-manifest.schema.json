@@ -1,0 +1,112 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/constmark/bloom/blob/main/examples/release-manifest.schema.json",
+  "title": "Bloom Release Manifest",
+  "description": "Metadata and binary checksums bundled inside a Bloom application archive.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "object",
+    "bloom_version",
+    "target",
+    "embedded_ui",
+    "self_check",
+    "binaries"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "object": {
+      "const": "bloom.release"
+    },
+    "bloom_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "target": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]{1,128}$"
+    },
+    "embedded_ui": {
+      "type": "boolean"
+    },
+    "self_check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "doctor_status", "failures"],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["passed", "not_run_cross_target"]
+        },
+        "doctor_status": {
+          "type": ["string", "null"],
+          "enum": ["pass", "warn", "fail", null]
+        },
+        "failures": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "passed"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "doctor_status": {
+                "enum": ["pass", "warn"]
+              },
+              "failures": {
+                "const": 0
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "doctor_status": {
+                "const": null
+              },
+              "failures": {
+                "const": null
+              }
+            }
+          }
+        }
+      ]
+    },
+    "binaries": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "size_bytes", "sha256"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_.-]{1,128}$"
+          },
+          "size_bytes": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      }
+    }
+  }
+}

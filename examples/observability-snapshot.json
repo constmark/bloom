@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "object": "bloom.observability_snapshot",
+  "created": 1785542400,
+  "server": {
+    "version": "0.1.0",
+    "uptime_seconds": 3723
+  },
+  "model": "example-model.gguf",
+  "ready": true,
+  "load": {
+    "phase": "ready",
+    "progress": 100,
+    "requested_model": "example-model.gguf",
+    "failure_present": false
+  },
+  "speculative_mode": "none",
+  "requests": {
+    "total": 12,
+    "completed": 10,
+    "failed": 1,
+    "in_flight": 1
+  },
+  "tokens": {
+    "prompt_total": 4096,
+    "generated_total": 1536
+  },
+  "scheduler": {
+    "ifb_enabled": false,
+    "prefill_queue": 0,
+    "decoding_queue": 0,
+    "active_requests": 1
+  },
+  "startup_memory_estimate": {
+    "weight_bytes": 4294967296,
+    "host_weight_bytes": 4294967296,
+    "device_weight_bytes": 0,
+    "kv_cache_bytes": 536870912,
+    "kv_cache_bytes_per_token": 131072,
+    "temp_tensor_bytes": 268435456,
+    "total_bytes": 5100273664,
+    "weight_dtype": "Q4",
+    "quantization": null,
+    "kv_cache_dtype": "F16",
+    "num_layers": 32,
+    "offloaded_layers": null,
+    "mmap_residency_applied": true,
+    "memory_scope": "host-resident estimate"
+  },
+  "kv_cache": {
+    "total_blocks": 256,
+    "free_blocks": 192,
+    "active_blocks": 32,
+    "cached_blocks": 32,
+    "hits": 18,
+    "misses": 7,
+    "evictions": 2,
+    "reuses": 15,
+    "utilization": 0.25
+  },
+  "cachemesh": null,
+  "memory": {
+    "total_vram": 0,
+    "used_vram": 0,
+    "total_ram": 34359738368,
+    "used_ram": 5368709120,
+    "peak_vram": 0,
+    "peak_ram": 5905580032,
+    "device_name": ""
+  }
+}

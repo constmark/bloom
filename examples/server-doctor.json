@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "object": "bloom.server_doctor",
+  "created": 1785542191,
+  "bloom_version": "0.1.0",
+  "status": "warn",
+  "summary": {
+    "passed": 9,
+    "warnings": 3,
+    "failures": 0
+  },
+  "checks": [
+    {
+      "id": "configuration",
+      "status": "pass",
+      "message": "No configuration file was present; built-in defaults and command-line values are effective."
+    },
+    {
+      "id": "arguments",
+      "status": "pass",
+      "message": "Numeric limits and feature dependencies are internally consistent."
+    },
+    {
+      "id": "network_security",
+      "status": "pass",
+      "message": "Listener authentication and browser-origin settings are appropriate for the configured bind scope."
+    },
+    {
+      "id": "runtime_engine",
+      "status": "pass",
+      "message": "The 'candle' engine is registered with experimental maturity."
+    },
+    {
+      "id": "device_backend",
+      "status": "pass",
+      "message": "The 'cpu' device backend is available."
+    },
+    {
+      "id": "model_catalog",
+      "status": "warn",
+      "message": "The model catalog does not exist yet; the server will start with an empty catalog.",
+      "remediation": "Create the catalog, enable a verified acquisition path, or load an explicit --model."
+    },
+    {
+      "id": "startup_model",
+      "status": "warn",
+      "message": "No startup model or recognized catalog model is available.",
+      "remediation": "Add a model before expecting readiness; liveness and model-management APIs can still start."
+    },
+    {
+      "id": "storage_policy",
+      "status": "pass",
+      "message": "Model downloads and browser imports are disabled; the catalog is read-only from the API."
+    },
+    {
+      "id": "model_license_policy",
+      "status": "pass",
+      "message": "Writable model acquisitions are disabled; a license admission policy is not required."
+    },
+    {
+      "id": "model_index",
+      "status": "pass",
+      "message": "No signed model discovery index is configured; manual verified acquisition remains available."
+    },
+    {
+      "id": "model_index_state",
+      "status": "pass",
+      "message": "Signed model discovery is disabled, so persistent rollback state is inactive."
+    },
+    {
+      "id": "embedded_ui",
+      "status": "warn",
+      "message": "This binary does not contain the Bloom browser UI.",
+      "remediation": "Use a release built with --features serve-ui after generating ui/dist, or host the standalone UI separately."
+    }
+  ]
+}

@@ -1,0 +1,193 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/constmark/bloom/blob/main/examples/model-index-payload.schema.json",
+  "title": "Bloom signed model index payload",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "object",
+    "name",
+    "generated_at",
+    "expires_at",
+    "models"
+  ],
+  "properties": {
+    "schema_version": { "enum": [1, 2] },
+    "object": { "const": "bloom.model_index" },
+    "name": { "type": "string", "minLength": 1, "maxLength": 80 },
+    "generated_at": { "type": "integer", "minimum": 1 },
+    "expires_at": { "type": "integer", "minimum": 1 },
+    "models": {
+      "type": "array",
+      "maxItems": 200,
+      "items": { "$ref": "#/definitions/model" }
+    }
+  },
+  "definitions": {
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "description",
+        "filename",
+        "size_bytes",
+        "license"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-z0-9][a-z0-9._-]*$"
+        },
+        "name": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "description": { "type": "string", "minLength": 1, "maxLength": 400 },
+        "download_url": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048,
+          "pattern": "^https://(www\\.)?huggingface\\.co/[^/?#]+/[^/?#]+/resolve/[0-9a-fA-F]{40}([0-9a-fA-F]{24})?/[^?#]+$"
+        },
+        "filename": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": "^(?!\\.)(?!.*[\\\\/%]).+$"
+        },
+        "size_bytes": { "type": "integer", "minimum": 1 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+          "files": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 256,
+            "items": { "$ref": "#/definitions/file" },
+            "allOf": [
+              {
+                "contains": {
+                  "required": ["filename"],
+                  "properties": { "filename": { "const": "config.json" } }
+                }
+              },
+              {
+                "anyOf": [
+                  {
+                    "contains": {
+                      "required": ["filename"],
+                      "properties": { "filename": { "const": "model.safetensors" } }
+                    }
+                  },
+                  {
+                    "allOf": [
+                      {
+                        "contains": {
+                          "required": ["filename"],
+                          "properties": {
+                            "filename": { "const": "model.safetensors.index.json" }
+                          }
+                        }
+                      },
+                      {
+                        "contains": {
+                          "required": ["filename"],
+                          "properties": {
+                            "filename": {
+                              "pattern": "^model-[0-9]{5}-of-[0-9]{5}\\.safetensors$"
+                            }
+                          }
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+        "license": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "family": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "parameter_count": { "type": "integer", "minimum": 1 },
+        "quantization": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "tags": {
+          "type": "array",
+          "maxItems": 12,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32,
+            "pattern": "^[A-Za-z0-9._-]+$"
+          }
+        }
+      },
+      "oneOf": [
+        {
+          "required": ["download_url", "sha256"],
+          "not": { "required": ["files"] },
+          "properties": {
+            "filename": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 255,
+              "pattern": "^[^./\\\\%][^/\\\\%]*\\.(gguf|onnx|mlmodel)$"
+            }
+          }
+        },
+        {
+          "required": ["files"],
+          "not": {
+            "anyOf": [
+              { "required": ["download_url"] },
+              { "required": ["sha256"] }
+            ]
+          },
+          "properties": {
+            "filename": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 255,
+              "pattern": "^(?!\\.)(?!.*[\\\\/%]).+$"
+            }
+          }
+        }
+      ]
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["download_url", "filename", "size_bytes", "sha256"],
+      "properties": {
+        "download_url": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048,
+          "pattern": "^https://(www\\.)?huggingface\\.co/[^/?#]+/[^/?#]+/resolve/[0-9a-fA-F]{40}([0-9a-fA-F]{24})?/[^?#]+$"
+        },
+        "filename": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*[\\\\%])[^/]+(?:/[^/]+)*\\.(json|safetensors|txt|model|tiktoken)$"
+        },
+        "size_bytes": { "type": "integer", "minimum": 1 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["schema_version"],
+        "properties": { "schema_version": { "const": 1 } }
+      },
+      "then": {
+        "properties": {
+          "models": {
+            "items": { "not": { "required": ["files"] } }
+          }
+        }
+      }
+    }
+  ]
+}

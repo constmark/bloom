@@ -1,0 +1,51 @@
+{
+  "version": 2,
+  "object": "bloom.conversation_archive",
+  "active_conversation": 0,
+  "conversations": [
+    {
+      "title": "Explain local inference",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Why run an inference server locally?"
+        },
+        {
+          "role": "assistant",
+          "content": "Local inference can improve privacy, offline availability, and deployment control.",
+          "model": "local-generation-model"
+        }
+      ]
+    },
+    {
+      "title": "Describe a local image",
+      "messages": [
+        {
+          "role": "user",
+          "content": "[Image: diagram.png]\nDescribe this image.",
+          "attachment_unavailable": true
+        },
+        {
+          "role": "assistant",
+          "content": "The attachment bytes are intentionally not included in this archive.",
+          "model": "local-vision-model"
+        }
+      ]
+    },
+    {
+      "title": "Structured service status",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Return the service status as JSON."
+        },
+        {
+          "role": "assistant",
+          "content": "{\"ready\":true,\"summary\":\"The local service is ready.\"}",
+          "model": "local-generation-model",
+          "response_format": "json_object"
+        }
+      ]
+    }
+  ]
+}

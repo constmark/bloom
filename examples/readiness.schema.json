@@ -1,0 +1,111 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/constmark/bloom/examples/readiness.schema.json",
+  "title": "Bloom readiness handshake",
+  "description": "Versioned public server identity, compatibility, model-load, and admission state returned by GET /ready.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "object",
+    "protocol_version",
+    "minimum_ui_protocol_version",
+    "maximum_ui_protocol_version",
+    "server_version",
+    "status",
+    "progress",
+    "model",
+    "loading",
+    "load_error",
+    "input_modalities",
+    "model_tasks",
+    "context_window",
+    "in_flight_requests",
+    "available_permits",
+    "memory_pressure_high",
+    "ram_utilization"
+  ],
+  "properties": {
+    "schema_version": { "const": 3 },
+    "object": { "const": "bloom.readiness" },
+    "protocol_version": {
+      "description": "The protocol implemented by this server.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "minimum_ui_protocol_version": {
+      "description": "The oldest UI protocol supported by this server.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "maximum_ui_protocol_version": {
+      "description": "The newest UI protocol supported by this server.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "server_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^\\S+$"
+    },
+    "status": { "enum": ["ready", "not_ready"] },
+    "progress": { "type": "integer", "minimum": 0, "maximum": 100 },
+    "model": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "loading": { "type": "boolean" },
+    "load_error": {
+      "type": ["string", "null"],
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "input_modalities": {
+      "type": "array",
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1, "maxLength": 64 }
+    },
+    "model_tasks": {
+      "type": "array",
+      "maxItems": 3,
+      "uniqueItems": true,
+      "items": { "enum": ["generation", "embedding", "rerank"] }
+    },
+    "context_window": {
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "maximum": 18446744073709551615
+    },
+    "in_flight_requests": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "available_permits": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "memory_pressure_high": { "type": "boolean" },
+    "ram_utilization": { "type": "number", "minimum": 0, "maximum": 1 }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "ready" } } },
+      "then": {
+        "properties": {
+          "model": { "not": { "const": "not loaded" } },
+          "progress": { "const": 100 },
+          "loading": { "const": false },
+          "load_error": { "type": "null" },
+          "model_tasks": { "minItems": 1 },
+          "context_window": { "type": "integer", "minimum": 1 },
+          "available_permits": { "minimum": 1 },
+          "memory_pressure_high": { "const": false }
+        }
+      }
+    }
+  ]
+}

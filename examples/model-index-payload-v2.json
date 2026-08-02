@@ -1,0 +1,46 @@
+{
+  "schema_version": 2,
+  "object": "bloom.model_index",
+  "name": "Bloom Example Model Packages",
+  "generated_at": 1785513600,
+  "expires_at": 1817049600,
+  "models": [
+    {
+      "id": "example-tiny-sharded",
+      "name": "Example Tiny Sharded",
+      "description": "A documentation-only signed multi-file Transformers package.",
+      "filename": "example-tiny-sharded",
+      "size_bytes": 26,
+      "license": "Apache-2.0",
+      "family": "Qwen2",
+      "parameter_count": 1000000,
+      "tags": ["chat", "cpu", "sharded"],
+      "files": [
+        {
+          "download_url": "https://huggingface.co/example-org/example-model/resolve/0123456789abcdef0123456789abcdef01234567/config.json",
+          "filename": "config.json",
+          "size_bytes": 3,
+          "sha256": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        },
+        {
+          "download_url": "https://huggingface.co/example-org/example-model/resolve/0123456789abcdef0123456789abcdef01234567/model-00001-of-00002.safetensors",
+          "filename": "model-00001-of-00002.safetensors",
+          "size_bytes": 7,
+          "sha256": "abababababababababababababababababababababababababababababababab"
+        },
+        {
+          "download_url": "https://huggingface.co/example-org/example-model/resolve/0123456789abcdef0123456789abcdef01234567/model-00002-of-00002.safetensors",
+          "filename": "model-00002-of-00002.safetensors",
+          "size_bytes": 11,
+          "sha256": "1212121212121212121212121212121212121212121212121212121212121212"
+        },
+        {
+          "download_url": "https://huggingface.co/example-org/example-model/resolve/0123456789abcdef0123456789abcdef01234567/model.safetensors.index.json",
+          "filename": "model.safetensors.index.json",
+          "size_bytes": 5,
+          "sha256": "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef"
+        }
+      ]
+    }
+  ]
+}

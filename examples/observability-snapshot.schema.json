@@ -1,0 +1,239 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/constmark/bloom/examples/observability-snapshot.schema.json",
+  "title": "Bloom observability snapshot",
+  "description": "Versioned, credential-free runtime counters returned by GET /v1/observability.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "object",
+    "created",
+    "server",
+    "model",
+    "ready",
+    "load",
+    "speculative_mode",
+    "requests",
+    "tokens",
+    "scheduler",
+    "startup_memory_estimate",
+    "kv_cache",
+    "cachemesh",
+    "memory"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "object": { "const": "bloom.observability_snapshot" },
+    "created": { "type": "integer", "minimum": 0 },
+    "server": { "$ref": "#/definitions/server" },
+    "model": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "ready": { "type": "boolean" },
+    "load": { "$ref": "#/definitions/load" },
+    "speculative_mode": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "requests": { "$ref": "#/definitions/requests" },
+    "tokens": { "$ref": "#/definitions/tokens" },
+    "scheduler": { "$ref": "#/definitions/scheduler" },
+    "startup_memory_estimate": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/definitions/memory_estimate" }
+      ]
+    },
+    "kv_cache": { "$ref": "#/definitions/kv_cache" },
+    "cachemesh": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/definitions/cachemesh" }
+      ]
+    },
+    "memory": { "$ref": "#/definitions/memory" }
+  },
+  "definitions": {
+    "server": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "uptime_seconds"],
+      "properties": {
+        "version": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "uptime_seconds": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "load": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["phase", "progress", "requested_model", "failure_present"],
+      "properties": {
+        "phase": { "enum": ["idle", "loading", "ready", "failed"] },
+        "progress": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "requested_model": {
+          "type": ["string", "null"],
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "failure_present": { "type": "boolean" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "phase": { "const": "failed" } } },
+          "then": { "properties": { "failure_present": { "const": true } } },
+          "else": { "properties": { "failure_present": { "const": false } } }
+        }
+      ]
+    },
+    "requests": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total", "completed", "failed", "in_flight"],
+      "properties": {
+        "total": { "type": "integer", "minimum": 0 },
+        "completed": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 },
+        "in_flight": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "tokens": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["prompt_total", "generated_total"],
+      "properties": {
+        "prompt_total": { "type": "integer", "minimum": 0 },
+        "generated_total": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "scheduler": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ifb_enabled", "prefill_queue", "decoding_queue", "active_requests"],
+      "properties": {
+        "ifb_enabled": { "type": "boolean" },
+        "prefill_queue": { "type": "integer", "minimum": 0 },
+        "decoding_queue": { "type": "integer", "minimum": 0 },
+        "active_requests": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "memory_estimate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "weight_bytes",
+        "host_weight_bytes",
+        "device_weight_bytes",
+        "kv_cache_bytes",
+        "kv_cache_bytes_per_token",
+        "temp_tensor_bytes",
+        "total_bytes",
+        "weight_dtype",
+        "quantization",
+        "kv_cache_dtype",
+        "num_layers",
+        "offloaded_layers",
+        "mmap_residency_applied",
+        "memory_scope"
+      ],
+      "properties": {
+        "weight_bytes": { "type": "integer", "minimum": 0 },
+        "host_weight_bytes": { "type": "integer", "minimum": 0 },
+        "device_weight_bytes": { "type": "integer", "minimum": 0 },
+        "kv_cache_bytes": { "type": "integer", "minimum": 0 },
+        "kv_cache_bytes_per_token": { "type": "integer", "minimum": 0 },
+        "temp_tensor_bytes": { "type": "integer", "minimum": 0 },
+        "total_bytes": { "type": "integer", "minimum": 0 },
+        "weight_dtype": { "type": "string", "minLength": 1 },
+        "quantization": { "type": ["object", "null"] },
+        "kv_cache_dtype": { "type": "string", "minLength": 1 },
+        "num_layers": { "type": ["integer", "null"], "minimum": 0 },
+        "offloaded_layers": { "type": ["integer", "null"], "minimum": 0 },
+        "mmap_residency_applied": { "type": "boolean" },
+        "memory_scope": { "type": "string", "maxLength": 512 }
+      }
+    },
+    "kv_cache": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "total_blocks",
+        "free_blocks",
+        "active_blocks",
+        "cached_blocks",
+        "hits",
+        "misses",
+        "evictions",
+        "reuses",
+        "utilization"
+      ],
+      "properties": {
+        "total_blocks": { "type": "integer", "minimum": 0 },
+        "free_blocks": { "type": "integer", "minimum": 0 },
+        "active_blocks": { "type": "integer", "minimum": 0 },
+        "cached_blocks": { "type": "integer", "minimum": 0 },
+        "hits": { "type": "integer", "minimum": 0 },
+        "misses": { "type": "integer", "minimum": 0 },
+        "evictions": { "type": "integer", "minimum": 0 },
+        "reuses": { "type": "integer", "minimum": 0 },
+        "utilization": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "cachemesh": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "l1", "l2", "l3"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "l1": { "$ref": "#/definitions/cache_tier" },
+        "l2": { "$ref": "#/definitions/cache_tier" },
+        "l3": { "$ref": "#/definitions/cache_tier" }
+      }
+    },
+    "cache_tier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "hits",
+        "misses",
+        "evictions",
+        "offloads",
+        "restores",
+        "failed_offloads",
+        "dropped",
+        "bytes",
+        "items",
+        "hit_rate"
+      ],
+      "properties": {
+        "hits": { "type": "integer", "minimum": 0 },
+        "misses": { "type": "integer", "minimum": 0 },
+        "evictions": { "type": "integer", "minimum": 0 },
+        "offloads": { "type": "integer", "minimum": 0 },
+        "restores": { "type": "integer", "minimum": 0 },
+        "failed_offloads": { "type": "integer", "minimum": 0 },
+        "dropped": { "type": "integer", "minimum": 0 },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "items": { "type": "integer", "minimum": 0 },
+        "hit_rate": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "memory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "total_vram",
+        "used_vram",
+        "total_ram",
+        "used_ram",
+        "peak_vram",
+        "peak_ram",
+        "device_name"
+      ],
+      "properties": {
+        "total_vram": { "type": "integer", "minimum": 0 },
+        "used_vram": { "type": "integer", "minimum": 0 },
+        "total_ram": { "type": "integer", "minimum": 0 },
+        "used_ram": { "type": "integer", "minimum": 0 },
+        "peak_vram": { "type": "integer", "minimum": 0 },
+        "peak_ram": { "type": "integer", "minimum": 0 },
+        "device_name": { "type": "string", "maxLength": 256 }
+      }
+    }
+  }
+}

@@ -1,0 +1,707 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/constmark/bloom/examples/model-catalog.schema.json",
+  "title": "Bloom Model Catalog",
+  "description": "Versioned model catalog, lifecycle, acquisition, storage, and integrity snapshot returned by GET /v1/model-management/models.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "object",
+    "root",
+    "root_exists",
+    "data",
+    "active_model",
+    "download",
+    "import",
+    "index",
+    "storage",
+    "integrity",
+    "load"
+  ],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "object": { "type": "string", "const": "bloom.model_catalog" },
+    "root": { "$ref": "#/definitions/pathText" },
+    "root_exists": { "type": "boolean" },
+    "data": {
+      "type": "array",
+      "maxItems": 4096,
+      "items": { "$ref": "#/definitions/model" }
+    },
+    "active_model": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/definitions/activeModel" }
+      ]
+    },
+    "download": { "$ref": "#/definitions/downloadCapability" },
+    "import": { "$ref": "#/definitions/importCapability" },
+    "index": { "$ref": "#/definitions/indexCapability" },
+    "storage": { "$ref": "#/definitions/storageStatus" },
+    "integrity": { "$ref": "#/definitions/integrityStatus" },
+    "load": { "$ref": "#/definitions/loadStatus" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["root_exists"],
+        "properties": { "root_exists": { "const": false } }
+      },
+      "then": { "properties": { "data": { "maxItems": 0 } } }
+    },
+    {
+      "if": {
+        "properties": {
+          "load": {
+            "required": ["phase"],
+            "properties": { "phase": { "const": "ready" } }
+          }
+        }
+      },
+      "then": { "properties": { "active_model": { "$ref": "#/definitions/activeModel" } } }
+    },
+    {
+      "if": {
+        "properties": {
+          "load": {
+            "required": ["phase"],
+            "properties": { "phase": { "enum": ["idle", "error"] } }
+          }
+        }
+      },
+      "then": { "properties": { "active_model": { "type": "null" } } }
+    }
+  ],
+  "definitions": {
+    "trimmedText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f-\\u009f]*\\S)?$"
+    },
+    "pathText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8192
+    },
+    "errorText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 16384,
+      "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f-\\u009f]*\\S)?$"
+    },
+    "catalogId": {
+      "allOf": [
+        {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": "^(?!.*[\\\\/])\\S(?:[^\\u0000-\\u001f\\u007f-\\u009f]*\\S)?$"
+        },
+        { "not": { "enum": [".", ".."] } }
+      ]
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9A-Fa-f]{64}$"
+    },
+    "nullableCount": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "nullableTimestamp": {
+      "type": ["integer", "null"],
+      "minimum": 1
+    },
+    "nullableCatalogId": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/definitions/catalogId" }
+      ]
+    },
+    "nullableError": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/definitions/errorText" }
+      ]
+    },
+    "nullableTrimmedText": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/definitions/trimmedText" }
+      ]
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "kind",
+        "format",
+        "size_bytes",
+        "size_complete",
+        "modified_at",
+        "active",
+        "provenance",
+        "provenance_error"
+      ],
+      "properties": {
+        "id": { "$ref": "#/definitions/catalogId" },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f-\\u009f]*\\S)?$"
+        },
+        "kind": { "enum": ["file", "directory"] },
+        "format": { "enum": ["gguf", "onnx", "coreml", "bloom", "transformers", "openvino"] },
+        "size_bytes": { "type": "integer", "minimum": 0 },
+        "size_complete": { "type": "boolean" },
+        "modified_at": { "$ref": "#/definitions/nullableCount" },
+        "active": { "type": "boolean" },
+        "provenance": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/definitions/provenance" }
+          ]
+        },
+        "provenance_error": { "$ref": "#/definitions/nullableError" }
+      },
+      "allOf": [
+        {
+          "not": {
+            "properties": {
+              "provenance": { "$ref": "#/definitions/provenance" },
+              "provenance_error": { "$ref": "#/definitions/errorText" }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["kind"],
+            "properties": { "kind": { "const": "directory" } }
+          },
+          "then": {
+            "properties": {
+              "provenance": {
+                "oneOf": [
+                  { "type": "null" },
+                  {
+                    "allOf": [
+                      { "$ref": "#/definitions/provenance" },
+                      { "required": ["file_count"] }
+                    ]
+                  }
+                ]
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "provenance": {
+                "oneOf": [
+                  { "type": "null" },
+                  {
+                    "allOf": [
+                      { "$ref": "#/definitions/provenance" },
+                      { "not": { "required": ["file_count"] } }
+                    ]
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "acquisition",
+        "model_index_id",
+        "source_url",
+        "source_host",
+        "sha256",
+        "license",
+        "installed_at",
+        "last_verified_at",
+        "integrity_mismatch_at"
+      ],
+      "properties": {
+        "acquisition": { "enum": ["download", "import"] },
+        "model_index_id": {
+          "type": ["string", "null"],
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-z0-9][a-z0-9._-]*$"
+        },
+        "source_url": {
+          "type": ["string", "null"],
+          "minLength": 1,
+          "maxLength": 2048,
+          "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f-\\u009f]*\\S)?$"
+        },
+        "source_host": {
+          "type": ["string", "null"],
+          "minLength": 1,
+          "maxLength": 253,
+          "pattern": "^\\S+$"
+        },
+        "sha256": { "$ref": "#/definitions/sha256" },
+        "file_count": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 256
+        },
+        "license": {
+          "type": ["string", "null"],
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f-\\u009f]*\\S)?$"
+        },
+        "installed_at": { "type": "integer", "minimum": 1 },
+        "last_verified_at": { "$ref": "#/definitions/nullableTimestamp" },
+        "integrity_mismatch_at": { "$ref": "#/definitions/nullableTimestamp" }
+      }
+    },
+    "activeModel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "catalog_id", "source", "input_modalities"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f-\\u009f]*\\S)?$"
+        },
+        "catalog_id": { "$ref": "#/definitions/nullableCatalogId" },
+        "source": { "enum": ["catalog", "external"] },
+        "input_modalities": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": { "enum": ["text", "audio", "vision", "multi"] }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["source"],
+            "properties": { "source": { "const": "catalog" } }
+          },
+          "then": { "properties": { "catalog_id": { "$ref": "#/definitions/catalogId" } } },
+          "else": { "properties": { "catalog_id": { "type": "null" } } }
+        }
+      ]
+    },
+    "loadStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["phase", "progress", "requested_model", "error"],
+      "properties": {
+        "phase": { "enum": ["idle", "loading", "ready", "error"] },
+        "progress": { "type": "integer", "minimum": 0, "maximum": 100 },
+        "requested_model": {
+          "type": ["string", "null"],
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f-\\u009f]*\\S)?$"
+        },
+        "error": { "$ref": "#/definitions/nullableError" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["phase"],
+            "properties": { "phase": { "const": "loading" } }
+          },
+          "then": {
+            "properties": {
+              "requested_model": { "type": "string" },
+              "error": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["phase"],
+            "properties": { "phase": { "const": "error" } }
+          },
+          "then": { "properties": { "error": { "$ref": "#/definitions/errorText" } } }
+        }
+      ]
+    },
+    "licensePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enforced", "allowed"],
+      "properties": {
+        "enforced": { "type": "boolean" },
+        "allowed": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f-\\u009f]*\\S)?$"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["enforced"],
+            "properties": { "enforced": { "const": true } }
+          },
+          "then": { "properties": { "allowed": { "minItems": 1 } } },
+          "else": { "properties": { "allowed": { "maxItems": 0 } } }
+        }
+      ]
+    },
+    "downloadStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase",
+        "filename",
+        "source_host",
+        "downloaded_bytes",
+        "total_bytes",
+        "resumable",
+        "error"
+      ],
+      "properties": {
+        "phase": { "enum": ["idle", "queued", "downloading", "verifying", "complete", "cancelled", "error"] },
+        "filename": { "$ref": "#/definitions/nullableCatalogId" },
+        "source_host": {
+          "type": ["string", "null"],
+          "minLength": 1,
+          "maxLength": 253,
+          "pattern": "^\\S+$"
+        },
+        "downloaded_bytes": { "type": "integer", "minimum": 0 },
+        "total_bytes": { "$ref": "#/definitions/nullableCount" },
+        "resumable": { "type": "boolean" },
+        "error": { "$ref": "#/definitions/nullableError" }
+      }
+    },
+    "stagedDownload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["filename", "source_host", "downloaded_bytes", "modified_at"],
+      "properties": {
+        "filename": { "$ref": "#/definitions/catalogId" },
+        "source_host": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 253,
+          "pattern": "^\\S+$"
+        },
+        "downloaded_bytes": { "type": "integer", "minimum": 0 },
+        "modified_at": { "$ref": "#/definitions/nullableCount" }
+      }
+    },
+    "downloadCapability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "license_policy", "status", "staged"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "license_policy": { "$ref": "#/definitions/licensePolicy" },
+        "status": { "$ref": "#/definitions/downloadStatus" },
+        "staged": {
+          "type": "array",
+          "maxItems": 1000,
+          "items": { "$ref": "#/definitions/stagedDownload" }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["enabled"],
+            "properties": { "enabled": { "const": false } }
+          },
+          "then": {
+            "properties": {
+              "status": {
+                "properties": {
+                  "phase": { "const": "idle" },
+                  "filename": { "type": "null" },
+                  "source_host": { "type": "null" },
+                  "downloaded_bytes": { "const": 0 },
+                  "total_bytes": { "type": "null" },
+                  "resumable": { "const": false },
+                  "error": { "type": "null" }
+                }
+              },
+              "staged": { "maxItems": 0 }
+            }
+          }
+        }
+      ]
+    },
+    "importStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["phase", "filename", "uploaded_bytes", "total_bytes", "error"],
+      "properties": {
+        "phase": { "enum": ["idle", "ready", "uploading", "verifying", "complete", "error"] },
+        "filename": { "$ref": "#/definitions/nullableCatalogId" },
+        "uploaded_bytes": { "type": "integer", "minimum": 0 },
+        "total_bytes": { "$ref": "#/definitions/nullableCount" },
+        "error": { "$ref": "#/definitions/nullableError" }
+      }
+    },
+    "stagedImport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["filename", "uploaded_bytes", "total_bytes", "modified_at"],
+      "properties": {
+        "filename": { "$ref": "#/definitions/catalogId" },
+        "uploaded_bytes": { "type": "integer", "minimum": 0 },
+        "total_bytes": { "type": "integer", "minimum": 1 },
+        "modified_at": { "$ref": "#/definitions/nullableCount" }
+      }
+    },
+    "importCapability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "max_bytes", "max_chunk_bytes", "license_policy", "status", "staged"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "max_bytes": { "type": "integer", "minimum": 0 },
+        "max_chunk_bytes": { "type": "integer", "minimum": 0 },
+        "license_policy": { "$ref": "#/definitions/licensePolicy" },
+        "status": { "$ref": "#/definitions/importStatus" },
+        "staged": {
+          "type": "array",
+          "maxItems": 1000,
+          "items": { "$ref": "#/definitions/stagedImport" }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["enabled"],
+            "properties": { "enabled": { "const": true } }
+          },
+          "then": {
+            "properties": {
+              "max_bytes": { "minimum": 1 },
+              "max_chunk_bytes": { "minimum": 1 }
+            }
+          },
+          "else": {
+            "properties": {
+              "max_bytes": { "const": 0 },
+              "max_chunk_bytes": { "const": 0 },
+              "status": {
+                "properties": {
+                  "phase": { "const": "idle" },
+                  "filename": { "type": "null" },
+                  "uploaded_bytes": { "const": 0 },
+                  "total_bytes": { "type": "null" },
+                  "error": { "type": "null" }
+                }
+              },
+              "staged": { "maxItems": 0 }
+            }
+          }
+        }
+      ]
+    },
+    "indexCapability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "key_id",
+        "trust_id",
+        "trusted_key_count",
+        "refresh_seconds",
+        "persistent_rollback_protection"
+      ],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "key_id": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/definitions/sha256" }
+          ]
+        },
+        "trust_id": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/definitions/sha256" }
+          ]
+        },
+        "trusted_key_count": { "type": "integer", "minimum": 0, "maximum": 8 },
+        "refresh_seconds": { "type": "integer", "minimum": 0, "maximum": 86400 },
+        "persistent_rollback_protection": { "type": "boolean" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["enabled"],
+            "properties": { "enabled": { "const": true } }
+          },
+          "then": {
+            "properties": {
+              "trust_id": { "$ref": "#/definitions/sha256" },
+              "trusted_key_count": { "minimum": 1 },
+              "refresh_seconds": { "minimum": 1 }
+            }
+          },
+          "else": {
+            "properties": {
+              "key_id": { "type": "null" },
+              "trust_id": { "type": "null" },
+              "trusted_key_count": { "const": 0 },
+              "refresh_seconds": { "const": 0 },
+              "persistent_rollback_protection": { "const": false }
+            }
+          }
+        }
+      ]
+    },
+    "storageStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "quota_enabled",
+        "max_bytes",
+        "used_bytes",
+        "committed_bytes",
+        "available_bytes",
+        "installed_bytes",
+        "staged_download_bytes",
+        "staged_import_bytes",
+        "reserved_bytes",
+        "staged_retention_seconds",
+        "last_cleanup_at",
+        "last_cleanup_removed_sessions"
+      ],
+      "properties": {
+        "quota_enabled": { "type": "boolean" },
+        "max_bytes": { "$ref": "#/definitions/nullableCount" },
+        "used_bytes": { "type": "integer", "minimum": 0 },
+        "committed_bytes": { "type": "integer", "minimum": 0 },
+        "available_bytes": { "$ref": "#/definitions/nullableCount" },
+        "installed_bytes": { "type": "integer", "minimum": 0 },
+        "staged_download_bytes": { "type": "integer", "minimum": 0 },
+        "staged_import_bytes": { "type": "integer", "minimum": 0 },
+        "reserved_bytes": { "type": "integer", "minimum": 0 },
+        "staged_retention_seconds": { "type": "integer", "minimum": 0 },
+        "last_cleanup_at": { "$ref": "#/definitions/nullableTimestamp" },
+        "last_cleanup_removed_sessions": { "type": "integer", "minimum": 0 }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["quota_enabled"],
+            "properties": { "quota_enabled": { "const": true } }
+          },
+          "then": {
+            "properties": {
+              "max_bytes": { "type": "integer", "minimum": 1 },
+              "available_bytes": { "type": "integer", "minimum": 0 }
+            }
+          },
+          "else": {
+            "properties": {
+              "max_bytes": { "type": "null" },
+              "available_bytes": { "type": "null" }
+            }
+          }
+        }
+      ]
+    },
+    "integrityStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase",
+        "model_id",
+        "checked_bytes",
+        "total_bytes",
+        "expected_sha256",
+        "actual_sha256",
+        "matches_expected",
+        "verified_at",
+        "error"
+      ],
+      "properties": {
+        "phase": { "enum": ["idle", "queued", "verifying", "complete", "cancelled", "error"] },
+        "model_id": { "$ref": "#/definitions/nullableCatalogId" },
+        "checked_bytes": { "type": "integer", "minimum": 0 },
+        "total_bytes": { "$ref": "#/definitions/nullableCount" },
+        "expected_sha256": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/definitions/sha256" }
+          ]
+        },
+        "actual_sha256": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/definitions/sha256" }
+          ]
+        },
+        "matches_expected": { "type": ["boolean", "null"] },
+        "verified_at": { "$ref": "#/definitions/nullableTimestamp" },
+        "error": { "$ref": "#/definitions/nullableError" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["phase"],
+            "properties": { "phase": { "const": "idle" } }
+          },
+          "then": {
+            "properties": {
+              "model_id": { "type": "null" },
+              "checked_bytes": { "const": 0 },
+              "total_bytes": { "type": "null" },
+              "expected_sha256": { "type": "null" },
+              "actual_sha256": { "type": "null" },
+              "matches_expected": { "type": "null" },
+              "verified_at": { "type": "null" },
+              "error": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["phase"],
+            "properties": { "phase": { "const": "complete" } }
+          },
+          "then": {
+            "properties": {
+              "model_id": { "$ref": "#/definitions/catalogId" },
+              "total_bytes": { "type": "integer", "minimum": 0 },
+              "expected_sha256": { "$ref": "#/definitions/sha256" },
+              "actual_sha256": { "$ref": "#/definitions/sha256" },
+              "matches_expected": { "type": "boolean" },
+              "verified_at": { "type": "integer", "minimum": 1 },
+              "error": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["phase"],
+            "properties": { "phase": { "const": "error" } }
+          },
+          "then": { "properties": { "error": { "$ref": "#/definitions/errorText" } } }
+        }
+      ]
+    }
+  }
+}

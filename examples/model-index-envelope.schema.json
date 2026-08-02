@@ -1,0 +1,33 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/constmark/bloom/blob/main/examples/model-index-envelope.schema.json",
+  "title": "Bloom signed model index envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "object",
+    "algorithm",
+    "key_id",
+    "payload",
+    "signature"
+  ],
+  "properties": {
+    "schema_version": { "enum": [1, 2] },
+    "object": { "const": "bloom.signed_model_index" },
+    "algorithm": { "const": "ed25519" },
+    "key_id": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "payload": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 524288,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "signature": {
+      "type": "string",
+      "minLength": 86,
+      "maxLength": 86,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    }
+  }
+}

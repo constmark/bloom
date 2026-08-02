@@ -1,0 +1,272 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/constmark/bloom/examples/model-preflight.schema.json",
+  "title": "Bloom Model Preflight",
+  "description": "Versioned, path-free compatibility and memory inspection returned by POST /v1/model-management/preflight before model weights are loaded.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "object", "data"],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "object": { "type": "string", "const": "bloom.model_preflight" },
+    "data": { "$ref": "#/definitions/report" }
+  },
+  "definitions": {
+    "boundedText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f-\\u009f]*\\S)?$"
+    },
+    "diagnosticText": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048,
+      "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f-\\u009f]*\\S)?$"
+    },
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f-\\u009f]*\\S)?$"
+    },
+    "nullableBoundedText": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/definitions/boundedText" }
+      ]
+    },
+    "nullableCount": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "report": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model_id",
+        "inspected_at",
+        "loadable",
+        "load_blocker",
+        "manifest",
+        "runtime",
+        "memory",
+        "warnings"
+      ],
+      "properties": {
+        "model_id": { "$ref": "#/definitions/identifier" },
+        "inspected_at": { "type": "integer", "minimum": 1 },
+        "loadable": { "type": "boolean" },
+        "load_blocker": { "$ref": "#/definitions/nullableBoundedText" },
+        "manifest": { "$ref": "#/definitions/manifest" },
+        "runtime": { "$ref": "#/definitions/runtime" },
+        "memory": { "$ref": "#/definitions/memory" },
+        "warnings": {
+          "type": "array",
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": { "$ref": "#/definitions/diagnosticText" }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["loadable"],
+            "properties": { "loadable": { "const": true } }
+          },
+          "then": {
+            "properties": {
+              "load_blocker": { "type": "null" },
+              "runtime": {
+                "properties": {
+                  "backend_available": { "const": true },
+                  "support": { "enum": ["native", "fallback"] }
+                }
+              },
+              "memory": {
+                "properties": { "fits_budget": { "const": true } }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "load_blocker": { "$ref": "#/definitions/boundedText" }
+            }
+          }
+        }
+      ]
+    },
+    "manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "family",
+        "version",
+        "model_tasks",
+        "description",
+        "license",
+        "input_modalities",
+        "output_modalities",
+        "formats",
+        "primary_dtype",
+        "quantization",
+        "quantization_bits",
+        "parameter_count",
+        "context_length",
+        "num_layers",
+        "hidden_size",
+        "vocab_size",
+        "supports_mmap",
+        "requires_streaming"
+      ],
+      "properties": {
+        "id": { "$ref": "#/definitions/identifier" },
+        "family": { "$ref": "#/definitions/identifier" },
+        "version": { "$ref": "#/definitions/identifier" },
+        "model_tasks": {
+          "oneOf": [
+            { "const": ["generation"] },
+            { "const": ["embedding", "rerank"] }
+          ]
+        },
+        "description": { "$ref": "#/definitions/nullableBoundedText" },
+        "license": { "$ref": "#/definitions/nullableBoundedText" },
+        "input_modalities": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": { "enum": ["text", "audio", "vision", "multi"] }
+        },
+        "output_modalities": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": { "enum": ["text", "audio", "vision", "multi"] }
+        },
+        "formats": {
+          "type": "array",
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "gguf",
+              "safetensors",
+              "openvino_ir",
+              "tensorrt_engine",
+              "onnx",
+              "coreml",
+              "torchscript",
+              "mlx",
+              "vulkan_spirv",
+              "vendor_bundle",
+              "unknown"
+            ]
+          }
+        },
+        "primary_dtype": {
+          "enum": ["f32", "f16", "bf16", "i8", "u8", "i4", "nf4", "q8", "q4", "unknown"]
+        },
+        "quantization": {
+          "type": ["string", "null"],
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f-\\u009f]*\\S)?$"
+        },
+        "quantization_bits": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "maximum": 16
+        },
+        "parameter_count": { "$ref": "#/definitions/nullableCount" },
+        "context_length": { "$ref": "#/definitions/nullableCount" },
+        "num_layers": { "$ref": "#/definitions/nullableCount" },
+        "hidden_size": { "$ref": "#/definitions/nullableCount" },
+        "vocab_size": { "$ref": "#/definitions/nullableCount" },
+        "supports_mmap": { "type": "boolean" },
+        "requires_streaming": { "type": "boolean" }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "configured_engine",
+        "selected_engine",
+        "engine_maturity",
+        "device",
+        "device_backend",
+        "backend_available",
+        "backend_reason",
+        "support",
+        "support_reason",
+        "diagnostic_tips"
+      ],
+      "properties": {
+        "configured_engine": { "$ref": "#/definitions/identifier" },
+        "selected_engine": { "$ref": "#/definitions/identifier" },
+        "engine_maturity": { "enum": ["production", "beta", "experimental", "skeleton"] },
+        "device": { "enum": ["cpu", "gpu", "npu"] },
+        "device_backend": { "$ref": "#/definitions/identifier" },
+        "backend_available": { "type": "boolean" },
+        "backend_reason": { "$ref": "#/definitions/nullableBoundedText" },
+        "support": { "enum": ["native", "fallback", "unsupported"] },
+        "support_reason": { "$ref": "#/definitions/nullableBoundedText" },
+        "diagnostic_tips": {
+          "type": "array",
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": { "$ref": "#/definitions/diagnosticText" }
+        }
+      }
+    },
+    "memory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "per_request_context_tokens",
+        "max_concurrent",
+        "planned_context_tokens",
+        "weight_bytes",
+        "host_weight_bytes",
+        "device_weight_bytes",
+        "kv_cache_bytes",
+        "kv_cache_bytes_per_token",
+        "temp_tensor_bytes",
+        "total_bytes",
+        "available_bytes",
+        "budget_bytes",
+        "reserve_bytes",
+        "memory_utilization",
+        "preallocation_enabled",
+        "fits_budget",
+        "scope"
+      ],
+      "properties": {
+        "per_request_context_tokens": { "type": "integer", "minimum": 1 },
+        "max_concurrent": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 18446744073709551615
+        },
+        "planned_context_tokens": { "type": "integer", "minimum": 1 },
+        "weight_bytes": { "type": "integer", "minimum": 0 },
+        "host_weight_bytes": { "type": "integer", "minimum": 0 },
+        "device_weight_bytes": { "type": "integer", "minimum": 0 },
+        "kv_cache_bytes": { "type": "integer", "minimum": 0 },
+        "kv_cache_bytes_per_token": { "type": "integer", "minimum": 0 },
+        "temp_tensor_bytes": { "type": "integer", "minimum": 0 },
+        "total_bytes": { "type": "integer", "minimum": 0 },
+        "available_bytes": { "$ref": "#/definitions/nullableCount" },
+        "budget_bytes": { "$ref": "#/definitions/nullableCount" },
+        "reserve_bytes": { "type": "integer", "minimum": 0 },
+        "memory_utilization": { "type": "number", "minimum": 0, "maximum": 1 },
+        "preallocation_enabled": { "type": "boolean" },
+        "fits_budget": { "type": "boolean" },
+        "scope": { "$ref": "#/definitions/identifier" }
+      }
+    }
+  }
+}

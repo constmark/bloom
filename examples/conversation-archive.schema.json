@@ -1,0 +1,119 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/constmark/bloom/examples/conversation-archive.schema.json",
+  "title": "Bloom Conversation Archive",
+  "description": "Portable browser-local conversation backup. Connection settings, API keys, generation settings, runtime measurements, and attachments are excluded. Optional assistant model provenance preserves cross-model continuation safeguards; response-format metadata preserves structured-output rendering. Bloom also accepts legacy version 1 archives without model provenance.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "object", "active_conversation", "conversations"],
+  "properties": {
+    "version": {
+      "const": 2
+    },
+    "object": {
+      "const": "bloom.conversation_archive"
+    },
+    "active_conversation": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Zero-based index into conversations. The runtime also verifies that the index exists."
+    },
+    "conversations": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1000,
+      "items": {
+        "$ref": "#/definitions/conversation"
+      }
+    }
+  },
+  "definitions": {
+    "conversation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "messages"],
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "pattern": "^(?=.*\\S)[^\\u0000-\\u001f\\u007f-\\u009f]*$"
+        },
+        "messages": {
+          "type": "array",
+          "maxItems": 50000,
+          "items": {
+            "$ref": "#/definitions/message"
+          }
+        }
+      }
+    },
+    "message": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "content"],
+      "properties": {
+        "role": {
+          "type": "string",
+          "enum": ["user", "assistant"]
+        },
+        "content": {
+          "type": "string",
+          "maxLength": 1000000
+        },
+        "attachment_unavailable": {
+          "type": "boolean",
+          "default": false,
+          "description": "True only for a user message whose original attachment bytes were intentionally not persisted."
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^\\S(?:[^\\u0000-\\u001f\\u007f-\\u009f]*\\S)?$",
+          "description": "Exact execution model recorded for an assistant response. Timing, token usage, and generation settings remain excluded."
+        },
+        "response_format": {
+          "type": "string",
+          "enum": ["json_object", "json_schema"],
+          "description": "Present only for assistant output generated under a structured response constraint."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["model"]
+          },
+          "then": {
+            "properties": {
+              "role": { "const": "assistant" }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["attachment_unavailable"],
+            "properties": {
+              "attachment_unavailable": { "const": true }
+            }
+          },
+          "then": {
+            "properties": {
+              "role": { "const": "user" }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["response_format"]
+          },
+          "then": {
+            "properties": {
+              "role": { "const": "assistant" }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

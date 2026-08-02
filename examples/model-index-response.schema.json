@@ -1,0 +1,187 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/constmark/bloom/blob/main/examples/model-index-response.schema.json",
+  "title": "Bloom verified model index API response",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "object",
+    "key_id",
+    "name",
+    "generated_at",
+    "expires_at",
+    "source_kind",
+    "cache_status",
+    "warning",
+    "data"
+  ],
+  "properties": {
+    "schema_version": { "enum": [1, 2] },
+    "object": { "const": "bloom.model_index" },
+    "key_id": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "name": { "type": "string", "minLength": 1, "maxLength": 80 },
+    "generated_at": { "type": "integer", "minimum": 1 },
+    "expires_at": { "type": "integer", "minimum": 1 },
+    "source_kind": { "type": "string", "enum": ["file", "https"] },
+    "cache_status": { "type": "string", "enum": ["fresh", "cached", "stale"] },
+    "warning": {
+      "type": ["string", "null"],
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "data": {
+      "type": "array",
+      "maxItems": 200,
+      "items": { "$ref": "#/definitions/entry" }
+    }
+  },
+  "definitions": {
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "description",
+        "filename",
+        "format",
+        "size_bytes",
+        "sha256",
+        "license",
+        "family",
+        "parameter_count",
+        "quantization",
+        "tags",
+        "downloadable",
+        "blocking_reasons"
+      ],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "description": { "type": "string", "minLength": 1, "maxLength": 400 },
+        "download_url": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "filename": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "format": { "type": "string", "enum": ["gguf", "onnx", "mlmodel", "transformers"] },
+        "size_bytes": { "type": "integer", "minimum": 1 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "files": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 256,
+          "items": { "$ref": "#/definitions/file" },
+          "allOf": [
+            {
+              "contains": {
+                "required": ["filename"],
+                "properties": { "filename": { "const": "config.json" } }
+              }
+            },
+            {
+              "anyOf": [
+                {
+                  "contains": {
+                    "required": ["filename"],
+                    "properties": { "filename": { "const": "model.safetensors" } }
+                  }
+                },
+                {
+                  "allOf": [
+                    {
+                      "contains": {
+                        "required": ["filename"],
+                        "properties": {
+                          "filename": { "const": "model.safetensors.index.json" }
+                        }
+                      }
+                    },
+                    {
+                      "contains": {
+                        "required": ["filename"],
+                        "properties": {
+                          "filename": {
+                            "pattern": "^model-[0-9]{5}-of-[0-9]{5}\\.safetensors$"
+                          }
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "license": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "family": { "type": ["string", "null"], "minLength": 1, "maxLength": 64 },
+        "parameter_count": { "type": ["integer", "null"], "minimum": 1 },
+        "quantization": { "type": ["string", "null"], "minLength": 1, "maxLength": 32 },
+        "tags": {
+          "type": "array",
+          "maxItems": 12,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^[a-z0-9._-]{1,32}$" }
+        },
+        "downloadable": { "type": "boolean" },
+        "blocking_reasons": {
+          "type": "array",
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": { "type": "string", "enum": ["size_limit", "license_policy"] }
+        }
+      },
+      "oneOf": [
+        {
+          "required": ["download_url"],
+          "not": { "required": ["files"] },
+          "properties": {
+            "format": { "enum": ["gguf", "onnx", "mlmodel"] }
+          }
+        },
+        {
+          "required": ["files"],
+          "not": { "required": ["download_url"] },
+          "properties": {
+            "format": { "const": "transformers" },
+            "filename": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 255,
+              "pattern": "^(?!\\.)(?!.*[\\\\/%]).+$"
+            }
+          }
+        }
+      ]
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["download_url", "filename", "size_bytes", "sha256"],
+      "properties": {
+        "download_url": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "filename": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*[\\\\%])[^/]+(?:/[^/]+)*\\.(json|safetensors|txt|model|tiktoken)$"
+        },
+        "size_bytes": { "type": "integer", "minimum": 1 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["schema_version"],
+        "properties": { "schema_version": { "const": 1 } }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "items": { "not": { "required": ["files"] } }
+          }
+        }
+      }
+    }
+  ]
+}

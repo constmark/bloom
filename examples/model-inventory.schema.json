@@ -1,0 +1,169 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Bloom Model Inventory",
+  "description": "Portable, path-free inventory exported by bloom_server.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "object", "summary", "models"],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "object": { "const": "bloom.model_inventory" },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model_count",
+        "provenance_count",
+        "source_locked_count",
+        "quarantined_count",
+        "invalid_provenance_count"
+      ],
+      "properties": {
+        "model_count": { "type": "integer", "minimum": 0 },
+        "provenance_count": { "type": "integer", "minimum": 0 },
+        "source_locked_count": { "type": "integer", "minimum": 0 },
+        "quarantined_count": { "type": "integer", "minimum": 0 },
+        "invalid_provenance_count": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "models": {
+      "type": "array",
+      "maxItems": 20000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "kind",
+          "format",
+          "size_bytes",
+          "size_complete",
+          "provenance_status",
+          "acquisition",
+          "model_index_id",
+          "source",
+          "sha256",
+          "license",
+          "installed_at",
+          "last_verified_at",
+          "integrity",
+          "source_locked"
+        ],
+        "properties": {
+          "id": { "type": "string", "minLength": 1, "maxLength": 255 },
+          "kind": { "enum": ["file", "directory"] },
+          "format": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[a-z0-9_]+$"
+          },
+          "size_bytes": { "type": "integer", "minimum": 0 },
+          "size_complete": { "type": "boolean" },
+          "provenance_status": {
+            "enum": ["recorded", "not_recorded", "invalid"]
+          },
+          "acquisition": {
+            "type": ["string", "null"],
+            "enum": ["download", "import", null]
+          },
+          "model_index_id": {
+            "type": ["string", "null"],
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[a-z0-9][a-z0-9._-]*$"
+          },
+          "source": {
+            "oneOf": [
+              { "type": "null" },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["url", "host", "revision", "immutable_revision"],
+                "properties": {
+                  "url": {
+                    "type": ["string", "null"],
+                    "format": "uri",
+                    "maxLength": 2048,
+                    "pattern": "^https://"
+                  },
+                  "host": { "type": ["string", "null"], "maxLength": 253 },
+                  "revision": { "type": ["string", "null"] },
+                  "immutable_revision": { "type": "boolean" }
+                }
+              }
+            ]
+          },
+          "sha256": {
+            "type": ["string", "null"],
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "license": { "type": ["string", "null"], "maxLength": 128 },
+          "installed_at": { "type": ["integer", "null"], "minimum": 1 },
+          "last_verified_at": { "type": ["integer", "null"], "minimum": 1 },
+          "integrity": {
+            "enum": ["untracked", "verified_at_acquisition", "verified", "quarantined"]
+          },
+          "source_locked": { "type": "boolean" }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": { "provenance_status": { "const": "recorded" } }
+            },
+            "then": {
+              "properties": {
+                "kind": { "const": "file" },
+                "size_bytes": { "minimum": 1 },
+                "size_complete": { "const": true },
+                "acquisition": { "enum": ["download", "import"] },
+                "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+                "installed_at": { "type": "integer", "minimum": 1 },
+                "integrity": {
+                  "enum": ["verified_at_acquisition", "verified", "quarantined"]
+                }
+              }
+            },
+            "else": {
+              "properties": {
+                "acquisition": { "const": null },
+                "model_index_id": { "const": null },
+                "source": { "const": null },
+                "sha256": { "const": null },
+                "license": { "const": null },
+                "installed_at": { "const": null },
+                "last_verified_at": { "const": null },
+                "integrity": { "const": "untracked" },
+                "source_locked": { "const": false }
+              }
+            }
+          },
+          {
+            "if": { "properties": { "model_index_id": { "type": "string" } } },
+            "then": {
+              "properties": {
+                "provenance_status": { "const": "recorded" },
+                "acquisition": { "const": "download" }
+              }
+            }
+          },
+          {
+            "if": { "properties": { "source_locked": { "const": true } } },
+            "then": {
+              "properties": {
+                "source": {
+                  "type": "object",
+                  "properties": {
+                    "url": { "type": "string" },
+                    "revision": { "type": "string", "pattern": "^[0-9A-Fa-f]{40}([0-9A-Fa-f]{24})?$" },
+                    "immutable_revision": { "const": true }
+                  }
+                }
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

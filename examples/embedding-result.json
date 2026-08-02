@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "object": "bloom.embedding_result",
+  "model": "all-MiniLM-L6-v2",
+  "prompt_tokens": 7,
+  "vectors": [
+    {
+      "index": 0,
+      "input": "Local inference keeps private text on the configured server.",
+      "embedding": [1.0, 0.0]
+    },
+    {
+      "index": 1,
+      "input": "Bloom exposes normalized sentence vectors.",
+      "embedding": [0.0, 1.0]
+    }
+  ]
+}

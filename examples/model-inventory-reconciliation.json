@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "object": "bloom.model_inventory_reconciliation",
+  "in_sync": false,
+  "truncated": false,
+  "summary": {
+    "expected_model_count": 2,
+    "current_model_count": 2,
+    "matching_count": 1,
+    "missing_count": 0,
+    "unexpected_count": 0,
+    "changed_count": 1,
+    "blocking_count": 1,
+    "restorable_count": 0,
+    "drift_count": 1
+  },
+  "drift": [
+    {
+      "id": "tiny-q4.gguf",
+      "status": "changed",
+      "severity": "blocking",
+      "changes": ["sha256", "integrity"],
+      "restore_available": false
+    }
+  ]
+}
