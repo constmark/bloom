@@ -55,7 +55,12 @@ impl ServerMetrics {
     /// Record a new request start.
     pub fn record_request_start(&self) {
         self.requests_total.fetch_add(1, Ordering::Relaxed);
-        self.in_flight_requests.fetch_add(1, Ordering::Relaxed);
+        self.in_flight_requests.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Whole seconds elapsed since this metrics collector was created.
+    pub fn uptime_seconds(&self) -> u64 {
+        self.start_time.elapsed().as_secs()
     }
 
     /// Record a request completion.
@@ -66,7 +71,7 @@ impl ServerMetrics {
         tokens_generated: u64,
         prompt_tokens: u64,
     ) {
-        self.in_flight_requests.fetch_sub(1, Ordering::Relaxed);
+        self.in_flight_requests.fetch_sub(1, Ordering::Release);
         if success {
             self.requests_completed.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -441,7 +446,7 @@ fn render_observation_stats(
     let sum: f64 = observations.iter().sum();
     let avg = sum / observations.len() as f64;
     let mut sorted = observations.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    sorted.sort_by(f64::total_cmp);
     let p50 = sorted[sorted.len() / 2];
     let p99_idx = ((sorted.len() - 1) as f64 * 0.99).round() as usize;
     let p99 = sorted[p99_idx.min(sorted.len() - 1)];

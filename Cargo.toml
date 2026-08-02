@@ -36,4 +36,3 @@ bloomai-core = { version = "0.1.0", path = "crates/core" }
 bloomai-backend = { version = "0.1.0", path = "crates/backend" }
 bloomai-tilelang = { version = "0.1.0", path = "crates/tilelang" }
 bloomai-engine = { version = "0.1.0", path = "crates/engine" }
-

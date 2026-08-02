@@ -49,12 +49,16 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 image = { version = "0.24", default-features = false, features = ["png", "jpeg"] }
 futures = "0.3"
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "stream"] }
 libloading = { workspace = true }
 libc = "0.2"
 sha2 = "0.10"
+base64 = "0.22"
+ed25519-dalek = { version = "2.2", default-features = false, features = ["std"] }
 tower-http = { workspace = true }
 rust-embed = { version = "8", optional = true }
 mime_guess = { version = "2", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

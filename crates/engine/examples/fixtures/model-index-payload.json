@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "object": "bloom.model_index",
+  "name": "Bloom Example Models",
+  "generated_at": 1785513600,
+  "expires_at": 1816963200,
+  "models": [
+    {
+      "id": "example-tiny-q4",
+      "name": "Example Tiny Q4",
+      "description": "Documentation-only entry showing the signed discovery format.",
+      "download_url": "https://huggingface.co/example-org/example-model/resolve/0123456789abcdef0123456789abcdef01234567/example-tiny-q4.gguf",
+      "filename": "example-tiny-q4.gguf",
+      "size_bytes": 1048576,
+      "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "license": "Apache-2.0",
+      "family": "Llama",
+      "parameter_count": 1000000,
+      "quantization": "Q4_K_M",
+      "tags": ["example", "cpu"]
+    }
+  ]
+}

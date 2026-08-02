@@ -1,6 +1,12 @@
 #![allow(unused_imports, dead_code)]
 use super::*;
 
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DoctorFormat {
+    Text,
+    Json,
+}
+
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "bloom_server",
@@ -16,9 +22,27 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = false)]
     pub init_config: bool,
 
+    /// Inspect the effective server configuration and exit without loading a model or binding a port.
+    #[arg(
+        long,
+        value_enum,
+        num_args = 0..=1,
+        default_missing_value = "text",
+        conflicts_with = "init_config"
+    )]
+    pub doctor: Option<DoctorFormat>,
+
+    /// Open the embedded Bloom UI in the system browser after the listener is ready.
+    #[arg(long, env = "BLOOM_OPEN_BROWSER", default_value_t = false)]
+    pub open_browser: bool,
+
     /// Path to the model directory or a GGUF file.
     #[arg(short, long)]
     pub model: Option<PathBuf>,
+
+    /// Root directory scanned by the model-management API.
+    #[arg(long, env = "BLOOM_MODELS_DIR")]
+    pub models_dir: Option<PathBuf>,
 
     /// Host address to bind the server to.
     #[arg(long, default_value = "127.0.0.1")]
@@ -40,7 +64,7 @@ pub(crate) struct Args {
     #[arg(long)]
     pub dtype: Option<String>,
 
-    /// Maximum concurrent requests (backpressure limit).
+    /// Maximum concurrent requests; bounded by the platform runtime semaphore capacity.
     #[arg(long, default_value_t = 4)]
     pub max_concurrent: usize,
 
@@ -68,17 +92,85 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = 300)]
     pub timeout: u64,
 
+    /// Maximum graceful shutdown drain time before forced process termination.
+    #[arg(long, env = "BLOOM_SHUTDOWN_TIMEOUT_SECONDS", default_value_t = 30)]
+    pub shutdown_timeout_seconds: u64,
+
     /// Optional API key for /v1 routes. Can also be set with BLOOM_API_KEY.
     #[arg(long, env = "BLOOM_API_KEY")]
     pub api_key: Option<String>,
 
-    /// CORS allowed origin. Use "*" for local development.
-    #[arg(long, env = "BLOOM_CORS_ALLOW_ORIGIN", default_value = "*")]
+    /// Browser origin policy: same-origin, one exact HTTP(S) origin, or explicit "*".
+    #[arg(long, env = "BLOOM_CORS_ALLOW_ORIGIN", default_value = "same-origin")]
     pub cors_allow_origin: String,
 
     /// Maximum JSON request body size in bytes.
     #[arg(long, env = "BLOOM_MAX_BODY_BYTES", default_value_t = 1024 * 1024)]
     pub max_body_bytes: usize,
+
+    /// Maximum multipart image upload size in bytes.
+    #[arg(long, env = "BLOOM_MAX_UPLOAD_BYTES", default_value_t = 12 * MIB as usize)]
+    pub max_upload_bytes: usize,
+
+    /// Allow authenticated downloads from trusted model-hosting domains.
+    #[arg(long, env = "BLOOM_ENABLE_MODEL_DOWNLOADS", default_value_t = false)]
+    pub enable_model_downloads: bool,
+
+    /// Maximum size of one downloaded model file in bytes.
+    #[arg(long, env = "BLOOM_MAX_MODEL_DOWNLOAD_BYTES", default_value_t = 20 * GIB)]
+    pub max_model_download_bytes: u64,
+
+    /// Allow authenticated, chunked local-file imports into the model catalog.
+    #[arg(long, env = "BLOOM_ENABLE_MODEL_IMPORTS", default_value_t = false)]
+    pub enable_model_imports: bool,
+
+    /// Maximum size of one imported model file in bytes.
+    #[arg(long, env = "BLOOM_MAX_MODEL_IMPORT_BYTES", default_value_t = 20 * GIB)]
+    pub max_model_import_bytes: u64,
+
+    /// Maximum request body for one model import chunk in bytes.
+    #[arg(long, env = "BLOOM_MAX_MODEL_IMPORT_CHUNK_BYTES", default_value_t = 8 * MIB as usize)]
+    pub max_model_import_chunk_bytes: usize,
+
+    /// Allowed model license declarations for downloads and imports (empty = record only).
+    #[arg(long, env = "BLOOM_ALLOWED_MODEL_LICENSES", value_delimiter = ',')]
+    pub allowed_model_licenses: Vec<String>,
+
+    /// Path to a signed model discovery index.
+    #[arg(long, env = "BLOOM_MODEL_INDEX_FILE")]
+    pub model_index_file: Option<PathBuf>,
+
+    /// HTTPS URL of a signed model discovery index.
+    #[arg(long, env = "BLOOM_MODEL_INDEX_URL")]
+    pub model_index_url: Option<String>,
+
+    /// Trusted Ed25519 index public key as 64 hex characters or unpadded base64url.
+    #[arg(long, env = "BLOOM_MODEL_INDEX_PUBLIC_KEY")]
+    pub model_index_public_key: Option<String>,
+
+    /// Additional trusted Ed25519 index public keys for bounded key rotation.
+    #[arg(long, env = "BLOOM_MODEL_INDEX_PUBLIC_KEYS", value_delimiter = ',')]
+    pub model_index_public_keys: Vec<String>,
+
+    /// Successful model index refresh interval in seconds.
+    #[arg(long, env = "BLOOM_MODEL_INDEX_REFRESH_SECONDS", default_value_t = 300)]
+    pub model_index_refresh_seconds: u64,
+
+    /// Directory for persistent signed-index rollback watermarks.
+    #[arg(long, env = "BLOOM_MODEL_INDEX_STATE_DIR")]
+    pub model_index_state_dir: Option<PathBuf>,
+
+    /// Maximum committed model-catalog bytes across installed and staged data (0 = unlimited).
+    #[arg(long, env = "BLOOM_MAX_MODEL_STORAGE_BYTES", default_value_t = 0)]
+    pub max_model_storage_bytes: u64,
+
+    /// Remove inactive staged acquisitions older than this (0 = disabled).
+    #[arg(
+        long,
+        env = "BLOOM_STAGED_MODEL_RETENTION_SECONDS",
+        default_value_t = 0
+    )]
+    pub staged_model_retention_seconds: u64,
 
     /// Speculative decoding mode: none, ngram, draft, mtp.
     #[arg(long, default_value = "none")]
@@ -104,7 +196,7 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = false)]
     pub enable_chunked_prefill: bool,
 
-    /// Maximum tokens per prefill chunk.
+    /// Maximum tokens per prefill chunk; must be at least 1 when enabled.
     #[arg(long, default_value_t = 512)]
     pub prefill_chunk_size: usize,
 
@@ -190,8 +282,13 @@ pub(crate) fn parse_args() -> Result<(Args, ArgMatches)> {
     Ok((args, matches))
 }
 
-pub(crate) fn apply_config(args: &mut Args, matches: &ArgMatches, config: &bloomai_engine::ServerConfig) {
+pub(crate) fn apply_config(
+    args: &mut Args,
+    matches: &ArgMatches,
+    config: &bloomai_engine::ServerConfig,
+) {
     apply_config_option!(args, matches, config, model);
+    apply_config_option!(args, matches, config, models_dir);
     apply_config_value!(args, matches, config, host);
     apply_config_value!(args, matches, config, port);
     apply_config_value!(args, matches, config, backend);
@@ -204,6 +301,22 @@ pub(crate) fn apply_config(args: &mut Args, matches: &ArgMatches, config: &bloom
     apply_config_value!(args, matches, config, disable_memory_prealloc);
     apply_config_value!(args, matches, config, max_num_tokens);
     apply_config_value!(args, matches, config, timeout);
+    apply_config_value!(args, matches, config, shutdown_timeout_seconds);
+    apply_config_value!(args, matches, config, max_upload_bytes);
+    apply_config_value!(args, matches, config, enable_model_downloads);
+    apply_config_value!(args, matches, config, max_model_download_bytes);
+    apply_config_value!(args, matches, config, enable_model_imports);
+    apply_config_value!(args, matches, config, max_model_import_bytes);
+    apply_config_value!(args, matches, config, max_model_import_chunk_bytes);
+    apply_config_value!(args, matches, config, allowed_model_licenses);
+    apply_config_option!(args, matches, config, model_index_file);
+    apply_config_option!(args, matches, config, model_index_url);
+    apply_config_option!(args, matches, config, model_index_public_key);
+    apply_config_value!(args, matches, config, model_index_public_keys);
+    apply_config_value!(args, matches, config, model_index_refresh_seconds);
+    apply_config_option!(args, matches, config, model_index_state_dir);
+    apply_config_value!(args, matches, config, max_model_storage_bytes);
+    apply_config_value!(args, matches, config, staged_model_retention_seconds);
     apply_config_value!(args, matches, config, speculative);
     apply_config_option!(args, matches, config, draft_model);
     apply_config_value!(args, matches, config, num_speculative_tokens);
@@ -229,6 +342,7 @@ pub(crate) fn select_backend_name(
     manifest: &bloomai_core::ModelManifest,
 ) -> String {
     if backend == "candle" {
+        let has_format = |format| manifest.files.iter().any(|file| file.format == format);
         let is_qwen_vl = manifest.family == bloomai_core::ModelFamily::Qwen
             && (manifest.id.to_lowercase().contains("vl")
                 || manifest
@@ -239,6 +353,16 @@ pub(crate) fn select_backend_name(
                     .unwrap_or(false));
         if speculative_mode_is_mtp(speculative) {
             "llamacpp".to_string()
+        } else if has_format(bloomai_core::ModelFormat::Onnx) {
+            "onnxruntime".to_string()
+        } else if has_format(bloomai_core::ModelFormat::OpenVinoIr) {
+            "openvino".to_string()
+        } else if has_format(bloomai_core::ModelFormat::CoreMl) {
+            "coreml".to_string()
+        } else if has_format(bloomai_core::ModelFormat::Mlx) {
+            "mlx".to_string()
+        } else if has_format(bloomai_core::ModelFormat::VulkanSpirv) {
+            "vulkan".to_string()
         } else if is_qwen_vl {
             "qwen3_vl".to_string()
         } else if matches!(&manifest.family, bloomai_core::ModelFamily::Custom(c) if c == "longcat-image-edit")
