@@ -63,7 +63,7 @@ jobs:
         run: cargo install dioxus-cli --version 0.7.10 --locked
       - name: Cache pinned trained Qwen2 model
         if: runner.os == 'Linux'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /tmp/bloom-trained-qwen2-runtime
           key: trained-qwen2-q4-aca679832ded61145239ce7f5c5ebddb1c57ada786c9c23733899c3888e0596f
@@ -72,7 +72,7 @@ jobs:
         run: ./scripts/test_trained_qwen2_runtime.sh
       - name: Cache pinned trained Qwen3 model
         if: runner.os == 'Linux'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /tmp/bloom-trained-qwen3-runtime
           key: trained-qwen3-q8-9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031
@@ -81,7 +81,7 @@ jobs:
         run: ./scripts/test_trained_qwen3_runtime.sh
       - name: Cache pinned trained SmolLM2 Llama model
         if: runner.os == 'Linux'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /tmp/bloom-trained-llama-runtime
           key: trained-llama-q8-48ab3034d0dd401fbc721eb1df3217902fee7dab9078992d66431f09b7750201
@@ -90,7 +90,7 @@ jobs:
         run: ./scripts/test_trained_llama_runtime.sh
       - name: Cache pinned trained SmolLM2 Safetensors model
         if: runner.os == 'Linux'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /tmp/bloom-trained-safetensors-runtime
           key: trained-safetensors-bf16-e6bffe7435d7ddc10fd3b9a9efd429dafbacb1cb17015fb5562664e7532bf86e
@@ -99,7 +99,7 @@ jobs:
         run: ./scripts/test_trained_safetensors_runtime.sh
       - name: Cache pinned trained MiniLM embedding model
         if: runner.os == 'Linux'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /tmp/bloom-trained-embedding-runtime
           key: trained-embedding-minilm-f32-53aa51172d142c89d9012cce15ae4d6cc0ca6895895114379cacb4fab128d9db
