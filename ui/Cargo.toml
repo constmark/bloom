@@ -13,10 +13,6 @@ publish = false
 # wasm32 and is built with `dx`, not with the native `cargo` workspace.
 [workspace]
 
-[lib]
-crate-type = ["cdylib", "rlib"]
-path = "src/main.rs"
-
 [dependencies]
 dioxus = { version = "0.7.9", features = ["web"] }
 serde = { version = "1", features = ["derive"] }
@@ -27,8 +23,12 @@ web-sys = { version = "0.3", features = [
   "console",
   "Storage",
   "Window",
+  "Performance",
+  "Navigator",
   "Location",
   "Document",
+  "AbortController",
+  "AbortSignal",
   "Headers",
   "Request",
   "RequestInit",
@@ -36,17 +36,28 @@ web-sys = { version = "0.3", features = [
   "ReadableStream",
   "ReadableStreamDefaultReader",
   "TextDecoder",
+  "TextDecodeOptions",
+  "Blob",
+  "BlobPropertyBag",
+  "CssStyleDeclaration",
+  "File",
+  "FormData",
   "HtmlElement",
+  "HtmlAnchorElement",
   "HtmlTextAreaElement",
   "Element",
+  "Node",
+  "NodeList",
+  "Url",
   "ScrollBehavior",
   "ScrollToOptions",
 ] }
 gloo-net = { version = "0.6", features = ["http"] }
-gloo-timers = "0.3"
+gloo-timers = { version = "0.3", features = ["futures"] }
 futures-util = "0.3"
 js-sys = "0.3"
 tracing = "0.1"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 
 [profile.release]
 opt-level = "z"
