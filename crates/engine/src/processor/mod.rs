@@ -66,6 +66,7 @@ impl Processor for IdentityProcessor {
 pub struct TokenizerProcessor {
     name: String,
     tokenizer: tokenizers::Tokenizer,
+    add_special_tokens: bool,
 }
 
 #[cfg(feature = "candle-engine")]
@@ -74,6 +75,19 @@ impl TokenizerProcessor {
         Self {
             name: name.into(),
             tokenizer,
+            add_special_tokens: false,
+        }
+    }
+
+    pub fn new_with_special_tokens(
+        name: impl Into<String>,
+        tokenizer: tokenizers::Tokenizer,
+        add_special_tokens: bool,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            tokenizer,
+            add_special_tokens,
         }
     }
 }
@@ -103,7 +117,7 @@ impl Processor for TokenizerProcessor {
                 DataBlock::Text(text) => {
                     let encoding = self
                         .tokenizer
-                        .encode(text, false)
+                        .encode(text, self.add_special_tokens)
                         .map_err(|e| anyhow!("tokenizer encode error: {}", e))?;
                     out.push(DataBlock::Tokens(encoding.get_ids().to_vec()));
                 }

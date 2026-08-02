@@ -99,14 +99,17 @@ impl PluginManager {
 
         // Entry point check
         if manifest.entry_point.path.is_empty() {
-            return Err(BloomError::Plugin("Plugin entry point path cannot be empty".into()).into());
+            return Err(
+                BloomError::Plugin("Plugin entry point path cannot be empty".into()).into(),
+            );
         }
         let allowed_types = ["native", "wasm", "remote", "subprocess"];
         if !allowed_types.contains(&manifest.entry_point.entry_type.as_str()) {
             return Err(BloomError::Plugin(format!(
                 "Invalid entry point type: {}",
                 manifest.entry_point.entry_type
-            )).into());
+            ))
+            .into());
         }
 
         Ok(())
@@ -125,32 +128,40 @@ impl PluginManager {
             "native" => {
                 let path = Self::resolve_entry_path(&manifest.entry_point.path, base_dir);
                 if !path.exists() {
-                    return Err(BloomError::MissingRequiredFile(
-                        format!("Native plugin entry point does not exist: {:?}", path)
-                    ).into());
+                    return Err(BloomError::MissingRequiredFile(format!(
+                        "Native plugin entry point does not exist: {:?}",
+                        path
+                    ))
+                    .into());
                 }
                 Ok(PluginEntryValidation::NativeLibrary { path })
             }
             "wasm" => {
                 let path = Self::resolve_entry_path(&manifest.entry_point.path, base_dir);
                 if !path.exists() {
-                    return Err(BloomError::MissingRequiredFile(
-                        format!("WASM plugin entry point does not exist: {:?}", path)
-                    ).into());
+                    return Err(BloomError::MissingRequiredFile(format!(
+                        "WASM plugin entry point does not exist: {:?}",
+                        path
+                    ))
+                    .into());
                 }
                 if path.extension().and_then(|s| s.to_str()) != Some("wasm") {
-                    return Err(BloomError::InvalidInput(
-                        format!("WASM plugin entry point must end with .wasm: {:?}", path)
-                    ).into());
+                    return Err(BloomError::InvalidInput(format!(
+                        "WASM plugin entry point must end with .wasm: {:?}",
+                        path
+                    ))
+                    .into());
                 }
                 Ok(PluginEntryValidation::WasmModule { path })
             }
             "subprocess" => {
                 let path = Self::resolve_entry_path(&manifest.entry_point.path, base_dir);
                 if !path.exists() {
-                    return Err(BloomError::MissingRequiredFile(
-                        format!("Subprocess plugin entry point does not exist: {:?}", path)
-                    ).into());
+                    return Err(BloomError::MissingRequiredFile(format!(
+                        "Subprocess plugin entry point does not exist: {:?}",
+                        path
+                    ))
+                    .into());
                 }
                 Ok(PluginEntryValidation::Subprocess { path })
             }
@@ -165,7 +176,9 @@ impl PluginManager {
                     url: url.to_string(),
                 })
             }
-            other => Err(BloomError::InvalidInput(format!("Invalid entry point type: {}", other)).into()),
+            other => {
+                Err(BloomError::InvalidInput(format!("Invalid entry point type: {}", other)).into())
+            }
         }
     }
 
@@ -188,21 +201,27 @@ impl PluginManager {
         let lib_path = Self::resolve_entry_path(&manifest.entry_point.path, base_dir);
 
         if !lib_path.exists() {
-            return Err(BloomError::MissingRequiredFile(
-                format!("Native library file does not exist: {:?}", lib_path)
-            ).into());
+            return Err(BloomError::MissingRequiredFile(format!(
+                "Native library file does not exist: {:?}",
+                lib_path
+            ))
+            .into());
         }
 
         unsafe {
             let lib = libloading::Library::new(&lib_path).map_err(|e| {
-                BloomError::Plugin(format!("Failed to load dynamic library {:?}: {:?}", lib_path, e))
+                BloomError::Plugin(format!(
+                    "Failed to load dynamic library {:?}: {:?}",
+                    lib_path, e
+                ))
             })?;
 
             // Try to resolve the standard initialization function
             let _init_fn: libloading::Symbol<unsafe extern "C" fn() -> i32> =
                 lib.get(b"bloom_plugin_init\0").map_err(|_| {
                     BloomError::Plugin(
-                        "Dynamic library does not export 'bloom_plugin_init' initialization symbol".into()
+                        "Dynamic library does not export 'bloom_plugin_init' initialization symbol"
+                            .into(),
                     )
                 })?;
         }
@@ -238,12 +257,18 @@ impl PluginManager {
         base_dir: P,
     ) -> Result<Box<dyn Engine>> {
         if manifest.entry_point.entry_type != "native" {
-            return Err(BloomError::Plugin("Only 'native' entry point type is supported for engine plugins".into()).into());
+            return Err(BloomError::Plugin(
+                "Only 'native' entry point type is supported for engine plugins".into(),
+            )
+            .into());
         }
         let lib_path = Self::resolve_entry_path(&manifest.entry_point.path, base_dir);
         let lib = Arc::new(unsafe {
             libloading::Library::new(&lib_path).map_err(|e| {
-                BloomError::Plugin(format!("Failed to load dynamic library {:?}: {:?}", lib_path, e))
+                BloomError::Plugin(format!(
+                    "Failed to load dynamic library {:?}: {:?}",
+                    lib_path, e
+                ))
             })?
         });
 
@@ -256,7 +281,11 @@ impl PluginManager {
         let mut c_engine = std::mem::MaybeUninit::<ffi::CBloomEngine>::uninit();
         let res = unsafe { init_fn(c_engine.as_mut_ptr()) };
         if res != 0 {
-            return Err(BloomError::Plugin(format!("bloom_plugin_init failed with error code {}", res)).into());
+            return Err(BloomError::Plugin(format!(
+                "bloom_plugin_init failed with error code {}",
+                res
+            ))
+            .into());
         }
         let c_engine = unsafe { c_engine.assume_init() };
 
@@ -369,7 +398,11 @@ impl Engine for FfiPluginEngine {
         let mut model_ptr = std::ptr::null_mut();
         let res = (self.c_engine.load_model)(path_str.as_ptr(), device_i32, &mut model_ptr);
         if res != 0 || model_ptr.is_null() {
-            return Err(BloomError::Plugin(format!("Failed to load model in dynamic plugin: error code {}", res)).into());
+            return Err(BloomError::Plugin(format!(
+                "Failed to load model in dynamic plugin: error code {}",
+                res
+            ))
+            .into());
         }
 
         // Get model metadata
@@ -380,7 +413,8 @@ impl Engine for FfiPluginEngine {
             return Err(BloomError::Plugin(format!(
                 "Failed to read metadata from plugin model: error code {}",
                 res
-            )).into());
+            ))
+            .into());
         }
         let metadata_str = unsafe { std::ffi::CStr::from_ptr(metadata_json_ptr).to_str()? };
         let metadata: ModelMetadata = serde_json::from_str(metadata_str)?;
@@ -450,7 +484,11 @@ impl LoadedModel for FfiPluginModel {
         let mut out_json_ptr = std::ptr::null_mut();
         let res = (self.model_infer_fn)(self.model_ptr, payload_c.as_ptr(), &mut out_json_ptr);
         if res != 0 || out_json_ptr.is_null() {
-            return Err(BloomError::Plugin(format!("Inference failed in dynamic plugin: error code {}", res)).into());
+            return Err(BloomError::Plugin(format!(
+                "Inference failed in dynamic plugin: error code {}",
+                res
+            ))
+            .into());
         }
 
         let out_str = unsafe { std::ffi::CStr::from_ptr(out_json_ptr).to_str()? };
@@ -526,7 +564,8 @@ impl LoadedModel for FfiPluginModel {
             return Err(BloomError::Plugin(format!(
                 "Stream inference failed in dynamic plugin: error code {}",
                 res
-            )).into());
+            ))
+            .into());
         }
 
         Ok(())

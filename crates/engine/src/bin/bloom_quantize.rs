@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), warn(clippy::unwrap_used))]
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -122,7 +124,10 @@ fn main() -> Result<()> {
 
         // Save output safetensors
         let out_filename = if args.output.is_dir() {
-            args.output.join(sf_path.file_name().unwrap())
+            let filename = sf_path
+                .file_name()
+                .ok_or_else(|| anyhow!("input path has no file name: {}", sf_path.display()))?;
+            args.output.join(filename)
         } else {
             args.output.clone()
         };

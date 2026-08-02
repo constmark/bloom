@@ -210,7 +210,8 @@ impl Config {
         let head_dim = text_config
             .get("head_dim")
             .and_then(|v| v.as_u64())
-            .ok_or_else(|| BloomError::ModelLoad("missing head_dim".into()))? as usize;
+            .ok_or_else(|| BloomError::ModelLoad("missing head_dim".into()))?
+            as usize;
         let global_head_dim = text_config
             .get("global_head_dim")
             .and_then(|v| v.as_u64())

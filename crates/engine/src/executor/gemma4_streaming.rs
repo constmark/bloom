@@ -992,7 +992,12 @@ impl Gemma4StreamingModel {
                         let current_seq_len = k.dim(2)?;
                         if len < current_seq_len {
                             let k_new = k.narrow(2, 0, len)?;
-                            let v_new = c.v()?.unwrap().narrow(2, 0, len)?;
+                            let v_new = c
+                                .v()?
+                                .ok_or_else(|| {
+                                    candle_core::Error::Msg("KV cache value is missing".into())
+                                })?
+                                .narrow(2, 0, len)?;
                             c.reset();
                             c.append(&k_new, &v_new)?;
                         }
@@ -1006,7 +1011,12 @@ impl Gemma4StreamingModel {
                 let current_seq_len = k.dim(2)?;
                 if len < current_seq_len {
                     let k_new = k.narrow(2, 0, len)?;
-                    let v_new = cache.v().unwrap().narrow(2, 0, len)?;
+                    let v_new = cache
+                        .v()
+                        .ok_or_else(|| {
+                            candle_core::Error::Msg("K-scale cache value is missing".into())
+                        })?
+                        .narrow(2, 0, len)?;
                     cache.reset();
                     cache.append(&k_new, &v_new)?;
                 }
@@ -1017,7 +1027,12 @@ impl Gemma4StreamingModel {
                 let current_seq_len = k.dim(2)?;
                 if len < current_seq_len {
                     let k_new = k.narrow(2, 0, len)?;
-                    let v_new = cache.v().unwrap().narrow(2, 0, len)?;
+                    let v_new = cache
+                        .v()
+                        .ok_or_else(|| {
+                            candle_core::Error::Msg("V-scale cache value is missing".into())
+                        })?
+                        .narrow(2, 0, len)?;
                     cache.reset();
                     cache.append(&k_new, &v_new)?;
                 }

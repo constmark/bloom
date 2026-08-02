@@ -150,7 +150,10 @@ impl SpeculativeStrategy for NGramStrategy {
             return;
         }
         let rate = accepted_count as f32 / proposed_count as f32;
-        let mut ema = self.acceptance_rate_ema.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ema = self
+            .acceptance_rate_ema
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *ema = 0.8 * (*ema) + 0.2 * rate;
 
         let mut limit = self.dynamic_limit.lock().unwrap_or_else(|e| e.into_inner());
@@ -420,7 +423,10 @@ impl SpeculativeStrategy for DraftModelStrategy {
             return;
         }
         let rate = accepted_count as f32 / proposed_count as f32;
-        let mut ema = self.acceptance_rate_ema.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ema = self
+            .acceptance_rate_ema
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *ema = 0.8 * (*ema) + 0.2 * rate;
 
         let mut limit = self.dynamic_limit.lock().unwrap_or_else(|e| e.into_inner());
@@ -1026,7 +1032,10 @@ mod tests {
                 _input_ids: &candle_core::Tensor,
                 _start_pos: usize,
             ) -> Result<candle_core::Tensor> {
-                let mut res = self.forward_result.lock().unwrap_or_else(|e| e.into_inner());
+                let mut res = self
+                    .forward_result
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 let next_tok = if !res.is_empty() { res.remove(0) } else { 0 };
                 let mut logits = vec![-10.0f32; 100];
                 if (next_tok as usize) < 100 {
@@ -1072,7 +1081,10 @@ mod tests {
         });
 
         let strategy = DraftModelStrategy::new("dummy_path".to_string(), 3, DeviceKind::Cpu);
-        *strategy.draft_model.lock().unwrap_or_else(|e| e.into_inner()) = Some(mock_model);
+        *strategy
+            .draft_model
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(mock_model);
         strategy.mark_loaded();
 
         let proposed = strategy.propose(&[1, 2, 3], 3).unwrap();

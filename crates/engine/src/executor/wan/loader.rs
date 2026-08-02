@@ -67,7 +67,10 @@ pub fn find_weight_files(model_path: &Path) -> Result<WeightFiles> {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_file() {
-                let name = path.file_name().unwrap().to_string_lossy().to_lowercase();
+                let Some(name) = path.file_name() else {
+                    continue;
+                };
+                let name = name.to_string_lossy().to_lowercase();
                 if name.contains("wan") && name.ends_with(".safetensors") {
                     return Ok(WeightFiles::Safetensors(vec![path]));
                 }

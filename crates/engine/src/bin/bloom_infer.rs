@@ -1,4 +1,5 @@
 #![allow(clippy::type_complexity)]
+#![cfg_attr(not(test), warn(clippy::unwrap_used))]
 //! bloom_infer — Standalone inference CLI for Bloom engine.
 //!
 //! Load a local model and run inference without any external runtime or
@@ -33,7 +34,8 @@ use bloomai_engine::executor::qwen3_vl::Qwen3VLEngine;
 #[cfg(feature = "candle-engine")]
 use bloomai_engine::executor::wan::WanEngine;
 use bloomai_engine::{
-    estimate_memory, speculative_mode_is_mtp, Engine, EngineRegistry, InferencePipeline, ModelInput,
+    model_manifest_supports_embeddings, speculative_mode_is_mtp, Engine, EngineRegistry,
+    InferencePipeline, ModelInput,
 };
 
 /// Chat completion message.
@@ -404,21 +406,91 @@ fn parse_dtype_str(s: &str) -> Option<DType> {
 }
 
 /// Build the final prompt string by prepending system prompt if provided.
+#[cfg(test)]
 fn build_prompt(system_prompt: Option<&str>, user_prompt: &str) -> String {
+    build_prompt_for_model(system_prompt, user_prompt, CliChatTemplate::Legacy)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliChatTemplate {
+    Legacy,
+    ChatMl,
+    SmolLm2,
+    Llama2,
+    Llama3,
+    Gemma,
+    Qwen3NoThink,
+}
+
+fn build_prompt_for_model(
+    system_prompt: Option<&str>,
+    user_prompt: &str,
+    template: CliChatTemplate,
+) -> String {
     match system_prompt {
-        Some(sys) if !sys.is_empty() => {
-            format!("<|system|>\n{}\n<|user|>\n{}", sys, user_prompt)
-        }
+        Some(sys) if !sys.is_empty() => chat_prompt_for_model(
+            &[
+                ChatCompletionMessage {
+                    role: "system".to_string(),
+                    content: sys.to_string(),
+                },
+                ChatCompletionMessage {
+                    role: "user".to_string(),
+                    content: user_prompt.to_string(),
+                },
+            ],
+            template,
+        ),
+        _ if template != CliChatTemplate::Legacy => chat_prompt_for_model(
+            &[ChatCompletionMessage {
+                role: "user".to_string(),
+                content: user_prompt.to_string(),
+            }],
+            template,
+        ),
         _ => user_prompt.to_string(),
     }
 }
 
 pub fn chat_prompt(messages: &[ChatCompletionMessage]) -> String {
-    if messages.len() == 1 && messages[0].role == "user" {
+    chat_prompt_for_model(messages, CliChatTemplate::Legacy)
+}
+
+fn chat_prompt_for_model(messages: &[ChatCompletionMessage], template: CliChatTemplate) -> String {
+    if messages.len() == 1 && messages[0].role == "user" && template == CliChatTemplate::Legacy {
         return messages[0].content.clone();
     }
 
+    if template == CliChatTemplate::Llama2 {
+        return llama2_chat_prompt(messages);
+    }
+    if template == CliChatTemplate::Llama3 {
+        return llama3_chat_prompt(messages);
+    }
+    if template == CliChatTemplate::Gemma {
+        let mut prompt = String::new();
+        for message in messages {
+            prompt.push_str(&format!(
+                "<start_of_turn>{}\n{}<end_of_turn>\n",
+                message.role, message.content
+            ));
+        }
+        prompt.push_str("<start_of_turn>model\n");
+        return prompt;
+    }
+
     let mut prompt = String::new();
+    if template == CliChatTemplate::SmolLm2
+        && !messages
+            .first()
+            .is_some_and(|message| message.role == "system")
+    {
+        prompt.push_str(concat!(
+            "<|im_start|>system\n",
+            "You are a helpful AI assistant named SmolLM, trained by Hugging Face",
+            "<|im_end|>\n"
+        ));
+    }
     for msg in messages {
         prompt.push_str(&format!(
             "<|im_start|>{}\n{}<|im_end|>\n",
@@ -426,10 +498,79 @@ pub fn chat_prompt(messages: &[ChatCompletionMessage]) -> String {
         ));
     }
     prompt.push_str("<|im_start|>assistant\n");
+    if template == CliChatTemplate::Qwen3NoThink {
+        prompt.push_str("<think>\n\n</think>\n\n");
+    }
     prompt
 }
 
-fn resolve_and_parse_input(args: &Args) -> Result<ResolvedInput> {
+fn llama2_chat_prompt(messages: &[ChatCompletionMessage]) -> String {
+    let mut prompt = String::from("<s>");
+    let mut index = 0;
+    if let Some(system) = messages.first().filter(|message| message.role == "system") {
+        if let Some(user) = messages.get(1).filter(|message| message.role == "user") {
+            prompt.push_str(&format!(
+                "[INST] <<SYS>>\n{}\n<</SYS>>\n\n{} [/INST]",
+                system.content, user.content
+            ));
+            index = 2;
+        } else {
+            prompt.push_str(&format!(
+                "[INST] <<SYS>>\n{}\n<</SYS>> [/INST]",
+                system.content
+            ));
+            index = 1;
+        }
+    }
+    for message in &messages[index..] {
+        match message.role.as_str() {
+            "user" => prompt.push_str(&format!("<s>[INST] {} [/INST]", message.content)),
+            "assistant" => prompt.push_str(&format!(" {} </s>", message.content)),
+            _ => prompt.push_str(&format!("[INST] {} [/INST]", message.content)),
+        }
+    }
+    prompt
+}
+
+fn llama3_chat_prompt(messages: &[ChatCompletionMessage]) -> String {
+    let mut prompt = String::from("<|begin_of_text|>");
+    for message in messages {
+        prompt.push_str(&format!(
+            "<|start_header_id|>{}<|end_header_id|>\n\n{}<|eot_id|>",
+            message.role, message.content
+        ));
+    }
+    prompt.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+    prompt
+}
+
+fn manifest_chat_template(manifest: &bloomai_core::ModelManifest) -> CliChatTemplate {
+    let architecture = manifest
+        .parameters
+        .get("gguf_architecture")
+        .or_else(|| manifest.parameters.get("model_type"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if architecture.eq_ignore_ascii_case("qwen3") {
+        return CliChatTemplate::Qwen3NoThink;
+    }
+    match manifest
+        .parameters
+        .get("chat_template_kind")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("chatml") => CliChatTemplate::ChatMl,
+        Some("smollm2") => CliChatTemplate::SmolLm2,
+        Some("llama2") => CliChatTemplate::Llama2,
+        Some("llama3") => CliChatTemplate::Llama3,
+        Some("gemma") => CliChatTemplate::Gemma,
+        _ => CliChatTemplate::Legacy,
+    }
+}
+
+fn resolve_and_parse_input(args: &Args, template: CliChatTemplate) -> Result<ResolvedInput> {
     let raw_input = if let Some(ref path) = args.prompt_file {
         std::fs::read_to_string(path)
             .map_err(|e| anyhow!("failed to read prompt file '{}': {}", path.display(), e))?
@@ -452,7 +593,7 @@ fn resolve_and_parse_input(args: &Args) -> Result<ResolvedInput> {
     if trimmed.starts_with('{') {
         if let Ok(json_obj) = serde_json::from_str::<PromptJson>(trimmed) {
             let prompt = if let Some(messages) = json_obj.messages {
-                chat_prompt(&messages)
+                chat_prompt_for_model(&messages, template)
             } else {
                 json_obj.prompt.unwrap_or_default()
             };
@@ -466,7 +607,7 @@ fn resolve_and_parse_input(args: &Args) -> Result<ResolvedInput> {
         }
     } else if trimmed.starts_with('[') {
         if let Ok(messages) = serde_json::from_str::<Vec<ChatCompletionMessage>>(trimmed) {
-            let prompt = chat_prompt(&messages);
+            let prompt = chat_prompt_for_model(&messages, template);
             return Ok(ResolvedInput {
                 prompt,
                 max_tokens: args.max_tokens,
@@ -477,7 +618,7 @@ fn resolve_and_parse_input(args: &Args) -> Result<ResolvedInput> {
         }
     }
 
-    let prompt = build_prompt(args.system_prompt.as_deref(), &raw_input);
+    let prompt = build_prompt_for_model(args.system_prompt.as_deref(), &raw_input, template);
     Ok(ResolvedInput {
         prompt,
         max_tokens: args.max_tokens,
@@ -555,8 +696,15 @@ async fn main() -> Result<()> {
     })?;
     let model_path = resolve_model_path_arg(model)?;
 
+    // Dtype affects both runtime construction and the device-specific memory
+    // estimate shown by metadata-only inspection.
+    if let Some(ref dt) = args.dtype {
+        std::env::set_var("BLOOM_DTYPE", dt);
+    }
+
     // --- Load manifest first to assist in engine auto-selection if needed ---
     let manifest = bloomai_engine::load_manifest(&model_path)?;
+    let chat_template = manifest_chat_template(&manifest);
 
     let backend_name = select_backend_name(
         args.engine.as_deref(),
@@ -580,10 +728,12 @@ async fn main() -> Result<()> {
         );
     }
 
-    // --- Apply dtype environment variable ---
-    if let Some(ref dt) = args.dtype {
-        std::env::set_var("BLOOM_DTYPE", dt);
+    if model_manifest_supports_embeddings(&manifest) {
+        return Err(anyhow!(
+            "bloom_infer serves text generation and cannot run an embedding encoder; start bloom_server and use /v1/embeddings, /v1/rerank, /api/embed, or /api/embeddings"
+        ));
     }
+
     if let Some(layers) = args.gpu_layers {
         std::env::set_var("BLOOM_GPU_LAYERS", layers.to_string());
     }
@@ -641,7 +791,7 @@ async fn main() -> Result<()> {
 
     // Pre-load memory estimation and startup reservation probe.
     let memory_context_size = args.context_size.saturating_mul(args.batch_size.max(1));
-    let mem = estimate_memory(&manifest, memory_context_size);
+    let mem = bloomai_engine::estimate_memory_for_device(&manifest, memory_context_size, device);
     if !args.quiet {
         tracing::info!("Memory estimate: {}", mem.display_summary());
     }
@@ -700,11 +850,11 @@ async fn main() -> Result<()> {
             seed: args.seed,
             response_format: None,
         };
-        return run_interactive(&args, &pipeline, params);
+        return run_interactive(&args, &pipeline, params, chat_template);
     }
 
     // --- Resolve and parse prompt / input overrides ---
-    let resolved_input = resolve_and_parse_input(&args)?;
+    let resolved_input = resolve_and_parse_input(&args, chat_template)?;
 
     // Build generation parameters
     let params = GenerationParams {
@@ -746,7 +896,7 @@ async fn main() -> Result<()> {
         .dtype
         .as_deref()
         .and_then(parse_dtype_str)
-        .unwrap_or(manifest.primary_dtype);
+        .unwrap_or(mem.weight_dtype);
 
     if !args.quiet && !args.bench_json {
         eprintln!("============================================================");
@@ -794,14 +944,14 @@ async fn main() -> Result<()> {
                     bloomai_engine::io::OutputChunk::TextDelta(text) => {
                         // Record first token time
                         {
-                            let mut ftt_guard = ftt.lock().unwrap();
+                            let mut ftt_guard = ftt.lock().unwrap_or_else(|e| e.into_inner());
                             if ftt_guard.is_none() {
                                 *ftt_guard = Some(Instant::now());
                             }
                         }
                         // Count tokens
                         {
-                            let mut count = tc.lock().unwrap();
+                            let mut count = tc.lock().unwrap_or_else(|e| e.into_inner());
                             *count += 1;
                         }
                         if !bench {
@@ -818,7 +968,7 @@ async fn main() -> Result<()> {
                             }
                         }
                         {
-                            let mut count = tc.lock().unwrap();
+                            let mut count = tc.lock().unwrap_or_else(|e| e.into_inner());
                             *count = step as usize;
                         }
                     }
@@ -827,11 +977,11 @@ async fn main() -> Result<()> {
                         if !bench {
                             eprintln!("Image saved to {}", output_path.display());
                         }
-                        *tc.lock().unwrap() = 1;
-                        *ftt.lock().unwrap() = Some(infer_start);
+                        *tc.lock().unwrap_or_else(|e| e.into_inner()) = 1;
+                        *ftt.lock().unwrap_or_else(|e| e.into_inner()) = Some(infer_start);
                     }
                     bloomai_engine::io::OutputChunk::VideoFrame(rgb) => {
-                        vf.lock().unwrap().push(rgb);
+                        vf.lock().unwrap_or_else(|e| e.into_inner()).push(rgb);
                     }
                     bloomai_engine::io::OutputChunk::VideoComplete {
                         width,
@@ -839,7 +989,8 @@ async fn main() -> Result<()> {
                         fps,
                         frame_count,
                     } => {
-                        *vm.lock().unwrap() = Some((width, height, fps, frame_count));
+                        *vm.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some((width, height, fps, frame_count));
                         if !bench {
                             eprintln!(
                                 "Video complete: {}x{}, {} frames @ {} fps",
@@ -860,9 +1011,9 @@ async fn main() -> Result<()> {
         // Save collected video frames to file
         #[cfg(feature = "candle-engine")]
         {
-            let frames = video_frames.lock().unwrap();
+            let frames = video_frames.lock().unwrap_or_else(|e| e.into_inner());
             if !frames.is_empty() {
-                let meta = video_meta.lock().unwrap();
+                let meta = video_meta.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some((width, height, fps, frame_count)) = *meta {
                     let video = bloomai_engine::io::VideoOutput {
                         width,
@@ -885,8 +1036,8 @@ async fn main() -> Result<()> {
                             fps
                         );
                     }
-                    *token_count.lock().unwrap() = frame_count as usize;
-                    *first_token_time.lock().unwrap() = Some(infer_start);
+                    *token_count.lock().unwrap_or_else(|e| e.into_inner()) = frame_count as usize;
+                    *first_token_time.lock().unwrap_or_else(|e| e.into_inner()) = Some(infer_start);
                 }
             }
         }
@@ -899,8 +1050,8 @@ async fn main() -> Result<()> {
         let output = pipeline.run(input, &params)?;
         if let Some(ref image) = output.image {
             std::fs::write(&args.output, image)?;
-            *token_count.lock().unwrap() = 1;
-            *first_token_time.lock().unwrap() = Some(infer_start);
+            *token_count.lock().unwrap_or_else(|e| e.into_inner()) = 1;
+            *first_token_time.lock().unwrap_or_else(|e| e.into_inner()) = Some(infer_start);
             if !args.bench_json {
                 println!("Image saved to {}", args.output.display());
             }
@@ -924,14 +1075,16 @@ async fn main() -> Result<()> {
             {
                 eprintln!("Video encoding requires candle-engine feature");
             }
-            *token_count.lock().unwrap() = video.frame_count as usize;
-            *first_token_time.lock().unwrap() = Some(infer_start);
+            *token_count.lock().unwrap_or_else(|e| e.into_inner()) = video.frame_count as usize;
+            *first_token_time.lock().unwrap_or_else(|e| e.into_inner()) = Some(infer_start);
         } else if let Some(ref text) = output.text {
             let approx_tokens = text.split_whitespace().count().max(1);
-            *token_count.lock().unwrap() = approx_tokens;
-            *first_token_time.lock().unwrap() = Some(infer_start);
+            *token_count.lock().unwrap_or_else(|e| e.into_inner()) = approx_tokens;
+            *first_token_time.lock().unwrap_or_else(|e| e.into_inner()) = Some(infer_start);
 
-            if !args.bench_json {
+            if args.quiet && !args.bench_json {
+                println!("{}", text);
+            } else if !args.bench_json {
                 println!("--- Output ---");
                 println!("{}", text);
                 println!("--- End ---");
@@ -943,10 +1096,10 @@ async fn main() -> Result<()> {
 
     let infer_elapsed = infer_start.elapsed();
     let total_elapsed = load_start.elapsed();
-    let generated_tokens = *token_count.lock().unwrap();
+    let generated_tokens = *token_count.lock().unwrap_or_else(|e| e.into_inner());
     let ttft = first_token_time
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .map(|t| t.duration_since(infer_start).as_secs_f64());
     let generation_secs = infer_elapsed.as_secs_f64();
     let tokens_per_sec = if generation_secs > 0.0 && generated_tokens > 0 {
@@ -1013,7 +1166,8 @@ fn print_inspect(
     manifest: &bloomai_core::ModelManifest,
     registry: &EngineRegistry,
 ) -> Result<()> {
-    let mem = estimate_memory(manifest, args.context_size);
+    let device = parse_device(&args.device)?;
+    let mem = bloomai_engine::estimate_memory_for_device(manifest, args.context_size, device);
     let engines = registry
         .iter()
         .map(|(name, engine)| {
@@ -1094,6 +1248,7 @@ fn build_interactive_prompt(
     system_prompt: Option<&str>,
     history: &[ChatCompletionMessage],
     user_prompt: &str,
+    template: CliChatTemplate,
 ) -> String {
     let mut messages = Vec::with_capacity(history.len() + 2);
     if let Some(system) = system_prompt {
@@ -1109,20 +1264,32 @@ fn build_interactive_prompt(
         role: "user".to_string(),
         content: user_prompt.to_string(),
     });
-    chat_prompt(&messages)
+    chat_prompt_for_model(&messages, template)
+}
+
+struct InteractiveSession {
+    history: Vec<ChatCompletionMessage>,
+    system_prompt: Option<String>,
+    stream: bool,
+    last_stats: Option<TextGenerationStats>,
+    chat_template: CliChatTemplate,
 }
 
 fn run_interactive(
     args: &Args,
     pipeline: &InferencePipeline,
     mut params: GenerationParams,
+    chat_template: CliChatTemplate,
 ) -> Result<()> {
     use std::io::Write;
 
-    let mut history: Vec<ChatCompletionMessage> = Vec::new();
-    let mut system_prompt = args.system_prompt.clone();
-    let mut stream = true;
-    let mut last_stats: Option<TextGenerationStats> = None;
+    let mut session = InteractiveSession {
+        history: Vec::new(),
+        system_prompt: args.system_prompt.clone(),
+        stream: true,
+        last_stats: None,
+        chat_template,
+    };
 
     if !args.quiet {
         println!("Bloom interactive TUI");
@@ -1131,15 +1298,7 @@ fn run_interactive(
     }
 
     if let Some(initial_prompt) = resolve_interactive_initial_prompt(args)? {
-        run_interactive_turn(
-            pipeline,
-            &mut history,
-            system_prompt.as_deref(),
-            &initial_prompt,
-            &params,
-            stream,
-            &mut last_stats,
-        )?;
+        run_interactive_turn(pipeline, &mut session, &initial_prompt, &params)?;
     }
 
     loop {
@@ -1162,25 +1321,17 @@ fn run_interactive(
             if handle_interactive_command(
                 line,
                 &mut params,
-                &mut stream,
-                &mut system_prompt,
-                &mut history,
-                &last_stats,
+                &mut session.stream,
+                &mut session.system_prompt,
+                &mut session.history,
+                &session.last_stats,
             )? {
                 break;
             }
             continue;
         }
 
-        run_interactive_turn(
-            pipeline,
-            &mut history,
-            system_prompt.as_deref(),
-            line,
-            &params,
-            stream,
-            &mut last_stats,
-        )?;
+        run_interactive_turn(pipeline, &mut session, line, &params)?;
     }
 
     Ok(())
@@ -1188,27 +1339,29 @@ fn run_interactive(
 
 fn run_interactive_turn(
     pipeline: &InferencePipeline,
-    history: &mut Vec<ChatCompletionMessage>,
-    system_prompt: Option<&str>,
+    session: &mut InteractiveSession,
     user_prompt: &str,
     params: &GenerationParams,
-    stream: bool,
-    last_stats: &mut Option<TextGenerationStats>,
 ) -> Result<()> {
-    let prompt = build_interactive_prompt(system_prompt, history, user_prompt);
-    let stats = run_text_generation(pipeline, prompt, params, stream)?;
+    let prompt = build_interactive_prompt(
+        session.system_prompt.as_deref(),
+        &session.history,
+        user_prompt,
+        session.chat_template,
+    );
+    let stats = run_text_generation(pipeline, prompt, params, session.stream)?;
 
-    history.push(ChatCompletionMessage {
+    session.history.push(ChatCompletionMessage {
         role: "user".to_string(),
         content: user_prompt.to_string(),
     });
     if !stats.text.trim().is_empty() {
-        history.push(ChatCompletionMessage {
+        session.history.push(ChatCompletionMessage {
             role: "assistant".to_string(),
             content: stats.text.clone(),
         });
     }
-    *last_stats = Some(stats);
+    session.last_stats = Some(stats);
     Ok(())
 }
 
@@ -1482,20 +1635,20 @@ fn run_bench(args: &Args, engine: &dyn Engine, model_path: &std::path::Path) -> 
 
         pipeline.run_stream(input.clone(), &params, &mut move |chunk| {
             if let bloomai_engine::io::OutputChunk::TextDelta(_) = chunk {
-                let mut ftt_guard = ftt.lock().unwrap();
+                let mut ftt_guard = ftt.lock().unwrap_or_else(|e| e.into_inner());
                 if ftt_guard.is_none() {
                     *ftt_guard = Some(Instant::now());
                 }
-                *tc.lock().unwrap() += 1;
+                *tc.lock().unwrap_or_else(|e| e.into_inner()) += 1;
             }
             Ok(())
         })?;
 
         let duration = infer_start.elapsed();
-        let generated = *token_count.lock().unwrap();
+        let generated = *token_count.lock().unwrap_or_else(|e| e.into_inner());
         let ttft = first_token_time
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .map(|t| t.duration_since(infer_start).as_secs_f64() * 1000.0);
 
         if generated > 0 {
@@ -1578,6 +1731,11 @@ fn run_bench(args: &Args, engine: &dyn Engine, model_path: &std::path::Path) -> 
             "f16" | "float16" => Some(DType::F16),
             "bf16" | "bfloat16" => Some(DType::BF16),
             _ => None,
+        })
+        .or_else(|| {
+            pipeline
+                .memory_estimate()
+                .map(|estimate| estimate.weight_dtype)
         })
         .unwrap_or(pipeline.metadata().manifest.primary_dtype);
 
@@ -1678,6 +1836,72 @@ mod tests {
             content: "hello".to_string(),
         }];
         assert_eq!(chat_prompt(&messages), "hello");
+    }
+
+    #[test]
+    fn system_prompt_uses_the_same_chatml_contract_as_message_input() {
+        assert_eq!(
+            build_prompt(Some("Follow policy."), "Hello"),
+            "<|im_start|>system\nFollow policy.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n"
+        );
+        assert_eq!(build_prompt(None, "Hello"), "Hello");
+    }
+
+    #[test]
+    fn qwen3_prompt_prefills_disabled_thinking_for_plain_and_message_input() {
+        let expected = concat!(
+            "<|im_start|>user\nHello<|im_end|>\n",
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+        assert_eq!(
+            build_prompt_for_model(None, "Hello", CliChatTemplate::Qwen3NoThink),
+            expected
+        );
+        assert_eq!(
+            chat_prompt_for_model(
+                &[ChatCompletionMessage {
+                    role: "user".to_string(),
+                    content: "Hello".to_string(),
+                }],
+                CliChatTemplate::Qwen3NoThink,
+            ),
+            expected
+        );
+
+        let mut manifest = bloomai_core::ModelManifest::default();
+        manifest
+            .parameters
+            .insert("gguf_architecture".to_string(), serde_json::json!("qwen3"));
+        assert_eq!(
+            manifest_chat_template(&manifest),
+            CliChatTemplate::Qwen3NoThink
+        );
+    }
+
+    #[test]
+    fn classified_llama_templates_are_used_by_cli_inputs() {
+        let messages = [ChatCompletionMessage {
+            role: "user".to_string(),
+            content: "Hello".to_string(),
+        }];
+        let smollm = chat_prompt_for_model(&messages, CliChatTemplate::SmolLm2);
+        assert!(smollm.starts_with(concat!(
+            "<|im_start|>system\n",
+            "You are a helpful AI assistant named SmolLM, trained by Hugging Face",
+            "<|im_end|>\n"
+        )));
+        assert!(smollm.ends_with("<|im_start|>assistant\n"));
+
+        let llama3 = chat_prompt_for_model(&messages, CliChatTemplate::Llama3);
+        assert!(llama3.starts_with("<|begin_of_text|><|start_header_id|>user"));
+        assert!(llama3.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"));
+
+        let mut manifest = bloomai_core::ModelManifest::default();
+        manifest.parameters.insert(
+            "chat_template_kind".to_string(),
+            serde_json::json!("smollm2"),
+        );
+        assert_eq!(manifest_chat_template(&manifest), CliChatTemplate::SmolLm2);
     }
 
     #[test]

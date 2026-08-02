@@ -81,16 +81,19 @@ pub fn linear(in_dim: usize, out_dim: usize, vb: nn::VarBuilder) -> Result<Linea
         format!("{}.weight", prefix)
     };
 
-    let qmatmul = QTENSOR_MAP.with(|map| {
-        if let Some(m) = map.borrow().as_ref() {
-            if let Some(qt) = m.get(&weight_name) {
-                return Some(std::sync::Arc::new(
-                    candle_core::quantized::QMatMul::from_arc(qt.clone()).unwrap(),
-                ));
+    let qmatmul = QTENSOR_MAP
+        .with(|map| {
+            if let Some(m) = map.borrow().as_ref() {
+                if let Some(qt) = m.get(&weight_name) {
+                    return Some(
+                        candle_core::quantized::QMatMul::from_arc(qt.clone())
+                            .map(std::sync::Arc::new),
+                    );
+                }
             }
-        }
-        None
-    });
+            None
+        })
+        .transpose()?;
 
     let bias = vb.get(out_dim, "bias").ok();
 
@@ -731,7 +734,9 @@ impl WanAttentionBlock {
     ) -> Result<Tensor> {
         // e = (modulation + e) split into 6 chunks
         let e_mod = self.modulation.broadcast_add(e)?;
-        let e_chunks: Vec<_> = (0..6).map(|i| e_mod.narrow(1, i, 1).unwrap()).collect();
+        let e_chunks: Vec<_> = (0..6)
+            .map(|index| e_mod.narrow(1, index, 1))
+            .collect::<candle_core::Result<_>>()?;
 
         // Self-attention with AdaLN modulation
         let norm1_out = self.norm1.forward(x)?;

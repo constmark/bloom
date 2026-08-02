@@ -32,7 +32,9 @@ use super::speculative::{
 };
 use crate::scheduler::kv_hook::KvHook;
 use crate::scheduler::paged_cache::PagedAttentionCache;
-use crate::scheduler::{BatchResult, EngineExecutor, ExecutionBatch, ExecutionPhase, RequestId};
+use crate::scheduler::{
+    token_budget_allows, BatchResult, EngineExecutor, ExecutionBatch, ExecutionPhase,
+};
 
 /// Shared state between the batch executor and the loaded model.
 ///
@@ -60,13 +62,14 @@ pub struct CandleBatchExecutor {
     /// End-of-sequence token ids, used by grammar filtering to decide when
     /// a structured response is allowed to terminate.
     eos_token_ids: Vec<u32>,
+    /// Explicit speculative mode used by deterministic executor tests. Normal
+    /// runtime construction retains environment-backed configuration.
+    #[cfg(test)]
+    speculative_mode: Option<SpeculativeMode>,
     /// Optional tokenizer for token-to-text decoding during generation.
     tokenizer: Option<tokenizers::Tokenizer>,
     /// Speculative decoding strategies indexed by request KV handle.
     speculative_strategies: Arc<Mutex<HashMap<usize, Box<dyn SpeculativeStrategy>>>>,
-    /// Per-request accumulated generated text, feeding the grammar state
-    /// machine across decode steps. Cleared on prefill (new generation).
-    generated_texts: Mutex<HashMap<String, String>>,
 }
 
 /// A model wrapper that supports batched forward passes.
@@ -107,9 +110,10 @@ impl CandleBatchExecutor {
             kv_hook: None,
             vocab_strings: Vec::new(),
             eos_token_ids: Vec::new(),
+            #[cfg(test)]
+            speculative_mode: None,
             tokenizer: None,
             speculative_strategies: Arc::new(Mutex::new(HashMap::new())),
-            generated_texts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -172,6 +176,12 @@ impl CandleBatchExecutor {
         self
     }
 
+    #[cfg(test)]
+    fn with_speculative_mode(mut self, mode: SpeculativeMode) -> Self {
+        self.speculative_mode = Some(mode);
+        self
+    }
+
     /// Create a batch executor from a `CandleTextModel`'s shared model state.
     ///
     /// This allows the scheduler to drive the same model that `CandleTextModel`
@@ -191,9 +201,10 @@ impl CandleBatchExecutor {
             kv_hook: None,
             vocab_strings: Vec::new(),
             eos_token_ids: Vec::new(),
+            #[cfg(test)]
+            speculative_mode: None,
             tokenizer: None,
             speculative_strategies: Arc::new(Mutex::new(HashMap::new())),
-            generated_texts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -208,22 +219,12 @@ impl CandleBatchExecutor {
         kv_handles: &[usize],
         start_positions: &[usize],
         params: &[GenerationParams],
-        request_ids: &[RequestId],
+        generated_tokens: &[Vec<u32>],
     ) -> Result<Vec<u32>> {
         let mut model_guard = self.model.lock().unwrap_or_else(|e| e.into_inner());
         let model = model_guard
             .as_mut()
             .ok_or_else(|| anyhow!("model not loaded in batch executor"))?;
-
-        // Prefill starts a new generation: reset per-request grammar state
-        // so stale text from a previous (possibly preempted) run does not
-        // leak into the new response.
-        if !self.vocab_strings.is_empty() {
-            let mut texts = self.generated_texts.lock().unwrap_or_else(|e| e.into_inner());
-            for rid in request_ids {
-                texts.remove(rid);
-            }
-        }
 
         if let Some(ref mut batch_forward) = model.forward_batch_fn {
             let input_tensor = Tensor::new(tokens, &self.device)?;
@@ -251,8 +252,8 @@ impl CandleBatchExecutor {
                 };
 
                 let req_params = params.get(i);
-                let rid = request_ids.get(i).map(|s| s.as_str()).unwrap_or("");
-                let next_tok = self.sample_request_token(&req_logits, req_params, rid)?;
+                let prior_tokens = generated_tokens.get(i).map(Vec::as_slice).unwrap_or(&[]);
+                let next_tok = self.sample_request_token(&req_logits, req_params, prior_tokens)?;
                 next_tokens.push(next_tok);
 
                 let handle = kv_handles[i];
@@ -286,8 +287,8 @@ impl CandleBatchExecutor {
             // Sample using per-request params (temperature/top_p/seed) with
             // optional grammar constraints from `response_format`.
             let req_params = params.get(i);
-            let rid = request_ids.get(i).map(|s| s.as_str()).unwrap_or("");
-            let next_tok = self.sample_request_token(&logits, req_params, rid)?;
+            let prior_tokens = generated_tokens.get(i).map(Vec::as_slice).unwrap_or(&[]);
+            let next_tok = self.sample_request_token(&logits, req_params, prior_tokens)?;
 
             next_tokens.push(next_tok);
 
@@ -298,42 +299,6 @@ impl CandleBatchExecutor {
             self.write_request_kv(handle, start_pos, seq_len)?;
         }
         Ok(next_tokens)
-    }
-
-    fn apply_grammar_filter(
-        &self,
-        logits: Tensor,
-        request_idx: usize,
-        params: &[GenerationParams],
-        generated_tokens: &[Vec<u32>],
-    ) -> Result<Tensor> {
-        let req_params = params.get(request_idx);
-        let mut filtered_logits = logits;
-        if let Some(req_p) = req_params {
-            if let Some(ref fmt) = req_p.response_format {
-                if !self.vocab_strings.is_empty() {
-                    let mut prev_text = String::new();
-                    if let Some(ref tok) = self.tokenizer {
-                        if let Some(req_gen_tokens) = generated_tokens.get(request_idx) {
-                            if !req_gen_tokens.is_empty() {
-                                if let Ok(text) = tok.decode(req_gen_tokens, false) {
-                                    prev_text = text;
-                                }
-                            }
-                        }
-                    }
-                    filtered_logits = crate::executor::candle::filter_logits_by_grammar(
-                        &filtered_logits,
-                        &prev_text,
-                        fmt,
-                        &self.vocab_strings,
-                        &self.eos_token_ids,
-                        &self.device,
-                    )?;
-                }
-            }
-        }
-        Ok(filtered_logits)
     }
 
     /// Run a decode forward pass with one token per request.
@@ -377,11 +342,8 @@ impl CandleBatchExecutor {
                 }
 
                 let req_params = params.get(i);
-                let filtered_logits =
-                    self.apply_grammar_filter(req_logits, i, params, generated_tokens)?;
-                let logits_f32 = filtered_logits.to_dtype(candle_core::DType::F32)?;
-                let logits_vec = logits_f32.to_vec1::<f32>()?;
-                let next_tok = sample_logits(&logits_vec, req_params);
+                let prior_tokens = generated_tokens.get(i).map(Vec::as_slice).unwrap_or(&[]);
+                let next_tok = self.sample_request_token(&req_logits, req_params, prior_tokens)?;
                 next_tokens.push(next_tok);
 
                 let handle = kv_handles.get(i).copied().unwrap_or(0);
@@ -405,7 +367,13 @@ impl CandleBatchExecutor {
             results.push(Mutex::new(None));
         }
 
-        let speculative_mode = SpeculativeMode::from_env().unwrap_or(SpeculativeMode::None);
+        #[cfg(test)]
+        let speculative_mode = match &self.speculative_mode {
+            Some(mode) => mode.clone(),
+            None => SpeculativeMode::from_env()?,
+        };
+        #[cfg(not(test))]
+        let speculative_mode = SpeculativeMode::from_env()?;
 
         std::thread::scope(|s| {
             for (i, &tok) in tokens.iter().enumerate() {
@@ -421,9 +389,19 @@ impl CandleBatchExecutor {
                     let run = || -> Result<(u32, Vec<u32>)> {
                         let req_params = params.get(i);
 
+                        let structured_output = req_params
+                            .and_then(|params| params.response_format.as_ref())
+                            .is_some_and(|format| {
+                                matches!(
+                                    format,
+                                    ResponseFormat::JsonObject | ResponseFormat::JsonSchema(_)
+                                )
+                            });
                         let mut use_speculative = false;
                         let mut num_speculative = 0;
-                        if let SpeculativeMode::None = speculative_mode_ref {
+                        if structured_output
+                            || matches!(speculative_mode_ref, SpeculativeMode::None)
+                        {
                             // None
                         } else {
                             use_speculative = true;
@@ -453,11 +431,10 @@ impl CandleBatchExecutor {
                             } else {
                                 logits
                             };
-                            let filtered_logits =
-                                self.apply_grammar_filter(logits, i, params, generated_tokens)?;
-                            let logits_f32 = filtered_logits.to_dtype(candle_core::DType::F32)?;
-                            let logits_vec = logits_f32.to_vec1::<f32>()?;
-                            let next_tok = sample_logits(&logits_vec, req_params);
+                            let prior_tokens =
+                                generated_tokens.get(i).map(Vec::as_slice).unwrap_or(&[]);
+                            let next_tok =
+                                self.sample_request_token(&logits, req_params, prior_tokens)?;
 
                             self.write_request_kv(
                                 kv_handles.get(i).copied().unwrap_or(0),
@@ -469,7 +446,10 @@ impl CandleBatchExecutor {
 
                         let handle = kv_handles.get(i).copied().unwrap_or(0);
 
-                        let mut strategy_map = self.speculative_strategies.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut strategy_map = self
+                            .speculative_strategies
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
                         let strategy =
                             strategy_map.entry(handle).or_insert_with(
                                 || match speculative_mode_ref {
@@ -494,9 +474,10 @@ impl CandleBatchExecutor {
                                 },
                             );
 
-                        let history = generated_tokens.get(i).cloned().unwrap_or_default();
-                        let mut all_tokens = history.clone();
-                        all_tokens.push(tok);
+                        let mut all_tokens = generated_tokens.get(i).cloned().unwrap_or_default();
+                        if all_tokens.last().copied() != Some(tok) {
+                            all_tokens.push(tok);
+                        }
 
                         strategy.update_context(&all_tokens);
 
@@ -512,11 +493,10 @@ impl CandleBatchExecutor {
                             } else {
                                 logits
                             };
-                            let filtered_logits =
-                                self.apply_grammar_filter(logits, i, params, generated_tokens)?;
-                            let logits_f32 = filtered_logits.to_dtype(candle_core::DType::F32)?;
-                            let logits_vec = logits_f32.to_vec1::<f32>()?;
-                            let next_tok = sample_logits(&logits_vec, req_params);
+                            let prior_tokens =
+                                generated_tokens.get(i).map(Vec::as_slice).unwrap_or(&[]);
+                            let next_tok =
+                                self.sample_request_token(&logits, req_params, prior_tokens)?;
 
                             self.write_request_kv(handle, start_pos, 1)?;
                             return Ok((next_tok, Vec::new()));
@@ -559,11 +539,10 @@ impl CandleBatchExecutor {
 
                         let correction_idx = accepted;
                         let last_logits = verifier_logits.get(correction_idx)?;
-                        let filtered_logits =
-                            self.apply_grammar_filter(last_logits, i, params, generated_tokens)?;
-                        let logits_f32 = filtered_logits.to_dtype(candle_core::DType::F32)?;
-                        let logits_vec = logits_f32.to_vec1::<f32>()?;
-                        let next_tok = sample_logits(&logits_vec, req_params);
+                        let prior_tokens =
+                            generated_tokens.get(i).map(Vec::as_slice).unwrap_or(&[]);
+                        let next_tok =
+                            self.sample_request_token(&last_logits, req_params, prior_tokens)?;
 
                         let final_len = accepted + 1;
                         self.write_request_kv(handle, start_pos, final_len)?;
@@ -592,7 +571,7 @@ impl CandleBatchExecutor {
         for (i, slot) in results.into_iter().enumerate() {
             let (first_tok, extra_toks) = slot
                 .into_inner()
-                .unwrap()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .ok_or_else(|| anyhow!("Thread did not finish task"))??;
             next_tokens[i] = first_tok;
             if !extra_toks.is_empty() {
@@ -614,35 +593,43 @@ impl CandleBatchExecutor {
     /// grammar constraints when `response_format` is set on `req_params`
     /// and a vocabulary is available on the executor.
     ///
-    /// After sampling, the decoded token string is appended to the
-    /// per-request `generated_texts` map so the next call's grammar state
-    /// machine sees the accumulated text. This is the single chokepoint
-    /// that threads `response_format` into the IFB hot path — both
-    /// `forward_prefill` and `forward_decode` route through here.
+    /// `generated_tokens` is the scheduler-owned authoritative response
+    /// history. Deriving grammar state from it on every decode keeps batching,
+    /// preemption, and request-ID reuse from leaking or losing parser state.
     fn sample_request_token(
         &self,
         logits_tensor: &Tensor,
         req_params: Option<&GenerationParams>,
-        request_id: &str,
+        generated_tokens: &[u32],
     ) -> Result<u32> {
         let format = req_params.and_then(|p| p.response_format.as_ref());
-
+        let grammar_format = format
+            .filter(|format| {
+                matches!(
+                    format,
+                    ResponseFormat::JsonObject | ResponseFormat::JsonSchema(_)
+                )
+            })
+            .filter(|_| !self.vocab_strings.is_empty());
         // Only apply grammar filtering for structured formats, and only when
         // we actually have a vocabulary to decode tokens against.
-        let needs_grammar = matches!(
-            format,
-            Some(ResponseFormat::JsonObject) | Some(ResponseFormat::JsonSchema(_))
-        ) && !self.vocab_strings.is_empty();
-
-        let logits_vec = if needs_grammar {
-            let fmt = format.unwrap();
-            let generated_text = self
-                .generated_texts
-                .lock()
-                .unwrap()
-                .get(request_id)
-                .cloned()
-                .unwrap_or_default();
+        let logits_vec = if let Some(fmt) = grammar_format {
+            let generated_text = if generated_tokens.is_empty() {
+                String::new()
+            } else if let Some(tokenizer) = &self.tokenizer {
+                tokenizer.decode(generated_tokens, false).map_err(|error| {
+                    anyhow!("failed to decode structured generation state: {error}")
+                })?
+            } else {
+                let mut text = String::new();
+                for token in generated_tokens {
+                    let decoded = self.vocab_strings.get(*token as usize).ok_or_else(|| {
+                        anyhow!("structured generation token {token} is outside the vocabulary")
+                    })?;
+                    text.push_str(decoded);
+                }
+                text
+            };
             let filtered = super::candle::filter_logits_by_grammar(
                 logits_tensor,
                 &generated_text,
@@ -661,23 +648,6 @@ impl CandleBatchExecutor {
         };
 
         let next_tok = sample_logits(&logits_vec, req_params);
-
-        // Maintain the grammar state machine by appending the decoded token.
-        // EOS tokens decode to "" or a sentinel — appending them is harmless
-        // because the scheduler terminates the request on EOS.
-        if needs_grammar {
-            let decoded = if (next_tok as usize) < self.vocab_strings.len() {
-                self.vocab_strings[next_tok as usize].as_str()
-            } else {
-                ""
-            };
-            let mut texts = self.generated_texts.lock().unwrap_or_else(|e| e.into_inner());
-            texts
-                .entry(request_id.to_string())
-                .or_default()
-                .push_str(decoded);
-        }
-
         Ok(next_tok)
     }
 
@@ -871,7 +841,7 @@ impl EngineExecutor for CandleBatchExecutor {
                     &batch.kv_handles,
                     &batch.start_positions,
                     &batch.params,
-                    &batch.request_ids,
+                    &batch.generated_tokens,
                 )?;
                 if let Some(ref cache) = self.cache {
                     cache.maintain_long_context();
@@ -938,13 +908,14 @@ impl TokenBudget {
     /// Check if adding `num_prefill_tokens` prefill tokens and `num_decode_tokens`
     /// decode tokens would exceed the budget.
     pub fn fits(&self, num_prefill_tokens: usize, num_decode_tokens: usize) -> bool {
-        num_prefill_tokens + num_decode_tokens <= self.max_num_tokens
+        token_budget_allows(num_prefill_tokens, num_decode_tokens, self.max_num_tokens)
     }
 
     /// Remaining token budget given current usage.
     pub fn remaining(&self, used_prefill: usize, used_decode: usize) -> usize {
         self.max_num_tokens
-            .saturating_sub(used_prefill + used_decode)
+            .saturating_sub(used_prefill)
+            .saturating_sub(used_decode)
     }
 }
 
@@ -962,7 +933,7 @@ fn sample_logits(logits: &[f32], params: Option<&GenerationParams>) -> u32 {
         return logits
             .iter()
             .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
             .map(|(idx, _)| idx as u32)
             .unwrap_or(0);
     }
@@ -980,7 +951,7 @@ fn sample_logits(logits: &[f32], params: Option<&GenerationParams>) -> u32 {
     if top_p < 1.0 && top_p > 0.0 {
         let mut indexed: Vec<(usize, f32)> =
             probs.iter().enumerate().map(|(i, &p)| (i, p)).collect();
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
 
         let mut cumulative = 0.0f32;
         let mut cutoff_idx = indexed.len();
@@ -1038,7 +1009,7 @@ fn sample_logits(logits: &[f32], params: Option<&GenerationParams>) -> u32 {
     probs
         .iter()
         .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .max_by(|(_, a), (_, b)| a.total_cmp(b))
         .map(|(idx, _)| idx as u32)
         .unwrap_or(0)
 }
@@ -1061,6 +1032,16 @@ mod tests {
     }
 
     #[test]
+    fn token_budget_fails_closed_on_counter_overflow() {
+        let budget = TokenBudget::new(usize::MAX);
+
+        assert!(budget.fits(usize::MAX, 0));
+        assert!(!budget.fits(usize::MAX, 1));
+        assert_eq!(budget.remaining(usize::MAX, 1), 0);
+        assert_eq!(budget.remaining(1, usize::MAX), 0);
+    }
+
+    #[test]
     fn test_batch_executor_max_batch() {
         let forward_fn = Box::new(
             |_input: &Tensor, _pos: usize, _handle: Option<usize>| -> Result<Tensor> {
@@ -1078,7 +1059,10 @@ mod tests {
         let observed_positions_clone = Arc::clone(&observed_positions);
         let forward_fn = Box::new(
             move |input: &Tensor, start_pos: usize, _handle: Option<usize>| -> Result<Tensor> {
-                observed_positions_clone.lock().unwrap_or_else(|e| e.into_inner()).push(start_pos);
+                observed_positions_clone
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(start_pos);
                 let seq_len = input.dim(1)?;
                 Tensor::new(vec![0.0f32, 1.0], &Device::Cpu)?
                     .reshape((1, 1, 2))?
@@ -1110,7 +1094,10 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(*observed_positions.lock().unwrap_or_else(|e| e.into_inner()), vec![0, 4]);
+        assert_eq!(
+            *observed_positions.lock().unwrap_or_else(|e| e.into_inner()),
+            vec![0, 4]
+        );
     }
 
     #[test]
@@ -1543,11 +1530,14 @@ mod tests {
                   kv_handles: &[usize],
                   _cu_seqlens: &[usize]|
                   -> Result<Tensor> {
-                observed_shapes_clone.lock().unwrap_or_else(|e| e.into_inner()).push((
-                    input.dims().to_vec(),
-                    start_positions.to_vec(),
-                    kv_handles.to_vec(),
-                ));
+                observed_shapes_clone
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((
+                        input.dims().to_vec(),
+                        start_positions.to_vec(),
+                        kv_handles.to_vec(),
+                    ));
                 let num_tokens = input.dim(0)?;
                 let data = vec![0.0f32; num_tokens * 2]; // 2 vocab classes
                 Tensor::new(data, &Device::Cpu)?
@@ -1599,7 +1589,10 @@ mod tests {
         }
 
         // 2. Decode verification
-        observed_shapes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        observed_shapes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         let batch_decode = ExecutionBatch {
             phase: ExecutionPhase::Decode,
             request_ids: vec!["req-1".to_string(), "req-2".to_string()],
@@ -1636,10 +1629,6 @@ mod tests {
 
     #[test]
     fn test_speculative_decoding_ngram_verification() {
-        std::env::set_var("BLOOM_SPECULATIVE", "ngram");
-        std::env::set_var("BLOOM_SPECULATIVE_NGRAM_ORDER", "3");
-        std::env::set_var("BLOOM_NUM_SPECULATIVE_TOKENS", "2");
-
         let forward_fn = Box::new(
             move |input: &Tensor, _start_pos: usize, _handle: Option<usize>| -> Result<Tensor> {
                 let seq_len = input.dim(1)?;
@@ -1667,7 +1656,11 @@ mod tests {
             },
         );
 
-        let executor = CandleBatchExecutor::new(forward_fn, Device::Cpu, 4, 32);
+        let executor = CandleBatchExecutor::new(forward_fn, Device::Cpu, 4, 32)
+            .with_speculative_mode(SpeculativeMode::NGram {
+                ngram_order: 3,
+                num_speculative: 2,
+            });
         let batch = ExecutionBatch {
             phase: ExecutionPhase::Decode,
             request_ids: vec!["req-1".to_string()],
@@ -1679,16 +1672,12 @@ mod tests {
                 temperature: 0.0,
                 ..Default::default()
             }],
-            // السلسلة: [2, 3, 10, 11, 12, 1, 2, 3] + current_token 10 -> will find match for [2, 3, 10]
-            generated_tokens: vec![vec![2, 3, 10, 11, 12, 1, 2, 3]],
+            // The authoritative history ends with the current token. Its
+            // suffix [2, 3, 10] has an earlier continuation [11, 12].
+            generated_tokens: vec![vec![2, 3, 10, 11, 12, 1, 2, 3, 10]],
         };
 
         let result = executor.execute(batch).unwrap();
-
-        // Cleanup environment
-        std::env::remove_var("BLOOM_SPECULATIVE");
-        std::env::remove_var("BLOOM_SPECULATIVE_NGRAM_ORDER");
-        std::env::remove_var("BLOOM_NUM_SPECULATIVE_TOKENS");
 
         assert_eq!(result.next_tokens, vec![11]);
         assert_eq!(result.speculative_tokens, Some(vec![vec![12, 13]]));
@@ -1785,14 +1774,53 @@ mod tests {
         assert_eq!(result.next_tokens, vec![0]); // "{"
     }
 
+    #[test]
+    fn resumed_prefill_uses_authoritative_structured_history() {
+        let vocab = vec![
+            "{".to_string(),
+            "a".to_string(),
+            "}".to_string(),
+            String::new(),
+            "\"".to_string(),
+            " ".to_string(),
+        ];
+        let forward_fn = Box::new(
+            |input: &Tensor, _pos: usize, _handle: Option<usize>| -> Result<Tensor> {
+                let mut row = [0.0_f32; 6];
+                row[0] = 5.0;
+                row[1] = 10.0;
+                row[2] = 2.0;
+                Tensor::new(row.repeat(input.dim(1)?), &Device::Cpu)?
+                    .reshape((1, input.dim(1)?, 6))
+                    .map_err(Into::into)
+            },
+        );
+        let executor = CandleBatchExecutor::new(forward_fn, Device::Cpu, 4, 32)
+            .with_grammar_support(vocab, vec![99]);
+
+        let result = executor
+            .execute(ExecutionBatch {
+                phase: ExecutionPhase::Prefill,
+                request_ids: vec!["resumed-structured".to_string()],
+                tokens: vec![8, 9, 0],
+                cu_seqlens: vec![0, 3],
+                kv_handles: vec![13],
+                start_positions: vec![0],
+                params: vec![GenerationParams {
+                    temperature: 0.0,
+                    response_format: Some(ResponseFormat::JsonObject),
+                    ..Default::default()
+                }],
+                generated_tokens: vec![vec![0]],
+            })
+            .unwrap();
+
+        assert_eq!(result.next_tokens, vec![2]);
+    }
+
     /// Verify grammar state machine carries across decode steps: after
     /// prefill emits "{", the decode step should only allow tokens that
     /// extend the JSON object (e.g. "}", not "a" outside a string).
-    // FIXME(known-issue): decode step applies the JSON grammar mask against
-    // stale state, so an invalid "{" (token 0) is sampled instead of the
-    // expected "}" (token 2). Tracked as a known issue; re-enable once the
-    // decode-chain grammar state is fixed. Ignored to keep default CI green.
-    #[ignore = "known issue: JSON grammar decode-chain state"]
     #[test]
     fn test_batch_executor_grammar_filtering_decode_chain() {
         // vocab: 0="{", 1="a", 2="}", 3=":", 4="\"", 5=" "
@@ -1873,5 +1901,125 @@ mod tests {
         // "}" (2, logit 2.0) — "\""(4, logit 1.0) is lower.
         assert_ne!(decode_result.next_tokens[0], 1); // not "a"
         assert_eq!(decode_result.next_tokens[0], 2); // "}"
+    }
+
+    #[test]
+    fn batched_structured_decode_keeps_authoritative_histories_independent() {
+        // vocab: 0="{", 1="a", 2="}", 3=":", 4="\"", 5=" "
+        let vocab = vec!["{", "a", "}", ":", "\"", " "]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let forward_fn = Box::new(
+            |_input: &Tensor, _pos: usize, _handle: Option<usize>| -> Result<Tensor> {
+                Err(anyhow!("scalar forward must not run"))
+            },
+        );
+        let forward_batch_fn = Box::new(
+            |input: &Tensor,
+             _positions: &[usize],
+             _handles: &[usize],
+             _cu_seqlens: &[usize]|
+             -> Result<Tensor> {
+                let mut row = [0.0_f32; 6];
+                row[0] = 9.0; // invalid after both prefixes
+                row[1] = 10.0; // invalid outside a JSON string
+                row[2] = 7.0; // valid after "{"
+                row[3] = 8.0; // valid after "{\"a\""
+                row[4] = 6.0;
+                Tensor::new(row.repeat(input.dim(0)?), &Device::Cpu)?
+                    .reshape((input.dim(0)?, 6))
+                    .map_err(Into::into)
+            },
+        );
+        let executor = CandleBatchExecutor::new(forward_fn, Device::Cpu, 4, 32)
+            .with_grammar_support(vocab, vec![99])
+            .with_forward_batch_fn(forward_batch_fn);
+
+        let result = executor
+            .execute(ExecutionBatch {
+                phase: ExecutionPhase::Decode,
+                request_ids: vec!["object-end".to_string(), "object-value".to_string()],
+                tokens: vec![0, 4],
+                cu_seqlens: vec![0, 1, 2],
+                kv_handles: vec![10, 11],
+                start_positions: vec![1, 4],
+                params: vec![
+                    GenerationParams {
+                        temperature: 0.0,
+                        response_format: Some(ResponseFormat::JsonObject),
+                        ..Default::default()
+                    },
+                    GenerationParams {
+                        temperature: 0.0,
+                        response_format: Some(ResponseFormat::JsonObject),
+                        ..Default::default()
+                    },
+                ],
+                generated_tokens: vec![vec![0], vec![0, 4, 1, 4]],
+            })
+            .unwrap();
+
+        assert_eq!(result.next_tokens, vec![2, 3]);
+        assert_eq!(result.speculative_tokens, None);
+    }
+
+    #[test]
+    fn structured_decode_disables_unconstrained_speculative_tokens() {
+        let vocab = vec!["{", "a", "}", "\"", ":", " "]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let forward_fn = Box::new(
+            |input: &Tensor, _pos: usize, _handle: Option<usize>| -> Result<Tensor> {
+                let seq_len = input.dim(1)?;
+                if seq_len > 1 {
+                    let input_tokens = input.to_vec2::<u32>()?[0].clone();
+                    let mut logits = vec![0.0_f32; seq_len * 6];
+                    for position in 0..seq_len {
+                        let target = input_tokens.get(position + 1).copied().unwrap_or(3);
+                        logits[position * 6 + target as usize] = 10.0;
+                    }
+                    Tensor::new(logits, &Device::Cpu)?
+                        .reshape((1, seq_len, 6))
+                        .map_err(Into::into)
+                } else {
+                    let mut logits = vec![0.0_f32; 6];
+                    logits[2] = 10.0; // EOS is invalid before the object closes
+                    logits[1] = 8.0; // continue the current string
+                    Tensor::new(logits, &Device::Cpu)?
+                        .reshape((1, 1, 6))
+                        .map_err(Into::into)
+                }
+            },
+        );
+        let executor = CandleBatchExecutor::new(forward_fn, Device::Cpu, 4, 32)
+            .with_grammar_support(vocab, vec![2])
+            .with_speculative_mode(SpeculativeMode::NGram {
+                ngram_order: 3,
+                num_speculative: 2,
+            });
+
+        let result = executor
+            .execute(ExecutionBatch {
+                phase: ExecutionPhase::Decode,
+                request_ids: vec!["structured-speculation".to_string()],
+                tokens: vec![1],
+                cu_seqlens: vec![0, 1],
+                kv_handles: vec![12],
+                start_positions: vec![7],
+                params: vec![GenerationParams {
+                    temperature: 0.0,
+                    response_format: Some(ResponseFormat::JsonObject),
+                    ..Default::default()
+                }],
+                // Repeated string content would produce an n-gram draft if
+                // structured generation did not force single-token checking.
+                generated_tokens: vec![vec![0, 3, 1, 1, 1, 1, 1]],
+            })
+            .unwrap();
+
+        assert_eq!(result.next_tokens, vec![1]);
+        assert_eq!(result.speculative_tokens, None);
     }
 }

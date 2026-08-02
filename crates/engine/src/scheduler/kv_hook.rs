@@ -184,8 +184,14 @@ impl InMemoryKvHook {
             }
         }
         // Put back
-        self.keys.lock().unwrap_or_else(|e| e.into_inner()).insert(handle, keys);
-        self.values.lock().unwrap_or_else(|e| e.into_inner()).insert(handle, values);
+        self.keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(handle, keys);
+        self.values
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(handle, values);
     }
 }
 
@@ -209,9 +215,9 @@ impl KvHook for InMemoryKvHook {
         if layer_idx >= self.num_layers {
             return Err(BloomError::Engine(format!(
                 "layer_idx {} >= num_layers {}",
-                layer_idx,
-                self.num_layers
-            )).into());
+                layer_idx, self.num_layers
+            ))
+            .into());
         }
         // Take ownership of per-handle Vec to avoid double-lock on outer map.
         let (keys, values) = self.ensure_handle(handle);
@@ -237,8 +243,14 @@ impl KvHook for InMemoryKvHook {
             (keys_out, values_out)
         };
         // Put back
-        self.keys.lock().unwrap_or_else(|e| e.into_inner()).insert(handle, keys);
-        self.values.lock().unwrap_or_else(|e| e.into_inner()).insert(handle, values);
+        self.keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(handle, keys);
+        self.values
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(handle, values);
         Ok(result)
     }
 
@@ -254,9 +266,9 @@ impl KvHook for InMemoryKvHook {
         if layer_idx >= self.num_layers {
             return Err(BloomError::Engine(format!(
                 "layer_idx {} >= num_layers {}",
-                layer_idx,
-                self.num_layers
-            )).into());
+                layer_idx, self.num_layers
+            ))
+            .into());
         }
         let expected = seq_len * self.kv_dim;
         if keys.len() != expected || values.len() != expected {
@@ -265,12 +277,17 @@ impl KvHook for InMemoryKvHook {
                 expected,
                 keys.len(),
                 values.len()
-            )).into());
+            ))
+            .into());
         }
         let (keys_map, values_map) = self.ensure_handle(handle);
         {
-            let mut k = keys_map[layer_idx].lock().unwrap_or_else(|e| e.into_inner());
-            let mut v = values_map[layer_idx].lock().unwrap_or_else(|e| e.into_inner());
+            let mut k = keys_map[layer_idx]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut v = values_map[layer_idx]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let start = start_pos * self.kv_dim;
             let end = start + expected;
             if k.len() < end {
@@ -280,8 +297,14 @@ impl KvHook for InMemoryKvHook {
             k[start..end].copy_from_slice(keys);
             v[start..end].copy_from_slice(values);
         }
-        self.keys.lock().unwrap_or_else(|e| e.into_inner()).insert(handle, keys_map);
-        self.values.lock().unwrap_or_else(|e| e.into_inner()).insert(handle, values_map);
+        self.keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(handle, keys_map);
+        self.values
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(handle, values_map);
         Ok(())
     }
 
@@ -299,8 +322,12 @@ impl KvHook for InMemoryKvHook {
         if let Some(per_layer_k) = keys.get(&handle) {
             if let Some(per_layer_v) = values.get(&handle) {
                 for layer_idx in 0..self.num_layers {
-                    let mut k = per_layer_k[layer_idx].lock().unwrap_or_else(|e| e.into_inner());
-                    let mut v = per_layer_v[layer_idx].lock().unwrap_or_else(|e| e.into_inner());
+                    let mut k = per_layer_k[layer_idx]
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let mut v = per_layer_v[layer_idx]
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
                     let end = length * self.kv_dim;
                     if k.len() > end {
                         k.truncate(end);

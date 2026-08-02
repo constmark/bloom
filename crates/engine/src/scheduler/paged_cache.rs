@@ -776,7 +776,7 @@ impl PagedAttentionCache {
     fn cachemesh_key(&self, layer_idx: usize, block_id: usize) -> Option<CacheMeshKey> {
         self.block_keys
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&(layer_idx, block_id))
             .cloned()
     }

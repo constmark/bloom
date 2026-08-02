@@ -20,11 +20,9 @@
     clippy::too_many_arguments,
     clippy::type_complexity
 )]
-// Surface new `unwrap`/panic usage in CI so recoverable-path panics are caught
-// early. The engine's model-load paths already return `anyhow::Result`; this lint
-// helps drive the remaining internal-invariant `.unwrap()` count down over time.
-// It is a warning (not deny) so the existing surface does not break the build yet.
-#![warn(clippy::unwrap_used)]
+// Surface new `unwrap` usage in production code. Tests may use unwrap to keep
+// assertions concise; runtime paths must recover or return a structured error.
+#![cfg_attr(not(test), warn(clippy::unwrap_used))]
 //! Model abstraction for multimodal inference.
 
 pub mod cachemesh;
@@ -65,7 +63,9 @@ pub use crate::core::io::{
     DataBlock, InferenceParams, InferenceRequest, ModelInput, ModelOutput, OutputChunk,
 };
 pub use crate::core::manifest::{
-    estimate_memory, format_bytes, infer_quantization, load_manifest, MemoryEstimate,
+    estimate_memory, estimate_memory_for_device, format_bytes, infer_quantization, load_manifest,
+    model_manifest_supports_embeddings, model_manifest_tasks, resolve_hf_safetensors_files,
+    MemoryEstimate,
 };
 pub use crate::core::memory::{
     available_system_memory, default_memory_utilization, plan_memory_preallocation,

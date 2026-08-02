@@ -433,16 +433,13 @@ impl LoadedModel for FunASRModel {
             "language": language,
         });
 
-        let (stdin_opt, stdout_opt) = (self.stdin.as_ref(), self.stdout.as_ref());
-        if stdin_opt.is_none() || stdout_opt.is_none() {
+        let (Some(stdin_mutex), Some(stdout_mutex)) = (self.stdin.as_ref(), self.stdout.as_ref())
+        else {
             // Fallback mock mode (e.g. in tests)
             sink.on_chunk(crate::io::OutputChunk::TextDelta("mocked text".to_string()))?;
             sink.on_chunk(crate::io::OutputChunk::End)?;
             return Ok(());
-        }
-
-        let stdin_mutex = stdin_opt.unwrap();
-        let stdout_mutex = stdout_opt.unwrap();
+        };
 
         {
             let mut stdin = stdin_mutex.lock().unwrap_or_else(|e| e.into_inner());

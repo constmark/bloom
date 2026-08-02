@@ -1,4 +1,5 @@
 #![allow(clippy::missing_safety_doc, clippy::needless_return)]
+#![cfg_attr(not(test), warn(clippy::unwrap_used))]
 use anyhow::{anyhow, Result};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;

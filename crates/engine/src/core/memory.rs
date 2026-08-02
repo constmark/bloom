@@ -210,6 +210,23 @@ pub fn available_system_memory() -> Option<usize> {
     }
 }
 
+/// Return whether an untyped runtime error explicitly reports memory exhaustion.
+///
+/// Matching `oom` as an arbitrary substring is unsafe because ordinary Bloom
+/// configuration names such as `BLOOM_DTYPE` contain those letters. Keep the
+/// fallback narrow: accept established phrases or `oom` as a standalone token.
+pub(crate) fn error_text_indicates_oom(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("out of memory")
+        || lower.contains("cannot allocate memory")
+        || lower.contains("failed to allocate memory")
+        || lower.contains("insufficient ram")
+        || lower.contains("insufficient vram")
+        || lower
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .any(|token| token == "oom")
+}
+
 fn clamp_memory_utilization(value: f64) -> Result<f64> {
     if !value.is_finite() {
         bail!("memory utilization must be finite");
@@ -343,6 +360,23 @@ mod tests {
         let reservation = MemoryReservation::reserve(8192).unwrap();
         assert_eq!(reservation.bytes(), 8192);
         assert!(!reservation.is_empty());
+    }
+
+    #[test]
+    fn oom_detection_requires_an_explicit_memory_error() {
+        assert!(error_text_indicates_oom(
+            "CUDA OOM while allocating a tensor"
+        ));
+        assert!(error_text_indicates_oom("allocator: out of memory"));
+        assert!(error_text_indicates_oom(
+            "cannot allocate memory for weights"
+        ));
+        assert!(!error_text_indicates_oom(
+            "BLOOM_DTYPE=bf16 is unsupported on CPU"
+        ));
+        assert!(!error_text_indicates_oom(
+            "bloom model configuration failed"
+        ));
     }
 
     #[test]

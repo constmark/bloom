@@ -51,10 +51,7 @@ pub trait LoadedModel: Send + Sync {
 
     #[cfg(feature = "candle-engine")]
     fn create_wrapper(&self) -> Result<Box<dyn std::any::Any + Send + Sync>> {
-        Err(BloomError::Engine(
-            "create_wrapper not supported for this model".into(),
-        )
-        .into())
+        Err(BloomError::Engine("create_wrapper not supported for this model".into()).into())
     }
 
     fn clear_kv_cache(&self) {}
@@ -104,6 +101,81 @@ pub trait LoadedModel: Send + Sync {
         Ok(())
     }
 
+    /// Whether [`LoadedModel::embed_batch`] performs one or more native
+    /// batched forward passes instead of invoking scalar inference for every
+    /// input.
+    fn supports_native_embedding_batch(&self) -> bool {
+        false
+    }
+
+    /// Produce one embedding for every input while preserving input order.
+    ///
+    /// The default implementation keeps existing embedding-capable adapters
+    /// compatible by executing their streaming path once per input. Native
+    /// encoder implementations may override this together with
+    /// [`LoadedModel::supports_native_embedding_batch`].
+    fn embed_batch(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+        if inputs.is_empty() {
+            return Err(BloomError::InvalidInput(
+                "Embedding batches must contain at least one input".into(),
+            )
+            .into());
+        }
+
+        let params = GenerationParams {
+            max_tokens: 1,
+            temperature: 0.0,
+            top_p: 1.0,
+            seed: None,
+            response_format: None,
+        };
+        let mut outputs = Vec::with_capacity(inputs.len());
+        for prompt in inputs {
+            let mut embedding = None;
+            let mut ended = false;
+            self.infer_stream(
+                ModelInput::Text {
+                    prompt: prompt.clone(),
+                },
+                &params,
+                &mut |chunk| {
+                    match chunk {
+                        OutputChunk::Embedding(values) if embedding.is_none() => {
+                            embedding = Some(values);
+                        }
+                        OutputChunk::Embedding(_) => {
+                            return Err(BloomError::Engine(
+                                "model produced multiple embeddings for one input".into(),
+                            )
+                            .into());
+                        }
+                        OutputChunk::End if !ended => ended = true,
+                        OutputChunk::End => {
+                            return Err(BloomError::Engine(
+                                "model produced multiple terminal embedding events".into(),
+                            )
+                            .into());
+                        }
+                        _ => {}
+                    }
+                    Ok(())
+                },
+            )?;
+            if !ended {
+                return Err(BloomError::Engine(
+                    "model did not terminate embedding inference".into(),
+                )
+                .into());
+            }
+            outputs.push(
+                embedding.ok_or_else(|| {
+                    BloomError::Engine("model did not produce an embedding".into())
+                })?,
+            );
+        }
+        Ok(outputs)
+    }
+
     fn processors(&self) -> Option<&crate::processor::ProcessorRegistry> {
         None
     }
@@ -119,15 +191,13 @@ pub trait LoadedModel: Send + Sync {
     /// The default implementation returns `Unsupported` — engines that
     /// support state migration should override this.
     fn export_state(&self, handle: &CacheHandle) -> Result<StateBlob> {
-        Err(BloomError::Engine(
-            format!(
-                "model '{}' does not support state export (handle_id={}); \
+        Err(BloomError::Engine(format!(
+            "model '{}' does not support state export (handle_id={}); \
                  engine '{}' has not implemented export_state",
-                self.metadata().id,
-                handle.handle_id,
-                self.metadata().manifest.id,
-            )
-        )
+            self.metadata().id,
+            handle.handle_id,
+            self.metadata().manifest.id,
+        ))
         .into())
     }
 
@@ -136,13 +206,12 @@ pub trait LoadedModel: Send + Sync {
     ///
     /// The default implementation returns `Unsupported`.
     fn import_state(&self, _blob: StateBlob) -> Result<CacheHandle> {
-        Err(BloomError::Engine(
-            format!(
-                "model '{}' does not support state import; \
+        Err(BloomError::Engine(format!(
+            "model '{}' does not support state import; \
                  engine '{}' has not implemented import_state",
-                self.metadata().id, self.metadata().manifest.id,
-            )
-        )
+            self.metadata().id,
+            self.metadata().manifest.id,
+        ))
         .into())
     }
 
@@ -242,9 +311,7 @@ fn convert_blocks_to_model_input(blocks: Vec<DataBlock>) -> Result<ModelInput> {
         return Ok(ModelInput::Text { prompt });
     }
 
-    Err(BloomError::InvalidInput(
-        "Could not convert blocks to legacy ModelInput".into()
-    ).into())
+    Err(BloomError::InvalidInput("Could not convert blocks to legacy ModelInput".into()).into())
 }
 
 pub struct EchoTextModel {
@@ -290,6 +357,46 @@ mod tests {
     use super::*;
     use crate::io::ModelInput;
 
+    struct ScalarEmbeddingModel {
+        meta: ModelMetadata,
+    }
+
+    impl Default for ScalarEmbeddingModel {
+        fn default() -> Self {
+            Self {
+                meta: ModelMetadata {
+                    id: "scalar-embedding".to_string(),
+                    modality: Modality::Text,
+                    quantized: false,
+                    manifest: ModelManifest::default(),
+                },
+            }
+        }
+    }
+
+    impl LoadedModel for ScalarEmbeddingModel {
+        fn metadata(&self) -> &ModelMetadata {
+            &self.meta
+        }
+
+        fn infer(&self, _input: ModelInput, _params: &GenerationParams) -> Result<ModelOutput> {
+            unreachable!("the scalar embedding fixture uses infer_stream")
+        }
+
+        fn infer_stream(
+            &self,
+            input: ModelInput,
+            _params: &GenerationParams,
+            sink: &mut dyn OutputSink,
+        ) -> Result<()> {
+            let ModelInput::Text { prompt } = input else {
+                return Err(BloomError::InvalidInput("expected text".into()).into());
+            };
+            sink.on_chunk(OutputChunk::Embedding(vec![prompt.len() as f32]))?;
+            sink.on_chunk(OutputChunk::End)
+        }
+    }
+
     #[test]
     fn test_echo_text_model_metadata() {
         let model = EchoTextModel::default();
@@ -297,6 +404,19 @@ mod tests {
         assert_eq!(meta.id, "demo.echo.text");
         assert_eq!(meta.modality, Modality::Text);
         assert!(!meta.quantized);
+    }
+
+    #[test]
+    fn default_embedding_batch_preserves_scalar_adapter_order() {
+        let model = ScalarEmbeddingModel::default();
+        assert!(!model.supports_native_embedding_batch());
+        assert!(model.embed_batch(&[]).is_err());
+        assert_eq!(
+            model
+                .embed_batch(&["a".to_string(), "three".to_string(), "xx".to_string()])
+                .unwrap(),
+            vec![vec![1.0], vec![5.0], vec![2.0]]
+        );
     }
 
     #[test]

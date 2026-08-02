@@ -7,8 +7,8 @@ use bloomai_core::{
         rate_limiter::{RateLimitDecision, TokenBucketRateLimiter},
         TokenSchedulingConfig as CoreTokenSchedulingConfig,
     },
-    BloomError, CacheHandle, DeviceCapability, GenerationParams, PowerState, ResourcePriority, ResourceTicket,
-    ThermalState,
+    BloomError, CacheHandle, DeviceCapability, GenerationParams, PowerState, ResourcePriority,
+    ResourceTicket, ThermalState,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -18,6 +18,14 @@ use crate::io::DataBlock;
 
 pub mod kv_hook;
 pub mod paged_cache;
+
+/// Return whether `requested` tokens fit without overflowing the counter.
+///
+/// Keeping this check subtraction-based makes oversized public configuration
+/// and accounting state fail closed in both debug and release builds.
+pub(crate) fn token_budget_allows(used: usize, requested: usize, limit: usize) -> bool {
+    used <= limit && requested <= limit - used
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenPhase {
@@ -55,20 +63,30 @@ impl TokenAdmission {
         phase: TokenPhase,
         tokens: usize,
     ) -> bool {
-        let total = self.prefill_tokens + self.decode_tokens + tokens;
-        if total > config.max_total_tokens_per_step {
+        let Some(total_used) = self.prefill_tokens.checked_add(self.decode_tokens) else {
+            return false;
+        };
+        if !token_budget_allows(total_used, tokens, config.max_total_tokens_per_step) {
             return false;
         }
         match phase {
             TokenPhase::Prefill => {
-                if self.prefill_tokens + tokens > config.max_prefill_tokens_per_step {
+                if !token_budget_allows(
+                    self.prefill_tokens,
+                    tokens,
+                    config.max_prefill_tokens_per_step,
+                ) {
                     return false;
                 }
                 self.prefill_tokens += tokens;
                 true
             }
             TokenPhase::Decode => {
-                if self.decode_tokens + tokens > config.max_decode_tokens_per_step {
+                if !token_budget_allows(
+                    self.decode_tokens,
+                    tokens,
+                    config.max_decode_tokens_per_step,
+                ) {
                     return false;
                 }
                 self.decode_tokens += tokens;
@@ -522,7 +540,12 @@ impl KvCachePool for BloomKvCachePool {
                 state.lru_list.remove(pos);
             }
             let allocated_blocks = {
-                let record = state.active_requests.get_mut(request_id).unwrap();
+                let Some(record) = state.active_requests.get_mut(request_id) else {
+                    return Err(BloomError::SchedulingFailed(format!(
+                        "active KV cache record disappeared for request {request_id}"
+                    ))
+                    .into());
+                };
                 record.active = true;
                 record.last_accessed = Instant::now();
                 record.blocks.clone()
@@ -533,7 +556,11 @@ impl KvCachePool for BloomKvCachePool {
                 .iter()
                 .find(|(_, rid)| *rid == request_id)
                 .map(|(&h, _)| h)
-                .unwrap_or(0);
+                .ok_or_else(|| {
+                    BloomError::SchedulingFailed(format!(
+                        "active KV cache handle disappeared for request {request_id}"
+                    ))
+                })?;
 
             return Ok(KvCacheAllocation {
                 handle,
@@ -584,8 +611,9 @@ impl KvCachePool for BloomKvCachePool {
                         continue;
                     }
                     return Err(BloomError::SchedulingFailed(
-                        "KV Cache Pool is full and no inactive sequences can be evicted".into()
-                    ).into());
+                        "KV Cache Pool is full and no inactive sequences can be evicted".into(),
+                    )
+                    .into());
                 }
                 let victim_idx = {
                     let mut best_idx = 0;
@@ -604,7 +632,12 @@ impl KvCachePool for BloomKvCachePool {
                     }
                     best_idx
                 };
-                let evict_id = state.lru_list.remove(victim_idx).unwrap();
+                let Some(evict_id) = state.lru_list.remove(victim_idx) else {
+                    return Err(BloomError::SchedulingFailed(
+                        "KV cache eviction candidate disappeared".into(),
+                    )
+                    .into());
+                };
                 if let Some(record) = state.active_requests.remove(&evict_id) {
                     for (block_id, prefix) in record.blocks.iter().zip(record.prefixes.iter()) {
                         let count = state.block_ref_counts.entry(*block_id).or_insert(1);
@@ -622,7 +655,12 @@ impl KvCachePool for BloomKvCachePool {
                 }
             }
 
-            let block_id = state.free_blocks.pop_front().unwrap();
+            let Some(block_id) = state.free_blocks.pop_front() else {
+                return Err(BloomError::SchedulingFailed(
+                    "KV cache free list became empty during allocation".into(),
+                )
+                .into());
+            };
             newly_allocated.push(block_id);
             state.block_ref_counts.insert(block_id, 1);
 
@@ -1013,7 +1051,10 @@ impl BloomScheduler {
 
     /// Get current environment constraints.
     pub fn current_constraints(&self) -> EnvironmentConstraints {
-        self.constraints.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.constraints
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Build a ModelRoute for a segment record.
@@ -1244,7 +1285,11 @@ impl Scheduler for BloomScheduler {
             c.power_state = dev.power_state;
         }
 
-        let constraints = self.constraints.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let constraints = self
+            .constraints
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
 
         // Derive effective batch size from (now updated) constraints
         let effective_max = constraints.effective_max_batch(self.base_max_batch);
@@ -1281,7 +1326,11 @@ impl Scheduler for BloomScheduler {
 
         // If segment wants to continue in a new phase, create a follow-up segment
         if let (Some(rec), SegmentResult::Continue { next_phase }) = (record, result) {
-            let degraded = self.constraints.lock().unwrap_or_else(|e| e.into_inner()).is_degraded();
+            let degraded = self
+                .constraints
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_degraded();
             let new_rec = SegmentRecord {
                 phase: next_phase,
                 token_cost: Self::estimate_input_tokens(&rec.inputs, next_phase),
@@ -1380,14 +1429,29 @@ impl InferenceScheduler {
 
     /// Cancel a request by ID, freeing its KV cache allocation.
     pub fn cancel_request(&self, request_id: &str) -> bool {
+        // A response body can disappear independently of queue ownership. Drop
+        // the client sender first so cancellation never leaves an orphaned
+        // channel registration, including races before or after scheduling.
+        let sender_removed = self
+            .token_senders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(request_id)
+            .is_some();
         // Check pending prefill requests
         {
-            let mut pending = self.pending_prefill_requests.lock().unwrap_or_else(|e| e.into_inner());
+            let mut pending = self
+                .pending_prefill_requests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if let Some(req) = pending.remove(request_id) {
                 if let Some(handle) = req.kv_handle {
                     self.kv_pool.free(handle);
                 }
-                let mut cp_queue = self.chunked_prefill_queue.lock().unwrap_or_else(|e| e.into_inner());
+                let mut cp_queue = self
+                    .chunked_prefill_queue
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 cp_queue.cancel(request_id);
                 return true;
             }
@@ -1395,8 +1459,11 @@ impl InferenceScheduler {
         // Check prefill queue
         {
             let mut prefill = self.prefill_queue.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(pos) = prefill.iter().position(|r| r.id == request_id) {
-                let req = prefill.remove(pos).unwrap();
+            if let Some(req) = prefill
+                .iter()
+                .position(|r| r.id == request_id)
+                .and_then(|pos| prefill.remove(pos))
+            {
                 if let Some(handle) = req.kv_handle {
                     self.kv_pool.free(handle);
                 }
@@ -1405,9 +1472,15 @@ impl InferenceScheduler {
         }
         // Check decoding queue
         {
-            let mut decoding = self.decoding_queue.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(pos) = decoding.iter().position(|r| r.id == request_id) {
-                let req = decoding.remove(pos).unwrap();
+            let mut decoding = self
+                .decoding_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(req) = decoding
+                .iter()
+                .position(|r| r.id == request_id)
+                .and_then(|pos| decoding.remove(pos))
+            {
                 if let Some(handle) = req.kv_handle {
                     self.kv_pool.free(handle);
                 }
@@ -1416,7 +1489,10 @@ impl InferenceScheduler {
         }
         // Check active requests
         {
-            let mut active = self.active_requests.lock().unwrap_or_else(|e| e.into_inner());
+            let mut active = self
+                .active_requests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if let Some(req) = active.remove(request_id) {
                 if let Some(handle) = req.kv_handle {
                     self.kv_pool.free(handle);
@@ -1424,18 +1500,32 @@ impl InferenceScheduler {
                 return true;
             }
         }
-        false
+        sender_removed
     }
 
     /// Return queue depths for monitoring.
     pub fn queue_stats(&self) -> (usize, usize, usize) {
         let prefill = if self.config.chunked_prefill.enabled {
-            self.chunked_prefill_queue.lock().unwrap_or_else(|e| e.into_inner()).pending_count()
+            self.chunked_prefill_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pending_count()
         } else {
-            self.prefill_queue.lock().unwrap_or_else(|e| e.into_inner()).len()
+            self.prefill_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len()
         };
-        let decoding = self.decoding_queue.lock().unwrap_or_else(|e| e.into_inner()).len();
-        let active = self.active_requests.lock().unwrap_or_else(|e| e.into_inner()).len();
+        let decoding = self
+            .decoding_queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        let active = self
+            .active_requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
         (prefill, decoding, active)
     }
 
@@ -1450,7 +1540,10 @@ impl InferenceScheduler {
             // Collect KvSessionInfo for eviction decisions
             let mut sessions = Vec::new();
             {
-                let active = self.active_requests.lock().unwrap_or_else(|e| e.into_inner());
+                let active = self
+                    .active_requests
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 for r in active.values() {
                     sessions.push(KvSessionInfo {
                         request_id: r.id.clone(),
@@ -1467,7 +1560,10 @@ impl InferenceScheduler {
                         ),
                     });
                 }
-                let decoding = self.decoding_queue.lock().unwrap_or_else(|e| e.into_inner());
+                let decoding = self
+                    .decoding_queue
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 for r in decoding.iter() {
                     sessions.push(KvSessionInfo {
                         request_id: r.id.clone(),
@@ -1483,7 +1579,10 @@ impl InferenceScheduler {
                 }
             }
 
-            let mut eviction_mgr = self.kv_eviction_manager.lock().unwrap_or_else(|e| e.into_inner());
+            let mut eviction_mgr = self
+                .kv_eviction_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let num_tokens = request.prompt_tokens.len() + request.params.max_tokens;
 
             // Check admission
@@ -1495,7 +1594,8 @@ impl InferenceScheduler {
                         return Err(BloomError::SchedulingFailed(format!(
                             "Admission rejected: {} and no inactive sessions can be evicted",
                             reason
-                        )).into());
+                        ))
+                        .into());
                     }
                     // Free evicted requests
                     for victim in victims {
@@ -1528,8 +1628,14 @@ impl InferenceScheduler {
         request.state = RequestState::Pending;
 
         if self.config.chunked_prefill.enabled {
-            let mut cp_queue = self.chunked_prefill_queue.lock().unwrap_or_else(|e| e.into_inner());
-            let mut pending = self.pending_prefill_requests.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cp_queue = self
+                .chunked_prefill_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut pending = self
+                .pending_prefill_requests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             cp_queue.submit(request.id.clone(), request.prompt_tokens.clone());
             pending.insert(request.id.clone(), request);
         } else {
@@ -1614,8 +1720,14 @@ impl InferenceScheduler {
         let mut highest_waiting_priority = 0;
 
         if self.config.chunked_prefill.enabled {
-            let cp_queue = self.chunked_prefill_queue.lock().unwrap_or_else(|e| e.into_inner());
-            let pending = self.pending_prefill_requests.lock().unwrap_or_else(|e| e.into_inner());
+            let cp_queue = self
+                .chunked_prefill_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let pending = self
+                .pending_prefill_requests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             for state in cp_queue.queue.iter() {
                 if let Some(req) = pending.get(&state.request_id) {
                     let wait = req.created_at.elapsed().as_millis() as u64;
@@ -1640,12 +1752,18 @@ impl InferenceScheduler {
             }
         }
 
-        let mut pm = self.preemption_manager.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pm = self
+            .preemption_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if pm.should_preempt(max_wait_ms) {
             // Find candidate active requests to preempt
             let mut preemptible = Vec::new();
             {
-                let decoding = self.decoding_queue.lock().unwrap_or_else(|e| e.into_inner());
+                let decoding = self
+                    .decoding_queue
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 for r in decoding.iter() {
                     if r.priority < highest_waiting_priority {
                         preemptible.push(PreemptibleRequest {
@@ -1665,12 +1783,15 @@ impl InferenceScheduler {
             if !preemptible.is_empty() {
                 if let Some(decision) = pm.select_victim(&preemptible) {
                     // Actually preempt the victim
-                    let mut decoding = self.decoding_queue.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(pos) = decoding
+                    let mut decoding = self
+                        .decoding_queue
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if let Some(mut req) = decoding
                         .iter()
                         .position(|r| r.id == decision.preempted_request_id)
+                        .and_then(|pos| decoding.remove(pos))
                     {
-                        let mut req = decoding.remove(pos).unwrap();
                         preempted_ids.push(req.id.clone());
 
                         // Free KV cache
@@ -1684,13 +1805,20 @@ impl InferenceScheduler {
 
                         // Move back to prefill
                         if self.config.chunked_prefill.enabled {
-                            let mut cp_queue = self.chunked_prefill_queue.lock().unwrap_or_else(|e| e.into_inner());
-                            let mut pending = self.pending_prefill_requests.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut cp_queue = self
+                                .chunked_prefill_queue
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            let mut pending = self
+                                .pending_prefill_requests
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
                             let full_prompt = self.prefill_tokens_for(&req);
                             cp_queue.submit(req.id.clone(), full_prompt);
                             pending.insert(req.id.clone(), req);
                         } else {
-                            let mut prefill = self.prefill_queue.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut prefill =
+                                self.prefill_queue.lock().unwrap_or_else(|e| e.into_inner());
                             prefill.push_back(req);
                         }
                     }
@@ -1709,9 +1837,18 @@ impl InferenceScheduler {
         preempted_ids: &[RequestId],
     ) -> Result<Option<ScheduledBatch>> {
         if self.config.chunked_prefill.enabled {
-            let mut cp_queue = self.chunked_prefill_queue.lock().unwrap_or_else(|e| e.into_inner());
-            let mut pending = self.pending_prefill_requests.lock().unwrap_or_else(|e| e.into_inner());
-            let mut active = self.active_requests.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cp_queue = self
+                .chunked_prefill_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut pending = self
+                .pending_prefill_requests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut active = self
+                .active_requests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let mut rate_limiter = self.rate_limiter.lock().unwrap_or_else(|e| e.into_inner());
 
             if cp_queue.queue.is_empty() {
@@ -1782,7 +1919,11 @@ impl InferenceScheduler {
                                 }
                             }
                         }
-                        (req.model_id.clone(), req.params.clone(), req.kv_handle)
+                        let Some(kv_handle) = req.kv_handle else {
+                            i += 1;
+                            continue;
+                        };
+                        (req.model_id.clone(), req.params.clone(), kv_handle)
                     } else {
                         i += 1;
                         continue;
@@ -1808,7 +1949,7 @@ impl InferenceScheduler {
                 *prefill_tokens_used += scheduled_chunk_size;
                 batch_request_ids.push(req_id.clone());
                 tokens.extend_from_slice(&chunk_tokens);
-                kv_handles.push(kv_handle.unwrap());
+                kv_handles.push(kv_handle);
                 cu_seqlens.push(tokens.len());
                 start_positions.push(start);
                 params.push(req_params);
@@ -1892,8 +2033,8 @@ impl InferenceScheduler {
             let req_tokens = self.prefill_tokens_for(req);
             let req_token_count = req_tokens.len();
             let phase_budget = self.config.budget().prefill_tokens.min(self.max_num_tokens);
-            if *tokens_used + req_token_count > self.max_num_tokens
-                || *prefill_tokens_used + req_token_count > phase_budget
+            if !token_budget_allows(*tokens_used, req_token_count, self.max_num_tokens)
+                || !token_budget_allows(*prefill_tokens_used, req_token_count, phase_budget)
             {
                 i += 1;
                 continue;
@@ -1911,7 +2052,9 @@ impl InferenceScheduler {
             }
 
             // Pop request and schedule
-            let mut req = prefill.remove(i).unwrap();
+            let Some(mut req) = prefill.remove(i) else {
+                break;
+            };
             if req.kv_handle.is_none() {
                 // Fallback allocation when submit didn't allocate.
                 // Use `allocate_paged` so prefix caching and
@@ -1933,19 +2076,28 @@ impl InferenceScheduler {
                 }
             }
 
+            let Some(kv_handle) = req.kv_handle else {
+                prefill.insert(i, req);
+                i += 1;
+                continue;
+            };
+
             *tokens_used += req_token_count;
             *prefill_tokens_used += req_token_count;
             req.state = RequestState::Prefill;
             batch_request_ids.push(req.id.clone());
             tokens.extend_from_slice(&req_tokens);
-            kv_handles.push(req.kv_handle.unwrap());
+            kv_handles.push(kv_handle);
             cu_seqlens.push(tokens.len());
             start_positions.push(0);
             params.push(req.params.clone());
             is_final_vec.push(true);
             generated_tokens.push(req.generated_tokens.clone());
 
-            let mut active = self.active_requests.lock().unwrap_or_else(|e| e.into_inner());
+            let mut active = self
+                .active_requests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             active.insert(req.id.clone(), req);
         }
 
@@ -1975,7 +2127,10 @@ impl InferenceScheduler {
         tokens_used: &mut usize,
         decode_tokens_used: &mut usize,
     ) -> Result<Option<ScheduledBatch>> {
-        let mut decoding = self.decoding_queue.lock().unwrap_or_else(|e| e.into_inner());
+        let mut decoding = self
+            .decoding_queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if decoding.is_empty() {
             return Ok(None);
         }
@@ -1997,10 +2152,10 @@ impl InferenceScheduler {
         let mut i = 0;
         while i < decoding.len() && batch_request_ids.len() < max_batch {
             // Each decode step adds 1 token per request
-            if *tokens_used + 1 > self.max_num_tokens {
+            if !token_budget_allows(*tokens_used, 1, self.max_num_tokens) {
                 break;
             }
-            if *decode_tokens_used + 1 > self.config.budget().decode_tokens {
+            if !token_budget_allows(*decode_tokens_used, 1, self.config.budget().decode_tokens) {
                 break;
             }
 
@@ -2017,8 +2172,28 @@ impl InferenceScheduler {
                 }
             }
 
+            let last_token = req
+                .generated_tokens
+                .last()
+                .or_else(|| req.prompt_tokens.last())
+                .copied()
+                .ok_or_else(|| {
+                    BloomError::SchedulingFailed(format!(
+                        "request {} has no token available for decoding",
+                        req.id
+                    ))
+                })?;
+            let kv_handle = req.kv_handle.ok_or_else(|| {
+                BloomError::SchedulingFailed(format!(
+                    "request {} has no KV cache allocation",
+                    req.id
+                ))
+            })?;
+
             // Pop request and schedule
-            let mut req = decoding.remove(i).unwrap();
+            let Some(mut req) = decoding.remove(i) else {
+                break;
+            };
             *tokens_used += 1;
             *decode_tokens_used += 1;
             req.state = RequestState::Decoding {
@@ -2031,14 +2206,8 @@ impl InferenceScheduler {
 
             batch_request_ids.push(req.id.clone());
 
-            let last_token = if req.generated_tokens.is_empty() {
-                *req.prompt_tokens.last().unwrap()
-            } else {
-                *req.generated_tokens.last().unwrap()
-            };
-
             tokens.push(last_token);
-            kv_handles.push(req.kv_handle.unwrap());
+            kv_handles.push(kv_handle);
             cu_seqlens.push(tokens.len());
             // Real start position: prompt_len + generated_so_far
             start_positions.push(req.prompt_tokens.len() + req.generated_tokens.len());
@@ -2054,7 +2223,10 @@ impl InferenceScheduler {
                 1.0,
             );
 
-            let mut active = self.active_requests.lock().unwrap_or_else(|e| e.into_inner());
+            let mut active = self
+                .active_requests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             active.insert(req.id.clone(), req);
         }
 
@@ -2085,8 +2257,14 @@ impl InferenceScheduler {
         _phase: ExecutionPhase,
         is_final: Vec<bool>,
     ) -> Result<()> {
-        let mut active = self.active_requests.lock().unwrap_or_else(|e| e.into_inner());
-        let mut decoding = self.decoding_queue.lock().unwrap_or_else(|e| e.into_inner());
+        let mut active = self
+            .active_requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut decoding = self
+            .decoding_queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         for (i, ((id, &next_token), &final_chunk)) in request_ids
             .iter()
@@ -2137,7 +2315,9 @@ impl InferenceScheduler {
 
                 if is_finished {
                     req.state = RequestState::Finished;
-                    self.kv_pool.free(req.kv_handle.unwrap());
+                    if let Some(handle) = req.kv_handle {
+                        self.kv_pool.free(handle);
+                    }
                     // Clean up sender
                     if let Ok(mut senders) = self.token_senders.lock() {
                         senders.remove(id);

@@ -164,7 +164,7 @@ impl<'a> SimpleGifEncoder<'a> {
         }
 
         // Simple LZW compression
-        let compressed = lzw_compress(&indices, min_code_size);
+        let compressed = lzw_compress(&indices, min_code_size)?;
 
         // Write in sub-blocks (max 255 bytes each)
         let mut offset = 0;
@@ -189,7 +189,7 @@ impl<'a> SimpleGifEncoder<'a> {
 }
 
 /// Minimal LZW compression for GIF.
-fn lzw_compress(indices: &[u8], min_code_size: u8) -> Vec<u8> {
+fn lzw_compress(indices: &[u8], min_code_size: u8) -> Result<Vec<u8>> {
     // Simplified LZW: use clear codes frequently to keep it simple
     let clear_code = 1u16 << min_code_size;
     let eoi_code = clear_code + 1;
@@ -203,7 +203,7 @@ fn lzw_compress(indices: &[u8], min_code_size: u8) -> Vec<u8> {
 
     if indices.is_empty() {
         write_bits(&mut output_bits, eoi_code, code_size);
-        return bits_to_bytes(&output_bits);
+        return Ok(bits_to_bytes(&output_bits));
     }
 
     // Simple table-based LZW
@@ -222,7 +222,9 @@ fn lzw_compress(indices: &[u8], min_code_size: u8) -> Vec<u8> {
             current = extended;
         } else {
             // Output code for current
-            let code = *table.get(&current).unwrap();
+            let code = *table
+                .get(&current)
+                .ok_or_else(|| anyhow!("GIF LZW dictionary lost its current sequence"))?;
             write_bits(&mut output_bits, code, code_size);
 
             // Add new entry
@@ -248,11 +250,13 @@ fn lzw_compress(indices: &[u8], min_code_size: u8) -> Vec<u8> {
     }
 
     // Output remaining
-    let code = *table.get(&current).unwrap();
+    let code = *table
+        .get(&current)
+        .ok_or_else(|| anyhow!("GIF LZW dictionary lost its final sequence"))?;
     write_bits(&mut output_bits, code, code_size);
     write_bits(&mut output_bits, eoi_code, code_size);
 
-    bits_to_bytes(&output_bits)
+    Ok(bits_to_bytes(&output_bits))
 }
 
 fn write_bits(bits: &mut Vec<bool>, value: u16, num_bits: usize) {
@@ -381,14 +385,14 @@ mod tests {
 
     #[test]
     fn test_lzw_compress_empty() {
-        let result = lzw_compress(&[], 8);
+        let result = lzw_compress(&[], 8).expect("empty input should produce a valid LZW stream");
         assert!(!result.is_empty()); // At least clear + EOI codes
     }
 
     #[test]
     fn test_lzw_compress_simple() {
         let data = vec![0u8, 0, 0, 0, 1, 1, 1, 1];
-        let result = lzw_compress(&data, 8);
+        let result = lzw_compress(&data, 8).expect("sample input should compress");
         assert!(!result.is_empty());
     }
 

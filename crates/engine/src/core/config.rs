@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
-use bloomai_core::constants::GIB;
+use bloomai_core::constants::{GIB, MIB};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_CONFIG_FILE: &str = "config.json";
@@ -64,6 +64,7 @@ pub struct InferConfig {
 #[serde(default)]
 pub struct ServerConfig {
     pub model: Option<PathBuf>,
+    pub models_dir: Option<PathBuf>,
     pub host: Option<String>,
     pub port: Option<u16>,
     pub backend: Option<String>,
@@ -75,7 +76,23 @@ pub struct ServerConfig {
     pub reserve_memory_bytes: Option<usize>,
     pub disable_memory_prealloc: Option<bool>,
     pub max_num_tokens: Option<usize>,
+    pub max_upload_bytes: Option<usize>,
+    pub enable_model_downloads: Option<bool>,
+    pub max_model_download_bytes: Option<u64>,
+    pub enable_model_imports: Option<bool>,
+    pub max_model_import_bytes: Option<u64>,
+    pub max_model_import_chunk_bytes: Option<usize>,
+    pub allowed_model_licenses: Option<Vec<String>>,
+    pub model_index_file: Option<PathBuf>,
+    pub model_index_url: Option<String>,
+    pub model_index_public_key: Option<String>,
+    pub model_index_public_keys: Option<Vec<String>>,
+    pub model_index_refresh_seconds: Option<u64>,
+    pub model_index_state_dir: Option<PathBuf>,
+    pub max_model_storage_bytes: Option<u64>,
+    pub staged_model_retention_seconds: Option<u64>,
     pub timeout: Option<u64>,
+    pub shutdown_timeout_seconds: Option<u64>,
     pub speculative: Option<String>,
     pub draft_model: Option<PathBuf>,
     pub num_speculative_tokens: Option<usize>,
@@ -190,6 +207,7 @@ fn example_config() -> BloomConfig {
             ..InferConfig::default()
         },
         server: ServerConfig {
+            models_dir: Some(PathBuf::from("~/.bloom/models")),
             host: Some("127.0.0.1".to_string()),
             port: Some(3000),
             backend: Some("candle".to_string()),
@@ -199,7 +217,19 @@ fn example_config() -> BloomConfig {
             memory_utilization: Some(crate::core::memory::default_memory_utilization()),
             disable_memory_prealloc: Some(false),
             max_num_tokens: Some(4096),
+            max_upload_bytes: Some(12 * MIB as usize),
+            enable_model_downloads: Some(false),
+            max_model_download_bytes: Some(20 * GIB),
+            enable_model_imports: Some(false),
+            max_model_import_bytes: Some(20 * GIB),
+            max_model_import_chunk_bytes: Some(8 * MIB as usize),
+            allowed_model_licenses: Some(Vec::new()),
+            model_index_public_keys: Some(Vec::new()),
+            model_index_refresh_seconds: Some(300),
+            max_model_storage_bytes: Some(0),
+            staged_model_retention_seconds: Some(0),
             timeout: Some(300),
+            shutdown_timeout_seconds: Some(30),
             speculative: Some("none".to_string()),
             num_speculative_tokens: Some(5),
             speculative_ngram_order: Some(4),
@@ -237,6 +267,9 @@ impl BloomConfig {
         expand_option_path(&mut self.infer.draft_model)?;
         expand_option_path(&mut self.infer.output)?;
         expand_option_path(&mut self.server.model)?;
+        expand_option_path(&mut self.server.models_dir)?;
+        expand_option_path(&mut self.server.model_index_file)?;
+        expand_option_path(&mut self.server.model_index_state_dir)?;
         expand_option_path(&mut self.server.draft_model)?;
         expand_option_path(&mut self.server.cachemesh_l3_path)?;
         expand_option_path(&mut self.bench.model)?;
@@ -309,5 +342,28 @@ mod tests {
         assert_eq!(config.server.sliding_window_tokens, Some(4096));
         assert_eq!(config.server.context_shift_tokens, Some(1024));
         assert_eq!(config.server.compact_free_blocks, Some(128));
+        assert_eq!(config.server.max_upload_bytes, Some(12 * MIB as usize));
+        assert_eq!(config.server.enable_model_downloads, Some(false));
+        assert_eq!(config.server.max_model_download_bytes, Some(20 * GIB));
+        assert_eq!(config.server.enable_model_imports, Some(false));
+        assert_eq!(config.server.max_model_import_bytes, Some(20 * GIB));
+        assert_eq!(
+            config.server.max_model_import_chunk_bytes,
+            Some(8 * MIB as usize)
+        );
+        assert_eq!(config.server.allowed_model_licenses, Some(Vec::new()));
+        assert_eq!(config.server.model_index_refresh_seconds, Some(300));
+        assert!(config.server.model_index_state_dir.is_none());
+        assert!(config.server.model_index_file.is_none());
+        assert!(config.server.model_index_url.is_none());
+        assert!(config.server.model_index_public_key.is_none());
+        assert_eq!(config.server.model_index_public_keys, Some(Vec::new()));
+        assert_eq!(config.server.max_model_storage_bytes, Some(0));
+        assert_eq!(config.server.staged_model_retention_seconds, Some(0));
+        assert_eq!(config.server.shutdown_timeout_seconds, Some(30));
+        assert_eq!(
+            config.server.models_dir.as_deref(),
+            Some(Path::new("~/.bloom/models"))
+        );
     }
 }

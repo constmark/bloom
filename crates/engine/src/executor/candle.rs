@@ -8,6 +8,7 @@ use bloomai_core::{
 };
 use candle_core::{DType, Device, Tensor};
 
+use crate::core::memory::error_text_indicates_oom;
 use crate::core::parallelism::ParallelStrategy;
 use crate::core::quantization::{QuantMethod, QuantizationConfig};
 use crate::engine::BackendMaturity;
@@ -29,6 +30,7 @@ enum ModelType {
     Qwen3,
     Gemma4,
     Llama,
+    Bert,
 }
 
 impl ModelType {
@@ -41,44 +43,157 @@ impl ModelType {
                 "qwen3" => Some(ModelType::Qwen3),
                 "gemma4_unified" | "gemma4" => Some(ModelType::Gemma4),
                 "llama" => Some(ModelType::Llama),
+                "bert" => Some(ModelType::Bert),
                 _ => None,
             })
     }
-}
 
-/// Find all safetensors files in model directory
-fn find_safetensors_files(model_path: &Path) -> Vec<PathBuf> {
-    // Check for single model.safetensors first
-    let single = model_path.join("model.safetensors");
-    if single.exists() {
-        return vec![single];
-    }
-
-    // Check for sharded model-*-of-*.safetensors files
-    if let Ok(entries) = std::fs::read_dir(model_path) {
-        let mut shard_files: Vec<_> = entries
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                let name = e.file_name();
-                let name_str = name.to_string_lossy();
-                name_str.starts_with("model-") && name_str.ends_with(".safetensors")
-            })
-            .map(|e| e.path())
-            .collect();
-
-        // Sort by shard number
-        shard_files.sort_by(|a, b| {
-            let name_a = a.file_name().unwrap().to_string_lossy();
-            let name_b = b.file_name().unwrap().to_string_lossy();
-            name_a.cmp(&name_b)
-        });
-
-        if !shard_files.is_empty() {
-            return shard_files;
+    fn from_gguf_architecture(architecture: &str) -> Option<Self> {
+        match architecture.to_lowercase().as_str() {
+            "qwen" | "qwen2" => Some(Self::Qwen2),
+            "qwen3" => Some(Self::Qwen3),
+            "gemma" | "gemma2" | "gemma4" => Some(Self::Gemma4),
+            "llama" | "mistral" | "deepseek" => Some(Self::Llama),
+            _ => None,
         }
     }
 
-    Vec::new()
+    fn hf_model_type(self) -> &'static str {
+        match self {
+            Self::Qwen2 => "qwen2",
+            Self::Qwen3 => "qwen3",
+            Self::Gemma4 => "gemma4_unified",
+            Self::Llama => "llama",
+            Self::Bert => "bert",
+        }
+    }
+}
+
+fn prepare_runtime_tokenizer(
+    mut tokenizer: tokenizers::Tokenizer,
+) -> Result<tokenizers::Tokenizer> {
+    tokenizer.with_padding(None);
+    tokenizer
+        .with_truncation(None)
+        .map_err(|error| anyhow!("failed to disable tokenizer truncation: {error}"))?;
+    Ok(tokenizer)
+}
+
+const MAX_BERT_EMBEDDING_BATCH_ITEMS: usize = 64;
+const MAX_BERT_PADDED_BATCH_TOKENS: usize = 4_096;
+
+/// Group encoded BERT inputs by length so padding stays bounded without
+/// changing the externally visible result order.
+fn plan_bert_embedding_batches(sequences: &[Vec<u32>]) -> Result<Vec<Vec<usize>>> {
+    if sequences.is_empty() {
+        return Err(anyhow!("BERT embedding batches must not be empty"));
+    }
+    if sequences.iter().any(Vec::is_empty) {
+        return Err(anyhow!(
+            "BERT embedding inputs must produce at least one token"
+        ));
+    }
+
+    let mut indices = (0..sequences.len()).collect::<Vec<_>>();
+    indices.sort_by_key(|index| (sequences[*index].len(), *index));
+
+    let mut batches = Vec::new();
+    let mut current = Vec::new();
+    let mut current_max_len = 0_usize;
+    for index in indices {
+        let sequence_len = sequences[index].len();
+        let proposed_max_len = current_max_len.max(sequence_len);
+        let proposed_items = current.len() + 1;
+        let padded_tokens = proposed_items.checked_mul(proposed_max_len);
+        let fits = current.len() < MAX_BERT_EMBEDDING_BATCH_ITEMS
+            && padded_tokens.is_some_and(|tokens| tokens <= MAX_BERT_PADDED_BATCH_TOKENS);
+        if !current.is_empty() && !fits {
+            batches.push(std::mem::take(&mut current));
+            current_max_len = 0;
+        }
+        current_max_len = current_max_len.max(sequence_len);
+        current.push(index);
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    Ok(batches)
+}
+
+fn masked_mean_pool(hidden_states: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
+    let mask = attention_mask
+        .to_dtype(hidden_states.dtype())?
+        .unsqueeze(2)?;
+    let sums = hidden_states.broadcast_mul(&mask)?.sum(1)?;
+    let counts = mask.sum(1)?;
+    Ok(sums.broadcast_div(&counts)?)
+}
+
+fn forward_bert_embedding_batch(
+    model: &candle_transformers::models::bert::BertModel,
+    sequences: &[&[u32]],
+    pad_token_id: u32,
+) -> Result<Vec<Vec<f32>>> {
+    if sequences.is_empty() || sequences.iter().any(|sequence| sequence.is_empty()) {
+        return Err(anyhow!(
+            "BERT embedding microbatches require non-empty token sequences"
+        ));
+    }
+    let batch_size = sequences.len();
+    let max_len = sequences
+        .iter()
+        .map(|sequence| sequence.len())
+        .max()
+        .unwrap_or_default();
+    let value_count = batch_size
+        .checked_mul(max_len)
+        .ok_or_else(|| anyhow!("BERT embedding microbatch shape overflowed"))?;
+    let mut token_ids = Vec::with_capacity(value_count);
+    let mut attention = Vec::with_capacity(value_count);
+    for sequence in sequences {
+        token_ids.extend_from_slice(sequence);
+        attention.extend(std::iter::repeat_n(1_u32, sequence.len()));
+        let padding = max_len - sequence.len();
+        token_ids.extend(std::iter::repeat_n(pad_token_id, padding));
+        attention.extend(std::iter::repeat_n(0_u32, padding));
+    }
+
+    let input_ids = Tensor::from_vec(token_ids, (batch_size, max_len), &model.device)?;
+    let attention_mask = Tensor::from_vec(attention, (batch_size, max_len), &model.device)?;
+    let token_type_ids = input_ids.zeros_like()?;
+    let hidden_states = model.forward(&input_ids, &token_type_ids, Some(&attention_mask))?;
+    masked_mean_pool(&hidden_states, &attention_mask)?
+        .to_dtype(DType::F32)?
+        .to_vec2::<f32>()
+        .map_err(Into::into)
+}
+
+fn safetensors_dtype_for_device(device: &Device) -> Result<DType> {
+    let requested = std::env::var("BLOOM_DTYPE").ok().and_then(|value| {
+        match value.to_ascii_lowercase().as_str() {
+            "f32" | "float32" => Some(DType::F32),
+            "f16" | "float16" => Some(DType::F16),
+            "bf16" | "bfloat16" => Some(DType::BF16),
+            _ => None,
+        }
+    });
+    select_safetensors_dtype(device, requested)
+}
+
+fn select_safetensors_dtype(device: &Device, requested: Option<DType>) -> Result<DType> {
+    let default = match device {
+        Device::Cpu => DType::F32,
+        Device::Cuda(_) | Device::Metal(_) => DType::F16,
+    };
+    let dtype = requested.unwrap_or(default);
+    if matches!(device, Device::Cpu) && dtype != DType::F32 {
+        return Err(anyhow!(
+            "Candle CPU Safetensors inference currently requires F32 weights; \
+             requested {dtype:?}, whose matmul kernel is unavailable. \
+             Remove --dtype/BLOOM_DTYPE or use a supported GPU build."
+        ));
+    }
+    Ok(dtype)
 }
 
 /// Find GGUF file in model directory
@@ -137,7 +252,12 @@ impl Engine for CandleEngine {
 
         EngineCapability {
             engine_name: "candle",
-            supported_families: vec![ModelFamily::Qwen, ModelFamily::Gemma, ModelFamily::Llama],
+            supported_families: vec![
+                ModelFamily::Qwen,
+                ModelFamily::Gemma,
+                ModelFamily::Llama,
+                ModelFamily::Bert,
+            ],
             supported_dtypes: vec![
                 bloomai_core::DType::F32,
                 bloomai_core::DType::F16,
@@ -269,15 +389,14 @@ impl Engine for CandleEngine {
 
         // Determine model type
         let model_type = ModelType::from_config(&config)
-            .or_else(|| gguf_model_type.as_deref().and_then(|arch| match arch {
-                "qwen2" | "qwen3" => Some(ModelType::Qwen3),
-                "gemma4" | "gemma" => Some(ModelType::Gemma4),
-                "llama" => Some(ModelType::Llama),
-                _ => None,
-            }))
+            .or_else(|| {
+                gguf_model_type
+                    .as_deref()
+                    .and_then(ModelType::from_gguf_architecture)
+            })
             .ok_or_else(|| {
                 anyhow!(
-                    "unsupported model type, expected qwen2, qwen3, gemma4_unified or llama.\n\
+                    "unsupported model type, expected qwen2, qwen3, gemma4_unified, llama, or bert.\n\
                      [Diagnostic Tip] Check model_type in config.json or verify the GGUF file architecture."
                 )
             })?;
@@ -305,6 +424,10 @@ impl Engine for CandleEngine {
                 model_path.display()
             ));
         };
+        // Package tokenizers may serialize training or demo-time padding and
+        // truncation. Runtime policy belongs to Bloom so API `truncate` flags,
+        // usage, pooling, and context errors remain truthful.
+        let tokenizer = prepare_runtime_tokenizer(tokenizer)?;
 
         let is_quantized = config.get("quantization_config").is_some()
             || model_path
@@ -315,51 +438,17 @@ impl Engine for CandleEngine {
             || model_path.to_string_lossy().to_lowercase().contains("gptq")
             || model_path.to_string_lossy().to_lowercase().contains("gguf");
 
-        // --- Parse tokenizer_config.json if available ---
-        let tokenizer_config_path = model_path.join("tokenizer_config.json");
-        if tokenizer_config_path.exists() {
-            if let Ok(tc_str) = std::fs::read_to_string(&tokenizer_config_path) {
-                if let Ok(tc) = serde_json::from_str::<serde_json::Value>(&tc_str) {
-                    // Extract chat_template into config if not already present
-                    if let Some(ct) = tc.get("chat_template").and_then(|v| v.as_str()) {
-                        tracing::info!(
-                            "Found chat_template in tokenizer_config.json ({} chars)",
-                            ct.len()
-                        );
-                    }
-                    // Extract bos_token / eos_token overrides
-                    if let Some(bos) = tc.get("bos_token") {
-                        let bos_str = match bos {
-                            serde_json::Value::String(s) => Some(s.clone()),
-                            serde_json::Value::Object(o) => {
-                                o.get("content").and_then(|c| c.as_str()).map(String::from)
-                            }
-                            _ => None,
-                        };
-                        if let Some(ref b) = bos_str {
-                            tracing::info!("tokenizer_config.json bos_token: {}", b);
-                        }
-                    }
-                    if let Some(eos) = tc.get("eos_token") {
-                        let eos_str = match eos {
-                            serde_json::Value::String(s) => Some(s.clone()),
-                            serde_json::Value::Object(o) => {
-                                o.get("content").and_then(|c| c.as_str()).map(String::from)
-                            }
-                            _ => None,
-                        };
-                        if let Some(ref e) = eos_str {
-                            tracing::info!("tokenizer_config.json eos_token: {}", e);
-                        }
-                    }
-                }
-            }
-        }
-
         // Build unified quantization config
         let _quant_config = QuantizationConfig::from_model_config(&config);
 
         let mut manifest = crate::manifest_adapter::load_manifest(model_path)?;
+        let has_safetensors =
+            !crate::core::manifest::resolve_hf_safetensors_files(model_path)?.is_empty();
+        if has_safetensors {
+            // Validate precision before constructing a model that can only fail
+            // later during its first CPU matmul.
+            safetensors_dtype_for_device(&device)?;
+        }
         let model_id = model_path
             .file_name()
             .and_then(|n| n.to_str())
@@ -377,14 +466,18 @@ impl Engine for CandleEngine {
             });
         }
 
+        let model_size = if has_safetensors {
+            crate::manifest_adapter::estimate_memory_for_device(&manifest, 0, device_kind)
+                .weight_bytes
+        } else {
+            estimate_model_size(model_path)
+        };
         let metadata = ModelMetadata {
             id: model_id,
             modality: Modality::Text,
             quantized: is_quantized,
             manifest,
         };
-
-        let model_size = estimate_model_size(model_path);
         let is_uma = cfg!(target_os = "macos");
 
         let model_holder = Arc::new(Mutex::new(None));
@@ -392,7 +485,9 @@ impl Engine for CandleEngine {
         let offload_cb = Arc::new(move || {
             let mut guard = model_ptr.lock().unwrap_or_else(|e| e.into_inner());
             *guard = None;
-            tracing::info!("Model weights successfully offloaded from GPU via dynamic VRAM Coordinator trigger.");
+            tracing::info!(
+                "Model weights released from runtime memory by the residency coordinator."
+            );
             Ok(())
         });
 
@@ -418,15 +513,19 @@ impl Engine for CandleEngine {
             match model_type {
                 ModelType::Gemma4 => eos_token_ids = vec![1, 106],
                 ModelType::Llama => eos_token_ids = vec![128009, 128001, 2],
-                _ => eos_token_ids = vec![151645],
+                ModelType::Qwen2 | ModelType::Qwen3 => eos_token_ids = vec![151645],
+                ModelType::Bert => {}
             }
         }
 
         let mut processors = crate::processor::ProcessorRegistry::default();
-        processors.register(Box::new(crate::processor::TokenizerProcessor::new(
-            processor_name,
-            tokenizer.clone(),
-        )));
+        processors.register(Box::new(
+            crate::processor::TokenizerProcessor::new_with_special_tokens(
+                processor_name,
+                tokenizer.clone(),
+                model_type == ModelType::Bert,
+            ),
+        ));
 
         let kv_cache_pool = Arc::new(crate::scheduler::BloomKvCachePool::new(16, 512));
         let current_prefix = Mutex::new(Vec::new());
@@ -506,7 +605,7 @@ fn synthesize_config_from_gguf(gguf_path: &Path) -> Result<(serde_json::Value, S
                 .unwrap_or("");
             let filename = gguf_path.file_name().unwrap_or_default().to_string_lossy();
             let tip = format!(
-                "unsupported GGUF quantization type (dtype ID: {}). The Candle engine does not support IQ (importance) quantization or legacy Q4_1/Q5_1 formats. [Diagnostic Tip] Re-quantize to Q4_K_M or Q8_0 using llama-quantize: `llama-quantize {} {} Q4_K_M`",
+                "unsupported GGUF quantization type (dtype ID: {}) in this Candle build. [Diagnostic Tip] Re-quantize to Q4_K_M or Q8_0 using llama-quantize: `llama-quantize {} {} Q4_K_M`",
                 dtype_id,
                 filename,
                 filename.replace("iq", "q4_k_m")
@@ -571,40 +670,6 @@ fn synthesize_config_from_gguf(gguf_path: &Path) -> Result<(serde_json::Value, S
         ));
     }
 
-    let gguf_filename = gguf_path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned();
-
-    let mut gguf_type_str = "F32".to_string();
-    for (name, info) in &content.tensor_infos {
-        if name.contains("weight") && (name.contains("blk") || name.contains("layers")) {
-            gguf_type_str = format!("{:?}", info.ggml_dtype);
-            break;
-        }
-    }
-    if gguf_type_str == "F32" {
-        gguf_type_str = content
-            .tensor_infos
-            .values()
-            .next()
-            .map(|info| format!("{:?}", info.ggml_dtype))
-            .unwrap_or_else(|| "F32".to_string());
-    }
-
-    let quant_lower = gguf_type_str.to_lowercase();
-    if quant_lower.starts_with("iq") || quant_lower == "q4_1" || quant_lower == "q5_1" {
-        return Err(anyhow!(
-            crate::core::quantization::GgufError::UnsupportedQuantType(format!(
-                "unsupported GGUF quantization type: '{}'. The Candle engine does not support IQ (importance) quantization or legacy Q4_1/Q5_1 formats. [Diagnostic Tip] Re-quantize to Q4_K_M or Q8_0 using llama-quantize: `llama-quantize {} {} Q4_K_M`",
-                gguf_type_str,
-                gguf_filename,
-                gguf_filename.replace(&gguf_type_str, "Q4_K_M")
-            ))
-        ));
-    }
-
     let prefix = if arch.is_empty() {
         "general".to_string()
     } else {
@@ -643,18 +708,9 @@ fn synthesize_config_from_gguf(gguf_path: &Path) -> Result<(serde_json::Value, S
     let head_dim = embedding_length / head_count;
 
     // Map GGUF architecture to HF model_type used by candle-transformers.
-    let model_type = match arch.as_str() {
-        a if a.contains("qwen") => {
-            if meta_u64(&format!("{}.attention.sliding_window", prefix)).unwrap_or(0) > 0 {
-                "qwen3"
-            } else {
-                "qwen2"
-            }
-        }
-        a if a.contains("gemma") => "gemma4_unified",
-        a if a.contains("llama") || a.contains("mistral") || a.contains("deepseek") => "llama",
-        _ => "unknown",
-    };
+    let model_type = ModelType::from_gguf_architecture(&arch)
+        .map(ModelType::hf_model_type)
+        .unwrap_or("unknown");
 
     let nextn_predict_layers = meta_u64(&format!("{}.nextn_predict_layers", prefix))
         .or_else(|| meta_u64(&format!("{}.next_n_predict_layers", prefix)))
@@ -698,6 +754,7 @@ fn synthesize_config_from_gguf(gguf_path: &Path) -> Result<(serde_json::Value, S
 
 fn synthesize_tokenizer_from_gguf(gguf_path: &Path) -> Result<tokenizers::Tokenizer> {
     use candle_core::quantized::gguf_file::Content;
+    use std::collections::BTreeMap;
     use std::str::FromStr;
 
     let mut file = std::fs::File::open(gguf_path)
@@ -718,6 +775,13 @@ fn synthesize_tokenizer_from_gguf(gguf_path: &Path) -> Result<tokenizers::Tokeni
             _ => None,
         })
         .unwrap_or_else(|| "gpt2".to_string());
+    let tokenizer_pre = md
+        .get("tokenizer.ggml.pre")
+        .and_then(|v| match v {
+            candle_core::quantized::gguf_file::Value::String(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .unwrap_or_default();
 
     let tokens_list = match tokens {
         candle_core::quantized::gguf_file::Value::Array(arr) => arr,
@@ -771,18 +835,103 @@ fn synthesize_tokenizer_from_gguf(gguf_path: &Path) -> Result<tokenizers::Tokeni
             _ => None,
         })
     };
-    let bos_token = get_token_str(bos_id as usize).unwrap_or_else(|| "<s>".to_string());
-    let eos_token = get_token_str(eos_id as usize).unwrap_or_else(|| "</s>".to_string());
+    // GGUF token types follow ggml's vocabulary contract: 3 is CONTROL and 4
+    // is USER_DEFINED. Both must remain indivisible in a synthesized tokenizer;
+    // CONTROL tokens and the explicit BOS/EOS IDs are special tokens. Keeping
+    // every field is required by the tokenizers JSON schema used by current
+    // releases of the Rust crate.
+    let mut added_token_ids = BTreeMap::new();
+    if let Some(candle_core::quantized::gguf_file::Value::Array(types)) =
+        md.get("tokenizer.ggml.token_type")
+    {
+        for (id, token_type) in types.iter().enumerate() {
+            let token_type = match token_type {
+                candle_core::quantized::gguf_file::Value::U32(value) => Some(*value as i64),
+                candle_core::quantized::gguf_file::Value::U64(value) => i64::try_from(*value).ok(),
+                candle_core::quantized::gguf_file::Value::I32(value) => Some(*value as i64),
+                candle_core::quantized::gguf_file::Value::I64(value) => Some(*value),
+                _ => None,
+            };
+            if matches!(token_type, Some(3 | 4)) {
+                added_token_ids.insert(id as u64, token_type == Some(3));
+            }
+        }
+    }
+    added_token_ids.insert(bos_id, true);
+    added_token_ids.insert(eos_id, true);
+    let added_tokens: Vec<_> = added_token_ids
+        .into_iter()
+        .filter_map(|(id, special)| {
+            get_token_str(id as usize).map(|content| {
+                serde_json::json!({
+                    "id": id,
+                    "content": content,
+                    "single_word": false,
+                    "lstrip": false,
+                    "rstrip": false,
+                    "normalized": false,
+                    "special": special
+                })
+            })
+        })
+        .collect();
 
-    let tokenizer_json = if !merges.is_empty() || model_type == "gpt2" || model_type == "bpe" {
+    let tokenizer_json = if tokenizer_pre.starts_with("qwen2") {
         serde_json::json!({
             "version": "1.0",
             "truncation": null,
             "padding": null,
-            "added_tokens": [
-                { "id": bos_id, "special": true, "content": bos_token },
-                { "id": eos_id, "special": true, "content": eos_token }
-            ],
+            "added_tokens": added_tokens,
+            "normalizer": { "type": "NFC" },
+            "pre_tokenizer": {
+                "type": "Sequence",
+                "pretokenizers": [
+                    {
+                        "type": "Split",
+                        "pattern": {
+                            "Regex": "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
+                        },
+                        "behavior": "Isolated",
+                        "invert": false
+                    },
+                    {
+                        "type": "ByteLevel",
+                        "add_prefix_space": false,
+                        "trim_offsets": false,
+                        "use_regex": false
+                    }
+                ]
+            },
+            "post_processor": {
+                "type": "ByteLevel",
+                "add_prefix_space": false,
+                "trim_offsets": false,
+                "use_regex": false
+            },
+            "decoder": {
+                "type": "ByteLevel",
+                "add_prefix_space": false,
+                "trim_offsets": false,
+                "use_regex": false
+            },
+            "model": {
+                "type": "BPE",
+                "dropout": null,
+                "unk_token": null,
+                "continuing_subword_prefix": "",
+                "end_of_word_suffix": "",
+                "fuse_unk": false,
+                "byte_fallback": false,
+                "vocab": vocab,
+                "merges": merges
+            }
+        })
+    } else if !merges.is_empty() || model_type == "gpt2" || model_type == "bpe" {
+        serde_json::json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": added_tokens,
             "normalizer": null,
             "pre_tokenizer": {
                 "type": "ByteLevel",
@@ -818,10 +967,7 @@ fn synthesize_tokenizer_from_gguf(gguf_path: &Path) -> Result<tokenizers::Tokeni
             "version": "1.0",
             "truncation": null,
             "padding": null,
-            "added_tokens": [
-                { "id": bos_id, "special": true, "content": bos_token },
-                { "id": eos_id, "special": true, "content": eos_token }
-            ],
+            "added_tokens": added_tokens,
             "normalizer": null,
             "pre_tokenizer": {
                 "type": "WhitespaceSplit"
@@ -843,7 +989,6 @@ fn synthesize_tokenizer_from_gguf(gguf_path: &Path) -> Result<tokenizers::Tokeni
 }
 
 /// Wrapper enum for different model variants
-/// Wrapper enum for different model variants
 pub enum QwenModelWrapper {
     Qwen2(candle_transformers::models::qwen2::ModelForCausalLM),
     Qwen3(candle_transformers::models::qwen3::ModelForCausalLM),
@@ -852,10 +997,12 @@ pub enum QwenModelWrapper {
         candle_transformers::models::llama::Llama,
         candle_transformers::models::llama::Cache,
     ),
+    Bert(candle_transformers::models::bert::BertModel),
     Streaming(crate::executor::qwen_streaming::QwenStreamingModelForCausalLM),
     Gemma4Streaming(crate::executor::gemma4_streaming::Gemma4StreamingModel),
     QuantizedLlama(candle_transformers::models::quantized_llama::ModelWeights),
     QuantizedQwen2(candle_transformers::models::quantized_qwen2::ModelWeights),
+    QuantizedQwen3(candle_transformers::models::quantized_qwen3::ModelWeights),
 }
 
 impl QwenModelWrapper {
@@ -867,6 +1014,11 @@ impl QwenModelWrapper {
             QwenModelWrapper::Llama(m, cache) => {
                 m.forward(input_ids, start_pos, cache).map_err(Into::into)
             }
+            QwenModelWrapper::Bert(m) => {
+                let token_type_ids = input_ids.zeros_like()?;
+                m.forward(input_ids, &token_type_ids, None)
+                    .map_err(Into::into)
+            }
             QwenModelWrapper::Streaming(m) => m.forward(input_ids, start_pos).map_err(Into::into),
             QwenModelWrapper::Gemma4Streaming(m) => {
                 m.forward(input_ids, start_pos).map_err(Into::into)
@@ -877,22 +1029,40 @@ impl QwenModelWrapper {
             QwenModelWrapper::QuantizedQwen2(m) => {
                 m.forward(input_ids, start_pos).map_err(Into::into)
             }
+            QwenModelWrapper::QuantizedQwen3(m) => {
+                m.forward(input_ids, start_pos).map_err(Into::into)
+            }
         }
     }
 
     pub fn clear_kv_cache(&mut self) {
         match self {
-            QwenModelWrapper::Qwen2(_)
-            | QwenModelWrapper::Qwen3(_)
-            | QwenModelWrapper::Llama(_, _)
-            | QwenModelWrapper::QuantizedLlama(_)
-            | QwenModelWrapper::QuantizedQwen2(_) => {
-                // Recreated via reload if start_pos == 0
-            }
+            QwenModelWrapper::Qwen2(m) => m.clear_kv_cache(),
+            QwenModelWrapper::Qwen3(m) => m.clear_kv_cache(),
             QwenModelWrapper::Gemma4(m) => m.clear_kv_cache(),
             QwenModelWrapper::Streaming(m) => m.clear_kv_cache(),
-            QwenModelWrapper::Gemma4Streaming(_) => {}
+            QwenModelWrapper::Gemma4Streaming(m) => m.clear_kv_cache(),
+            QwenModelWrapper::QuantizedQwen3(m) => m.clear_kv_cache(),
+            QwenModelWrapper::Bert(_) => {}
+            QwenModelWrapper::Llama(_, _)
+            | QwenModelWrapper::QuantizedLlama(_)
+            | QwenModelWrapper::QuantizedQwen2(_) => {
+                // These variants are recreated by their owner for a fresh sequence.
+            }
         }
+    }
+
+    fn can_clear_kv_cache_in_place(&self) -> bool {
+        matches!(
+            self,
+            QwenModelWrapper::Qwen2(_)
+                | QwenModelWrapper::Qwen3(_)
+                | QwenModelWrapper::Gemma4(_)
+                | QwenModelWrapper::Bert(_)
+                | QwenModelWrapper::Streaming(_)
+                | QwenModelWrapper::Gemma4Streaming(_)
+                | QwenModelWrapper::QuantizedQwen3(_)
+        )
     }
 
     /// Return the variant name for diagnostic error messages.
@@ -902,10 +1072,12 @@ impl QwenModelWrapper {
             QwenModelWrapper::Qwen3(_) => "Qwen3",
             QwenModelWrapper::Gemma4(_) => "Gemma4",
             QwenModelWrapper::Llama(_, _) => "Llama",
+            QwenModelWrapper::Bert(_) => "Bert",
             QwenModelWrapper::Streaming(_) => "Streaming",
             QwenModelWrapper::Gemma4Streaming(_) => "Gemma4Streaming",
             QwenModelWrapper::QuantizedLlama(_) => "QuantizedLlama",
             QwenModelWrapper::QuantizedQwen2(_) => "QuantizedQwen2",
+            QwenModelWrapper::QuantizedQwen3(_) => "QuantizedQwen3",
         }
     }
 }
@@ -972,7 +1144,10 @@ impl crate::scheduler::kv_hook::KvHook for PerRequestKvHook {
         start_pos: usize,
         seq_len: usize,
     ) -> Result<(Vec<f32>, Vec<f32>)> {
-        let models = self.request_models.lock().unwrap_or_else(|e| e.into_inner());
+        let models = self
+            .request_models
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let Some(wrapper) = models.get(&handle) else {
             return Err(anyhow!(
                 "PerRequestKvHook: handle {} not found in request_models map",
@@ -1014,7 +1189,10 @@ impl crate::scheduler::kv_hook::KvHook for PerRequestKvHook {
         values: &[f32],
         seq_len: usize,
     ) -> Result<()> {
-        let mut models = self.request_models.lock().unwrap_or_else(|e| e.into_inner());
+        let mut models = self
+            .request_models
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let Some(wrapper) = models.get_mut(&handle) else {
             return Err(anyhow!(
                 "PerRequestKvHook: handle {} not found in request_models map",
@@ -1064,13 +1242,113 @@ struct CandleTextModel {
 }
 
 impl CandleTextModel {
+    fn is_embedding_model(&self) -> bool {
+        self.model_type == ModelType::Bert
+            || self
+                .metadata
+                .manifest
+                .parameters
+                .get("bloom_task")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|task| {
+                    task.eq_ignore_ascii_case("embedding") || task.eq_ignore_ascii_case("rerank")
+                })
+    }
+
+    fn embed_bert_batch(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+        if self.model_type != ModelType::Bert {
+            return Err(anyhow!(
+                "native embedding batches are only available for BERT models"
+            ));
+        }
+        if inputs.is_empty() {
+            return Err(anyhow!("BERT embedding batches must not be empty"));
+        }
+
+        let max_positions = self
+            .config
+            .get("max_position_embeddings")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .ok_or_else(|| anyhow!("BERT config has an invalid max_position_embeddings"))?;
+        let pad_token_id = self
+            .config
+            .get("pad_token_id")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| anyhow!("BERT config has an invalid pad_token_id"))?;
+
+        let mut sequences = Vec::with_capacity(inputs.len());
+        for (index, input) in inputs.iter().enumerate() {
+            let encoding = self
+                .tokenizer
+                .encode(input.as_str(), true)
+                .map_err(|error| anyhow!("failed to tokenize BERT input {index}: {error}"))?;
+            let token_ids = encoding.get_ids().to_vec();
+            if token_ids.is_empty() {
+                return Err(anyhow!("BERT input {index} produced no tokens"));
+            }
+            if token_ids.len() > max_positions {
+                return Err(anyhow!(
+                    "BERT input {index} contains {} tokens and exceeds max_position_embeddings {max_positions}",
+                    token_ids.len()
+                ));
+            }
+            sequences.push(token_ids);
+        }
+        let batches = plan_bert_embedding_batches(&sequences)?;
+
+        let mut model_guard = self.model.lock().unwrap_or_else(|error| error.into_inner());
+        if model_guard.is_none() {
+            *model_guard = Some(self.reload_for_generation()?);
+        }
+        let model = match model_guard.as_ref() {
+            Some(QwenModelWrapper::Bert(model)) => model,
+            Some(wrapper) => {
+                return Err(anyhow!(
+                    "BERT embedding batch resolved to unexpected {} model wrapper",
+                    wrapper.variant_name()
+                ));
+            }
+            None => return Err(anyhow!("BERT model is not loaded")),
+        };
+
+        let mut outputs = vec![None; inputs.len()];
+        for indices in batches {
+            let batch_sequences = indices
+                .iter()
+                .map(|index| sequences[*index].as_slice())
+                .collect::<Vec<_>>();
+            let batch_outputs =
+                forward_bert_embedding_batch(model, &batch_sequences, pad_token_id)?;
+            if batch_outputs.len() != indices.len() {
+                return Err(anyhow!(
+                    "BERT embedding microbatch returned {} vectors for {} inputs",
+                    batch_outputs.len(),
+                    indices.len()
+                ));
+            }
+            for (index, embedding) in indices.into_iter().zip(batch_outputs) {
+                outputs[index] = Some(embedding);
+            }
+        }
+
+        outputs
+            .into_iter()
+            .enumerate()
+            .map(|(index, output)| {
+                output.ok_or_else(|| anyhow!("BERT embedding output {index} is missing"))
+            })
+            .collect()
+    }
+
     fn reload_for_generation(&self) -> Result<QwenModelWrapper> {
         match self.reload() {
             Ok(m) => Ok(m),
             Err(e) => {
                 let err_str = e.to_string().to_lowercase();
-                if err_str.contains("oom")
-                    || err_str.contains("out of memory")
+                if error_text_indicates_oom(&err_str)
                     || err_str.contains("metal")
                     || err_str.contains("cuda")
                 {
@@ -1109,7 +1387,9 @@ impl CandleTextModel {
     }
 
     fn reload_on_device(&self, device: &Device) -> Result<QwenModelWrapper> {
-        let is_streaming = self.model_size > 3_500_000_000 && matches!(device, Device::Cuda(_));
+        let is_large_cuda = self.model_size > 3_500_000_000 && matches!(device, Device::Cuda(_));
+        let is_streaming =
+            is_large_cuda && matches!(self.model_type, ModelType::Qwen2 | ModelType::Qwen3);
         let offloaded_layers = std::env::var("BLOOM_GPU_LAYERS")
             .ok()
             .and_then(|s| s.parse::<usize>().ok());
@@ -1131,7 +1411,7 @@ impl CandleTextModel {
             crate::core::memory::prefetch_file_madvise(path);
         }
 
-        if is_streaming && self.model_type == ModelType::Gemma4 {
+        if is_large_cuda && self.model_type == ModelType::Gemma4 {
             tracing::info!("Initializing memory-efficient layer-wise weight streaming on CUDA for Gemma-4 GGUF...");
             let gguf_path = gguf_path.ok_or_else(|| {
                 anyhow!(
@@ -1155,7 +1435,8 @@ impl CandleTextModel {
             return Ok(QwenModelWrapper::Gemma4Streaming(m));
         }
 
-        let safetensors_files = find_safetensors_files(&self.model_path);
+        let safetensors_files =
+            crate::core::manifest::resolve_hf_safetensors_files(&self.model_path)?;
         if safetensors_files.is_empty() {
             if let Some(path) = gguf_path {
                 match self.model_type {
@@ -1187,8 +1468,8 @@ impl CandleTextModel {
                             )?;
                         return Ok(QwenModelWrapper::QuantizedLlama(m));
                     }
-                    ModelType::Qwen2 | ModelType::Qwen3 => {
-                        tracing::info!("GGUF Qwen model loading quantized weights...");
+                    ModelType::Qwen2 => {
+                        tracing::info!("GGUF Qwen2 model loading quantized weights...");
                         let mut file = std::fs::File::open(&path)
                             .map_err(|e| anyhow!("failed to open GGUF file: {}", e))?;
                         let content = candle_core::quantized::gguf_file::Content::read(&mut file)
@@ -1199,6 +1480,23 @@ impl CandleTextModel {
                             )?;
                         return Ok(QwenModelWrapper::QuantizedQwen2(m));
                     }
+                    ModelType::Qwen3 => {
+                        tracing::info!("GGUF Qwen3 model loading quantized weights...");
+                        let mut file = std::fs::File::open(&path)
+                            .map_err(|e| anyhow!("failed to open GGUF file: {}", e))?;
+                        let content = candle_core::quantized::gguf_file::Content::read(&mut file)
+                            .map_err(|e| anyhow!("failed to read GGUF content: {}", e))?;
+                        let m =
+                            candle_transformers::models::quantized_qwen3::ModelWeights::from_gguf(
+                                content, &mut file, device,
+                            )?;
+                        return Ok(QwenModelWrapper::QuantizedQwen3(m));
+                    }
+                    ModelType::Bert => {
+                        return Err(anyhow!(
+                            "BERT GGUF checkpoints are not supported by the Candle encoder path; use the original Safetensors checkpoint"
+                        ));
+                    }
                 }
             }
             return Err(anyhow!(
@@ -1207,20 +1505,7 @@ impl CandleTextModel {
             ));
         }
 
-        let mut dtype = match device {
-            Device::Cpu => DType::F32,
-            Device::Cuda(_) => DType::F16,
-            Device::Metal(_) => DType::F16,
-        };
-
-        if let Ok(dt_str) = std::env::var("BLOOM_DTYPE") {
-            dtype = match dt_str.to_lowercase().as_str() {
-                "f32" | "float32" => DType::F32,
-                "f16" | "float16" => DType::F16,
-                "bf16" | "bfloat16" => DType::BF16,
-                _ => dtype,
-            };
-        }
+        let dtype = safetensors_dtype_for_device(device)?;
 
         let vb_device = if is_streaming { &Device::Cpu } else { device };
 
@@ -1422,6 +1707,14 @@ impl CandleTextModel {
                             .map_err(|e| anyhow!("failed to create llama cache: {}", e))?;
                     QwenModelWrapper::Llama(m, cache)
                 }
+                ModelType::Bert => {
+                    let cfg: candle_transformers::models::bert::Config =
+                        serde_json::from_value(self.config.clone())
+                            .map_err(|e| anyhow!("failed to parse bert config: {}", e))?;
+                    let m = candle_transformers::models::bert::BertModel::load(vb, &cfg)
+                        .map_err(|e| anyhow!("failed to build bert model: {}", e))?;
+                    QwenModelWrapper::Bert(m)
+                }
             }
         };
 
@@ -1439,7 +1732,7 @@ impl CandleTextModel {
                 Ok(m) => m,
                 Err(e) => {
                     let err_str = e.to_string().to_lowercase();
-                    if err_str.contains("oom") || err_str.contains("out of memory") {
+                    if error_text_indicates_oom(&err_str) {
                         tracing::warn!("verify_loading: GPU load failed with OOM, trying CPU...");
                         self.reload_cpu()?
                     } else {
@@ -1449,7 +1742,9 @@ impl CandleTextModel {
             };
             *model_guard = Some(reloaded);
         }
-        let model = model_guard.as_mut().unwrap();
+        let model = model_guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("verify_loading: model reload produced no model"))?;
 
         // Dummy forward pass with tiny input
         let dummy_ids = vec![1u32, 2, 3];
@@ -1556,7 +1851,9 @@ impl LoadedModel for CandleTextModel {
             let reloaded = self.reload()?;
             *model_guard = Some(reloaded);
         }
-        let model = model_guard.as_mut().unwrap();
+        let model = model_guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("model reload produced no model"))?;
         model.forward(input_ids, start_pos)
     }
 
@@ -1566,18 +1863,19 @@ impl LoadedModel for CandleTextModel {
     }
 
     fn clear_kv_cache(&self) {
+        // Keep the logical prefix and physical cache state synchronized. A
+        // later request must not report a prefix hit after an explicit clear.
+        self.current_prefix
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         let mut model_guard = self.model.lock().unwrap_or_else(|e| e.into_inner());
         let should_drop = if let Some(wrapper) = model_guard.as_mut() {
-            match wrapper {
-                QwenModelWrapper::Streaming(m) => {
-                    m.clear_kv_cache();
-                    false
-                }
-                QwenModelWrapper::Gemma4Streaming(m) => {
-                    m.clear_kv_cache();
-                    false
-                }
-                _ => true,
+            if wrapper.can_clear_kv_cache_in_place() {
+                wrapper.clear_kv_cache();
+                false
+            } else {
+                true
             }
         } else {
             false
@@ -1601,6 +1899,14 @@ impl LoadedModel for CandleTextModel {
 
     fn metadata(&self) -> &ModelMetadata {
         &self.metadata
+    }
+
+    fn supports_native_embedding_batch(&self) -> bool {
+        self.model_type == ModelType::Bert
+    }
+
+    fn embed_batch(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.embed_bert_batch(inputs)
     }
 
     fn processors(&self) -> Option<&crate::processor::ProcessorRegistry> {
@@ -1647,7 +1953,7 @@ impl LoadedModel for CandleTextModel {
 
         let encoding = self
             .tokenizer
-            .encode(prompt, false)
+            .encode(prompt, self.model_type == ModelType::Bert)
             .map_err(|e| anyhow!("tokenizer encode error: {}", e))?;
         let token_ids = encoding.get_ids().to_vec();
         self.infer_tokens_stream(token_ids, params, sink)
@@ -1699,6 +2005,13 @@ impl LoadedModel for CandleTextModel {
 }
 
 impl CandleTextModel {
+    fn reusable_prefix_len(token_ids: &[u32], cached_tokens: &[u32]) -> Option<usize> {
+        (!cached_tokens.is_empty()
+            && cached_tokens.len() < token_ids.len()
+            && token_ids.starts_with(cached_tokens))
+        .then_some(cached_tokens.len())
+    }
+
     fn infer_tokens_stream(
         &self,
         token_ids: Vec<u32>,
@@ -1711,63 +2024,69 @@ impl CandleTextModel {
 
         tracing::debug!("Prompt token IDs: {:?}", token_ids);
 
-        // Check if this is an embedding model
-        let is_embedding = self.metadata.id.to_lowercase().contains("bert")
-            || self.metadata.id.to_lowercase().contains("embed")
-            || self.metadata.id.to_lowercase().contains("bge")
-            || self.metadata.id.to_lowercase().contains("rerank");
+        let is_embedding = self.is_embedding_model();
 
         let mut start_pos = 0;
-        let mut current_prefix_guard = self.current_prefix.lock().unwrap_or_else(|e| e.into_inner());
+        let mut current_prefix_guard = self
+            .current_prefix
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if !is_embedding {
-            let mut matched_tokens = 0;
-            for (a, b) in token_ids.iter().zip(current_prefix_guard.iter()) {
-                if a == b {
-                    matched_tokens += 1;
-                } else {
-                    break;
-                }
-            }
-
-            if matched_tokens > 0 && matched_tokens < token_ids.len() {
+            // Candle's causal caches can extend an existing sequence, but
+            // these wrappers do not expose safe suffix truncation. Reuse is
+            // therefore valid only when the new prompt contains the entire
+            // physical cached sequence and appends more tokens. A merely
+            // shared prefix must start from a cleared cache.
+            if let Some(matched_tokens) =
+                Self::reusable_prefix_len(&token_ids, &current_prefix_guard)
+            {
                 start_pos = matched_tokens;
                 tracing::info!(
                     "Prompt cache hit! Reusing {} prefix tokens. start_pos = {}",
                     matched_tokens,
                     start_pos
                 );
-                let mut pool_state = self.kv_cache_pool.state.lock().unwrap_or_else(|e| e.into_inner());
+                let mut pool_state = self
+                    .kv_cache_pool
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 pool_state.metrics.hits += 1;
                 pool_state.metrics.reuses += matched_tokens;
             } else {
                 start_pos = 0;
-                let mut pool_state = self.kv_cache_pool.state.lock().unwrap_or_else(|e| e.into_inner());
+                let mut pool_state = self
+                    .kv_cache_pool
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 pool_state.metrics.misses += 1;
             }
         }
 
         let mut model_guard = self.model.lock().unwrap_or_else(|e| e.into_inner());
-        if start_pos == 0 && !is_embedding {
-            let needs_reload = match model_guard.as_ref() {
-                None => true,
-                Some(wrapper) => matches!(
-                    wrapper,
-                    QwenModelWrapper::Qwen2(_)
-                        | QwenModelWrapper::Qwen3(_)
-                        | QwenModelWrapper::Llama(_, _)
-                        | QwenModelWrapper::QuantizedLlama(_)
-                        | QwenModelWrapper::QuantizedQwen2(_)
-                ),
-            };
+        // Every start-at-zero execution needs an empty KV state. This includes
+        // embedding inputs: startup verification and earlier items in the same
+        // embedding batch may have populated a causal model's cache. Reusing
+        // that state can leak context across inputs and can make attention-mask
+        // dimensions inconsistent with the new input.
+        if start_pos == 0 {
+            let needs_reload = model_guard
+                .as_ref()
+                .is_none_or(|wrapper| !wrapper.can_clear_kv_cache_in_place());
 
             if needs_reload {
                 tracing::info!("Resetting KV cache: recreating model wrapper...");
+                // Release the previous wrapper before constructing its replacement.
+                // Llama and some quantized variants cannot clear their KV cache in
+                // place; retaining the old wrapper here briefly doubles resident
+                // weight memory and can turn a valid CPU load into an OOM failure.
+                *model_guard = None;
                 let reloaded = match self.reload() {
                     Ok(m) => m,
                     Err(e) => {
                         let err_str = e.to_string().to_lowercase();
-                        if err_str.contains("oom")
-                            || err_str.contains("out of memory")
+                        if error_text_indicates_oom(&err_str)
                             || err_str.contains("metal")
                             || err_str.contains("cuda")
                         {
@@ -1794,8 +2113,7 @@ impl CandleTextModel {
                 Ok(m) => m,
                 Err(e) => {
                     let err_str = e.to_string().to_lowercase();
-                    if err_str.contains("oom")
-                        || err_str.contains("out of memory")
+                    if error_text_indicates_oom(&err_str)
                         || err_str.contains("metal")
                         || err_str.contains("cuda")
                     {
@@ -1819,7 +2137,7 @@ impl CandleTextModel {
                 .ok_or_else(|| anyhow!("model is not loaded"))?
                 .forward(&input_ids, 0)?;
             let mean = logits.mean(1)?;
-            let mean_vec = mean.squeeze(0)?.to_vec1::<f32>()?;
+            let mean_vec = mean.squeeze(0)?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
             sink.on_chunk(crate::io::OutputChunk::Embedding(mean_vec))?;
             sink.on_chunk(crate::io::OutputChunk::End)?;
             return Ok(());
@@ -1987,7 +2305,9 @@ impl CandleTextModel {
                             let has_draft_logits =
                                 proposed_with_logits.iter().any(|(_, l)| !l.is_empty());
 
-                            let last = *all_tokens.last().unwrap();
+                            let last = *all_tokens
+                                .last()
+                                .ok_or_else(|| anyhow!("generation token history is empty"))?;
                             let mut verify_tokens = Vec::with_capacity(proposed.len() + 1);
                             verify_tokens.push(last);
                             verify_tokens.extend_from_slice(&proposed);
@@ -2129,7 +2449,9 @@ impl CandleTextModel {
                     }
                 }
 
-                let last = *all_tokens.last().unwrap();
+                let last = *all_tokens
+                    .last()
+                    .ok_or_else(|| anyhow!("generation token history is empty"))?;
                 let input_ids = Tensor::new(&[[last]], &self.device)?;
                 let logits = model_guard
                     .as_mut()
@@ -2197,7 +2519,11 @@ impl CandleTextModel {
 
         if strategy == ResidencyStrategy::OnDemand {
             *model_guard = None;
-            tracing::info!("Model weights successfully offloaded from GPU (OnDemand).");
+            // The physical KV cache is owned by the dropped wrapper. Retaining
+            // its logical prefix would report a hit against a newly reloaded,
+            // empty cache on the next request.
+            current_prefix_guard.clear();
+            tracing::info!("Model weights released from runtime memory (OnDemand).");
         } else {
             tracing::debug!("Keeping model weights resident (strategy: {:?}).", strategy);
         }
@@ -2272,8 +2598,7 @@ fn validate_partial_json_schema(
     path: &str,
 ) -> std::result::Result<(), String> {
     if let Some(enum_values) = schema.get("enum").and_then(|v| v.as_array()) {
-        if value.is_string() {
-            let s = value.as_str().unwrap();
+        if let Some(s) = value.as_str() {
             if !enum_values.iter().any(|candidate| {
                 if let Some(cand_str) = candidate.as_str() {
                     cand_str.starts_with(s)
@@ -2301,8 +2626,7 @@ fn validate_partial_json_schema(
         }
     }
 
-    if value.is_object() {
-        let object = value.as_object().unwrap();
+    if let Some(object) = value.as_object() {
         if let Some(properties) = schema.get("properties").and_then(|v| v.as_object()) {
             for (field, property_schema) in properties {
                 if let Some(field_value) = object.get(field) {
@@ -2354,8 +2678,7 @@ fn validate_complete_json_schema(
         }
     }
 
-    if value.is_object() {
-        let object = value.as_object().unwrap();
+    if let Some(object) = value.as_object() {
         if let Some(required) = schema.get("required").and_then(|v| v.as_array()) {
             for field in required.iter().filter_map(|v| v.as_str()) {
                 if !object.contains_key(field) {
@@ -2404,7 +2727,7 @@ fn json_value_matches_type(value: &serde_json::Value, schema_type: &str) -> bool
         "integer" => {
             value.is_i64()
                 || value.is_u64()
-                || (value.is_f64() && value.as_f64().unwrap().fract() == 0.0)
+                || value.as_f64().is_some_and(|number| number.fract() == 0.0)
         }
         "boolean" => value.is_boolean(),
         "object" => value.is_object(),
@@ -2438,7 +2761,9 @@ fn starts_with_valid_outside_string_char(s: &str) -> bool {
     if s_trimmed.is_empty() {
         return true;
     }
-    let first_char = s_trimmed.chars().next().unwrap();
+    let Some(first_char) = s_trimmed.chars().next() else {
+        return true;
+    };
     matches!(
         first_char,
         '{' | '}' | '[' | ']' | ':' | ',' | '"' | '-' | '+' | '.' | '0'
@@ -2749,6 +3074,10 @@ pub(crate) fn filter_logits_by_grammar(
     eos_token_ids: &[u32],
     device: &Device,
 ) -> Result<Tensor> {
+    if matches!(format, bloomai_core::ResponseFormat::Text) {
+        return Ok(logits.clone());
+    }
+
     let logits_f32 = logits.to_dtype(DType::F32)?;
     let mut logits_vec = logits_f32.to_vec1::<f32>()?;
     let vocab_size = logits_vec.len();
@@ -2907,7 +3236,10 @@ impl crate::scheduler::kv_hook::KvHook for ServerKvHook {
         seq_len: usize,
     ) -> anyhow::Result<(Vec<f32>, Vec<f32>)> {
         let model_arc = {
-            let models = self.request_models.lock().unwrap_or_else(|e| e.into_inner());
+            let models = self
+                .request_models
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             models.get(&handle).cloned()
         };
 
@@ -2939,7 +3271,10 @@ impl crate::scheduler::kv_hook::KvHook for ServerKvHook {
         seq_len: usize,
     ) -> anyhow::Result<Option<(Tensor, Tensor)>> {
         let model_arc = {
-            let models = self.request_models.lock().unwrap_or_else(|e| e.into_inner());
+            let models = self
+                .request_models
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             models.get(&handle).cloned()
         };
 
@@ -2972,7 +3307,10 @@ impl crate::scheduler::kv_hook::KvHook for ServerKvHook {
         seq_len: usize,
     ) -> anyhow::Result<()> {
         let model_arc = {
-            let models = self.request_models.lock().unwrap_or_else(|e| e.into_inner());
+            let models = self
+                .request_models
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             models.get(&handle).cloned()
         };
 
@@ -3020,7 +3358,10 @@ impl crate::scheduler::kv_hook::KvHook for ServerKvHook {
         values: &Tensor,
     ) -> anyhow::Result<()> {
         let model_arc = {
-            let models = self.request_models.lock().unwrap_or_else(|e| e.into_inner());
+            let models = self
+                .request_models
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             models.get(&handle).cloned()
         };
 
@@ -3043,7 +3384,10 @@ impl crate::scheduler::kv_hook::KvHook for ServerKvHook {
 
     fn clear_kv_cache(&self, handle: usize) -> anyhow::Result<()> {
         let model_arc = {
-            let models = self.request_models.lock().unwrap_or_else(|e| e.into_inner());
+            let models = self
+                .request_models
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             models.get(&handle).cloned()
         };
         if let Some(model_arc) = model_arc {
@@ -3063,7 +3407,10 @@ impl crate::scheduler::kv_hook::KvHook for ServerKvHook {
 
     fn rollback_kv_cache(&self, handle: usize, length: usize) -> anyhow::Result<()> {
         let model_arc = {
-            let models = self.request_models.lock().unwrap_or_else(|e| e.into_inner());
+            let models = self
+                .request_models
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             models.get(&handle).cloned()
         };
         if let Some(model_arc) = model_arc {
@@ -3114,34 +3461,155 @@ mod tests {
     }
 
     #[test]
-    fn test_find_safetensors_files() {
-        let dir = create_temp_dir();
+    fn gguf_architecture_keeps_qwen_generations_distinct() {
+        assert_eq!(
+            ModelType::from_gguf_architecture("qwen2"),
+            Some(ModelType::Qwen2)
+        );
+        assert_eq!(
+            ModelType::from_gguf_architecture("qwen3"),
+            Some(ModelType::Qwen3)
+        );
+        assert_eq!(ModelType::Qwen2.hf_model_type(), "qwen2");
+        assert_eq!(ModelType::Qwen3.hf_model_type(), "qwen3");
+    }
 
-        // Initially empty
-        assert!(find_safetensors_files(&dir).is_empty());
+    #[test]
+    fn prompt_cache_reuses_only_a_complete_cached_sequence() {
+        assert_eq!(
+            CandleTextModel::reusable_prefix_len(&[1, 2, 3, 4], &[1, 2, 3]),
+            Some(3)
+        );
+        assert_eq!(
+            CandleTextModel::reusable_prefix_len(&[1, 2, 4, 5], &[1, 2, 3]),
+            None
+        );
+        assert_eq!(
+            CandleTextModel::reusable_prefix_len(&[1, 2], &[1, 2, 3]),
+            None
+        );
+        assert_eq!(
+            CandleTextModel::reusable_prefix_len(&[1, 2, 3], &[1, 2, 3]),
+            None
+        );
+        assert_eq!(CandleTextModel::reusable_prefix_len(&[1], &[]), None);
+    }
 
-        // Single file
-        let single = dir.join("model.safetensors");
-        fs::write(&single, "").unwrap();
-        let found = find_safetensors_files(&dir);
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0], single);
+    #[test]
+    fn cpu_safetensors_precision_fails_before_an_unsupported_matmul() {
+        assert_eq!(
+            select_safetensors_dtype(&Device::Cpu, None).unwrap(),
+            DType::F32
+        );
+        let bf16 = select_safetensors_dtype(&Device::Cpu, Some(DType::BF16))
+            .unwrap_err()
+            .to_string();
+        assert!(bf16.contains("matmul kernel is unavailable"));
+        let f16 = select_safetensors_dtype(&Device::Cpu, Some(DType::F16))
+            .unwrap_err()
+            .to_string();
+        assert!(f16.contains("requires F32"));
+    }
 
-        fs::remove_file(single).unwrap();
+    #[test]
+    fn runtime_tokenizer_disables_serialized_padding_and_truncation() {
+        let mut tokenizer = tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default());
+        tokenizer.with_padding(Some(tokenizers::PaddingParams::default()));
+        tokenizer
+            .with_truncation(Some(tokenizers::TruncationParams {
+                max_length: 8,
+                ..Default::default()
+            }))
+            .unwrap();
 
-        // Sharded files
-        let shard2 = dir.join("model-00002-of-00002.safetensors");
-        let shard1 = dir.join("model-00001-of-00002.safetensors");
-        fs::write(&shard2, "").unwrap();
-        fs::write(&shard1, "").unwrap();
+        let tokenizer = prepare_runtime_tokenizer(tokenizer).unwrap();
+        assert!(tokenizer.get_padding().is_none());
+        assert!(tokenizer.get_truncation().is_none());
+    }
 
-        let found_shards = find_safetensors_files(&dir);
-        assert_eq!(found_shards.len(), 2);
-        // Should be sorted
-        assert_eq!(found_shards[0], shard1);
-        assert_eq!(found_shards[1], shard2);
+    #[test]
+    fn bert_config_selects_the_native_encoder_model_type() {
+        let config = serde_json::json!({"model_type": "bert"});
+        assert_eq!(ModelType::from_config(&config), Some(ModelType::Bert));
+        assert_eq!(ModelType::Bert.hf_model_type(), "bert");
+        assert_eq!(ModelType::from_gguf_architecture("bert"), None);
+    }
 
-        let _ = fs::remove_dir_all(dir);
+    #[test]
+    fn bert_embedding_batch_plan_bounds_padding_and_groups_similar_lengths() {
+        let sequences = vec![vec![1; 3], vec![1; 1], vec![1; 2]];
+        assert_eq!(
+            plan_bert_embedding_batches(&sequences).unwrap(),
+            vec![vec![1, 2, 0]]
+        );
+
+        let many = vec![vec![1]; MAX_BERT_EMBEDDING_BATCH_ITEMS * 2 + 1];
+        let batches = plan_bert_embedding_batches(&many).unwrap();
+        assert_eq!(
+            batches.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![64, 64, 1]
+        );
+
+        let long = vec![vec![1; 3_000], vec![1; 3_000]];
+        assert_eq!(plan_bert_embedding_batches(&long).unwrap().len(), 2);
+        assert!(plan_bert_embedding_batches(&[]).is_err());
+        assert!(plan_bert_embedding_batches(&[Vec::new()]).is_err());
+    }
+
+    #[test]
+    fn masked_mean_pool_excludes_padding_positions() {
+        let hidden = Tensor::from_vec(
+            vec![
+                1_f32, 2.0, 3.0, 4.0, 100.0, 200.0, 10.0, 20.0, 50.0, 60.0, 70.0, 80.0,
+            ],
+            (2, 3, 2),
+            &Device::Cpu,
+        )
+        .unwrap();
+        let attention = Tensor::from_vec(vec![1_u32, 1, 0, 1, 0, 0], (2, 3), &Device::Cpu).unwrap();
+        assert_eq!(
+            masked_mean_pool(&hidden, &attention)
+                .unwrap()
+                .to_vec2::<f32>()
+                .unwrap(),
+            vec![vec![2.0, 3.0], vec![10.0, 20.0]]
+        );
+    }
+
+    #[test]
+    fn padded_bert_batch_matches_individual_cpu_forward_passes() {
+        let config = candle_transformers::models::bert::Config {
+            vocab_size: 8,
+            hidden_size: 8,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            intermediate_size: 16,
+            hidden_dropout_prob: 0.0,
+            max_position_embeddings: 16,
+            type_vocab_size: 2,
+            pad_token_id: 0,
+            classifier_dropout: None,
+            model_type: None,
+            ..Default::default()
+        };
+        let variables = candle_nn::VarMap::new();
+        let builder = candle_nn::VarBuilder::from_varmap(&variables, DType::F32, &Device::Cpu);
+        let model = candle_transformers::models::bert::BertModel::load(builder, &config).unwrap();
+        let sequences = [vec![2_u32, 4, 3], vec![2_u32, 5, 6, 3]];
+        let refs = sequences.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let batched = forward_bert_embedding_batch(&model, &refs, 0).unwrap();
+        assert_eq!(batched.len(), sequences.len());
+
+        for (index, sequence) in sequences.iter().enumerate() {
+            let scalar = forward_bert_embedding_batch(&model, &[sequence.as_slice()], 0).unwrap();
+            assert_eq!(scalar[0].len(), config.hidden_size);
+            for (actual, expected) in batched[index].iter().zip(&scalar[0]) {
+                assert!(
+                    (actual - expected).abs() <= 1e-4,
+                    "batch item {index} changed from {expected} to {actual}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3238,6 +3706,92 @@ mod tests {
         buf.extend_from_slice(&0u64.to_le_bytes());
 
         buf
+    }
+
+    fn create_mock_qwen2_tokenizer_gguf_bytes() -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3_u32.to_le_bytes());
+        buf.extend_from_slice(&0_u64.to_le_bytes());
+        buf.extend_from_slice(&7_u64.to_le_bytes());
+
+        fn write_string(buf: &mut Vec<u8>, value: &str) {
+            buf.extend_from_slice(&(value.len() as u64).to_le_bytes());
+            buf.extend_from_slice(value.as_bytes());
+        }
+        fn write_string_value(buf: &mut Vec<u8>, key: &str, value: &str) {
+            write_string(buf, key);
+            buf.extend_from_slice(&8_u32.to_le_bytes());
+            write_string(buf, value);
+        }
+        fn write_u32_value(buf: &mut Vec<u8>, key: &str, value: u32) {
+            write_string(buf, key);
+            buf.extend_from_slice(&4_u32.to_le_bytes());
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
+        fn write_string_array(buf: &mut Vec<u8>, key: &str, values: &[&str]) {
+            write_string(buf, key);
+            buf.extend_from_slice(&9_u32.to_le_bytes());
+            buf.extend_from_slice(&8_u32.to_le_bytes());
+            buf.extend_from_slice(&(values.len() as u64).to_le_bytes());
+            for value in values {
+                write_string(buf, value);
+            }
+        }
+        fn write_i32_array(buf: &mut Vec<u8>, key: &str, values: &[i32]) {
+            write_string(buf, key);
+            buf.extend_from_slice(&9_u32.to_le_bytes());
+            buf.extend_from_slice(&5_u32.to_le_bytes());
+            buf.extend_from_slice(&(values.len() as u64).to_le_bytes());
+            for value in values {
+                buf.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+
+        write_string_value(&mut buf, "tokenizer.ggml.model", "gpt2");
+        write_string_value(&mut buf, "tokenizer.ggml.pre", "qwen2");
+        write_string_array(
+            &mut buf,
+            "tokenizer.ggml.tokens",
+            &[
+                "a",
+                "b",
+                "ab",
+                "<|endoftext|>",
+                "<|im_start|>",
+                "<|im_end|>",
+                "<custom>",
+            ],
+        );
+        write_i32_array(
+            &mut buf,
+            "tokenizer.ggml.token_type",
+            &[1, 1, 1, 3, 3, 3, 4],
+        );
+        write_string_array(&mut buf, "tokenizer.ggml.merges", &["a b"]);
+        write_u32_value(&mut buf, "tokenizer.ggml.bos_token_id", 3);
+        write_u32_value(&mut buf, "tokenizer.ggml.eos_token_id", 5);
+        buf
+    }
+
+    #[test]
+    fn synthesized_qwen2_tokenizer_preserves_control_and_user_defined_tokens() {
+        let dir = create_temp_dir();
+        let path = dir.join("tokenizer.gguf");
+        fs::write(&path, create_mock_qwen2_tokenizer_gguf_bytes()).unwrap();
+
+        let tokenizer = synthesize_tokenizer_from_gguf(&path).unwrap();
+        assert_eq!(tokenizer.token_to_id("<|endoftext|>"), Some(3));
+        assert_eq!(tokenizer.token_to_id("<|im_start|>"), Some(4));
+        assert_eq!(tokenizer.token_to_id("<|im_end|>"), Some(5));
+        assert_eq!(tokenizer.token_to_id("<custom>"), Some(6));
+        assert_eq!(
+            tokenizer.encode("<|im_start|>", false).unwrap().get_ids(),
+            &[4]
+        );
+        assert_eq!(tokenizer.encode("<custom>", false).unwrap().get_ids(), &[6]);
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -3424,6 +3978,24 @@ mod tests {
         assert!(filtered_vec[2] > -f32::INFINITY); // '}' closing object is valid
         assert!(filtered_vec[4] > -f32::INFINITY); // '"hello":' string key is valid
         assert_eq!(filtered_vec[3], -f32::INFINITY); // 'abc' is invalid outside string
+    }
+
+    #[test]
+    fn text_response_format_does_not_modify_logits() {
+        let device = Device::Cpu;
+        let logits = Tensor::new(&[f32::NAN, -2.0, 7.5, f32::INFINITY], &device).unwrap();
+        let filtered = filter_logits_by_grammar(
+            &logits,
+            "ignored",
+            &bloomai_core::ResponseFormat::Text,
+            &[],
+            &[],
+            &device,
+        )
+        .unwrap();
+        let values = filtered.to_vec1::<f32>().unwrap();
+        assert!(values[0].is_nan());
+        assert_eq!(values[1..], [-2.0, 7.5, f32::INFINITY]);
     }
 
     #[test]

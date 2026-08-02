@@ -3,9 +3,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
+use crate::constants::GIB;
 #[allow(unused_imports)]
 use crate::error::ResourceError;
-use crate::constants::GIB;
 use crate::resource::{
     BackendLease, CacheHandle, ModelResidencyRecord, ModelResourceSnapshot, OffloadCallback,
     ResourceSnapshot, ResourceTicket,
@@ -115,7 +115,7 @@ impl ResourceCoordinator {
         ticket: ResourceTicket,
         offload_cb: OffloadCallback,
     ) -> Result<BackendLease, ResourceError> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
         // Check if already loaded
         if let Some(existing) = inner.residencies.get(&ticket.model_id) {
@@ -240,7 +240,7 @@ impl ResourceCoordinator {
 
     /// Release a lease by lease_id.
     pub fn release(&self, lease_id: u64) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(lease) = inner.leases.remove(&lease_id) {
             inner.ram_allocated = inner.ram_allocated.saturating_sub(lease.granted_ram);
             inner.vram_allocated = inner.vram_allocated.saturating_sub(lease.granted_vram);
@@ -257,7 +257,7 @@ impl ResourceCoordinator {
 
     /// Release a lease by model_id (backward compatible with record_unload).
     pub fn release_by_model(&self, model_id: &str) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(record) = inner.residencies.remove(model_id) {
             inner.ram_allocated = inner.ram_allocated.saturating_sub(record.ram_bytes);
             inner.vram_allocated = inner.vram_allocated.saturating_sub(record.vram_bytes);
@@ -273,7 +273,7 @@ impl ResourceCoordinator {
 
     /// Register a cache handle in the coordinator.
     pub fn register_cache(&self, handle: CacheHandle) -> Result<(), ResourceError> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let (ram_budget, _) = self.effective_budget();
         let total_used = inner.ram_allocated + inner.vram_allocated;
 
@@ -303,7 +303,7 @@ impl ResourceCoordinator {
 
     /// Release a cache handle.
     pub fn release_cache(&self, handle_id: u64) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(cache) = inner.caches.remove(&handle_id) {
             inner.ram_allocated = inner.ram_allocated.saturating_sub(cache.bytes);
         }
@@ -311,7 +311,7 @@ impl ResourceCoordinator {
 
     /// Get a snapshot of current resource state.
     pub fn snapshot(&self) -> ResourceSnapshot {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         ResourceSnapshot {
             ram_budget: self.ram_budget,
             vram_budget: self.vram_budget,
@@ -326,7 +326,7 @@ impl ResourceCoordinator {
 
     /// Get per-model residency snapshots sorted by model id.
     pub fn model_snapshots(&self) -> Vec<ModelResourceSnapshot> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut models = inner
             .residencies
             .values()
@@ -347,19 +347,19 @@ impl ResourceCoordinator {
 
     /// Look up lease_id for a given model_id.
     pub fn lease_id_for_model(&self, model_id: &str) -> Option<u64> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.residencies.get(model_id).map(|r| r.lease_id)
     }
 
     /// Look up residency strategy for a given model_id.
     pub fn residency_strategy_for_model(&self, model_id: &str) -> Option<ResidencyStrategy> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.residencies.get(model_id).map(|r| r.strategy)
     }
 
     /// Touch a model's last_accessed timestamp (for LRU eviction).
     pub fn touch(&self, model_id: &str) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(record) = inner.residencies.get_mut(model_id) {
             record.last_accessed = Instant::now();
         }
@@ -499,7 +499,7 @@ impl ResourceCoordinator {
     ) -> Result<(), String> {
         // UMA backward-compat: skip budget, just track residency
         if is_uma {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             if inner.residencies.contains_key(id) {
                 return Ok(());
             }

@@ -205,15 +205,13 @@ fn get_rope_index(
     image_grid_thw: Option<(usize, usize, usize)>,
 ) -> (Vec<Vec<usize>>, usize) {
     let seq_len = token_ids.len();
-    if image_grid_thw.is_none() {
+    let Some((t, h, w)) = image_grid_thw else {
         let coords: Vec<usize> = (0..seq_len).collect();
         return (
             vec![coords.clone(), coords.clone(), coords.clone()],
             seq_len,
         );
-    }
-
-    let (t, h, w) = image_grid_thw.unwrap();
+    };
     let llm_grid_t = t;
     let llm_grid_h = h / 2;
     let llm_grid_w = w / 2;
@@ -816,12 +814,11 @@ impl Qwen3VLVisionModel {
         let mut deepstack_features = Vec::new();
         for (idx, block) in self.blocks.iter().enumerate() {
             hidden_states = block.forward(&hidden_states, &cos, &sin)?;
-            if self.deepstack_visual_indexes.contains(&idx) {
-                let list_idx = self
-                    .deepstack_visual_indexes
-                    .iter()
-                    .position(|&x| x == idx)
-                    .unwrap();
+            if let Some(list_idx) = self
+                .deepstack_visual_indexes
+                .iter()
+                .position(|&candidate| candidate == idx)
+            {
                 let feat = self.deepstack_merger_list[list_idx].forward(&hidden_states)?;
                 deepstack_features.push(feat);
             }

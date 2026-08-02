@@ -1,5 +1,7 @@
 //! Device backend abstraction.
 
+#![cfg_attr(not(test), warn(clippy::unwrap_used))]
+
 pub mod backend;
 pub mod intel_npu;
 pub mod registry;

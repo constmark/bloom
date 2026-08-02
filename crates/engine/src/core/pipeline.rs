@@ -2,13 +2,32 @@ use std::path::Path;
 
 use anyhow::Result;
 use bloomai_backend::Backend;
-use bloomai_core::{BackendLease, BloomError, DeviceKind, GenerationParams, ResourceError, ResourceTicket};
+use bloomai_core::{
+    BackendLease, BloomError, DeviceKind, GenerationParams, ResourceError, ResourceTicket,
+};
 
-use crate::core::memory::available_system_memory;
+use crate::core::memory::{available_system_memory, error_text_indicates_oom};
 use crate::{model::OutputSink, Engine, InferenceRequest, LoadedModel, ModelInput, ModelOutput};
 
 /// Default context size used for memory pre-checks when none is specified.
 const DEFAULT_CONTEXT_SIZE: usize = 2048;
+
+fn model_context_limit(manifest: &bloomai_core::ModelManifest) -> Option<usize> {
+    [
+        "max_seq_length",
+        "max_position_embeddings",
+        "context_length",
+    ]
+    .into_iter()
+    .find_map(|name| {
+        manifest
+            .parameters
+            .get(name)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| *value > 0)
+    })
+}
 
 pub struct InferencePipeline {
     model: Box<dyn LoadedModel>,
@@ -71,7 +90,17 @@ impl InferencePipeline {
             }
         }
         let mut current_device = device;
-        let mut current_context_size = context_size;
+        let mut current_context_size = pre_manifest
+            .as_ref()
+            .and_then(model_context_limit)
+            .map_or(context_size, |limit| context_size.min(limit));
+        if current_context_size < context_size {
+            tracing::warn!(
+                requested_context_size = context_size,
+                model_context_size = current_context_size,
+                "Clamped the runtime context to the model's advertised limit"
+            );
+        }
         let mut attempts = 0;
         let mut last_err = None;
 
@@ -79,13 +108,20 @@ impl InferencePipeline {
             attempts += 1;
             if attempts > 5 {
                 return Err(last_err
-                    .unwrap_or_else(|| BloomError::Runtime("OOM recovery failed: too many attempts".into())).into());
+                    .unwrap_or_else(|| {
+                        BloomError::Runtime("OOM recovery failed: too many attempts".into())
+                    })
+                    .into());
             }
 
             // 1. Pre-load memory check
-            let temp_estimate = pre_manifest
-                .as_ref()
-                .map(|m| crate::manifest_adapter::estimate_memory(m, current_context_size));
+            let temp_estimate = pre_manifest.as_ref().map(|m| {
+                crate::manifest_adapter::estimate_memory_for_device(
+                    m,
+                    current_context_size,
+                    current_device,
+                )
+            });
 
             if let Some(ref est) = temp_estimate {
                 if let Some(avail) = available_system_memory() {
@@ -95,7 +131,8 @@ impl InferencePipeline {
                             return Err(BloomError::Resource(ResourceError::InsufficientRam {
                                 requested: est.total_bytes,
                                 available: avail,
-                            }).into());
+                            })
+                            .into());
                         }
                         tracing::warn!("{}. Attempting OOM degradation step...", message);
 
@@ -122,9 +159,12 @@ impl InferencePipeline {
                 } else if strict_memory_budget() {
                     return Err(BloomError::Resource(ResourceError::BackendUnavailable {
                         backend: "system".into(),
-                        reason: "Strict memory budget requested with BLOOM_STRICT_MEMORY_BUDGET=1, \
-                                 but available system memory could not be detected on this platform".into(),
-                    }).into());
+                        reason:
+                            "Strict memory budget requested with BLOOM_STRICT_MEMORY_BUDGET=1, \
+                                 but available system memory could not be detected on this platform"
+                                .into(),
+                    })
+                    .into());
                 }
                 if attempts == 1 {
                     tracing::info!("Memory estimate: {}", est.display_summary());
@@ -151,12 +191,13 @@ impl InferencePipeline {
                         e.downcast_ref::<BloomError>(),
                         Some(BloomError::Resource(ResourceError::InsufficientRam { .. }))
                             | Some(BloomError::Resource(ResourceError::InsufficientVram { .. }))
-                            | Some(BloomError::Resource(ResourceError::InsufficientUnifiedMemory { .. }))
+                            | Some(BloomError::Resource(
+                                ResourceError::InsufficientUnifiedMemory { .. }
+                            ))
                             | Some(BloomError::Resource(ResourceError::BudgetExceeded { .. }))
                     );
                     let is_oom = is_typed_oom
-                        || err_str.contains("oom")
-                        || err_str.contains("out of memory")
+                        || error_text_indicates_oom(&err_str)
                         || err_str.contains("metal")
                         || err_str.contains("cuda");
 
@@ -194,13 +235,21 @@ impl InferencePipeline {
         // Post-load estimate (manifest is now populated from actual model).
         let post_estimate = {
             let m = &model.metadata().manifest;
-            let est = crate::manifest_adapter::estimate_memory(m, current_context_size);
+            let est = crate::manifest_adapter::estimate_memory_for_device(
+                m,
+                current_context_size,
+                current_device,
+            );
             Some(est)
         };
 
-        let final_pre_estimate = pre_manifest
-            .as_ref()
-            .map(|m| crate::manifest_adapter::estimate_memory(m, current_context_size));
+        let final_pre_estimate = pre_manifest.as_ref().map(|m| {
+            crate::manifest_adapter::estimate_memory_for_device(
+                m,
+                current_context_size,
+                current_device,
+            )
+        });
 
         Ok(Self {
             model,
@@ -223,13 +272,17 @@ impl InferencePipeline {
         tracing::info!("loading model");
         let device = backend.info().device;
         let model = engine.load(model_path, device)?;
+        let context_size = model_context_limit(&model.metadata().manifest)
+            .map_or(DEFAULT_CONTEXT_SIZE, |limit| {
+                DEFAULT_CONTEXT_SIZE.min(limit)
+            });
         backend.warmup()?;
         tracing::info!("model loaded successfully");
         Ok(Self {
             model,
             lease: None,
             memory_estimate: None,
-            context_size: DEFAULT_CONTEXT_SIZE,
+            context_size,
             device,
         })
     }
@@ -250,22 +303,26 @@ impl InferencePipeline {
         )
         .entered();
         tracing::info!("reserving resources");
-        let lease = backend
-            .reserve(&ticket)
-            .map_err(|e| BloomError::Resource(ResourceError::BackendUnavailable {
+        let lease = backend.reserve(&ticket).map_err(|e| {
+            BloomError::Resource(ResourceError::BackendUnavailable {
                 backend: backend.info().name.to_string(),
                 reason: format!("{}", e),
-            }))?;
+            })
+        })?;
         backend.warmup()?;
         tracing::info!("loading model weights");
         let device = backend.info().device;
         let model = engine.load(model_path, device)?;
+        let context_size = model_context_limit(&model.metadata().manifest)
+            .map_or(DEFAULT_CONTEXT_SIZE, |limit| {
+                DEFAULT_CONTEXT_SIZE.min(limit)
+            });
         tracing::info!("model loaded with ticket");
         Ok(Self {
             model,
             lease: Some(lease),
             memory_estimate: None,
-            context_size: DEFAULT_CONTEXT_SIZE,
+            context_size,
             device,
         })
     }
@@ -283,6 +340,18 @@ impl InferencePipeline {
     ) -> Result<()> {
         let _span = tracing::info_span!("pipeline.run_stream").entered();
         self.model.infer_stream(input, params, sink)
+    }
+
+    /// Whether the loaded model has a native embedding-batch execution path.
+    pub fn supports_native_embedding_batch(&self) -> bool {
+        self.model.supports_native_embedding_batch()
+    }
+
+    /// Produce one embedding per input while retaining input order.
+    pub fn run_embedding_batch(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+        let _span = tracing::info_span!("pipeline.run_embedding_batch", batch_size = inputs.len())
+            .entered();
+        self.model.embed_batch(inputs)
     }
 
     pub fn run_request(&self, request: InferenceRequest, sink: &mut dyn OutputSink) -> Result<()> {
@@ -317,9 +386,13 @@ impl InferencePipeline {
     pub fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
         #[cfg(feature = "candle-engine")]
         if let Some(tokenizer) = self.model.tokenizer() {
+            let add_special_tokens =
+                self.model.metadata().manifest.family == bloomai_core::ModelFamily::Bert;
             let encoding = tokenizer
-                .encode(text, false)
-                .map_err(|error| BloomError::Engine(format!("failed to tokenize benchmark input: {error}")))?;
+                .encode(text, add_special_tokens)
+                .map_err(|error| {
+                    BloomError::Engine(format!("failed to tokenize benchmark input: {error}"))
+                })?;
             return Ok(encoding.get_ids().to_vec());
         }
 
@@ -394,6 +467,23 @@ mod tests {
         atomic::{AtomicBool, Ordering},
         Arc,
     };
+
+    #[test]
+    fn sentence_encoder_context_prefers_task_limit_over_architecture_capacity() {
+        let mut manifest = ModelManifest {
+            family: ModelFamily::Bert,
+            ..ModelManifest::default()
+        };
+        manifest.parameters.insert(
+            "max_position_embeddings".to_string(),
+            serde_json::json!(512),
+        );
+        manifest
+            .parameters
+            .insert("max_seq_length".to_string(), serde_json::json!(256));
+
+        assert_eq!(model_context_limit(&manifest), Some(256));
+    }
 
     struct DummyEngine {
         loaded: Arc<AtomicBool>,
@@ -535,7 +625,8 @@ mod tests {
                 return Err(BloomError::Resource(ResourceError::InsufficientVram {
                     requested: 0,
                     available: 0,
-                }).into());
+                })
+                .into());
             }
             let manifest = ModelManifest {
                 id: "dummy".to_string(),

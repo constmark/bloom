@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{self as nn, Module};
 
@@ -217,7 +217,10 @@ impl WanVAE {
         vb: nn::VarBuilder,
         device: &Device,
     ) -> Result<VaeDecoder> {
-        let max_mult = *config.channel_mult.last().unwrap();
+        let max_mult = *config
+            .channel_mult
+            .last()
+            .ok_or_else(|| anyhow!("VAE channel multiplier list must not be empty"))?;
         let in_ch = config.base_channels * max_mult;
 
         // Input convolution (spatial Conv2d, applied per temporal frame)

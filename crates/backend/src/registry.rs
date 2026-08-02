@@ -97,20 +97,19 @@ impl BackendRegistry {
         backend_name: &str,
         ticket: &ResourceTicket,
     ) -> std::result::Result<BackendLease, ResourceError> {
-        let avail = self
+        let backend = self
             .get(backend_name)
             .map_err(|_| ResourceError::BackendUnavailable {
                 backend: backend_name.to_string(),
                 reason: format!("backend '{}' not found", backend_name),
-            })?
-            .availability();
+            })?;
+        let avail = backend.availability();
         if !avail.available {
             return Err(ResourceError::BackendUnavailable {
                 backend: backend_name.to_string(),
                 reason: avail.reason.unwrap_or_else(|| "unavailable".to_string()),
             });
         }
-        let backend = self.get(backend_name).unwrap();
         backend.reserve(ticket)
     }
 

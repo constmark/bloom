@@ -1,5 +1,7 @@
 //! TileLang integration for high-performance cross-platform kernels.
 
+#![cfg_attr(not(test), warn(clippy::unwrap_used))]
+
 pub mod compiler;
 pub mod kernel;
 

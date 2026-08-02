@@ -166,7 +166,10 @@ impl ChunkedPrefillQueue {
                 continue;
             }
 
-            let (start, tokens) = state.next_chunk().unwrap();
+            let Some((start, tokens)) = state.next_chunk() else {
+                i += 1;
+                continue;
+            };
             let chunk = PrefillChunk {
                 request_id: state.request_id.clone(),
                 chunk_start: start,

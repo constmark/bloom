@@ -94,7 +94,7 @@ impl KvOverlayManager {
         }
 
         let block_size = self.config.block_size_tokens.max(1);
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.entries.len() >= self.config.max_overlay_entries.max(1) {
             if let Some(oldest_key) = state
                 .entries
@@ -126,7 +126,7 @@ impl KvOverlayManager {
             return false;
         }
 
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let granularity = self.config.sync_granularity_tokens.max(1);
         let should_sync = if let Some(entry) = state.entries.get_mut(request_id) {
             entry.token_count = entry.token_count.saturating_add(new_tokens);
@@ -150,13 +150,13 @@ impl KvOverlayManager {
             return;
         }
 
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.entries.remove(request_id);
         state.metrics.entries = state.entries.len();
     }
 
     pub fn metrics(&self) -> KvOverlayMetrics {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         KvOverlayMetrics {
             entries: state.entries.len(),
             retained_entries: state.entries.len(),
@@ -165,7 +165,12 @@ impl KvOverlayManager {
     }
 
     pub fn entry(&self, request_id: &str) -> Option<KvOverlayEntry> {
-        self.state.lock().unwrap().entries.get(request_id).cloned()
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .get(request_id)
+            .cloned()
     }
 }
 

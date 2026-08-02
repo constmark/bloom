@@ -408,9 +408,9 @@ mod tests {
     use crate::pipeline::InferencePipeline;
     use bloomai_backend::CpuBackend;
     use bloomai_core::{
-        DType, DeviceCapability, DeviceClass, DeviceKind, GenerationParams, MemoryTopology,
-        Modality, ModelFamily, ModelFormat, ModelIoSchema, ModelManifest, ModelMemoryProfile,
-        PowerState, RuntimeHints, ThermalState, constants::GIB,
+        constants::GIB, DType, DeviceCapability, DeviceClass, DeviceKind, GenerationParams,
+        MemoryTopology, Modality, ModelFamily, ModelFormat, ModelIoSchema, ModelManifest,
+        ModelMemoryProfile, PowerState, RuntimeHints, ThermalState,
     };
 
     struct MockEngine;

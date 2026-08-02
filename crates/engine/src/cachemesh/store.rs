@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -194,7 +194,7 @@ impl InMemoryRemoteCache {
 
 impl RemoteCacheBackend for InMemoryRemoteCache {
     fn get(&self, key: &CacheMeshKey) -> Result<Option<CacheMeshBlock>> {
-        let block = self.blocks.lock().unwrap().get(key).cloned();
+        let block = lock_recover(&self.blocks).get(key).cloned();
         if let Some(block) = &block {
             block.validate()?;
         }
@@ -203,26 +203,24 @@ impl RemoteCacheBackend for InMemoryRemoteCache {
 
     fn put(&self, block: CacheMeshBlock) -> Result<()> {
         block.validate()?;
-        self.blocks.lock().unwrap().insert(block.key.clone(), block);
+        lock_recover(&self.blocks).insert(block.key.clone(), block);
         Ok(())
     }
 
     fn remove(&self, key: &CacheMeshKey) -> Result<()> {
-        self.blocks.lock().unwrap().remove(key);
+        lock_recover(&self.blocks).remove(key);
         Ok(())
     }
 
     fn len(&self) -> usize {
-        self.blocks.lock().unwrap().len()
+        lock_recover(&self.blocks).len()
     }
 
     fn bytes(&self) -> Option<usize> {
         Some(
-            self.blocks
-                .lock()
-                .unwrap()
+            lock_recover(&self.blocks)
                 .values()
-                .map(|b| b.bytes())
+                .map(CacheMeshBlock::bytes)
                 .sum(),
         )
     }
@@ -426,7 +424,7 @@ impl CacheMesh {
         }
         block.validate()?;
 
-        let mut state = self.l2.lock().unwrap();
+        let mut state = lock_recover(&self.l2);
         let block_bytes = block.bytes();
         if block_bytes > self.config.l2_capacity_bytes {
             drop(state);
@@ -480,7 +478,7 @@ impl CacheMesh {
             } else {
                 self.l2_metrics.dropped.fetch_add(1, Ordering::Relaxed);
             }
-            state = self.l2.lock().unwrap();
+            state = lock_recover(&self.l2);
         }
 
         Ok(())
@@ -492,7 +490,7 @@ impl CacheMesh {
         }
 
         {
-            let mut state = self.l2.lock().unwrap();
+            let mut state = lock_recover(&self.l2);
             if let Some(block) = state.blocks.get(key).cloned() {
                 state.touch(key);
                 self.l2_metrics.hits.fetch_add(1, Ordering::Relaxed);
@@ -519,7 +517,7 @@ impl CacheMesh {
     }
 
     pub fn metrics(&self) -> CacheMeshMetrics {
-        let state = self.l2.lock().unwrap();
+        let state = lock_recover(&self.l2);
         let l3_items = self.remote.as_ref().map(|remote| remote.len()).unwrap_or(0);
         let l3_bytes = self
             .remote
@@ -535,7 +533,7 @@ impl CacheMesh {
     }
 
     pub fn snapshot(&self) -> CacheMeshSnapshot {
-        let l2_keys = self.l2.lock().unwrap().blocks.len();
+        let l2_keys = lock_recover(&self.l2).blocks.len();
         CacheMeshSnapshot {
             metrics: self.metrics(),
             l2_keys,
@@ -561,6 +559,12 @@ fn normalize_config(mut config: CacheMeshConfig) -> CacheMeshConfig {
         config.namespace = "default".to_string();
     }
     config
+}
+
+fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn hex_digest(bytes: &[u8]) -> String {

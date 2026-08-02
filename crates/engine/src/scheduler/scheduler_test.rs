@@ -47,7 +47,10 @@ mod tests {
                 .ok_or_else(|| BloomError::SchedulingFailed("KV cache pool full".into()).into())
         }
         fn free(&self, handle: usize) {
-            self.free_slots.lock().unwrap_or_else(|e| e.into_inner()).push_back(handle);
+            self.free_slots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_back(handle);
         }
         fn allocate_paged(
             &self,
@@ -67,7 +70,11 @@ mod tests {
             // no-op for mock
         }
         fn get_metrics(&self) -> KvCacheMetrics {
-            let free = self.free_slots.lock().unwrap_or_else(|e| e.into_inner()).len();
+            let free = self
+                .free_slots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len();
             KvCacheMetrics {
                 total_blocks: self.capacity,
                 free_blocks: free,
@@ -75,6 +82,29 @@ mod tests {
                 ..Default::default()
             }
         }
+    }
+
+    #[test]
+    fn token_budget_capacity_check_is_overflow_safe() {
+        assert!(token_budget_allows(usize::MAX, 0, usize::MAX));
+        assert!(!token_budget_allows(usize::MAX, 1, usize::MAX));
+        assert!(!token_budget_allows(usize::MAX, 0, usize::MAX - 1));
+    }
+
+    #[test]
+    fn token_admission_fails_closed_on_counter_overflow() {
+        let config = TokenSchedulingConfig {
+            max_prefill_tokens_per_step: usize::MAX,
+            max_decode_tokens_per_step: usize::MAX,
+            max_total_tokens_per_step: usize::MAX,
+        };
+        let mut admission = TokenAdmission::default();
+
+        assert!(admission.try_reserve(&config, TokenPhase::Prefill, usize::MAX));
+        assert!(!admission.try_reserve(&config, TokenPhase::Decode, 1));
+
+        admission.decode_tokens = 1;
+        assert!(!admission.try_reserve(&config, TokenPhase::Decode, 0));
     }
 
     #[test]
@@ -109,7 +139,10 @@ mod tests {
         scheduler.step().unwrap();
 
         {
-            let decoding = scheduler.decoding_queue.lock().unwrap_or_else(|e| e.into_inner());
+            let decoding = scheduler
+                .decoding_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             assert_eq!(decoding.len(), 1);
             assert_eq!(decoding[0].id, "req1");
             assert_eq!(decoding[0].generated_tokens, vec![42]);
@@ -118,9 +151,37 @@ mod tests {
         // Second step should do next decoding for req1
         scheduler.step().unwrap();
         {
-            let decoding = scheduler.decoding_queue.lock().unwrap_or_else(|e| e.into_inner());
+            let decoding = scheduler
+                .decoding_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             assert_eq!(decoding[0].generated_tokens, vec![42, 42]);
         }
+    }
+
+    #[test]
+    fn test_scheduler_cancellation_removes_orphaned_token_sender() {
+        let executor = Arc::new(MockExecutor);
+        let kv_pool = Arc::new(MockKvPool::new(10));
+        let scheduler = InferenceScheduler::new(executor, kv_pool);
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        scheduler
+            .token_senders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("detached".to_string(), sender);
+
+        assert!(scheduler.cancel_request("detached"));
+        assert!(!scheduler
+            .token_senders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key("detached"));
+        assert_eq!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        );
+        assert!(!scheduler.cancel_request("missing"));
     }
 
     #[test]
@@ -175,7 +236,10 @@ mod tests {
         scheduler.submit(req2).unwrap();
         scheduler.step().unwrap();
 
-        let decoding = scheduler.decoding_queue.lock().unwrap_or_else(|e| e.into_inner());
+        let decoding = scheduler
+            .decoding_queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         assert_eq!(decoding.len(), 2);
         let req1 = decoding.iter().find(|r| r.id == "req1").unwrap();
         let req2 = decoding.iter().find(|r| r.id == "req2").unwrap();
@@ -240,13 +304,19 @@ mod tests {
         scheduler.step().unwrap();
 
         {
-            let decoding = scheduler.decoding_queue.lock().unwrap_or_else(|e| e.into_inner());
+            let decoding = scheduler
+                .decoding_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             assert_eq!(decoding.len(), 1);
             assert_eq!(decoding[0].id, "req1");
             assert_eq!(decoding[0].generated_tokens.len(), 2);
         }
         {
-            let prefill = scheduler.prefill_queue.lock().unwrap_or_else(|e| e.into_inner());
+            let prefill = scheduler
+                .prefill_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             assert_eq!(prefill.len(), 1);
             assert_eq!(prefill[0].id, "req2");
         }
@@ -287,7 +357,10 @@ mod tests {
         scheduler.step().unwrap();
         scheduler.step().unwrap();
 
-        let decoding = scheduler.decoding_queue.lock().unwrap_or_else(|e| e.into_inner());
+        let decoding = scheduler
+            .decoding_queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         assert_eq!(decoding.len(), 1);
         assert_eq!(decoding[0].generated_tokens.len(), 3);
     }
@@ -353,12 +426,18 @@ mod tests {
         scheduler.step().unwrap();
 
         {
-            let decoding = scheduler.decoding_queue.lock().unwrap_or_else(|e| e.into_inner());
+            let decoding = scheduler
+                .decoding_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             assert_eq!(decoding.len(), 1);
             assert_eq!(decoding[0].id, "req2"); // req2 was scheduled successfully!
         }
         {
-            let prefill = scheduler.prefill_queue.lock().unwrap_or_else(|e| e.into_inner());
+            let prefill = scheduler
+                .prefill_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             assert_eq!(prefill.len(), 1);
             assert_eq!(prefill[0].id, "req1"); // req1 is still pending in prefill queue
         }
@@ -400,23 +479,35 @@ mod tests {
         // Step 1: schedules first chunk of 4 tokens.
         scheduler.step().unwrap();
         {
-            let cp_queue = scheduler.chunked_prefill_queue.lock().unwrap_or_else(|e| e.into_inner());
+            let cp_queue = scheduler
+                .chunked_prefill_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             assert_eq!(cp_queue.queue[0].filled_tokens, 4);
-            let active = scheduler.active_requests.lock().unwrap_or_else(|e| e.into_inner());
+            let active = scheduler
+                .active_requests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             assert_eq!(active["req1"].state, RequestState::Prefill);
         }
 
         // Step 2: schedules second chunk of 4 tokens.
         scheduler.step().unwrap();
         {
-            let cp_queue = scheduler.chunked_prefill_queue.lock().unwrap_or_else(|e| e.into_inner());
+            let cp_queue = scheduler
+                .chunked_prefill_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             assert_eq!(cp_queue.queue[0].filled_tokens, 8);
         }
 
         // Step 3: schedules final chunk of 2 tokens -> transitions to decoding.
         scheduler.step().unwrap();
         {
-            let decoding = scheduler.decoding_queue.lock().unwrap_or_else(|e| e.into_inner());
+            let decoding = scheduler
+                .decoding_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             assert_eq!(decoding.len(), 1);
             assert_eq!(decoding[0].id, "req1");
             assert_eq!(decoding[0].generated_tokens.len(), 1);
@@ -458,19 +549,28 @@ mod tests {
 
         scheduler.step().unwrap();
         {
-            let cp_queue = scheduler.chunked_prefill_queue.lock().unwrap_or_else(|e| e.into_inner());
+            let cp_queue = scheduler
+                .chunked_prefill_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             assert_eq!(cp_queue.queue[0].filled_tokens, 4);
         }
 
         scheduler.step().unwrap();
         {
-            let cp_queue = scheduler.chunked_prefill_queue.lock().unwrap_or_else(|e| e.into_inner());
+            let cp_queue = scheduler
+                .chunked_prefill_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             assert_eq!(cp_queue.queue[0].filled_tokens, 8);
         }
 
         scheduler.step().unwrap();
         {
-            let decoding = scheduler.decoding_queue.lock().unwrap_or_else(|e| e.into_inner());
+            let decoding = scheduler
+                .decoding_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             assert_eq!(decoding.len(), 1);
             assert_eq!(decoding[0].id, "req1");
             assert_eq!(decoding[0].generated_tokens.len(), 1);
@@ -513,13 +613,19 @@ mod tests {
 
         scheduler.step().unwrap();
         {
-            let active = scheduler.active_requests.lock().unwrap_or_else(|e| e.into_inner());
+            let active = scheduler
+                .active_requests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             assert_eq!(active["req1"].generated_tokens.len(), 0);
         }
 
         scheduler.step().unwrap();
         {
-            let decoding = scheduler.decoding_queue.lock().unwrap_or_else(|e| e.into_inner());
+            let decoding = scheduler
+                .decoding_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             assert_eq!(decoding.len(), 1);
             assert_eq!(decoding[0].generated_tokens.len(), 1);
         }
@@ -561,7 +667,10 @@ mod tests {
 
         // Ensure req-low is in decoding
         {
-            let decoding = scheduler.decoding_queue.lock().unwrap_or_else(|e| e.into_inner());
+            let decoding = scheduler
+                .decoding_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             assert_eq!(decoding[0].id, "req-low");
         }
 
@@ -595,12 +704,18 @@ mod tests {
         scheduler.step().unwrap();
 
         {
-            let decoding = scheduler.decoding_queue.lock().unwrap_or_else(|e| e.into_inner());
+            let decoding = scheduler
+                .decoding_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             assert_eq!(decoding.len(), 1);
             assert_eq!(decoding[0].id, "req-high"); // req-high scheduled!
         }
         {
-            let prefill = scheduler.prefill_queue.lock().unwrap_or_else(|e| e.into_inner());
+            let prefill = scheduler
+                .prefill_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             assert_eq!(prefill.len(), 1);
             assert_eq!(prefill[0].id, "req-low"); // req-low preempted and sent back to prefill
             assert_eq!(prefill[0].preemption_count, 1);
@@ -1216,7 +1331,10 @@ mod tests {
         // `active_requests` map. `block_for_handle` is the executor's
         // lookup path — it must resolve to a real block id.
         let handle = {
-            let prefill = scheduler.prefill_queue.lock().unwrap_or_else(|e| e.into_inner());
+            let prefill = scheduler
+                .prefill_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             prefill[0]
                 .kv_handle
                 .expect("submit must allocate a kv_handle")
@@ -1277,7 +1395,10 @@ mod tests {
 
         // Mark req1 inactive so its blocks become cached prefix entries.
         {
-            let prefill = scheduler.prefill_queue.lock().unwrap_or_else(|e| e.into_inner());
+            let prefill = scheduler
+                .prefill_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let handle = prefill[0].kv_handle.unwrap();
             pool.free_paged("req-prefix-1");
             // free_paged marks the request inactive but keeps blocks cached.

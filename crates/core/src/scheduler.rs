@@ -231,7 +231,7 @@ impl CoreScheduler {
             None
         };
 
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.active.contains_key(&request.request_id)
             || state
                 .pending
@@ -260,7 +260,7 @@ impl CoreScheduler {
         &self,
         capabilities: &[DeviceCapability],
     ) -> Result<Vec<ScheduledInvocation>, BloomError> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let capacity = self
             .config
             .max_concurrent_requests
@@ -278,7 +278,9 @@ impl CoreScheduler {
                 break;
             };
 
-            let queued = state.pending.remove(index).expect("pending index valid");
+            let Some(queued) = state.pending.remove(index) else {
+                break;
+            };
             let scheduled = ScheduledInvocation {
                 request_id: queued.request.request_id.clone(),
                 model_id: queued.request.model_id.clone(),
@@ -305,7 +307,7 @@ impl CoreScheduler {
     }
 
     pub fn complete(&self, request_id: &str, result: InvocationResult) -> Result<(), BloomError> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let active = state.active.remove(request_id).ok_or_else(|| {
             BloomError::SchedulingFailed(format!("request '{request_id}' is not active"))
         })?;
@@ -318,7 +320,7 @@ impl CoreScheduler {
     }
 
     pub fn snapshot(&self) -> SchedulerSnapshot {
-        let state = self.state.lock().unwrap();
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         SchedulerSnapshot {
             pending_count: state.pending.len(),
             active_count: state.active.len(),

@@ -1,5 +1,7 @@
 //! Core abstractions for Bloom runtime.
 
+#![cfg_attr(not(test), warn(clippy::unwrap_used))]
+
 pub mod config;
 pub mod constants;
 pub mod error;

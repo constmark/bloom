@@ -437,7 +437,11 @@ impl StreamingQwenAttention {
             let current_seq_len = k.dim(2)?;
             if len < current_seq_len {
                 let k_new = k.narrow(2, 0, len)?;
-                let v_new = self.kv_cache.v().unwrap().narrow(2, 0, len)?;
+                let v_new = self
+                    .kv_cache
+                    .v()
+                    .ok_or_else(|| candle_core::Error::Msg("KV cache value is missing".into()))?
+                    .narrow(2, 0, len)?;
                 self.kv_cache.reset();
                 self.kv_cache.append(&k_new, &v_new)?;
             }
@@ -446,7 +450,13 @@ impl StreamingQwenAttention {
             let current_seq_len = k_scale.dim(2)?;
             if len < current_seq_len {
                 let k_scale_new = k_scale.narrow(2, 0, len)?;
-                let v_scale_new = self.k_scale_cache.v().unwrap().narrow(2, 0, len)?;
+                let v_scale_new = self
+                    .k_scale_cache
+                    .v()
+                    .ok_or_else(|| {
+                        candle_core::Error::Msg("KV scale cache value is missing".into())
+                    })?
+                    .narrow(2, 0, len)?;
                 self.k_scale_cache.reset();
                 self.k_scale_cache.append(&k_scale_new, &v_scale_new)?;
             }
@@ -837,15 +847,16 @@ impl QwenStreamingModelForCausalLM {
                 "layer_idx {} > model layers {}",
                 layer_idx,
                 self.base.layers.len()
-            )).into());
+            ))
+            .into());
         }
         let kv_cache = &self.base.layers[layer_idx].self_attn.kv_cache;
-        let k = kv_cache
-            .k()
-            .ok_or_else(|| BloomError::Engine(format!("KV k cache empty for layer {}", layer_idx)))?;
-        let v = kv_cache
-            .v()
-            .ok_or_else(|| BloomError::Engine(format!("KV v cache empty for layer {}", layer_idx)))?;
+        let k = kv_cache.k().ok_or_else(|| {
+            BloomError::Engine(format!("KV k cache empty for layer {}", layer_idx))
+        })?;
+        let v = kv_cache.v().ok_or_else(|| {
+            BloomError::Engine(format!("KV v cache empty for layer {}", layer_idx))
+        })?;
 
         if seq_len == 0 {
             return Ok((Vec::new(), Vec::new()));
@@ -854,10 +865,9 @@ impl QwenStreamingModelForCausalLM {
         if start_pos + seq_len > current_seq_len {
             return Err(BloomError::Engine(format!(
                 "extract_kv out of range: start_pos={} seq_len={} but cache holds {} tokens",
-                start_pos,
-                seq_len,
-                current_seq_len
-            )).into());
+                start_pos, seq_len, current_seq_len
+            ))
+            .into());
         }
         let k_slice = k.narrow(2, start_pos, seq_len)?;
         let v_slice = v.narrow(2, start_pos, seq_len)?;
@@ -893,7 +903,8 @@ impl QwenStreamingModelForCausalLM {
                 "layer_idx {} > model layers {}",
                 layer_idx,
                 self.base.layers.len()
-            )).into());
+            ))
+            .into());
         }
         if seq_len == 0 {
             return Ok(());
@@ -908,7 +919,8 @@ impl QwenStreamingModelForCausalLM {
                 expected,
                 seq_len,
                 kv_dim
-            )).into());
+            ))
+            .into());
         }
 
         let device = self.base.device.clone();
@@ -932,8 +944,9 @@ impl QwenStreamingModelForCausalLM {
                     Some(k_buf) => k_buf.slice_set(&k_tensor, 2, start_pos)?,
                     None => {
                         return Err(BloomError::Engine(
-                            "inject_kv case 2 (in-place) but k cache buffer is None".into()
-                        ).into());
+                            "inject_kv case 2 (in-place) but k cache buffer is None".into(),
+                        )
+                        .into());
                     }
                 }
             }
@@ -943,8 +956,9 @@ impl QwenStreamingModelForCausalLM {
                     Some(v_buf) => v_buf.slice_set(&v_tensor, 2, start_pos)?,
                     None => {
                         return Err(BloomError::Engine(
-                            "inject_kv case 2 (in-place) but v cache buffer is None".into()
-                        ).into());
+                            "inject_kv case 2 (in-place) but v cache buffer is None".into(),
+                        )
+                        .into());
                     }
                 }
             }
@@ -1137,7 +1151,8 @@ impl crate::scheduler::kv_hook::KvHook for QwenKvHook {
                 k_vec.len(),
                 seq_len,
                 self.kv_dim
-            )).into());
+            ))
+            .into());
         }
         Ok((k_vec, v_vec))
     }

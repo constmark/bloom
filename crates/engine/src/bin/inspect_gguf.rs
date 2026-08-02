@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), warn(clippy::unwrap_used))]
+
 use std::fs::File;
 use std::path::Path;
 

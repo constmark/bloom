@@ -16,6 +16,7 @@ pub enum ModelFamily {
     Llama,
     Qwen,
     Gemma,
+    Bert,
     Whisper,
     FunAsr,
     Custom(String),

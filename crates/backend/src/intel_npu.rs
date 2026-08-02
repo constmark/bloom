@@ -7,8 +7,8 @@ use std::path::Path;
 
 use anyhow::{anyhow, Result};
 use bloomai_core::{
-    DType, DeviceCapability, DeviceClass, DeviceKind, MemoryTopology, ModelFormat, PowerState,
-    ThermalState, constants::GIB,
+    constants::GIB, DType, DeviceCapability, DeviceClass, DeviceKind, MemoryTopology, ModelFormat,
+    PowerState, ThermalState,
 };
 
 use crate::backend::{Backend, BackendAvailability, BackendInfo};

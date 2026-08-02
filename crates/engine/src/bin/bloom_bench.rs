@@ -1,4 +1,5 @@
 #![allow(clippy::manual_map)]
+#![cfg_attr(not(test), warn(clippy::unwrap_used))]
 //! bloom_bench — Dedicated benchmarking utility for Bloom engine.
 //!
 //! Benchmark local models and report TTFT, TBT, throughput (tokens/s), latency,
@@ -30,7 +31,10 @@ use bloomai_engine::executor::qwen3_vl::Qwen3VLEngine;
 use bloomai_engine::executor::vulkan::VulkanEngine;
 #[cfg(feature = "candle-engine")]
 use bloomai_engine::executor::wan::WanEngine;
-use bloomai_engine::{EngineRegistry, InferencePipeline, MemoryEstimate, ModelInput};
+use bloomai_engine::{
+    model_manifest_supports_embeddings, EngineRegistry, InferencePipeline, MemoryEstimate,
+    ModelInput,
+};
 
 /// Extended benchmark result with additional timing and hardware metrics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -275,6 +279,11 @@ fn main() -> Result<()> {
 
     // --- Load manifest first to assist in engine auto-selection if needed ---
     let manifest = bloomai_engine::load_manifest(model_path)?;
+    if model_manifest_supports_embeddings(&manifest) {
+        return Err(anyhow!(
+            "bloom_bench currently measures token generation and cannot benchmark an embedding encoder; use scripts/test_trained_embedding_runtime.sh for embedding latency and quality evidence"
+        ));
+    }
 
     let mut registry = EngineRegistry::default();
     registry.register("candle", Box::new(CandleEngine));
@@ -466,11 +475,14 @@ fn main() -> Result<()> {
                         if text.is_empty() {
                             return Ok(());
                         }
-                        let mut ftt_guard = ftt.lock().unwrap();
+                        let mut ftt_guard = ftt.lock().unwrap_or_else(|e| e.into_inner());
                         if ftt_guard.is_none() {
                             *ftt_guard = Some(Instant::now());
                         }
-                        output.lock().unwrap().push_str(&text);
+                        output
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push_str(&text);
                     }
                     bloomai_engine::io::OutputChunk::Metrics {
                         speculative_draft_tokens,
@@ -481,10 +493,10 @@ fn main() -> Result<()> {
                         // run in the trailing Metrics chunk. Overwrite rather
                         // than add so we always reflect the final tally.
                         if let Some(d) = speculative_draft_tokens {
-                            *rd.lock().unwrap() = Some(d);
+                            *rd.lock().unwrap_or_else(|e| e.into_inner()) = Some(d);
                         }
                         if let Some(a) = speculative_accepted_tokens {
-                            *ra.lock().unwrap() = Some(a);
+                            *ra.lock().unwrap_or_else(|e| e.into_inner()) = Some(a);
                         }
                     }
                     _ => {}
@@ -494,8 +506,10 @@ fn main() -> Result<()> {
 
             // Fold this run's speculative counters into the cross-run totals.
             if spec_mode_enabled {
-                let draft = *run_draft_tokens.lock().unwrap();
-                let accepted = *run_accepted_tokens.lock().unwrap();
+                let draft = *run_draft_tokens.lock().unwrap_or_else(|e| e.into_inner());
+                let accepted = *run_accepted_tokens
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 if let Some(d) = draft {
                     all_speculative_draft.push(d);
                 }
@@ -510,11 +524,14 @@ fn main() -> Result<()> {
             }
 
             let duration = infer_start.elapsed();
-            let output_text = generated_text.lock().unwrap().clone();
+            let output_text = generated_text
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             let generated = pipeline.tokenize(&output_text)?.len();
             let ttft = first_token_time
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .map(|t| t.duration_since(infer_start).as_secs_f64() * 1000.0);
 
             if generated > 0 {
@@ -691,6 +708,11 @@ fn main() -> Result<()> {
             "f16" | "float16" => Some(DType::F16),
             "bf16" | "bfloat16" => Some(DType::BF16),
             _ => None,
+        })
+        .or_else(|| {
+            memory_breakdown
+                .as_ref()
+                .map(|estimate| estimate.weight_dtype)
         })
         .unwrap_or(pipeline.metadata().manifest.primary_dtype);
 
