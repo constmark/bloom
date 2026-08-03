@@ -167,6 +167,18 @@ server-ui: ui-build
 app models_dir: server-ui
     ./target/release/bloom_server --models-dir "{{models_dir}}" --open-browser
 
+# Build the native SwiftUI macOS client as target/macos/Bloom Desktop.app.
+desktop-build:
+    ./scripts/build_macos_client.sh
+
+# Run native macOS client unit tests.
+desktop-test:
+    ./scripts/test_macos_client.sh
+
+# Build and open the native macOS client. Start bloom_server separately first.
+desktop-run: desktop-build
+    open "target/macos/Bloom Desktop.app"
+
 # Build a self-checked release archive with the embedded UI.
 package-release:
     ./scripts/package_release.sh

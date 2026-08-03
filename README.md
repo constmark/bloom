@@ -741,6 +741,27 @@ Do not infer production readiness from the presence of an engine adapter. A
 path is promoted only after reproducible real-model validation and benchmark
 evidence are recorded.
 
+## Native macOS Client
+
+Bloom includes a native SwiftUI client for macOS 13 and newer. It connects
+directly to a local or remote `bloom_server`, validates the readiness v3
+contract, and streams OpenAI-compatible chat completions without loading a Web
+UI or embedding a browser runtime. API keys remain in memory and the server URL
+is saved as a local preference.
+
+Start a Metal backend, then build and open the desktop client:
+
+```bash
+cargo run --release --features metal --bin bloom_server -- \
+  --model /path/to/model \
+  --device gpu
+
+just desktop-run
+```
+
+The application bundle is written to `target/macos/Bloom Desktop.app`. Run the
+native parser and readiness tests with `just desktop-test`.
+
 ## Web UI
 
 The optional Dioxus UI can run separately or be embedded in `bloom_server`. It
@@ -806,6 +827,7 @@ Public JSON schemas and examples live under `examples/`. Validate them with:
 | `crates/tilelang` | TileLang kernel compilation and loading |
 | `crates/ffi` | Stable C ABI for native consumers |
 | `python` | Python SDK bindings |
+| `clients/macos` | Native SwiftUI macOS client |
 | `ui` | Optional Dioxus web interface |
 | `docs` | Architecture, operations, support, and roadmap documentation |
 | `examples` | Schemas, manifests, plugins, and integration examples |
