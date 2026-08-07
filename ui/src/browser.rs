@@ -1,9 +1,216 @@
 //! Small browser-only file helpers kept outside the API protocol client.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 
 const MODAL_FOCUSABLE_SELECTOR: &str = "button:not([disabled]):not([tabindex=\"-1\"]),a[href]:not([tabindex=\"-1\"]),input:not([disabled]):not([tabindex=\"-1\"]),select:not([disabled]):not([tabindex=\"-1\"]),textarea:not([disabled]):not([tabindex=\"-1\"]),[tabindex]:not([tabindex=\"-1\"])";
+const MAX_BUFFERED_MICROPHONE_SECONDS: usize = 30;
+
+/// A live browser microphone capture that exposes bounded mono PCM windows.
+///
+/// The deprecated ScriptProcessor API is intentionally used here because it
+/// remains the smallest broadly supported bridge from Web Audio into WASM.
+/// The node writes silence to its output, so connecting it to the destination
+/// keeps callbacks active without playing the microphone through the speakers.
+pub struct MicrophoneCapture {
+    context: web_sys::AudioContext,
+    stream: web_sys::MediaStream,
+    source: web_sys::MediaStreamAudioSourceNode,
+    processor: web_sys::ScriptProcessorNode,
+    samples: Rc<RefCell<Vec<f32>>>,
+    sample_rate: u32,
+    stopped: bool,
+    _on_audio: Closure<dyn FnMut(web_sys::AudioProcessingEvent)>,
+}
+
+impl MicrophoneCapture {
+    pub async fn start() -> Result<Self, String> {
+        let window =
+            web_sys::window().ok_or_else(|| "browser window is unavailable".to_string())?;
+        let media_devices = window
+            .navigator()
+            .media_devices()
+            .map_err(|error| microphone_error("Microphone access is unavailable", error))?;
+        let constraints = web_sys::MediaStreamConstraints::new();
+        constraints.set_audio_bool(true);
+        constraints.set_video_bool(false);
+        let stream = JsFuture::from(
+            media_devices
+                .get_user_media_with_constraints(&constraints)
+                .map_err(|error| microphone_error("Could not request microphone access", error))?,
+        )
+        .await
+        .map_err(|error| {
+            microphone_error(
+                "Microphone permission was denied or no input device is available",
+                error,
+            )
+        })?
+        .dyn_into::<web_sys::MediaStream>()
+        .map_err(|_| "The browser returned an invalid microphone stream.".to_string())?;
+
+        let context = match web_sys::AudioContext::new() {
+            Ok(context) => context,
+            Err(error) => {
+                stop_media_stream(&stream);
+                return Err(microphone_error(
+                    "Could not start browser audio capture",
+                    error,
+                ));
+            }
+        };
+        let sample_rate = context.sample_rate().round() as u32;
+        if !(8_000..=192_000).contains(&sample_rate) {
+            stop_media_stream(&stream);
+            let _ = context.close();
+            return Err("The browser reported an unsupported microphone sample rate.".to_string());
+        }
+        let source = match context.create_media_stream_source(&stream) {
+            Ok(source) => source,
+            Err(error) => {
+                stop_media_stream(&stream);
+                let _ = context.close();
+                return Err(microphone_error("Could not connect the microphone", error));
+            }
+        };
+        let processor = match context
+            .create_script_processor_with_buffer_size_and_number_of_input_channels_and_number_of_output_channels(
+                4_096, 1, 1,
+            )
+        {
+            Ok(processor) => processor,
+            Err(error) => {
+                stop_media_stream(&stream);
+                let _ = context.close();
+                return Err(microphone_error(
+                    "Could not create the audio capture processor",
+                    error,
+                ));
+            }
+        };
+        let samples = Rc::new(RefCell::new(Vec::<f32>::new()));
+        let callback_samples = Rc::clone(&samples);
+        let max_samples = sample_rate as usize * MAX_BUFFERED_MICROPHONE_SECONDS;
+        let on_audio = Closure::wrap(Box::new(move |event: web_sys::AudioProcessingEvent| {
+            let Ok(input) = event.input_buffer() else {
+                return;
+            };
+            let Ok(mut chunk) = input.get_channel_data(0) else {
+                return;
+            };
+            chunk.retain(|sample| sample.is_finite());
+            let mut buffered = callback_samples.borrow_mut();
+            let remaining = max_samples.saturating_sub(buffered.len());
+            buffered.extend(chunk.into_iter().take(remaining));
+        }) as Box<dyn FnMut(_)>);
+        processor.set_onaudioprocess(Some(on_audio.as_ref().unchecked_ref()));
+        if let Err(error) = source.connect_with_audio_node(&processor) {
+            processor.set_onaudioprocess(None);
+            stop_media_stream(&stream);
+            let _ = context.close();
+            return Err(microphone_error(
+                "Could not activate microphone capture",
+                error,
+            ));
+        }
+        if let Err(error) = processor.connect_with_audio_node(&context.destination()) {
+            processor.set_onaudioprocess(None);
+            let _ = source.disconnect();
+            stop_media_stream(&stream);
+            let _ = context.close();
+            return Err(microphone_error(
+                "Could not activate the audio processor",
+                error,
+            ));
+        }
+        if let Ok(resume) = context.resume() {
+            let _ = JsFuture::from(resume).await;
+        }
+
+        Ok(Self {
+            context,
+            stream,
+            source,
+            processor,
+            samples,
+            sample_rate,
+            stopped: false,
+            _on_audio: on_audio,
+        })
+    }
+
+    /// Stop acquiring new samples while retaining the final buffered window.
+    pub fn stop_input(&mut self) {
+        if self.stopped {
+            return;
+        }
+        self.stopped = true;
+        stop_media_stream(&self.stream);
+        self.processor.set_onaudioprocess(None);
+        let _ = self.source.disconnect();
+        let _ = self.processor.disconnect();
+    }
+
+    /// Drain captured audio and resample it to the model-facing sample rate.
+    pub fn take_resampled(&mut self, target_rate: u32) -> Vec<f32> {
+        let captured = std::mem::take(&mut *self.samples.borrow_mut());
+        resample_mono_pcm(&captured, self.sample_rate, target_rate)
+    }
+}
+
+impl Drop for MicrophoneCapture {
+    fn drop(&mut self) {
+        self.stop_input();
+        let _ = self.context.close();
+    }
+}
+
+fn stop_media_stream(stream: &web_sys::MediaStream) {
+    for track in stream.get_tracks().iter() {
+        if let Ok(track) = track.dyn_into::<web_sys::MediaStreamTrack>() {
+            track.stop();
+        }
+    }
+}
+
+fn microphone_error(context: &str, error: wasm_bindgen::JsValue) -> String {
+    let detail = error
+        .dyn_ref::<js_sys::Error>()
+        .map(js_sys::Error::message)
+        .map(String::from)
+        .filter(|message| !message.is_empty())
+        .unwrap_or_else(|| format!("{error:?}"));
+    format!("{context}: {detail}. Use HTTPS or localhost and allow microphone permission.")
+}
+
+fn resample_mono_pcm(samples: &[f32], source_rate: u32, target_rate: u32) -> Vec<f32> {
+    if samples.is_empty() || source_rate == 0 || target_rate == 0 {
+        return Vec::new();
+    }
+    if source_rate == target_rate {
+        return samples
+            .iter()
+            .copied()
+            .map(|sample| sample.clamp(-1.0, 1.0))
+            .collect();
+    }
+    let output_len =
+        ((samples.len() as u64 * target_rate as u64) / source_rate as u64).max(1) as usize;
+    let source_per_output = source_rate as f64 / target_rate as f64;
+    (0..output_len)
+        .map(|index| {
+            let position = index as f64 * source_per_output;
+            let left = position.floor() as usize;
+            let right = (left + 1).min(samples.len() - 1);
+            let fraction = (position - left as f64) as f32;
+            (samples[left] + (samples[right] - samples[left]) * fraction).clamp(-1.0, 1.0)
+        })
+        .collect()
+}
 
 pub fn capture_active_element() -> Option<web_sys::HtmlElement> {
     web_sys::window()?
@@ -198,7 +405,7 @@ pub fn download_text_file(filename: &str, mime: &str, text: &str) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
-    use super::modal_focus_target;
+    use super::{modal_focus_target, resample_mono_pcm};
 
     #[test]
     fn modal_focus_target_cycles_only_at_boundaries() {
@@ -214,5 +421,17 @@ mod tests {
         assert_eq!(modal_focus_target(3, None, false), Some(0));
         assert_eq!(modal_focus_target(3, None, true), Some(2));
         assert_eq!(modal_focus_target(3, Some(9), false), Some(0));
+    }
+
+    #[test]
+    fn microphone_resampling_is_bounded_and_keeps_endpoints_stable() {
+        let source = vec![-1.0, -0.5, 0.0, 0.5, 1.0, 2.0];
+        let downsampled = resample_mono_pcm(&source, 48_000, 16_000);
+        assert_eq!(downsampled.len(), 2);
+        assert_eq!(downsampled, vec![-1.0, 0.5]);
+
+        let unchanged = resample_mono_pcm(&source, 16_000, 16_000);
+        assert_eq!(unchanged.last(), Some(&1.0));
+        assert!(resample_mono_pcm(&source, 0, 16_000).is_empty());
     }
 }

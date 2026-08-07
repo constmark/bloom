@@ -33,6 +33,8 @@ pub const MAX_STOP_SEQUENCES_BYTES: usize = 16 * 1_024;
 pub const MAX_BASE_URL_CHARS: usize = 2_048;
 pub const MAX_API_KEY_CHARS: usize = 4_096;
 pub const MAX_IMAGE_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
+pub const SPEECH_SAMPLE_RATE: u32 = 16_000;
+pub const MAX_SPEECH_SEGMENT_SAMPLES: usize = SPEECH_SAMPLE_RATE as usize * 3;
 const MAX_HTTP_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_HTTP_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_HTTP_ERROR_MESSAGE_BYTES: usize = 4 * 1024;
@@ -83,6 +85,7 @@ const MAX_CHAT_REQUEST_MESSAGES: usize = 2_048;
 const MAX_CHAT_CONTENT_BYTES: usize = 768 * 1024;
 const MAX_CHAT_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_MULTIMODAL_PROMPT_BYTES: usize = 1024 * 1024;
+const MAX_SPEECH_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_ATTACHMENT_NAME_CHARS: usize = 255;
 const MAX_MODEL_IMPORT_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const _: () = {
@@ -473,6 +476,28 @@ struct ChatRequest<'a> {
 #[derive(Debug, Serialize)]
 struct ChatStreamOptions {
     include_usage: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct SpeechInferenceRequest<'a> {
+    blocks: [SpeechDataBlock<'a>; 1],
+    params: SpeechInferenceParams,
+}
+
+#[derive(Debug, Serialize)]
+enum SpeechDataBlock<'a> {
+    AudioPcm {
+        samples: &'a [f32],
+        sample_rate: u32,
+    },
+}
+
+#[derive(Debug, Serialize)]
+struct SpeechInferenceParams {
+    max_tokens: usize,
+    temperature: f64,
+    top_p: f64,
+    seed: Option<u64>,
 }
 
 /// Server readiness snapshot from `GET /ready`.
@@ -4067,6 +4092,103 @@ async fn decode_model_import_response(
         })
 }
 
+/// Stream one bounded mono PCM window through the active speech-to-text model.
+pub async fn speech_to_text_stream<F>(
+    cfg: &ConnConfig,
+    model: &str,
+    samples: &[f32],
+    sample_rate: u32,
+    cancellation: &ChatCancellation,
+    mut on_update: F,
+) -> Result<String, ChatStreamError>
+where
+    F: FnMut(StreamUpdate),
+{
+    cfg.validate().map_err(ChatStreamError::Request)?;
+    validate_stream_model_id(model)?;
+    if sample_rate != SPEECH_SAMPLE_RATE {
+        return Err(ChatStreamError::Request(format!(
+            "Speech audio must use a {SPEECH_SAMPLE_RATE} Hz sample rate."
+        )));
+    }
+    if samples.is_empty() || samples.len() > MAX_SPEECH_SEGMENT_SAMPLES {
+        return Err(ChatStreamError::Request(format!(
+            "Speech audio must contain between 1 and {MAX_SPEECH_SEGMENT_SAMPLES} samples."
+        )));
+    }
+    if samples
+        .iter()
+        .any(|sample| !sample.is_finite() || !(-1.0..=1.0).contains(sample))
+    {
+        return Err(ChatStreamError::Request(
+            "Speech audio contains an invalid PCM sample.".to_string(),
+        ));
+    }
+
+    let body = SpeechInferenceRequest {
+        blocks: [SpeechDataBlock::AudioPcm {
+            samples,
+            sample_rate,
+        }],
+        params: SpeechInferenceParams {
+            max_tokens: 1,
+            temperature: 0.0,
+            top_p: 1.0,
+            seed: None,
+        },
+    };
+    let body_text = serde_json::to_string(&body).map_err(|error| {
+        ChatStreamError::Request(format!("failed to encode speech audio: {error}"))
+    })?;
+    validate_request_body_size("Speech request", body_text.len(), MAX_SPEECH_REQUEST_BYTES)
+        .map_err(ChatStreamError::Request)?;
+
+    let url = format!(
+        "{}/v1/multimodal/stream",
+        cfg.base_url.trim_end_matches('/')
+    );
+    let headers =
+        web_sys::Headers::new().map_err(|error| ChatStreamError::Request(format!("{error:?}")))?;
+    auth_headers(cfg, &headers);
+    headers.set("Content-Type", "application/json").ok();
+    let opts = web_sys::RequestInit::new();
+    opts.set_method("POST");
+    opts.set_headers(&headers);
+    opts.set_body(&wasm_bindgen::JsValue::from_str(&body_text));
+    opts.set_signal(Some(&cancellation.controller.signal()));
+
+    let response = match http_request(&url, &opts).await {
+        Ok(response) => response,
+        Err(_) if cancellation.is_cancelled() => return Err(ChatStreamError::Cancelled),
+        Err(error) => return Err(ChatStreamError::Request(error)),
+    };
+    if !response.ok() {
+        return Err(ChatStreamError::Request(
+            read_response_error(&response).await,
+        ));
+    }
+
+    let mut accumulated = String::new();
+    let mut observed_model = None;
+    let mut observed_request_id = None;
+    let mut observed_asr_partial = false;
+    consume_sse(&response, cancellation, |frame| {
+        process_speech_frame(
+            frame,
+            model,
+            &mut observed_model,
+            &mut observed_request_id,
+            &mut observed_asr_partial,
+            &mut accumulated,
+            &mut on_update,
+        )
+    })
+    .await?;
+    ensure_stream_model_observed(&observed_model)?;
+    ensure_stream_request_id_observed(&observed_request_id)?;
+    Ok(accumulated)
+}
+
 /// Upload one image and stream multimodal text output.
 pub async fn multimodal_stream<F>(
     cfg: &ConnConfig,
@@ -4669,6 +4791,77 @@ where
         on_update(StreamUpdate::TextDelta(delta.to_string()));
     }
     Ok(false)
+}
+
+fn process_speech_frame<F>(
+    frame: &str,
+    expected_model: &str,
+    observed_model: &mut Option<String>,
+    observed_request_id: &mut Option<String>,
+    observed_asr_partial: &mut bool,
+    accumulated: &mut String,
+    on_update: &mut F,
+) -> Result<bool, ChatStreamError>
+where
+    F: FnMut(StreamUpdate),
+{
+    let Some(data) = sse_data(frame) else {
+        return Ok(false);
+    };
+    if data == "[DONE]" {
+        return Ok(true);
+    }
+    let event: serde_json::Value = serde_json::from_str(&data)
+        .map_err(|error| ChatStreamError::Request(format!("invalid stream event: {error}")))?;
+    if let Some(message) = event
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(serde_json::Value::as_str)
+    {
+        validate_stream_error_message(message)?;
+        return Err(ChatStreamError::Request(message.to_string()));
+    }
+    observe_stream_model(&event, expected_model, observed_model, on_update)?;
+    ensure_stream_model_observed(observed_model)?;
+    observe_stream_request_id(&event, observed_request_id, on_update)?;
+    ensure_stream_request_id_observed(observed_request_id)?;
+
+    let chunk = event.get("chunk");
+    if let Some(partial) = chunk
+        .and_then(|chunk| chunk.get("AsrPartial"))
+        .and_then(|partial| partial.get("text"))
+        .and_then(serde_json::Value::as_str)
+    {
+        *observed_asr_partial = true;
+        append_speech_text(accumulated, partial, on_update)?;
+    } else if !*observed_asr_partial {
+        if let Some(delta) = chunk
+            .and_then(|chunk| chunk.get("TextDelta"))
+            .and_then(serde_json::Value::as_str)
+        {
+            append_speech_text(accumulated, delta, on_update)?;
+        }
+    }
+    Ok(false)
+}
+
+fn append_speech_text<F>(
+    accumulated: &mut String,
+    text: &str,
+    on_update: &mut F,
+) -> Result<(), ChatStreamError>
+where
+    F: FnMut(StreamUpdate),
+{
+    // Some ASR runtimes emit cumulative hypotheses, while others emit deltas.
+    // Only forward the new suffix for cumulative updates.
+    let delta = text.strip_prefix(accumulated.as_str()).unwrap_or(text);
+    if delta.is_empty() {
+        return Ok(());
+    }
+    append_stream_delta(accumulated, delta, MAX_STREAM_OUTPUT_BYTES)?;
+    on_update(StreamUpdate::TextDelta(delta.to_string()));
+    Ok(())
 }
 
 fn append_stream_delta(
@@ -6041,6 +6234,67 @@ mod tests {
             &mut |_| {},
         )
         .unwrap());
+    }
+
+    #[test]
+    fn speech_frame_prefers_asr_partials_and_merges_cumulative_hypotheses() {
+        let mut updates = Vec::new();
+        let mut accumulated = String::new();
+        let mut observed_model = None;
+        let mut observed_request_id = None;
+        let mut observed_asr_partial = false;
+
+        for frame in [
+            r#"data: {"id":"mms-1","model":"qwen-asr","chunk":{"AsrPartial":{"text":"hello","tokens":[]}}}"#,
+            r#"data: {"id":"mms-1","model":"qwen-asr","chunk":{"AsrPartial":{"text":"hello world","tokens":[]}}}"#,
+            r#"data: {"id":"mms-1","model":"qwen-asr","chunk":{"TextDelta":"hello world"}}"#,
+        ] {
+            process_speech_frame(
+                frame,
+                "qwen-asr",
+                &mut observed_model,
+                &mut observed_request_id,
+                &mut observed_asr_partial,
+                &mut accumulated,
+                &mut |update| updates.push(update),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(accumulated, "hello world");
+        assert_eq!(
+            updates,
+            vec![
+                StreamUpdate::Model("qwen-asr".into()),
+                StreamUpdate::RequestId("mms-1".into()),
+                StreamUpdate::TextDelta("hello".into()),
+                StreamUpdate::TextDelta(" world".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn speech_request_uses_bounded_inline_pcm_shape() {
+        let samples = [0.0_f32, 0.5, -0.5];
+        let body = serde_json::to_value(SpeechInferenceRequest {
+            blocks: [SpeechDataBlock::AudioPcm {
+                samples: &samples,
+                sample_rate: SPEECH_SAMPLE_RATE,
+            }],
+            params: SpeechInferenceParams {
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                seed: None,
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            body["blocks"][0]["AudioPcm"]["sample_rate"],
+            SPEECH_SAMPLE_RATE
+        );
+        assert_eq!(body["blocks"][0]["AudioPcm"]["samples"][1], 0.5);
+        assert_eq!(body["params"]["max_tokens"], 1);
     }
 
     #[test]

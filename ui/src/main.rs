@@ -31,6 +31,9 @@ const MODEL_IMPORT_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CONVERSATION_SEARCH_CHARS: usize = 200;
 const INITIAL_VISIBLE_MESSAGES: usize = 100;
 const MESSAGE_HISTORY_PAGE_SIZE: usize = 100;
+const LIVE_SPEECH_WINDOW_MS: u32 = 2_000;
+const MIN_SPEECH_WINDOW_SAMPLES: usize = api::SPEECH_SAMPLE_RATE as usize / 4;
+const MAX_TRANSCRIPT_BYTES: usize = 1024 * 1024;
 const MODEL_DRAWER_DIALOG_ID: &str = "model-manager-dialog";
 const DIAGNOSTICS_DRAWER_DIALOG_ID: &str = "runtime-diagnostics-dialog";
 const SETTINGS_DRAWER_DIALOG_ID: &str = "settings-dialog";
@@ -192,6 +195,8 @@ enum ConnectionState {
     Ready {
         model: String,
         supports_vision: bool,
+        supports_text_input: bool,
+        supports_audio_input: bool,
         supports_generation: bool,
         supports_embeddings: bool,
         supports_rerank: bool,
@@ -232,10 +237,16 @@ impl ConnectionState {
         if readiness.status == "ready" {
             Self::Ready {
                 model: readiness.model,
-                supports_vision: readiness
-                    .input_modalities
-                    .iter()
-                    .any(|modality| modality.eq_ignore_ascii_case("vision")),
+                supports_vision: readiness.input_modalities.iter().any(|modality| {
+                    modality.eq_ignore_ascii_case("vision")
+                        || modality.eq_ignore_ascii_case("multi")
+                }),
+                supports_text_input: readiness.input_modalities.iter().any(|modality| {
+                    modality.eq_ignore_ascii_case("text") || modality.eq_ignore_ascii_case("multi")
+                }),
+                supports_audio_input: readiness.input_modalities.iter().any(|modality| {
+                    modality.eq_ignore_ascii_case("audio") || modality.eq_ignore_ascii_case("multi")
+                }),
                 supports_generation: readiness
                     .model_tasks
                     .iter()
@@ -261,11 +272,15 @@ impl ConnectionState {
             Self::Connecting => ("", "Connecting…".into()),
             Self::Ready {
                 model,
+                supports_text_input,
+                supports_audio_input,
                 supports_generation,
                 supports_embeddings,
                 ..
             } => {
-                let task = if *supports_embeddings && !*supports_generation {
+                let task = if *supports_audio_input && !*supports_text_input {
+                    "Transcription"
+                } else if *supports_embeddings && !*supports_generation {
                     "Embeddings"
                 } else {
                     "Generation"
@@ -288,6 +303,7 @@ impl ConnectionState {
             self,
             Self::Ready {
                 supports_generation: true,
+                supports_text_input: true,
                 ..
             }
         )
@@ -308,6 +324,17 @@ impl ConnectionState {
             self,
             Self::Ready {
                 supports_rerank: true,
+                ..
+            }
+        )
+    }
+
+    fn can_transcribe(&self) -> bool {
+        matches!(
+            self,
+            Self::Ready {
+                supports_audio_input: true,
+                supports_generation: true,
                 ..
             }
         )
@@ -1199,17 +1226,24 @@ fn App() -> Element {
         }
     };
     let show_embedding_workspace = connection().can_embed() && !connection().can_chat();
+    let show_speech_workspace = connection().can_transcribe() && !connection().can_chat();
+    let show_specialized_workspace = show_embedding_workspace || show_speech_workspace;
     let embedding_workspace_model = connection()
         .active_model()
         .filter(|_| show_embedding_workspace)
         .unwrap_or_default()
         .to_string();
     let embedding_workspace_rerank = connection().can_rerank();
+    let speech_workspace_model = connection()
+        .active_model()
+        .filter(|_| show_speech_workspace)
+        .unwrap_or_default()
+        .to_string();
 
     rsx! {
         document::Stylesheet { href: STYLE }
         div { class: "shell",
-            if !show_embedding_workspace {
+            if !show_specialized_workspace {
                 aside { class: if show_sidebar() { "sidebar open" } else { "sidebar" },
                 div { class: "sidebar-header",
                     div { class: "sidebar-title", "Conversations" }
@@ -1422,7 +1456,7 @@ fn App() -> Element {
                 }
             }
 
-            if !show_embedding_workspace && show_sidebar() {
+            if !show_specialized_workspace && show_sidebar() {
                 button {
                     class: "sidebar-backdrop",
                     aria_label: "Close conversations",
@@ -1433,7 +1467,7 @@ fn App() -> Element {
             main { class: "app",
                 header { class: "app-header",
                     div { class: "brand",
-                        if !show_embedding_workspace {
+                        if !show_specialized_workspace {
                             button {
                                 class: "menu-btn",
                                 aria_label: "Open conversations",
@@ -1445,7 +1479,9 @@ fn App() -> Element {
                         div {
                             div { class: "brand-title", "Bloom" }
                             div { class: "brand-sub",
-                                if show_embedding_workspace {
+                                if show_speech_workspace {
+                                    "Live speech to text"
+                                } else if show_embedding_workspace {
                                     "Local embedding and reranking"
                                 } else {
                                     "Local multimodal inference"
@@ -1557,7 +1593,13 @@ fn App() -> Element {
                     }
                 }
 
-                if show_embedding_workspace {
+                if show_speech_workspace {
+                    SpeechWorkspace {
+                        key: "{speech_workspace_model}",
+                        config,
+                        model: speech_workspace_model,
+                    }
+                } else if show_embedding_workspace {
                     EmbeddingWorkspace {
                         key: "{embedding_workspace_model}",
                         config,
@@ -4255,6 +4297,355 @@ fn supported_image_mime(name: &str, reported_mime: &str) -> Option<String> {
     }
 }
 
+fn append_transcript_segment(transcript: &mut String, segment: &str) -> Result<(), String> {
+    let segment = segment.trim();
+    if segment.is_empty() {
+        return Ok(());
+    }
+    let separator = if transcript.is_empty()
+        || transcript.ends_with(char::is_whitespace)
+        || segment.starts_with(char::is_whitespace)
+    {
+        ""
+    } else {
+        let previous = transcript.chars().next_back();
+        let next = segment.chars().next();
+        if previous.is_some_and(|character| character.is_ascii())
+            && next.is_some_and(|character| character.is_ascii_alphanumeric())
+        {
+            " "
+        } else {
+            ""
+        }
+    };
+    let next_bytes = transcript
+        .len()
+        .checked_add(separator.len())
+        .and_then(|size| size.checked_add(segment.len()))
+        .ok_or_else(|| "Transcript size overflowed.".to_string())?;
+    if next_bytes > MAX_TRANSCRIPT_BYTES {
+        return Err(format!(
+            "Transcript reached the {} byte limit. Copy it, clear the workspace, and continue.",
+            MAX_TRANSCRIPT_BYTES
+        ));
+    }
+    transcript.push_str(separator);
+    transcript.push_str(segment);
+    Ok(())
+}
+
+fn format_speech_duration(samples: u64) -> String {
+    let seconds = samples as f64 / api::SPEECH_SAMPLE_RATE as f64;
+    format!("{seconds:.1}s")
+}
+
+#[component]
+fn SpeechWorkspace(config: Signal<ConnConfig>, model: String) -> Element {
+    let mut capture = use_signal(|| Option::<browser::MicrophoneCapture>::None);
+    let mut starting = use_signal(|| false);
+    let mut recording = use_signal(|| false);
+    let mut processing = use_signal(|| false);
+    let mut transcript = use_signal(String::new);
+    let mut live_partial = use_signal(String::new);
+    let mut workspace_error = use_signal(|| Option::<String>::None);
+    let mut workspace_notice = use_signal(|| Option::<String>::None);
+    let mut recorded_samples = use_signal(|| 0_u64);
+    let mut completed_segments = use_signal(|| 0_u64);
+    let mut copied = use_signal(|| false);
+
+    use_drop(move || {
+        recording.set(false);
+        capture.with_mut(|current| {
+            if let Some(capture) = current.as_mut() {
+                capture.stop_input();
+            }
+            current.take();
+        });
+    });
+
+    let start_model = model.clone();
+    let start_recording = move |_| {
+        if starting() || recording() || processing() {
+            return;
+        }
+        starting.set(true);
+        workspace_error.set(None);
+        workspace_notice.set(Some("Requesting microphone permission…".to_string()));
+        live_partial.set(String::new());
+        let model = start_model.clone();
+        let cfg = config();
+        spawn(async move {
+            let microphone = match browser::MicrophoneCapture::start().await {
+                Ok(microphone) => microphone,
+                Err(message) => {
+                    starting.set(false);
+                    workspace_notice.set(None);
+                    workspace_error.set(Some(message));
+                    return;
+                }
+            };
+            capture.set(Some(microphone));
+            starting.set(false);
+            recording.set(true);
+            workspace_notice.set(Some(
+                "Listening · speech is transcribed in short live windows.".to_string(),
+            ));
+
+            let mut final_drain_started = false;
+            loop {
+                if recording() {
+                    TimeoutFuture::new(LIVE_SPEECH_WINDOW_MS).await;
+                }
+                let samples = capture
+                    .with_mut(|current| {
+                        current
+                            .as_mut()
+                            .map(|capture| capture.take_resampled(api::SPEECH_SAMPLE_RATE))
+                    })
+                    .unwrap_or_default();
+                recorded_samples += samples.len() as u64;
+
+                if samples.len() >= MIN_SPEECH_WINDOW_SAMPLES {
+                    for window in samples.chunks(api::MAX_SPEECH_SEGMENT_SAMPLES) {
+                        processing.set(true);
+                        live_partial.set(String::new());
+                        workspace_notice.set(Some(if recording() {
+                            "Listening · transcribing the latest speech…".to_string()
+                        } else {
+                            "Finishing the last speech window…".to_string()
+                        }));
+                        let cancellation = match ChatCancellation::new() {
+                            Ok(cancellation) => cancellation,
+                            Err(message) => {
+                                workspace_error.set(Some(message));
+                                recording.set(false);
+                                break;
+                            }
+                        };
+                        let result = api::speech_to_text_stream(
+                            &cfg,
+                            &model,
+                            window,
+                            api::SPEECH_SAMPLE_RATE,
+                            &cancellation,
+                            |update| {
+                                if let StreamUpdate::TextDelta(delta) = update {
+                                    live_partial.with_mut(|partial| {
+                                        if partial.len().saturating_add(delta.len())
+                                            <= MAX_TRANSCRIPT_BYTES
+                                        {
+                                            partial.push_str(&delta);
+                                        }
+                                    });
+                                }
+                            },
+                        )
+                        .await;
+                        processing.set(false);
+                        match result {
+                            Ok(segment) => {
+                                live_partial.set(String::new());
+                                if !segment.trim().is_empty() {
+                                    let appended = transcript.with_mut(|value| {
+                                        append_transcript_segment(value, &segment)
+                                    });
+                                    if let Err(message) = appended {
+                                        workspace_error.set(Some(message));
+                                        recording.set(false);
+                                        break;
+                                    }
+                                    completed_segments += 1;
+                                }
+                            }
+                            Err(ChatStreamError::Cancelled) => {
+                                live_partial.set(String::new());
+                                recording.set(false);
+                                break;
+                            }
+                            Err(ChatStreamError::Request(message)) => {
+                                live_partial.set(String::new());
+                                workspace_error.set(Some(message));
+                                recording.set(false);
+                                capture.with_mut(|current| {
+                                    if let Some(capture) = current.as_mut() {
+                                        capture.stop_input();
+                                    }
+                                });
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if recording() {
+                    final_drain_started = false;
+                } else {
+                    capture.with_mut(|current| {
+                        if let Some(capture) = current.as_mut() {
+                            capture.stop_input();
+                        }
+                    });
+                    if final_drain_started {
+                        break;
+                    }
+                    // Run once more without waiting so samples captured while
+                    // the previous model request was in flight are not lost.
+                    final_drain_started = true;
+                }
+            }
+
+            capture.with_mut(|current| {
+                if let Some(capture) = current.as_mut() {
+                    capture.stop_input();
+                }
+                current.take();
+            });
+            recording.set(false);
+            processing.set(false);
+            live_partial.set(String::new());
+            if workspace_error().is_none() {
+                workspace_notice.set(Some(if transcript().trim().is_empty() {
+                    "Recording stopped · no speech was recognized.".to_string()
+                } else {
+                    "Recording stopped · transcript is ready.".to_string()
+                }));
+            }
+        });
+    };
+
+    let stop_recording = move |_| {
+        recording.set(false);
+        capture.with_mut(|current| {
+            if let Some(capture) = current.as_mut() {
+                capture.stop_input();
+            }
+        });
+        workspace_notice.set(Some("Stopping · finishing captured speech…".to_string()));
+    };
+
+    let copy_transcript = move |_| {
+        let text = transcript();
+        if text.trim().is_empty() {
+            return;
+        }
+        workspace_error.set(None);
+        spawn(async move {
+            match browser::copy_text_to_clipboard(&text).await {
+                Ok(()) => {
+                    copied.set(true);
+                    TimeoutFuture::new(1_200).await;
+                    copied.set(false);
+                }
+                Err(message) => workspace_error.set(Some(message)),
+            }
+        });
+    };
+
+    rsx! {
+        section { class: "embedding-workspace speech-workspace", aria_labelledby: "speech-workspace-title",
+            div { class: "embedding-workspace-header",
+                div {
+                    span { class: "workspace-eyebrow", "Speech workspace" }
+                    h2 { id: "speech-workspace-title", "Live speech to text" }
+                    p { "Speak into your microphone and Bloom will append each model result while recording continues." }
+                }
+                div { class: "workspace-model-meta",
+                    span { "Active model" }
+                    strong { "{model}" }
+                    span { "16 kHz mono PCM · {format_speech_duration(recorded_samples())}" }
+                }
+            }
+
+            if let Some(message) = workspace_error() {
+                div { class: "test-result err workspace-error", role: "alert", "{message}" }
+            }
+            if let Some(message) = workspace_notice() {
+                div { class: "test-result ok workspace-notice", role: "status", "{message}" }
+            }
+
+            div { class: "workspace-panel speech-panel",
+                div { class: "speech-recorder",
+                    div {
+                        div {
+                            class: if recording() { "speech-orb active" } else { "speech-orb" },
+                            aria_hidden: "true",
+                            span { "●" }
+                        }
+                        div { class: "speech-state-copy",
+                            strong {
+                                if starting() {
+                                    "Opening microphone"
+                                } else if recording() && processing() {
+                                    "Listening and transcribing"
+                                } else if recording() {
+                                    "Listening"
+                                } else if processing() {
+                                    "Finishing transcription"
+                                } else {
+                                    "Ready to listen"
+                                }
+                            }
+                            span { "{completed_segments()} model result(s) · audio stays in this browser until each window is sent to Bloom." }
+                        }
+                    }
+                    if recording() {
+                        button { class: "speech-stop", onclick: stop_recording, "Stop recording" }
+                    } else {
+                        button {
+                            class: "btn-primary speech-start",
+                            disabled: starting() || processing(),
+                            onclick: start_recording,
+                            if starting() { "Allow microphone…" } else { "Start speaking" }
+                        }
+                    }
+                }
+
+                div { class: "speech-transcript-heading",
+                    div {
+                        strong { "Transcript" }
+                        span { "Updates after every short speech window" }
+                    }
+                    div { class: "workspace-item-actions",
+                        button {
+                            class: "workspace-copy",
+                            disabled: transcript().trim().is_empty(),
+                            onclick: copy_transcript,
+                            if copied() { "Copied" } else { "Copy" }
+                        }
+                        button {
+                            class: "workspace-copy",
+                            disabled: recording() || processing() || transcript().is_empty(),
+                            onclick: move |_| {
+                                transcript.set(String::new());
+                                live_partial.set(String::new());
+                                completed_segments.set(0);
+                                recorded_samples.set(0);
+                                workspace_error.set(None);
+                                workspace_notice.set(None);
+                            },
+                            "Clear"
+                        }
+                    }
+                }
+                div {
+                    class: "speech-transcript",
+                    role: "log",
+                    aria_live: "polite",
+                    aria_label: "Live transcript",
+                    if transcript().is_empty() && live_partial().is_empty() {
+                        p { "Your transcript will appear here as you speak." }
+                    } else {
+                        span { "{transcript}" }
+                        if !live_partial().is_empty() {
+                            span { class: "speech-partial", "{live_partial}" }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EmbeddingWorkspaceMode {
     Embeddings,
@@ -5808,7 +6199,7 @@ fn ConfirmDialog(
 #[cfg(test)]
 mod tests {
     use super::{
-        api, conversation_context_status, conversation_import_candidate,
+        api, append_transcript_segment, conversation_context_status, conversation_import_candidate,
         conversation_model_transition, embedding_vector_norm, embedding_vector_preview,
         empty_state_view, encoder_input_preview, format_duration, format_duration_seconds,
         format_generation_millis, format_inventory_changes, format_inventory_drift_severity,
@@ -6120,6 +6511,8 @@ mod tests {
         let ready = empty_state_view(&ConnectionState::Ready {
             model: "tiny.gguf".to_string(),
             supports_vision: false,
+            supports_text_input: true,
+            supports_audio_input: false,
             supports_generation: true,
             supports_embeddings: false,
             supports_rerank: false,
@@ -6131,6 +6524,8 @@ mod tests {
         let encoder = empty_state_view(&ConnectionState::Ready {
             model: "encoder".to_string(),
             supports_vision: false,
+            supports_text_input: true,
+            supports_audio_input: false,
             supports_generation: false,
             supports_embeddings: true,
             supports_rerank: true,
@@ -6316,7 +6711,20 @@ mod tests {
         assert!(ready.supports_vision());
         assert!(!ready.can_embed());
         assert!(!ready.can_rerank());
+        assert!(!ready.can_transcribe());
         assert_eq!(ready.context_window(), Some(8_192));
+
+        let speech = ConnectionState::from_readiness(Readiness {
+            status: "ready".into(),
+            model: "qwen-asr".into(),
+            input_modalities: vec!["audio".into()],
+            model_tasks: vec!["generation".into()],
+            context_window: Some(1_024),
+            ..Readiness::default()
+        });
+        assert!(!speech.can_chat());
+        assert!(speech.can_transcribe());
+        assert_eq!(speech.view().1, "Ready · Transcription · qwen-asr");
 
         let encoder = ConnectionState::from_readiness(Readiness {
             status: "ready".into(),
@@ -6381,5 +6789,18 @@ mod tests {
         );
         assert_eq!(supported_image_mime("photo.jpg", "text/plain"), None);
         assert_eq!(supported_image_mime("photo.webp", ""), None);
+    }
+
+    #[test]
+    fn speech_segments_preserve_cjk_flow_and_separate_ascii_words() {
+        let mut transcript = "hello".to_string();
+        append_transcript_segment(&mut transcript, "world").unwrap();
+        assert_eq!(transcript, "hello world");
+
+        let mut transcript = "你好".to_string();
+        append_transcript_segment(&mut transcript, "世界").unwrap();
+        assert_eq!(transcript, "你好世界");
+        append_transcript_segment(&mut transcript, "  ").unwrap();
+        assert_eq!(transcript, "你好世界");
     }
 }

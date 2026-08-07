@@ -26,7 +26,8 @@ static site or embed it in the server binary.
 - Versioned, bounded conversation backup with transactional merge or confirmed full-history restore
 - Configurable server URL and API key with session-only storage by default and explicit opt-in persistence
 - Versioned UI/server readiness handshake with explicit unavailable and incompatible states
-- Task-aware generation or embedding/rerank workspace selection from readiness v3
+- Task-aware generation, live speech-to-text, or embedding/rerank workspace selection from readiness v3
+- Browser microphone capture with bounded 16 kHz mono PCM windows, live ASR partials, final-window flushing, and copyable transcripts
 - Bounded embedding batches with optional dimensions and compact normalized-vector summaries
 - Bounded bi-encoder reranking with exact document and stable-order response validation
 - Complete per-result clipboard copy and versioned embedding/rerank JSON downloads
