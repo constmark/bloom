@@ -24,7 +24,10 @@ trap 'rm -rf "$PACKAGE_VERIFY_DIR"' EXIT
 
 cd "$WORKSPACE_ROOT"
 
-mapfile -t WORKSPACE_PACKAGES < <(
+WORKSPACE_PACKAGES=()
+while IFS= read -r package; do
+    WORKSPACE_PACKAGES+=("$package")
+done < <(
     cargo metadata --no-deps --format-version 1 | python3 -c '
 import json
 import sys

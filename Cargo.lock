@@ -263,8 +263,6 @@ name = "bloomai-engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "axum",
- "base64 0.22.1",
  "bloomai-backend",
  "bloomai-core",
  "bloomai-tilelang",
@@ -274,16 +272,11 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "clap",
- "ed25519-dalek",
- "futures",
  "image",
  "libc",
  "libloading 0.8.9",
  "metal",
- "mime_guess",
  "objc2-metal",
- "reqwest",
- "rust-embed",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -291,10 +284,6 @@ dependencies = [
  "thiserror 2.0.19",
  "tokenizers 0.23.1",
  "tokio",
- "tokio-stream",
- "tokio-util",
- "tower",
- "tower-http",
  "tracing",
  "tracing-subscriber",
 ]
@@ -310,6 +299,39 @@ dependencies = [
  "once_cell",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "bloomai-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "bloomai-backend",
+ "bloomai-core",
+ "bloomai-engine",
+ "candle-core",
+ "clap",
+ "ed25519-dalek",
+ "futures",
+ "image",
+ "libc",
+ "mime_guess",
+ "reqwest",
+ "rust-embed",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

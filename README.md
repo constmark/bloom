@@ -149,7 +149,8 @@ reference.
 
 ## OpenAI-Compatible Server
 
-Start the API server:
+Start the API-only server. This is the default build and does not require the
+Dioxus toolchain or generated browser assets:
 
 ```bash
 cargo run --release --bin bloom_server -- \
@@ -823,7 +824,8 @@ Public JSON schemas and examples live under `examples/`. Validate them with:
 | --- | --- |
 | `crates/core` | Shared types, manifests, scheduling, memory, world-state, and plugin contracts |
 | `crates/backend` | Device probing, backend traits, and backend registry helpers |
-| `crates/engine` | Model loading, inference engines, pipelines, server, CLI, and CacheMesh |
+| `crates/engine` | Model loading, inference engines, pipelines, native CLI tools, and CacheMesh |
+| `crates/server` | HTTP application layer, model lifecycle, protocol adapters, and optional UI embedding |
 | `crates/tilelang` | TileLang kernel compilation and loading |
 | `crates/ffi` | Stable C ABI for native consumers |
 | `python` | Python SDK bindings |

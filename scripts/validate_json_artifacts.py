@@ -868,7 +868,7 @@ def basic_validate() -> list[tuple[Path, str]]:
         raise AssertionError(f"{signed_index_path}: embedded payload differs from the payload example")
     if len(decoded_signature) != 64:
         raise AssertionError(f"{signed_index_path}: Ed25519 signature is not 64 bytes")
-    packaged_fixture_dir = ROOT / "crates/engine/examples/fixtures"
+    packaged_fixture_dir = ROOT / "crates/server/examples/fixtures"
     if (
         packaged_fixture_dir / "model-index-payload.json"
     ).read_bytes() != model_index_payload_path.read_bytes():

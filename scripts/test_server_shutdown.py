@@ -71,6 +71,8 @@ def start_server(
     models = directory / "models"
     log_path = directory / "server.log"
     log_handle = log_path.open("wb")
+    environment = os.environ.copy()
+    environment["RUST_LOG"] = "bloom_server=info"
     try:
         process = subprocess.Popen(
             [
@@ -85,6 +87,7 @@ def start_server(
             cwd=ROOT,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
+            env=environment,
         )
     finally:
         log_handle.close()

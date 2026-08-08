@@ -1,7 +1,9 @@
-//! bloom_server — local OpenAI- and Ollama-compatible HTTP server for Bloom.
+//! Bloom's HTTP application layer.
 //!
 //! Exposes bounded `/v1` and `/api` compatibility surfaces, health, readiness,
-//! and local model-management routes.
+//! and local model-management routes. The crate depends on `bloomai-engine`,
+//! while the engine has no dependency on this transport layer or its optional
+//! browser presentation.
 //! Integrates concurrent scheduling with backpressure, request cancellation,
 //! graceful shutdown, tower-http middleware (tracing, CORS, request-id, timeout).
 
@@ -1379,8 +1381,11 @@ fn ollama_api_router(state: Arc<ServerState>) -> Router<Arc<ServerState>> {
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Parse process configuration, assemble the application, and serve requests.
+///
+/// Keeping the Tokio runtime in the binary entry point lets tests and other
+/// launchers reuse the application bootstrap without nesting runtimes.
+pub async fn run_cli() -> Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(

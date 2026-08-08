@@ -1612,7 +1612,7 @@ mod tests {
             parse_public_key("ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c")
                 .unwrap();
         let snapshot = decode_signed_index(
-            include_bytes!("../../../examples/fixtures/model-index.signed.json"),
+            include_bytes!("../examples/fixtures/model-index.signed.json"),
             &keyring(&[verifying_key]),
             "file",
             2 * 1024 * 1024,

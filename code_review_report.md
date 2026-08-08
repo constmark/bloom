@@ -184,6 +184,9 @@ Two P0/P1 items from Section 5 were addressed.
 `crates/engine/src/bin/bloom_server/main.rs` (3849 lines) was decomposed without
 changing behavior:
 
+The later application-layer split moved this composition root and its modules
+to `crates/server`; the table below records the earlier remediation state.
+
 | File | Lines | Contents |
 | --- | --- | --- |
 | `main.rs` | 1310 | `Args` config struct, `ServerState`, `ApiError`, DTOs, error helpers, `main()` wiring, `mod` declarations |

@@ -4,18 +4,43 @@ Bloom is a standalone inference engine. It owns model loading, preprocessing,
 execution, in-engine scheduling, KV-cache management, and streaming output.
 Cross-model orchestration belongs outside the engine.
 
-![Bloom architecture](assets/architecture.svg)
+## Layering and dependency direction
+
+The native workspace follows one-way dependencies. Transport and presentation
+may depend on the application and engine layers; the engine never depends on
+HTTP or UI code.
+
+```mermaid
+flowchart TD
+    Web["Bloom UI (standalone Dioxus crate)"] -->|HTTP/SSE| Server["bloomai-server (application + HTTP)"]
+    Client["OpenAI / Ollama clients"] -->|HTTP| Server
+    Server --> Engine["bloomai-engine (pipeline + scheduling)"]
+    CLI["bloom_infer / bloom_bench"] --> Engine
+    FFI["bloomai-ffi"] --> Engine
+    Engine --> Core["bloomai-core (contracts)"]
+    Engine --> Backend["bloomai-backend (devices)"]
+    Engine --> Tile["bloomai-tilelang (kernels)"]
+    Backend --> Core
+```
+
+`bloomai-server` is the composition root: it owns process configuration,
+runtime lifecycle, model catalog services, protocol adapters, routing, and
+middleware. The Dioxus UI consumes only versioned HTTP contracts. It can be
+hosted independently, or its static build can be embedded in the server by the
+`serve-ui` feature. This keeps browser dependencies outside every inference
+path.
 
 ## Request flow
 
-1. A request enters through `bloom_infer`, `bloom_server`, the UI, or an SDK.
-2. `InferencePipeline` loads or infers the model manifest and validates input.
-3. `EngineRegistry` selects an engine from declared capabilities instead of
+1. A request enters through `bloom_infer`, the server protocol adapters, or an SDK.
+2. `bloomai-server` normalizes HTTP requests and delegates typed work to the engine.
+3. `InferencePipeline` loads or infers the model manifest and validates input.
+4. `EngineRegistry` selects an engine from declared capabilities instead of
    trying implementations until one works.
-4. Memory and security checks run before model execution.
-5. The engine scheduler admits prefill and decode work, allocates KV-cache
+5. Memory and security checks run before model execution.
+6. The engine scheduler admits prefill and decode work, allocates KV-cache
    blocks, and applies the configured long-context policy.
-6. The selected executor runs on a native backend or an explicit external
+7. The selected executor runs on a native backend or an explicit external
    runtime and returns typed output chunks.
 
 ## Workspace boundaries
@@ -24,9 +49,35 @@ Cross-model orchestration belongs outside the engine.
 | --- | --- |
 | `bloomai-core` | Public data types, manifests, resource contracts, scheduling configuration, and errors |
 | `bloomai-backend` | Device capabilities, hardware probing, reservation, and backend registry |
-| `bloomai-engine` | Model loading, processors, executors, inference pipeline, scheduler, CLI, and HTTP server |
+| `bloomai-engine` | Model loading, processors, executors, inference pipeline, scheduler, and native CLI tools |
+| `bloomai-server` | Application assembly, model lifecycle, HTTP protocols, operations, and optional embedded UI adapter |
 | `bloomai-tilelang` | Dynamic kernel compilation and loading |
 | `bloomai-ffi` | Stable C ABI used by native and Python consumers |
+
+The standalone `ui/` crate intentionally remains outside the native workspace
+because it targets WebAssembly and has its own toolchain and lockfile.
+
+## Deployment profiles
+
+The API-only server is the default and does not compile or require browser
+assets:
+
+```bash
+cargo build --release -p bloomai-server --bin bloom_server
+./target/release/bloom_server --models-dir /path/to/models
+```
+
+For a self-contained local application, build the UI first and opt into the
+presentation adapter:
+
+```bash
+./scripts/build_ui.sh
+cargo build --release -p bloomai-server --bin bloom_server --features serve-ui
+./target/release/bloom_server --models-dir /path/to/models --open-browser
+```
+
+A separately hosted UI is a third profile: run the default API-only server and
+configure one exact UI origin with `--cors-allow-origin`.
 
 Inside `bloomai-engine`:
 

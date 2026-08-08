@@ -98,7 +98,7 @@ replacement. Application archives include the format documentation and
 schemas, but not the Cargo-based publisher helper:
 
 ```bash
-cargo run -p bloomai-engine --example sign_model_index -- \
+cargo run -p bloomai-server --example sign_model_index -- \
   --payload model-index-payload.json \
   --private-key model-index-signing-key.hex \
   --output model-index.signed.json

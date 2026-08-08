@@ -76,7 +76,7 @@ package examples, including a recomputed domain-separated package digest. Run
 the offline publisher helper's own admission tests as well:
 
 ```bash
-cargo test -p bloomai-engine --example sign_model_index --locked
+cargo test -p bloomai-server --example sign_model_index --locked
 ```
 
 Server unit coverage must prove that one bad package-file checksum leaves no
@@ -248,18 +248,18 @@ persisted resume identity, checksum failure, route-level lifecycle exclusion,
 and restart recovery before and after replacement publication:
 
 ```bash
-cargo test --locked -p bloomai-engine --bin bloom_server model_upgrade::tests
-cargo test --locked -p bloomai-engine --bin bloom_server \
+cargo test --locked -p bloomai-server --lib model_upgrade::tests
+cargo test --locked -p bloomai-server --lib \
   signed_index_download_endpoint_transactionally_upgrades_an_installed_alias
-cargo test --locked -p bloomai-engine --bin bloom_server \
+cargo test --locked -p bloomai-server --lib \
   ollama_pull_transactionally_upgrades_and_reuses_a_signed_model_package
-cargo test --locked -p bloomai-engine --bin bloom_server \
+cargo test --locked -p bloomai-server --lib \
   upgrades_reserve_peak_space_without_treating_the_old_model_as_reclaimable
-cargo test --locked -p bloomai-engine --bin bloom_server \
+cargo test --locked -p bloomai-server --lib \
   restart_resume_retains_the_exact_signed_upgrade_identity
-cargo test --locked -p bloomai-engine --bin bloom_server \
+cargo test --locked -p bloomai-server --lib \
   failed_upgrade_verification_leaves_the_installed_model_usable
-cargo test --locked -p bloomai-engine --bin bloom_server catalog_lock::tests
+cargo test --locked -p bloomai-server --lib catalog_lock::tests
 ```
 
 ## Feature Policy

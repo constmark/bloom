@@ -133,6 +133,16 @@ doc:
 clean:
     cargo clean
 
+# ===== Server profiles =====
+
+# Build the standalone API server without browser assets or a UI toolchain.
+server-headless:
+    cargo build --locked --release -p bloomai-server --bin bloom_server
+
+# Run the standalone API server against a managed model directory.
+serve-headless models_dir:
+    cargo run --locked -p bloomai-server --bin bloom_server -- --models-dir "{{models_dir}}"
+
 # ===== Frontend (Dioxus UI) =====
 
 # Run the standalone UI on the documented exact development origin.
@@ -161,7 +171,7 @@ ui-build:
 
 # Build a single binary containing both the API and UI.
 server-ui: ui-build
-    cargo build --locked --release --bin bloom_server --features serve-ui
+    cargo build --locked --release -p bloomai-server --bin bloom_server --features serve-ui
 
 # Build and run the single-binary local app against a managed model directory.
 app models_dir: server-ui

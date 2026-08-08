@@ -1,0 +1,63 @@
+[package]
+name = "bloomai-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "HTTP application layer and optional embedded UI for Bloom."
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+
+[lib]
+# Preserve the established tracing target (`bloom_server`) even though the
+# package now has its own application-layer name.
+name = "bloom_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bloom_server"
+path = "src/main.rs"
+
+[features]
+default = ["candle-engine"]
+candle-engine = ["bloomai-engine/candle-engine"]
+cuda = ["bloomai-engine/cuda", "candle-core/cuda"]
+metal = ["bloomai-engine/metal", "candle-core/metal"]
+flash-attn = ["bloomai-engine/flash-attn"]
+hardware-tests = ["bloomai-engine/hardware-tests"]
+# The default build is an API-only service. This feature embeds the Dioxus
+# assets and adds browser routes without changing the application/core layers.
+serve-ui = ["dep:rust-embed", "dep:mime_guess"]
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+bloomai-core.workspace = true
+bloomai-backend.workspace = true
+bloomai-engine.workspace = true
+candle-core = "0.10"
+axum = { version = "0.8.9", features = ["multipart"] }
+tokio = { version = "1.52.3", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+image = { version = "0.24", default-features = false, features = ["png", "jpeg"] }
+futures = "0.3"
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "stream"] }
+libc = "0.2"
+sha2 = "0.10"
+base64 = "0.22"
+ed25519-dalek = { version = "2.2", default-features = false, features = ["std"] }
+tower-http.workspace = true
+rust-embed = { version = "8", optional = true }
+mime_guess = { version = "2", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+tower.workspace = true

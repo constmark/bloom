@@ -35,7 +35,7 @@ python3 scripts/test_release_workflow_security.py
 python3 scripts/test_create_release_archive.py
 python3 scripts/check_toolchain_consistency.py
 python3 scripts/test_validate_release_artifact.py
-cargo test --locked -p bloomai-engine --example sign_model_index
+cargo test --locked -p bloomai-server --example sign_model_index
 ./scripts/test_crate_packages.sh
 ./scripts/openai_compat_smoke.py --api-key release-compat-smoke --require-openai-sdk
 ./scripts/ollama_compat_smoke.py --api-key release-compat-smoke --require-ollama-sdk
