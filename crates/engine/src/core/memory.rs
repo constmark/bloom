@@ -180,7 +180,7 @@ pub fn available_system_memory() -> Option<usize> {
     #[cfg(target_os = "linux")]
     {
         let content = std::fs::read_to_string("/proc/meminfo").ok()?;
-        return parse_meminfo_kib(&content, "MemAvailable").map(|kib| kib.saturating_mul(1024));
+        parse_meminfo_kib(&content, "MemAvailable").map(|kib| kib.saturating_mul(1024))
     }
 
     #[cfg(target_os = "macos")]

@@ -547,7 +547,7 @@ fn total_memory_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
-        return parse_meminfo_kib(&meminfo, "MemTotal").map(|kib| kib * 1024);
+        parse_meminfo_kib(&meminfo, "MemTotal").map(|kib| kib * 1024)
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -569,7 +569,7 @@ fn available_memory_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
-        return parse_meminfo_kib(&meminfo, "MemAvailable").map(|kib| kib * 1024);
+        parse_meminfo_kib(&meminfo, "MemAvailable").map(|kib| kib * 1024)
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -727,14 +727,12 @@ fn probe_longcat_gguf_headers(weight_files: &[PathBuf]) -> Result<(usize, Option
 fn candle_gpu_device() -> Result<candle_core::Device> {
     #[cfg(feature = "cuda")]
     {
-        return candle_core::Device::new_cuda(0)
-            .context("failed to initialize CUDA device 0 for LongCat");
+        candle_core::Device::new_cuda(0).context("failed to initialize CUDA device 0 for LongCat")
     }
 
     #[cfg(all(not(feature = "cuda"), feature = "metal"))]
     {
-        return candle_core::Device::new_metal(0)
-            .context("failed to initialize Metal device 0 for LongCat");
+        candle_core::Device::new_metal(0).context("failed to initialize Metal device 0 for LongCat")
     }
 
     #[cfg(not(any(feature = "cuda", feature = "metal")))]
