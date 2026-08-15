@@ -24,11 +24,14 @@ if SERVER_OVERRIDE:
 else:
     SERVER = ROOT / "target" / "debug" / "bloom_server"
 STARTUP_PATTERN = re.compile(r"server running on http://127\.0\.0\.1:(\d+)")
+ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def read_log(path: pathlib.Path) -> str:
     try:
-        return path.read_text(encoding="utf-8", errors="replace")
+        return ANSI_ESCAPE_PATTERN.sub(
+            "", path.read_text(encoding="utf-8", errors="replace")
+        )
     except FileNotFoundError:
         return ""
 

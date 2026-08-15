@@ -179,7 +179,20 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings -A missing_docs
       - name: Test
-        run: cargo test --workspace --locked
+        shell: bash
+        run: |
+          set +e
+          cargo test --workspace --locked 2>&1 | tee "$RUNNER_TEMP/bloom-windows-cargo-test.log"
+          test_status=${PIPESTATUS[0]}
+          set -e
+          if [ "$test_status" -ne 0 ]; then
+            summary=$(tail -n 80 "$RUNNER_TEMP/bloom-windows-cargo-test.log")
+            summary=${summary//'%'/'%25'}
+            summary=${summary//$'\r'/'%0D'}
+            summary=${summary//$'\n'/'%0A'}
+            echo "::error title=Windows cargo test failure::$summary"
+          fi
+          exit "$test_status"
       - name: Package server-only zip smoke
         shell: bash
         run: |
