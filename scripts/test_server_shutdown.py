@@ -12,7 +12,6 @@ import socket
 import subprocess
 import tempfile
 import time
-import traceback
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -275,9 +274,12 @@ def github_command_escape(value: str) -> str:
 if __name__ == "__main__":
     try:
         exit_code = main()
-    except BaseException:
+    except BaseException as error:
         if os.environ.get("GITHUB_ACTIONS") == "true":
-            failure = traceback.format_exc()[-50_000:]
+            # GitHub silently drops workflow commands that exceed its command
+            # transport limit. Exception text retains assertion diagnostics and
+            # recent server logs while staying safely below that bound.
+            failure = f"{type(error).__name__}: {error}"[-6_000:]
             print(
                 "::error title=Server shutdown lifecycle failure::"
                 + github_command_escape(failure),
