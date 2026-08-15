@@ -453,8 +453,8 @@ mod tests {
         let mut rng = SimpleRng::new(42);
         let v1 = rng.next_f32();
         let v2 = rng.next_f32();
-        assert!(v1 >= 0.0 && v1 <= 1.0);
-        assert!(v2 >= 0.0 && v2 <= 1.0);
+        assert!((0.0..=1.0).contains(&v1));
+        assert!((0.0..=1.0).contains(&v2));
         assert!(v1 != v2);
     }
 }

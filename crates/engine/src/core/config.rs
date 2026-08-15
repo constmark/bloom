@@ -133,7 +133,7 @@ pub struct BenchConfig {
 
 pub fn default_config_dir() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("BLOOM_CONFIG_HOME") {
-        return Ok(expand_tilde(PathBuf::from(path))?);
+        return expand_tilde(PathBuf::from(path));
     }
 
     home_dir()

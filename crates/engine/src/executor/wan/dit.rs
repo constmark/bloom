@@ -1,3 +1,6 @@
+// DiT tensor axes and forward arguments follow the model checkpoint contract.
+#![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+
 //! Wan2.1 DiT (Diffusion Transformer) implementation in Candle.
 //!
 //! Architecture: 3D patch embedding + transformer blocks (self-attn + cross-attn + FFN)
@@ -7,7 +10,7 @@ use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{self as nn, Module};
 
 thread_local! {
-    pub static QTENSOR_MAP: std::cell::RefCell<Option<std::collections::HashMap<String, std::sync::Arc<candle_core::quantized::QTensor>>>> = std::cell::RefCell::new(None);
+    pub static QTENSOR_MAP: std::cell::RefCell<Option<std::collections::HashMap<String, std::sync::Arc<candle_core::quantized::QTensor>>>> = const { std::cell::RefCell::new(None) };
 }
 
 #[derive(Clone)]
@@ -894,7 +897,7 @@ impl WanModel {
         let mut blocks = Vec::with_capacity(cfg.num_layers);
         let block_vb = vb_cpu.as_ref().unwrap_or(&vb);
         for i in 0..cfg.num_layers {
-            let block = WanAttentionBlock::new(cfg, block_vb.pp(&format!("blocks.{i}")))?;
+            let block = WanAttentionBlock::new(cfg, block_vb.pp(format!("blocks.{i}")))?;
             blocks.push(block);
         }
 

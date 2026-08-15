@@ -1,3 +1,6 @@
+// Pixel reference loops use explicit spatial indices to preserve axis semantics.
+#![allow(clippy::needless_range_loop)]
+
 //! Wan2.1 VAE decoder implementation.
 //!
 //! Decodes latent tensors [C=16, F', H', W'] back to video frames [3, F, H, W].

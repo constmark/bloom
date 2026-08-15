@@ -1115,7 +1115,7 @@ fn read_optional_sentence_transformer_json(
     path: &Path,
     label: &str,
 ) -> Result<Option<serde_json::Value>> {
-    let metadata = match fs::metadata(&path) {
+    let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),

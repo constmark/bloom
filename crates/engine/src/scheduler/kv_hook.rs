@@ -1,3 +1,6 @@
+// The optional KV snapshot tuple is the bridge's public ownership contract.
+#![allow(clippy::type_complexity)]
+
 //! Bridge trait connecting a model's internal KV state with `PagedAttentionCache`.
 //!
 //! Without an implementation of `KvHook`, the paged cache only tracks block

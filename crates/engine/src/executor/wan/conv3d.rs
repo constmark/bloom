@@ -1,4 +1,4 @@
-//! Conv3d stubs for Candle (which lacks native 3D convolution).
+//! Conv3d compatibility surface for Candle (which lacks native 3D convolution).
 //!
 //! Provides placeholder types and functions for future TileLang integration.
 //! Currently, Wan modules use Conv2d (applied per temporal frame) instead.
@@ -42,9 +42,11 @@ pub struct Conv3d {
 }
 
 impl Conv3d {
-    /// Forward pass placeholder — not used in current implementation.
+    /// Return an actionable error until a native kernel is available.
     pub fn forward(&self, _x: &Tensor) -> Result<Tensor> {
-        unimplemented!("Conv3d forward not yet implemented; use Conv2d per-frame fallback")
+        Err(candle_core::Error::Msg(
+            "Conv3d is unavailable; use the Wan Conv2d per-frame fallback".to_string(),
+        ))
     }
 }
 
@@ -88,5 +90,31 @@ mod tests {
         let cfg = Conv3dConfig::default();
         assert_eq!(cfg.stride, 1);
         assert_eq!(cfg.padding, 0);
+    }
+
+    #[test]
+    fn conv3d_forward_fails_without_panicking() {
+        let layer = Conv3d {
+            weight: Tensor::zeros(
+                (1, 1, 1, 1, 1),
+                candle_core::DType::F32,
+                &candle_core::Device::Cpu,
+            )
+            .unwrap(),
+            bias: None,
+            in_channels: 1,
+            out_channels: 1,
+            kernel_size: 1,
+            config: Conv3dConfig::default(),
+        };
+        let input = Tensor::zeros(
+            (1, 1, 1, 1, 1),
+            candle_core::DType::F32,
+            &candle_core::Device::Cpu,
+        )
+        .unwrap();
+
+        let error = layer.forward(&input).unwrap_err();
+        assert!(error.to_string().contains("Conv3d is unavailable"));
     }
 }

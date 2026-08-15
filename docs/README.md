@@ -18,6 +18,7 @@ request.
 - [OpenAI API compatibility](openai-compatibility.md)
 - [Ollama API compatibility](ollama-compatibility.md)
 - [Structured output](structured-output.md)
+- [C ABI and Python SDK](ffi-python.md)
 - [Readiness and UI/server compatibility](readiness-contract.md)
 - [Model load preflight](model-preflight.md)
 - [Runtime diagnostics](runtime-diagnostics.md)

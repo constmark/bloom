@@ -52,7 +52,7 @@ path.
 | `bloomai-engine` | Model loading, processors, executors, inference pipeline, scheduler, and native CLI tools |
 | `bloomai-server` | Application assembly, model lifecycle, HTTP protocols, operations, and optional embedded UI adapter |
 | `bloomai-tilelang` | Dynamic kernel compilation and loading |
-| `bloomai-ffi` | Stable C ABI used by native and Python consumers |
+| `bloomai-ffi` | Pre-1.0 C ABI used by native and Python consumers |
 
 The standalone `ui/` crate intentionally remains outside the native workspace
 because it targets WebAssembly and has its own toolchain and lockfile.

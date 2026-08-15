@@ -1,25 +1,3 @@
-#![allow(
-    clippy::collapsible_if,
-    clippy::derivable_impls,
-    clippy::double_ended_iterator_last,
-    clippy::field_reassign_with_default,
-    clippy::for_kv_map,
-    clippy::manual_is_multiple_of,
-    clippy::manual_range_contains,
-    clippy::manual_repeat_n,
-    clippy::missing_const_for_thread_local,
-    clippy::needless_borrows_for_generic_args,
-    clippy::needless_character_iteration,
-    clippy::needless_range_loop,
-    clippy::needless_return,
-    clippy::needless_update,
-    clippy::needless_question_mark,
-    clippy::new_without_default,
-    clippy::redundant_field_names,
-    clippy::repeat_vec_with_capacity,
-    clippy::too_many_arguments,
-    clippy::type_complexity
-)]
 // Surface new `unwrap` usage in production code. Tests may use unwrap to keep
 // assertions concise; runtime paths must recover or return a structured error.
 #![cfg_attr(not(test), warn(clippy::unwrap_used))]

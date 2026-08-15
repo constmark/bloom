@@ -359,7 +359,10 @@ fn flash_attn(
 
 #[cfg(not(feature = "flash-attn"))]
 fn flash_attn(_: &Tensor, _: &Tensor, _: &Tensor, _: f32, _: bool) -> Result<Tensor> {
-    unimplemented!("compile with '--features flash-attn'")
+    Err(candle::Error::Msg(
+        "Gemma 4 FlashAttention was requested, but Bloom was built without the `flash-attn` feature"
+            .to_string(),
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -1059,5 +1062,19 @@ impl Model {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache()
         }
+    }
+}
+
+#[cfg(all(test, not(feature = "flash-attn")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_flash_attention_returns_an_error() {
+        let tensor = Tensor::zeros((1, 1, 1, 1), DType::F32, &Device::Cpu).unwrap();
+        let error = flash_attn(&tensor, &tensor, &tensor, 1.0, true).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("without the `flash-attn` feature"));
     }
 }

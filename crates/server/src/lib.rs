@@ -97,6 +97,7 @@ mod model_upgrade;
 mod ollama;
 mod readiness;
 mod response_store;
+mod shutdown;
 mod tool_calling;
 mod ui;
 
@@ -123,6 +124,12 @@ use model_storage::ModelStorageManager;
 use ollama::*;
 use readiness::*;
 use response_store::ResponseStore;
+#[cfg(test)]
+use shutdown::ShutdownSignal;
+use shutdown::{
+    wait_for_server_or_shutdown_timeout, wait_for_shutdown_notification, ShutdownSignalListener,
+    ShutdownWait,
+};
 use tool_calling::*;
 
 const MODEL_CATALOG_CACHE_TTL: Duration = Duration::from_secs(10);
@@ -2389,123 +2396,6 @@ fn build_scheduling_runtime(
         memory_reservation,
         shutdown,
     })
-}
-
-// ─── Graceful shutdown ─────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ShutdownSignal {
-    Interrupt,
-    #[cfg(unix)]
-    Terminate,
-}
-
-impl ShutdownSignal {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Interrupt => "interrupt",
-            #[cfg(unix)]
-            Self::Terminate => "terminate",
-        }
-    }
-}
-
-#[cfg(unix)]
-struct ShutdownSignalListener {
-    interrupt: tokio::signal::unix::Signal,
-    terminate: tokio::signal::unix::Signal,
-}
-
-#[cfg(unix)]
-impl ShutdownSignalListener {
-    fn install() -> std::io::Result<Self> {
-        Ok(Self {
-            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
-            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
-        })
-    }
-
-    async fn recv(&mut self) -> std::io::Result<ShutdownSignal> {
-        tokio::select! {
-            signal = self.interrupt.recv() => signal
-                .map(|()| ShutdownSignal::Interrupt)
-                .ok_or_else(|| std::io::Error::other("SIGINT listener closed unexpectedly")),
-            signal = self.terminate.recv() => signal
-                .map(|()| ShutdownSignal::Terminate)
-                .ok_or_else(|| std::io::Error::other("SIGTERM listener closed unexpectedly")),
-        }
-    }
-}
-
-#[cfg(windows)]
-struct ShutdownSignalListener {
-    interrupt: tokio::signal::windows::CtrlC,
-}
-
-#[cfg(windows)]
-impl ShutdownSignalListener {
-    fn install() -> std::io::Result<Self> {
-        Ok(Self {
-            interrupt: tokio::signal::windows::ctrl_c()?,
-        })
-    }
-
-    async fn recv(&mut self) -> std::io::Result<ShutdownSignal> {
-        self.interrupt
-            .recv()
-            .await
-            .map(|()| ShutdownSignal::Interrupt)
-            .ok_or_else(|| std::io::Error::other("Ctrl-C listener closed unexpectedly"))
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-struct ShutdownSignalListener;
-
-#[cfg(not(any(unix, windows)))]
-impl ShutdownSignalListener {
-    fn install() -> std::io::Result<Self> {
-        Ok(Self)
-    }
-
-    async fn recv(&mut self) -> std::io::Result<ShutdownSignal> {
-        tokio::signal::ctrl_c().await?;
-        Ok(ShutdownSignal::Interrupt)
-    }
-}
-
-async fn wait_for_shutdown_notification(mut receiver: watch::Receiver<bool>) {
-    while !*receiver.borrow() {
-        if receiver.changed().await.is_err() {
-            break;
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum ShutdownWait<T> {
-    Completed(T),
-    TimedOut,
-}
-
-async fn wait_for_server_or_shutdown_timeout<F, T>(
-    server: F,
-    shutdown_receiver: watch::Receiver<bool>,
-    timeout: Duration,
-) -> ShutdownWait<T>
-where
-    F: std::future::Future<Output = T>,
-{
-    let deadline = async move {
-        wait_for_shutdown_notification(shutdown_receiver).await;
-        tokio::time::sleep(timeout).await;
-    };
-    tokio::pin!(server);
-    tokio::pin!(deadline);
-    tokio::select! {
-        result = &mut server => ShutdownWait::Completed(result),
-        () = &mut deadline => ShutdownWait::TimedOut,
-    }
 }
 
 // ─── Health / readiness ─────────────────────────────────────────────────────

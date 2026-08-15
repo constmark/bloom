@@ -87,7 +87,7 @@ fn test_ffi_mock_inference() {
             pipeline,
             input_json.as_ptr(),
             params_json.as_ptr(),
-            test_stream_callback,
+            Some(test_stream_callback),
             user_data,
             err_buf_stream.as_mut_ptr(),
             err_buf_stream.len(),
@@ -106,6 +106,66 @@ fn test_ffi_mock_inference() {
 
         // 4. Clean up pipeline
         bloom_pipeline_free(pipeline);
+    }
+}
+
+#[test]
+fn test_ffi_rejects_a_null_stream_callback() {
+    unsafe {
+        let model_path = CString::new(".").unwrap();
+        let engine_name = CString::new("mock").unwrap();
+        let device_name = CString::new("cpu").unwrap();
+        let input_json = CString::new(r#"{"Text":{"prompt":"Hello World"}}"#).unwrap();
+        let params_json =
+            CString::new(r#"{"max_tokens":10,"temperature":0.7,"top_p":0.9,"seed":null}"#).unwrap();
+        let mut err_buf = [0 as c_char; 512];
+        let pipeline = bloom_pipeline_load(
+            model_path.as_ptr(),
+            engine_name.as_ptr(),
+            device_name.as_ptr(),
+            2048,
+            err_buf.as_mut_ptr(),
+            err_buf.len(),
+        );
+        assert!(!pipeline.is_null());
+
+        let result = bloom_pipeline_run_stream(
+            pipeline,
+            input_json.as_ptr(),
+            params_json.as_ptr(),
+            None,
+            std::ptr::null_mut(),
+            err_buf.as_mut_ptr(),
+            err_buf.len(),
+        );
+
+        assert_eq!(result, -1);
+        let error = CStr::from_ptr(err_buf.as_ptr()).to_string_lossy();
+        assert!(error.contains("Null argument"));
+        bloom_pipeline_free(pipeline);
+    }
+}
+
+#[test]
+fn test_ffi_rejects_a_zero_context_size() {
+    unsafe {
+        let model_path = CString::new(".").unwrap();
+        let engine_name = CString::new("mock").unwrap();
+        let device_name = CString::new("cpu").unwrap();
+        let mut err_buf = [0 as c_char; 512];
+
+        let pipeline = bloom_pipeline_load(
+            model_path.as_ptr(),
+            engine_name.as_ptr(),
+            device_name.as_ptr(),
+            0,
+            err_buf.as_mut_ptr(),
+            err_buf.len(),
+        );
+
+        assert!(pipeline.is_null());
+        let error = CStr::from_ptr(err_buf.as_ptr()).to_string_lossy();
+        assert!(error.contains("context_size must be greater than zero"));
     }
 }
 

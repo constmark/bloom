@@ -1,3 +1,6 @@
+// Placement loops intentionally index parallel vectors by device/chunk coordinate.
+#![allow(clippy::needless_range_loop)]
+
 use anyhow::{anyhow, bail, Context, Result};
 
 use crate::core::manifest::{format_bytes, suggest_memory_downgrade, MemoryEstimate};
@@ -198,10 +201,10 @@ pub fn available_system_memory() -> Option<usize> {
         if !output.status.success() {
             return None;
         }
-        return String::from_utf8_lossy(&output.stdout)
+        String::from_utf8_lossy(&output.stdout)
             .trim()
             .parse::<usize>()
-            .ok();
+            .ok()
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]

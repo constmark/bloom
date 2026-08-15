@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import pathlib
+import re
 import sys
 import unittest
 
@@ -61,11 +62,13 @@ class ReleaseWorkflowSecurityTests(unittest.TestCase):
         )
 
     def test_rejects_mutable_attestation_action(self) -> None:
-        mutated = self.workflow.replace(
-            "actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d",
-            "actions/attest@v4.2.1",
-            1,
+        mutated, replacements = re.subn(
+            r"actions/attest@[0-9a-f]{40}",
+            "actions/attest@v4",
+            self.workflow,
+            count=1,
         )
+        self.assertEqual(replacements, 1)
         self.assert_rejected(mutated, "lacks a full-SHA actions/attest step")
 
     def test_rejects_publication_before_attestation(self) -> None:

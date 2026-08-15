@@ -1,3 +1,6 @@
+// The top-level diffusion call keeps checkpoint inputs explicit at the boundary.
+#![allow(clippy::too_many_arguments)]
+
 //! Wan2.1 video generation model — the main inference pipeline.
 //!
 //! Orchestrates the full text-to-video generation:
@@ -272,16 +275,16 @@ impl WanVideoModel {
         // Signal completion
         if let Some(sink) = sink.as_mut() {
             sink.on_chunk(OutputChunk::VideoComplete {
-                width: width,
-                height: height,
+                width,
+                height,
                 fps,
                 frame_count: frame_count as u32,
             })?;
         }
 
         Ok(VideoOutput {
-            width: width,
-            height: height,
+            width,
+            height,
             fps,
             frame_count: frame_count as u32,
             frames,

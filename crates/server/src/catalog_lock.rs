@@ -152,6 +152,9 @@ fn open_lock_file(lock_path: &Path) -> io::Result<File> {
         .read(true)
         .write(true)
         .create(true)
+        // Existing non-empty lock files are rejected after opening, so never
+        // erase their contents as a side effect of attempting acquisition.
+        .truncate(false)
         .mode(0o600)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .open(lock_path)
@@ -163,6 +166,7 @@ fn open_lock_file(lock_path: &Path) -> io::Result<File> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(lock_path)
 }
 

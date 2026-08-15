@@ -17,6 +17,8 @@ cargo clippy --workspace --all-targets --features serve-ui --locked -- -D warnin
 cargo clippy --manifest-path ui/Cargo.toml --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 cargo test --manifest-path ui/Cargo.toml --locked
+cargo build -p bloomai-ffi --locked
+BLOOM_TEST_NATIVE_FFI=1 python3 -m unittest discover -s python/tests -v
 python3 scripts/test_server_shutdown.py
 python3 scripts/test_server_http_boundary.py
 ./scripts/test_tiny_model_runtime.sh --require-official-clients
@@ -24,6 +26,7 @@ python3 scripts/test_server_http_boundary.py
 ./scripts/test_trained_qwen3_runtime.sh
 ./scripts/test_trained_llama_runtime.sh
 ./scripts/test_trained_safetensors_runtime.sh
+./scripts/test_trained_embedding_runtime.sh --require-official-clients
 ./scripts/validate_json_artifacts.py
 python3 scripts/check_readiness_contract.py
 python3 scripts/check_markdown_links.py
@@ -239,9 +242,10 @@ all protocol errors while leaving static UI paths outside the dynamic policy.
 
 ## Publishing to crates.io
 
-The workspace publishes five crates under the `bloomai-*` namespace. Publish
+The workspace publishes six crates under the `bloomai-*` namespace. Publish
 them in dependency order so each crate's path dependencies already exist on
-the registry:
+the registry. The server and FFI crates can be published in either order after
+the engine because neither depends on the other:
 
 ```bash
 cargo login                          # one-time, needs a crates.io API token
@@ -250,11 +254,14 @@ cargo publish -p bloomai-backend
 cargo publish -p bloomai-tilelang
 cargo publish -p bloomai-engine
 cargo publish -p bloomai-ffi
+cargo publish -p bloomai-server
 ```
 
 > **Namespace:** crates are published as `bloomai-*` because the bare
 > `bloom-core` name was already taken on crates.io by an unrelated project.
-> All five `bloomai-*` names were verified free on 2026-07-21. The FFI dynamic
+> The original five library names were verified free on 2026-07-21; verify the
+> newer `bloomai-server` name again immediately before its first publication.
+> The FFI dynamic
 > library keeps the file name `bloom_ffi` (`libbloom_ffi.{so,dylib,dll}`) so
 > the Python SDK and downstream loaders are unaffected by the crate rename.
 

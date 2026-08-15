@@ -750,9 +750,10 @@ pub fn verify_with_rejection_sampling(
 }
 
 /// Speculative decoding mode configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum SpeculativeMode {
     /// No speculative decoding.
+    #[default]
     None,
     /// N-gram based speculative decoding.
     NGram {
@@ -773,12 +774,6 @@ pub enum SpeculativeMode {
         /// Number of auxiliary future tokens to verify per step.
         num_speculative: usize,
     },
-}
-
-impl Default for SpeculativeMode {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 impl SpeculativeMode {

@@ -180,9 +180,10 @@ impl std::fmt::Display for QuantMethod {
 }
 
 /// Bits precision for KV cache storage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum KvCacheDtype {
     /// Full precision F16.
+    #[default]
     F16,
     /// Brain float 16.
     BF16,
@@ -207,12 +208,6 @@ impl KvCacheDtype {
     /// Whether this dtype requires dequantization before attention computation.
     pub fn needs_dequant(&self) -> bool {
         matches!(self, Self::Int8 | Self::Fp8)
-    }
-}
-
-impl Default for KvCacheDtype {
-    fn default() -> Self {
-        Self::F16
     }
 }
 

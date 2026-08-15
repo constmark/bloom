@@ -72,7 +72,7 @@ def start_server(
     log_path = directory / "server.log"
     log_handle = log_path.open("wb")
     environment = os.environ.copy()
-    environment["RUST_LOG"] = "bloom_server=info"
+    environment["RUST_LOG"] = "bloom_server=info,tower_http=debug"
     try:
         process = subprocess.Popen(
             [
@@ -97,7 +97,7 @@ def start_server(
 def wait_for_log(
     process: subprocess.Popen[bytes], log_path: pathlib.Path, marker: str
 ) -> str:
-    deadline = time.monotonic() + 2
+    deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         log = read_log(log_path)
         if marker in log:
@@ -109,8 +109,32 @@ def wait_for_log(
             )
         time.sleep(0.02)
     raise AssertionError(
-        f"bloom_server did not log {marker!r} within 2 seconds:\n{read_log(log_path)}"
+        f"bloom_server did not log {marker!r} within 5 seconds:\n{read_log(log_path)}"
     )
+
+
+def open_active_request(
+    process: subprocess.Popen[bytes], log_path: pathlib.Path, port: int, request_id: str
+) -> socket.socket:
+    """Open a request whose incomplete body keeps graceful shutdown draining."""
+    connection = socket.create_connection(("127.0.0.1", port), timeout=2)
+    connection.sendall(
+        (
+            "POST /v1/chat/completions HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: 1024\r\n"
+            f"X-Request-Id: {request_id}\r\n"
+            "\r\n"
+            "{"
+        ).encode("ascii")
+    )
+    try:
+        wait_for_log(process, log_path, f'request_id="{request_id}"')
+    except BaseException:
+        connection.close()
+        raise
+    return connection
 
 
 def stop_process(process: subprocess.Popen[bytes]) -> None:
@@ -169,10 +193,10 @@ def test_clean_sigterm(directory: pathlib.Path) -> None:
 
 def test_forced_deadline(directory: pathlib.Path) -> None:
     process, log_path, port = start_server(directory, 1)
-    connection = socket.create_connection(("127.0.0.1", port), timeout=2)
+    connection = open_active_request(
+        process, log_path, port, "shutdown-deadline-request"
+    )
     try:
-        connection.sendall(b"GET /health HTTP/1.1\r\nHost: localhost\r\n")
-        time.sleep(0.05)
         process.send_signal(signal.SIGTERM)
         status = process.wait(timeout=5)
         log = read_log(log_path)
@@ -189,10 +213,10 @@ def test_forced_deadline(directory: pathlib.Path) -> None:
 
 def test_repeated_sigterm(directory: pathlib.Path) -> None:
     process, log_path, port = start_server(directory, 30)
-    connection = socket.create_connection(("127.0.0.1", port), timeout=2)
+    connection = open_active_request(
+        process, log_path, port, "shutdown-repeated-signal-request"
+    )
     try:
-        connection.sendall(b"GET /health HTTP/1.1\r\nHost: localhost\r\n")
-        time.sleep(0.05)
         process.send_signal(signal.SIGTERM)
         wait_for_log(process, log_path, "Received shutdown signal")
         assert_catalog_owned_during_drain(directory)

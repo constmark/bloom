@@ -251,10 +251,12 @@ mod tests {
     fn test_inference_scheduler_prioritizes_decode_when_budget_is_tight() {
         let executor = Arc::new(MockExecutor);
         let kv_pool = Arc::new(MockKvPool::new(10));
-        let mut config = bloomai_core::TokenSchedulingConfig::default();
-        config.max_total_tokens_per_step = 1;
-        config.max_prefill_tokens_per_step = 4;
-        config.max_decode_tokens_per_step = 1;
+        let config = bloomai_core::TokenSchedulingConfig {
+            max_total_tokens_per_step: 1,
+            max_prefill_tokens_per_step: 4,
+            max_decode_tokens_per_step: 1,
+            ..Default::default()
+        };
 
         let scheduler = InferenceScheduler::with_config(executor, kv_pool, config);
 
@@ -326,10 +328,12 @@ mod tests {
     fn test_inference_scheduler_continuous_decode_quantum() {
         let executor = Arc::new(MockExecutor);
         let kv_pool = Arc::new(MockKvPool::new(10));
-        let mut config = bloomai_core::TokenSchedulingConfig::default();
-        config.decode_quantum_tokens = 2;
-        config.max_decode_tokens_per_step = 2;
-        config.max_total_tokens_per_step = 4;
+        let config = bloomai_core::TokenSchedulingConfig {
+            decode_quantum_tokens: 2,
+            max_decode_tokens_per_step: 2,
+            max_total_tokens_per_step: 4,
+            ..Default::default()
+        };
 
         let scheduler = InferenceScheduler::with_config(executor, kv_pool, config);
 
@@ -873,7 +877,6 @@ mod tests {
                 max_prefill_tokens_per_step: 2,
                 max_decode_tokens_per_step: 4,
                 max_total_tokens_per_step: 2,
-                ..Default::default()
             },
         );
 

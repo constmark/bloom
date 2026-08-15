@@ -1,3 +1,6 @@
+// Kernel reference loops use explicit indices to match Metal thread coordinates.
+#![allow(clippy::needless_range_loop)]
+
 use candle_core::{Device, Result, Tensor};
 
 #[cfg(feature = "metal")]

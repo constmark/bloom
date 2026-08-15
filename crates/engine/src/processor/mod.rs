@@ -1,3 +1,6 @@
+// Image resampling indexes source and destination coordinates explicitly.
+#![allow(clippy::needless_range_loop)]
+
 use std::collections::HashMap;
 
 use anyhow::{anyhow, bail, Result};

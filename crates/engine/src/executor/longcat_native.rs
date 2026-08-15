@@ -1,3 +1,6 @@
+// Tensor-coordinate loops and graph entry points mirror the published model layout.
+#![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+
 //! Native LongCat image-edit graph planning and metadata validation.
 //!
 //! This module intentionally stays off the PyTorch/Diffusers path.  It builds
@@ -355,10 +358,13 @@ fn validate_config_compatibility(
             text.hidden_size
         );
     }
-    if text.hidden_size % text.num_attention_heads != 0 {
+    if !text.hidden_size.is_multiple_of(text.num_attention_heads) {
         bail!("Qwen2.5-VL hidden_size must be divisible by attention heads");
     }
-    if text.num_attention_heads % text.num_key_value_heads != 0 {
+    if !text
+        .num_attention_heads
+        .is_multiple_of(text.num_key_value_heads)
+    {
         bail!("Qwen2.5-VL attention heads must be divisible by KV heads");
     }
     if text.rope_scaling.mrope_section.iter().sum::<usize>() * 2
@@ -366,7 +372,11 @@ fn validate_config_compatibility(
     {
         bail!("Qwen2.5-VL mrope_section does not match attention head dim");
     }
-    if text.vision_config.hidden_size % text.vision_config.num_heads != 0 {
+    if !text
+        .vision_config
+        .hidden_size
+        .is_multiple_of(text.vision_config.num_heads)
+    {
         bail!("Qwen2.5-VL vision hidden_size must be divisible by vision heads");
     }
     if vae.latent_channels != 16 {
@@ -407,7 +417,7 @@ fn calculate_dimensions(target_area: usize, ratio: f64) -> (usize, usize) {
 }
 
 fn round_up_to(value: usize, factor: usize) -> usize {
-    if value % factor == 0 {
+    if value.is_multiple_of(factor) {
         value
     } else {
         (value / factor + 1) * factor

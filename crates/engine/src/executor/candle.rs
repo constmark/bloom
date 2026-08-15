@@ -2581,10 +2581,8 @@ fn autocomplete_json(text: &str) -> String {
             } else if trimmed.ends_with(',') {
                 completed.push_str("\"_dummy\":null");
             }
-        } else if close_char == ']' {
-            if trimmed.ends_with(',') {
-                completed.push_str("null");
-            }
+        } else if close_char == ']' && trimmed.ends_with(',') {
+            completed.push_str("null");
         }
         completed.push(close_char);
     }
@@ -2612,10 +2610,10 @@ fn validate_partial_json_schema(
                 ));
             }
         } else {
-            if !enum_values.iter().any(|candidate| candidate == value) {
-                if value != &serde_json::Value::Null {
-                    return Err(format!("{} does not match any allowed enum value", path));
-                }
+            if !enum_values.iter().any(|candidate| candidate == value)
+                && value != &serde_json::Value::Null
+            {
+                return Err(format!("{} does not match any allowed enum value", path));
             }
         }
     }

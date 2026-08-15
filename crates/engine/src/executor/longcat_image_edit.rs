@@ -538,10 +538,10 @@ fn total_memory_bytes() -> Option<u64> {
         if !output.status.success() {
             return None;
         }
-        return String::from_utf8_lossy(&output.stdout)
+        String::from_utf8_lossy(&output.stdout)
             .trim()
             .parse::<u64>()
-            .ok();
+            .ok()
     }
 
     #[cfg(target_os = "linux")]
@@ -563,7 +563,7 @@ fn available_memory_bytes() -> Option<u64> {
         if !output.status.success() {
             return None;
         }
-        return parse_macos_vm_stat_available(&String::from_utf8_lossy(&output.stdout));
+        parse_macos_vm_stat_available(&String::from_utf8_lossy(&output.stdout))
     }
 
     #[cfg(target_os = "linux")]

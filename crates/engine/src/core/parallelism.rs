@@ -11,9 +11,10 @@ use serde::{Deserialize, Serialize};
 use candle_core::Tensor;
 
 /// Parallel execution strategy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum ParallelStrategy {
     /// No parallelism — single device execution.
+    #[default]
     None,
     /// Tensor parallelism — split weight matrices across GPUs.
     TensorParallel,
@@ -23,12 +24,6 @@ pub enum ParallelStrategy {
     DataParallel,
     /// Expert parallelism — for MoE models.
     ExpertParallel,
-}
-
-impl Default for ParallelStrategy {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 impl std::fmt::Display for ParallelStrategy {

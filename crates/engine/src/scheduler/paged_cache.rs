@@ -57,9 +57,10 @@ pub struct PagedCacheConfig {
 
 /// Policy for keeping long-context decode bounded before model-level kernels
 /// wire in full context shifting.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum LongContextPolicy {
     /// Attend to every allocated KV block.
+    #[default]
     Full,
     /// Attend only to the most recent window of tokens.
     SlidingWindow { window_tokens: usize },
@@ -85,12 +86,6 @@ impl LongContextPolicy {
                 tokens_to_blocks(retained_tokens.max(block_size), block_size)
             }
         }
-    }
-}
-
-impl Default for LongContextPolicy {
-    fn default() -> Self {
-        Self::Full
     }
 }
 
@@ -377,8 +372,8 @@ impl PagedAttentionCache {
                 // Block not yet populated — fill with zeros
                 let block_tokens = self.config.block_size;
                 let block_elements = block_tokens * self.config.kv_dim;
-                all_keys.extend(std::iter::repeat(0.0f32).take(block_elements));
-                all_values.extend(std::iter::repeat(0.0f32).take(block_elements));
+                all_keys.extend(std::iter::repeat_n(0.0f32, block_elements));
+                all_values.extend(std::iter::repeat_n(0.0f32, block_elements));
             }
         }
 
@@ -530,7 +525,7 @@ impl PagedAttentionCache {
         let mut total = 0usize;
 
         for layer_map in layer_data.iter() {
-            for (_, block) in layer_map {
+            for block in layer_map.values() {
                 if self.config.kv_dtype.needs_dequant() {
                     if let (Some(qk), Some(qv)) = (&block.quantized_keys, &block.quantized_values) {
                         total += qk.memory_bytes() + qv.memory_bytes();

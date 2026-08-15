@@ -7,12 +7,22 @@ cargo fmt --all -- --check
 cargo check --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings -A missing_docs
 cargo test --workspace --locked
+python3 -m unittest discover -s python/tests -v
 python3 scripts/test_server_shutdown.py
 python3 scripts/test_server_http_boundary.py
 ./scripts/test_tiny_model_runtime.sh
 python3 -m pip install -r requirements/schema-validation.txt
 ./scripts/validate_json_artifacts.py
 ```
+
+The Python SDK boundary tests do not require a model or compiled native
+library. A contract fake verifies lazy native-library loading, parameter
+admission, native string ownership, idempotent close, and serialization between
+active streaming calls and handle destruction. The Rust FFI tests separately
+cross the real C ABI with the mock engine and require a NULL stream callback to
+fail closed rather than invoke undefined behavior. CI also builds the shared
+library and sets `BLOOM_TEST_NATIVE_FFI=1`, which makes the Python suite run a
+real buffered and streaming `ctypes` round trip through the Rust mock engine.
 
 The process-lifecycle test builds and launches the real server. It exercises a
 clean `SIGTERM`, bounded deadline expiry, and repeated-signal escalation on

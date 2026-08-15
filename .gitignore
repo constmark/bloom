@@ -94,6 +94,7 @@ test_*.rs
 !scripts/test_community_metadata.py
 !scripts/test_release_workflow_security.py
 !scripts/test_validate_release_artifact.py
+!python/tests/test_*.py
 mock_wan.py
 dummy_wan/
 crates/engine/src/executor/wan/dummy.rs

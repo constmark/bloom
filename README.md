@@ -68,8 +68,8 @@ supported model or install the commands into `PATH`.
 
 ### Prerequisites
 
-- [Rust](https://www.rust-lang.org/tools/install) with the toolchain pinned in
-  `rust-toolchain.toml`
+- [Rust](https://www.rust-lang.org/tools/install) 1.97.1, pinned in
+  `rust-toolchain.toml` and declared as the current minimum supported version
 - Git
 - A compatible local model; start with the
   [support matrix](docs/support-matrix.md)
@@ -827,8 +827,8 @@ Public JSON schemas and examples live under `examples/`. Validate them with:
 | `crates/engine` | Model loading, inference engines, pipelines, native CLI tools, and CacheMesh |
 | `crates/server` | HTTP application layer, model lifecycle, protocol adapters, and optional UI embedding |
 | `crates/tilelang` | TileLang kernel compilation and loading |
-| `crates/ffi` | Stable C ABI for native consumers |
-| `python` | Python SDK bindings |
+| `crates/ffi` | Pre-1.0 C ABI for native consumers |
+| `python` | Python SDK bindings over the C ABI |
 | `clients/macos` | Native SwiftUI macOS client |
 | `ui` | Optional Dioxus web interface |
 | `docs` | Architecture, operations, support, and roadmap documentation |
@@ -846,6 +846,7 @@ cargo check --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings -A missing_docs
 cargo test --workspace --locked
 cargo test --manifest-path ui/Cargo.toml --locked
+python3 -m unittest discover -s python/tests -v
 ./scripts/test_tiny_model_runtime.sh
 ./scripts/validate_json_artifacts.py
 python3 -m pip install -r requirements/compat-smoke.txt

@@ -450,6 +450,7 @@ fn validate_directory_path(directory: &Path) -> Result<()> {
 }
 
 fn ensure_directory(directory: &Path) -> Result<()> {
+    #[cfg(unix)]
     let existed = fs::symlink_metadata(directory).is_ok();
     create_private_directory(directory)?;
     let metadata = fs::symlink_metadata(directory)

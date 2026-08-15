@@ -1,5 +1,7 @@
 #![cfg(feature = "candle-engine")]
 #![allow(dead_code)]
+// Multiaxis position construction intentionally indexes coordinate planes.
+#![allow(clippy::needless_range_loop)]
 
 use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
@@ -693,8 +695,12 @@ impl Qwen3VLVisionModel {
             &self.device,
         )?;
 
-        let mut idx_list = vec![Vec::with_capacity(grid_h * grid_w); 4];
-        let mut weight_list = vec![Vec::with_capacity(grid_h * grid_w); 4];
+        let mut idx_list = (0..4)
+            .map(|_| Vec::with_capacity(grid_h * grid_w))
+            .collect::<Vec<_>>();
+        let mut weight_list = (0..4)
+            .map(|_| Vec::with_capacity(grid_h * grid_w))
+            .collect::<Vec<_>>();
 
         let h_idxs_vec = h_idxs.to_vec1::<f32>()?;
         let w_idxs_vec = w_idxs.to_vec1::<f32>()?;

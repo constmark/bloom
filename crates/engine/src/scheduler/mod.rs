@@ -1,3 +1,6 @@
+// Scheduler queues expose callback and completion-channel ownership in their types.
+#![allow(clippy::type_complexity)]
+
 use anyhow::Result;
 use bloomai_core::{
     token_scheduling::{
@@ -1096,7 +1099,7 @@ impl BloomScheduler {
             .map(|block| match block {
                 DataBlock::Text(text) => {
                     let chars = text.chars().count();
-                    if text.chars().any(|c| !c.is_ascii()) {
+                    if !text.is_ascii() {
                         chars.max(1)
                     } else {
                         (chars / 4).max(1)
@@ -1394,8 +1397,10 @@ impl InferenceScheduler {
         kv_pool: Arc<dyn KvCachePool>,
         max_num_tokens: usize,
     ) -> Self {
-        let mut config = CoreTokenSchedulingConfig::default();
-        config.max_total_tokens_per_step = max_num_tokens;
+        let config = CoreTokenSchedulingConfig {
+            max_total_tokens_per_step: max_num_tokens,
+            ..Default::default()
+        };
         Self::with_config(executor, kv_pool, config)
     }
 

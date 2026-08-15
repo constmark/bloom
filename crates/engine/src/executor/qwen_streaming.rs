@@ -1,3 +1,6 @@
+// Streaming attention entry points mirror the model's separate state tensors.
+#![allow(clippy::too_many_arguments)]
+
 use bloomai_core::BloomError;
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{kv_cache::ConcatKvCache, Activation, VarBuilder};

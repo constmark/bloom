@@ -1,3 +1,6 @@
+// Callback and KV bridge types stay explicit because they encode scheduler ownership.
+#![allow(clippy::type_complexity)]
+
 //! Batch executor that bridges the InferenceScheduler with the Candle model forward pass.
 //!
 //! Implements `EngineExecutor` to accept `ExecutionBatch` from the scheduler

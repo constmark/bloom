@@ -16,7 +16,7 @@ use crate::{
 };
 
 thread_local! {
-    static FORCE_SPAWN_DAEMON: std::cell::Cell<bool> = std::cell::Cell::new(false);
+    static FORCE_SPAWN_DAEMON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub struct FunASREngine;

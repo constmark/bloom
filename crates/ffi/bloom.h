@@ -27,7 +27,7 @@ typedef void (*BloomStreamCallback)(void* user_data, const char* chunk_json);
  * @param model_path Path to the model directory or single file (GGUF).
  * @param engine_name Name of the execution engine (e.g. "candle", "openvino", "funasr").
  * @param device_name Name of the target device kind ("cpu", "gpu", "npu").
- * @param context_size Maximum sequence length context.
+ * @param context_size Maximum sequence length context; must be greater than zero.
  * @param error_buffer Buffer to write the error message on failure.
  * @param error_buffer_len Capacity of the error buffer in bytes.
  * @return A pointer to the loaded BloomPipeline, or NULL on error.
@@ -72,11 +72,12 @@ char* bloom_pipeline_run(
  * @param pipeline Handle to the loaded pipeline.
  * @param input_json JSON-serialized ModelInput representation.
  * @param params_json JSON-serialized GenerationParams representation.
- * @param callback Callback function invoked for each streamed chunk.
+ * @param callback Non-NULL callback function invoked for each streamed chunk.
  * @param user_data User-provided pointer forwarded to the callback.
  * @param error_buffer Buffer to write error details on failure.
  * @param error_buffer_len Capacity of the error buffer.
- * @return 0 on success, negative error code on failure.
+ * @return 0 on success, -1 for a NULL argument, -2 through -6 for input or
+ *         inference errors, and -7 if Bloom catches an internal panic.
  */
 int32_t bloom_pipeline_run_stream(
     BloomPipeline* pipeline,

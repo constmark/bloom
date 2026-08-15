@@ -110,10 +110,10 @@ fn detect_tts_backend(model_path: &Path) -> TtsBackend {
     let path_str = model_path.to_string_lossy().to_lowercase();
 
     // ChatTTS detection
-    if path_str.contains("chattts") || path_str.contains("chat_tts") {
-        if model_path.join("config.json").exists() {
-            return TtsBackend::ChatTts;
-        }
+    if (path_str.contains("chattts") || path_str.contains("chat_tts"))
+        && model_path.join("config.json").exists()
+    {
+        return TtsBackend::ChatTts;
     }
 
     // Default to CosyVoice
@@ -263,7 +263,7 @@ fn download_from_modelscope(repo_id: &str, model_root: &Path) -> Result<PathBuf>
         Ok(result_path)
     } else {
         // Fallback: look in model_root for the downloaded directory
-        let repo_name = repo_id.split('/').last().unwrap_or(repo_id);
+        let repo_name = repo_id.split('/').next_back().unwrap_or(repo_id);
         let fallback_path = model_root.join(repo_name);
         if fallback_path.exists() {
             Ok(fallback_path)
@@ -577,7 +577,7 @@ fn read_wav_to_pcm(path: &Path) -> Result<(Vec<f32>, u32)> {
 
         pos += 8 + chunk_size;
         // Chunks are 2-byte aligned
-        if chunk_size % 2 != 0 {
+        if !chunk_size.is_multiple_of(2) {
             pos += 1;
         }
     }

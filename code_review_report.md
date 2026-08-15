@@ -4,6 +4,10 @@
 > Method: static review of dependencies, core traits, error handling, CLI and
 > server entry points, engine implementations, CI, project governance, and
 > technical-debt indicators.
+>
+> **Current status:** Sections 1–5 preserve the original assessment. Sections
+> 6–8 record subsequent remediation; Section 8 is the current 2026-08-15
+> reassessment and remaining-risk list.
 
 ## Executive Summary
 
@@ -25,18 +29,14 @@ documentation expected from a public open-source project.
 
 ### 1.1 Dependency graph
 
-The five workspace crates form a directed acyclic graph:
+The six workspace crates form a directed acyclic graph:
 
 ```text
 core
-  ^
-backend
-  ^
-engine
-  ^
-ffi
-
-tilelang (independent leaf used by engine)
+  ├── backend ──┐
+  └─────────────┼── engine ── ffi
+tilelang ───────┘       └──── server
+backend ─────────────────────┘
 ```
 
 `core` does not depend on `engine`, and dependencies flow toward lower-level
@@ -238,3 +238,101 @@ lint to `#![deny(clippy::unwrap_used)]` once the count is driven down.
 - `cargo clippy --bin bloom_server --workspace` — passes (warnings only).
 - `cargo clippy -p bloomai-engine` — passes; 59 `unwrap_used` warnings now
   tracked (were silently allowed before).
+
+## 7. Reassessment and Iteration Log (2026-08-14)
+
+The default workspace baseline passed formatting, all-target compilation,
+strict Clippy, and 772 Rust tests before this iteration. The original report's
+real-model-gate and lockfile concerns are now stale: `Cargo.lock` is committed,
+and Linux CI requires deterministic native fixtures plus pinned trained Qwen2,
+Qwen3, Llama, Safetensors, and MiniLM embedding gates instead of silently
+skipping every real execution path.
+
+### 7.1 Completed in this iteration
+
+- Removed the remaining runtime `unimplemented!` crash paths. Unavailable Gemma
+  FlashAttention and placeholder Conv3d execution now return actionable Candle
+  errors, with regression tests.
+- Hardened the pre-1.0 C ABI. NULL stream callbacks and zero context sizes fail
+  closed, load/run/stream entry points catch internal Rust panics, unsafe entry
+  points carry explicit safety contracts, and the crate no longer needs broad
+  `missing_safety_doc` or `needless_return` lint allowances.
+- Hardened the Python wrapper. Import no longer loads the native library;
+  generation parameters and NUL-bearing identifiers are validated; returned C
+  strings are freed on decode failures; and a per-pipeline lock prevents
+  `close()` from freeing a handle during active buffered or streaming work.
+- Added model-free Python contract tests and a real Python → `ctypes` → Rust
+  mock-engine round trip to Linux CI.
+- Reconciled release metadata after the server application-layer split. All six
+  publishable crates now declare Rust 1.97.1, the consistency checker enforces
+  workspace/UI declarations, and the release checklist includes
+  `bloomai-server`, the Python/FFI gate, and the trained embedding gate.
+- Corrected documentation that prematurely called the ABI stable and added an
+  ownership, threading, and failure contract for C and Python consumers.
+
+### 7.2 Remaining priorities at that checkpoint
+
+| Priority | Remaining gap | Exit condition |
+| --- | --- | --- |
+| P1 | Production modules remain too large: UI `main.rs` (~6.2k lines), UI `api.rs` (~5.5k), server `handlers.rs` (~5k), and Candle executor (~3.4k before tests) | Split by feature boundary while preserving focused module-level tests |
+| P1 | The engine crate still carries broad crate-level Clippy allowances | Move each necessary allowance to the smallest item/module and remove obsolete entries |
+| P1 | C ABI streaming has no cancellation function, and string inputs are NUL-terminated rather than length-delimited | Add a versioned, length-aware ABI with cancellation before declaring stability |
+| P1 | Metal/CUDA benchmark evidence is not a required cross-platform release artifact | Publish reproducible hardware profiles using the benchmark schema |
+| P2 | ONNX, TensorRT, CoreML, MLX, and Vulkan remain truthful diagnostic skeletons | Keep them non-routable until an executable adapter has pinned runtime evidence |
+
+The next implementation iteration should split the HTTP handler and UI feature
+surfaces before adding more protocol behavior. That work is primarily a review
+and ownership improvement, so it should be done in small behavior-preserving
+changes with the existing HTTP and UI state suites kept green.
+
+## 8. CI Reliability and Lint-Scope Iteration (2026-08-15)
+
+The failing `main` workflow at commit `a28da32` was reproduced against Linux
+process behavior and a locally cross-compiled Windows workspace. Its three
+blocking jobs had independent causes rather than one shared toolchain failure.
+
+### 8.1 GitHub CI failures remediated
+
+- The Linux shutdown test used a fixed 50 ms sleep after writing a partial HTTP
+  request. On a contended runner the server could begin shutdown before it had
+  accepted that connection. The test now waits for a unique request ID in the
+  server's HTTP trace before sending SIGTERM, making the active drain observable
+  instead of timing-dependent.
+- Windows Clippy exposed an Unix-only local variable and an implicit
+  `OpenOptions` truncation policy. The variable is now conditionally compiled,
+  while the persistent catalog lock explicitly uses `truncate(false)` so an
+  acquisition attempt cannot erase an invalid non-empty lock file.
+- The RustSec Action tried to create a GitHub Check while the workflow correctly
+  defaulted to `contents: read`. CI now runs pinned `cargo-audit` directly; it
+  requires no write-capable token and therefore works for push, Dependabot, and
+  fork pull-request contexts.
+- Node 20 actions were upgraded to current full-SHA-pinned releases across CI
+  and release workflows. The immutable-action and release-provenance contract
+  tests remain blocking.
+
+### 8.2 Engine Clippy policy narrowed
+
+The 20-entry crate-root `clippy::allow` block was removed. Clippy's safe fixes
+resolved the mechanical findings, including derivable defaults, redundant
+fields, needless borrows/returns/question marks, manual range/repeat/divisibility
+operations, and an actual repeated-`Vec::with_capacity` allocation bug. The only
+remaining exceptions are `needless_range_loop`, `too_many_arguments`, and
+`type_complexity`; each is now scoped to the specific tensor/model/scheduler
+module with a rationale instead of disabling the lint across the engine crate.
+
+### 8.3 First server ownership split
+
+Cross-platform signal listeners and graceful-shutdown deadline coordination now
+live in `crates/server/src/shutdown.rs`. This is a small first extraction from
+the server composition module and gives subsequent HTTP/runtime splits a clear
+process-lifecycle boundary.
+
+### 8.4 Current remaining priorities
+
+| Priority | Remaining gap | Exit condition |
+| --- | --- | --- |
+| P1 | UI `main.rs`/`api.rs`, server handlers and model-management modules, and Candle executors remain too large | Continue behavior-preserving splits by protocol and runtime ownership, with focused tests per extracted module |
+| P1 | C ABI streaming still lacks cancellation and length-delimited string inputs | Ship a versioned ABI revision and migration path before declaring stability |
+| P1 | Metal/CUDA benchmark evidence is not a required cross-platform release artifact | Publish reproducible hardware profiles using the benchmark schema |
+| P2 | `paste` 1.0.15 is an unmaintained transitive dependency through Candle/gemm/tokenizers | Track upstream replacement and remove it when the model stack supports a compatible release |
+| P2 | ONNX, TensorRT, CoreML, MLX, and Vulkan remain truthful diagnostic skeletons | Keep them non-routable until an executable adapter has pinned runtime evidence |

@@ -17,6 +17,12 @@ TOOLCHAIN_CHANNEL = re.compile(
 ACTION_REFERENCE = re.compile(r"dtolnay/rust-toolchain@([0-9a-f]{40})")
 TOOLCHAIN_INPUT = re.compile(r'^\s*toolchain:\s*["\']?([^"\'\s]+)["\']?\s*$', re.MULTILINE)
 DOCKER_RUST_IMAGE = re.compile(r"^\s*FROM\s+rust:([^\s@]+)", re.MULTILINE)
+WORKSPACE_RUST_VERSION = re.compile(
+    r'^\s*rust-version\s*=\s*"([^"]+)"\s*(?:#.*)?$', re.MULTILINE
+)
+INHERITED_RUST_VERSION = re.compile(
+    r"^\s*rust-version\.workspace\s*=\s*true\s*(?:#.*)?$", re.MULTILINE
+)
 
 
 def validate(root: pathlib.Path) -> tuple[str | None, list[str]]:
@@ -31,6 +37,47 @@ def validate(root: pathlib.Path) -> tuple[str | None, list[str]]:
     version = channel.group(1) if channel is not None else None
     if version is None or EXACT_VERSION.fullmatch(version) is None:
         return None, ["rust-toolchain.toml must select one major.minor.patch release"]
+
+    workspace_manifest_path = root / "Cargo.toml"
+    try:
+        workspace_manifest = workspace_manifest_path.read_text(encoding="utf-8")
+    except OSError as error:
+        errors.append(f"cannot read Cargo.toml: {error}")
+    else:
+        declared_version = WORKSPACE_RUST_VERSION.search(workspace_manifest)
+        if declared_version is None:
+            errors.append("workspace.package must declare rust-version")
+        elif declared_version.group(1) != version:
+            errors.append(
+                f"workspace rust-version is {declared_version.group(1)}; expected {version}"
+            )
+
+    for crate_manifest_path in sorted((root / "crates").glob("*/Cargo.toml")):
+        try:
+            crate_manifest = crate_manifest_path.read_text(encoding="utf-8")
+        except OSError as error:
+            errors.append(
+                f"cannot read {crate_manifest_path.relative_to(root)}: {error}"
+            )
+            continue
+        if INHERITED_RUST_VERSION.search(crate_manifest) is None:
+            errors.append(
+                f"{crate_manifest_path.relative_to(root)} must inherit workspace rust-version"
+            )
+
+    ui_manifest_path = root / "ui" / "Cargo.toml"
+    try:
+        ui_manifest = ui_manifest_path.read_text(encoding="utf-8")
+    except OSError as error:
+        errors.append(f"cannot read ui/Cargo.toml: {error}")
+    else:
+        ui_version = WORKSPACE_RUST_VERSION.search(ui_manifest)
+        if ui_version is None:
+            errors.append("ui/Cargo.toml must declare rust-version")
+        elif ui_version.group(1) != version:
+            errors.append(
+                f"ui rust-version is {ui_version.group(1)}; expected {version}"
+            )
 
     workflow_paths = sorted((root / ".github" / "workflows").glob("*.yml"))
     action_references: list[tuple[pathlib.Path, str]] = []
