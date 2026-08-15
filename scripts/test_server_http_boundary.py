@@ -32,6 +32,7 @@ EXPECT_EMBEDDED_UI = os.environ.get("BLOOM_EXPECT_EMBEDDED_UI", "").lower() in {
     "yes",
 }
 STARTUP_PATTERN = re.compile(r"server running on http://127\.0\.0\.1:(\d+)")
+ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-9;]*m")
 MAX_RESPONSE_BYTES = 1024 * 1024
 ALLOWED_BROWSER_ORIGIN = "https://bloom-boundary.invalid"
 REJECTED_BROWSER_ORIGIN = "https://malicious-boundary.invalid"
@@ -39,7 +40,9 @@ REJECTED_BROWSER_ORIGIN = "https://malicious-boundary.invalid"
 
 def read_log(path: pathlib.Path) -> str:
     try:
-        return path.read_text(encoding="utf-8", errors="replace")
+        return ANSI_ESCAPE_PATTERN.sub(
+            "", path.read_text(encoding="utf-8", errors="replace")
+        )
     except FileNotFoundError:
         return ""
 
@@ -853,5 +856,20 @@ def main() -> int:
     return 0
 
 
+def github_command_escape(value: str) -> str:
+    return value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        exit_code = main()
+    except BaseException as error:
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            failure = f"{type(error).__name__}: {error}"[-6_000:]
+            print(
+                "::error title=Server HTTP boundary failure::"
+                + github_command_escape(failure),
+                flush=True,
+            )
+        raise
+    raise SystemExit(exit_code)
