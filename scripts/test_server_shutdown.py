@@ -12,6 +12,7 @@ import socket
 import subprocess
 import tempfile
 import time
+import traceback
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -267,5 +268,20 @@ def main() -> int:
     return 0
 
 
+def github_command_escape(value: str) -> str:
+    return value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        exit_code = main()
+    except BaseException:
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            failure = traceback.format_exc()[-50_000:]
+            print(
+                "::error title=Server shutdown lifecycle failure::"
+                + github_command_escape(failure),
+                flush=True,
+            )
+        raise
+    raise SystemExit(exit_code)

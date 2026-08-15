@@ -6424,7 +6424,12 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(status.phase, ModelDownloadPhase::Complete);
+        assert_eq!(
+            status.phase,
+            ModelDownloadPhase::Complete,
+            "signed package download failed: {:?}",
+            status.error
+        );
         for (filename, expected) in files {
             assert_eq!(
                 tokio::fs::read(temp.path().join("endpoint-package").join(filename))

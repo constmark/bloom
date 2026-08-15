@@ -2540,7 +2540,10 @@ async fn sync_package_tree_for_install(
             if metadata.file_type().is_symlink() || !metadata.is_file() {
                 return Err(anyhow!("package file {filename:?} is not a regular file"));
             }
-            std::fs::File::open(&path)
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
                 .and_then(|file| file.sync_all())
                 .with_context(|| format!("failed to sync package file {filename:?}"))?;
             let mut parent = path.parent();
@@ -3325,7 +3328,12 @@ mod tests {
         manager.start(download).await.unwrap();
         let status = wait_for_terminal(&manager).await;
 
-        assert_eq!(status.phase, ModelDownloadPhase::Complete);
+        assert_eq!(
+            status.phase,
+            ModelDownloadPhase::Complete,
+            "single-file download failed: {:?}",
+            status.error
+        );
         assert_eq!(
             fs::read(temp.path().join("fixture.gguf")).await.unwrap(),
             bytes
@@ -3362,7 +3370,12 @@ mod tests {
         assert!(!temp.path().join("tiny-package").exists());
         let status = wait_for_terminal(&manager).await;
 
-        assert_eq!(status.phase, ModelDownloadPhase::Complete);
+        assert_eq!(
+            status.phase,
+            ModelDownloadPhase::Complete,
+            "package download failed: {:?}",
+            status.error
+        );
         for (filename, bytes) in &files {
             assert_eq!(
                 fs::read(temp.path().join("tiny-package").join(filename))
@@ -3645,7 +3658,12 @@ mod tests {
             .unwrap();
         let status = wait_for_terminal(&manager).await;
 
-        assert_eq!(status.phase, ModelDownloadPhase::Complete);
+        assert_eq!(
+            status.phase,
+            ModelDownloadPhase::Complete,
+            "resumed package download failed: {:?}",
+            status.error
+        );
         assert_eq!(
             fs::read(
                 temp.path()

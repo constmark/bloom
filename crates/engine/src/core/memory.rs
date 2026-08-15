@@ -148,6 +148,14 @@ pub fn plan_memory_preallocation(
             .saturating_add(estimate.temp_tensor_bytes)
     });
 
+    if reserve_bytes > isize::MAX as usize {
+        bail!(
+            "requested startup memory reservation {} exceeds the platform allocation limit {}",
+            format_bytes(reserve_bytes),
+            format_bytes(isize::MAX as usize)
+        );
+    }
+
     if let Some(budget) = budget_bytes {
         if reserve_bytes > budget {
             bail!(
@@ -356,6 +364,21 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("memory utilization"));
+    }
+
+    #[test]
+    fn rejects_reservation_above_platform_allocation_limit() {
+        let err = plan_memory_preallocation(
+            estimate(),
+            MemoryPreallocationConfig {
+                enabled: true,
+                memory_utilization: default_memory_utilization(),
+                reserve_memory_bytes: Some(usize::MAX),
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("platform allocation limit"));
     }
 
     #[test]
