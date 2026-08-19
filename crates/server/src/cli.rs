@@ -33,7 +33,12 @@ pub(crate) struct Args {
     pub doctor: Option<DoctorFormat>,
 
     /// Open the embedded Bloom UI in the system browser after the listener is ready.
-    #[arg(long, env = "BLOOM_OPEN_BROWSER", default_value_t = false)]
+    #[arg(
+        long,
+        env = "BLOOM_OPEN_BROWSER",
+        default_value_t = false,
+        value_parser = BoolishValueParser::new()
+    )]
     pub open_browser: bool,
 
     /// Path to the model directory or a GGUF file.
@@ -81,7 +86,12 @@ pub(crate) struct Args {
     pub reserve_memory_bytes: Option<usize>,
 
     /// Disable startup memory preallocation and only log memory estimates.
-    #[arg(long, env = "BLOOM_DISABLE_MEMORY_PREALLOC", default_value_t = false)]
+    #[arg(
+        long,
+        env = "BLOOM_DISABLE_MEMORY_PREALLOC",
+        default_value_t = false,
+        value_parser = BoolishValueParser::new()
+    )]
     pub disable_memory_prealloc: bool,
 
     /// Maximum total tokens per scheduling step (in-flight batching budget).
@@ -100,6 +110,15 @@ pub(crate) struct Args {
     #[arg(long, env = "BLOOM_API_KEY")]
     pub api_key: Option<String>,
 
+    /// Explicitly allow a non-loopback listener without authentication (unsafe; development only).
+    #[arg(
+        long,
+        env = "BLOOM_ALLOW_UNAUTHENTICATED_NETWORK",
+        default_value_t = false,
+        value_parser = BoolishValueParser::new()
+    )]
+    pub allow_unauthenticated_network: bool,
+
     /// Browser origin policy: same-origin, one exact HTTP(S) origin, or explicit "*".
     #[arg(long, env = "BLOOM_CORS_ALLOW_ORIGIN", default_value = "same-origin")]
     pub cors_allow_origin: String,
@@ -113,7 +132,12 @@ pub(crate) struct Args {
     pub max_upload_bytes: usize,
 
     /// Allow authenticated downloads from trusted model-hosting domains.
-    #[arg(long, env = "BLOOM_ENABLE_MODEL_DOWNLOADS", default_value_t = false)]
+    #[arg(
+        long,
+        env = "BLOOM_ENABLE_MODEL_DOWNLOADS",
+        default_value_t = false,
+        value_parser = BoolishValueParser::new()
+    )]
     pub enable_model_downloads: bool,
 
     /// Maximum size of one downloaded model file in bytes.
@@ -121,7 +145,12 @@ pub(crate) struct Args {
     pub max_model_download_bytes: u64,
 
     /// Allow authenticated, chunked local-file imports into the model catalog.
-    #[arg(long, env = "BLOOM_ENABLE_MODEL_IMPORTS", default_value_t = false)]
+    #[arg(
+        long,
+        env = "BLOOM_ENABLE_MODEL_IMPORTS",
+        default_value_t = false,
+        value_parser = BoolishValueParser::new()
+    )]
     pub enable_model_imports: bool,
 
     /// Maximum size of one imported model file in bytes.
@@ -241,11 +270,21 @@ pub(crate) struct Args {
     pub compact_free_blocks: usize,
 
     /// Enforce strict memory budget check, failing startup if estimate exceeds available memory.
-    #[arg(long, env = "BLOOM_STRICT_MEMORY_BUDGET", default_value_t = false)]
+    #[arg(
+        long,
+        env = "BLOOM_STRICT_MEMORY_BUDGET",
+        default_value_t = false,
+        value_parser = BoolishValueParser::new()
+    )]
     pub strict_memory_budget: bool,
 
     /// Enforce strict security check, failing startup if external scripts/plugins are not allowlisted.
-    #[arg(long, env = "BLOOM_STRICT_SECURITY", default_value_t = false)]
+    #[arg(
+        long,
+        env = "BLOOM_STRICT_SECURITY",
+        default_value_t = false,
+        value_parser = BoolishValueParser::new()
+    )]
     pub strict_security: bool,
 }
 
@@ -302,6 +341,7 @@ pub(crate) fn apply_config(
     apply_config_value!(args, matches, config, max_num_tokens);
     apply_config_value!(args, matches, config, timeout);
     apply_config_value!(args, matches, config, shutdown_timeout_seconds);
+    apply_config_value!(args, matches, config, allow_unauthenticated_network);
     apply_config_value!(args, matches, config, max_upload_bytes);
     apply_config_value!(args, matches, config, enable_model_downloads);
     apply_config_value!(args, matches, config, max_model_download_bytes);

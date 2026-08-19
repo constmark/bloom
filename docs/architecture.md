@@ -681,6 +681,10 @@ request and do not form a transactional benchmark record.
 Browser-origin admission is parsed once at startup and shared by the request
 guard and CORS layer. The default `same-origin` policy permits origin-free
 non-browser clients and an HTTP `Origin` whose authority exactly matches `Host`.
+Independently, a non-loopback listener requires an API key before storage
+mutation or socket binding. An explicit development-only unauthenticated
+override restores a warning-level admission on isolated networks, but strict
+security rejects it.
 On a loopback listener, that same-origin host must itself be `localhost` or a
 loopback IP, which closes the ordinary DNS-rebinding path where an attacker
 points an unrelated hostname at the local listener. A deployment may instead

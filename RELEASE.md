@@ -35,6 +35,8 @@ python3 scripts/test_community_metadata.py
 python3 scripts/check_github_action_pins.py
 python3 scripts/check_release_workflow_security.py
 python3 scripts/test_release_workflow_security.py
+python3 scripts/check_dockerfile_security.py
+python3 scripts/test_dockerfile_security.py
 python3 scripts/test_create_release_archive.py
 python3 scripts/check_toolchain_consistency.py
 python3 scripts/test_validate_release_artifact.py

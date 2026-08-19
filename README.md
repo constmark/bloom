@@ -146,6 +146,29 @@ cargo run --release --features cuda --bin bloom_infer -- \
 Run `cargo run --release --bin bloom_infer -- --help` for the complete CLI
 reference.
 
+### Docker
+
+The container image runs as the fixed unprivileged UID/GID `10001`, stores
+mutable configuration and catalog data under `/var/lib/bloom`, and enables
+strict security and memory admission. Because its listener is public inside the
+container, an API key is required:
+
+```bash
+docker build -t bloom:local .
+docker volume create bloom-data
+docker run --rm -p 127.0.0.1:3000:3000 \
+  -e BLOOM_API_KEY="replace-with-a-long-random-secret" \
+  -v bloom-data:/var/lib/bloom \
+  bloom:local
+```
+
+Keep the host port bound to loopback unless a TLS reverse proxy, rate limits,
+and network policy protect it. A host bind mount must be writable by UID/GID
+`10001`; a named volume receives the image's prepared ownership automatically.
+The Docker build also pins and verifies the Linux UI helper binaries and runs
+Dioxus with auxiliary downloads disabled; a missing or mismatched tool fails
+the image build.
+
 ## OpenAI-Compatible Server
 
 Start the API-only server. This is the default build and does not require the
@@ -657,8 +680,10 @@ and never presents an encoder-only model as chat-capable. See the
 
 For anything beyond localhost, set `BLOOM_API_KEY`, restrict
 `BLOOM_CORS_ALLOW_ORIGIN`, and protect health and metrics endpoints with a
-reverse proxy or network ACL. See the [production guide](docs/production.md)
-and [security policy](SECURITY.md).
+reverse proxy or network ACL. Bloom fails startup when a non-loopback listener
+has no key. The explicit `BLOOM_ALLOW_UNAUTHENTICATED_NETWORK` escape hatch is
+for isolated development only and cannot be combined with strict security. See
+the [production guide](docs/production.md) and [security policy](SECURITY.md).
 
 Protected OpenAI and Ollama routes accept `Authorization: Bearer ...` or
 `X-API-Key`. A rejected credential returns the protocol's JSON 401 plus
@@ -691,6 +716,7 @@ Common environment variables include:
 | --- | --- |
 | `BLOOM_CONFIG` | Runtime configuration path |
 | `BLOOM_API_KEY` | API key required by `/v1/*` and `/api/*` routes |
+| `BLOOM_ALLOW_UNAUTHENTICATED_NETWORK` | Development-only override for a non-loopback listener without an API key (default false) |
 | `BLOOM_OPEN_BROWSER` | Open the embedded local UI after the listener is ready |
 | `BLOOM_SHUTDOWN_TIMEOUT_SECONDS` | Maximum graceful HTTP drain before forced exit (default 30 seconds) |
 | `BLOOM_MODELS_DIR` | Root scanned by the authenticated model-management API |
@@ -706,6 +732,7 @@ Common environment variables include:
 | `BLOOM_CORS_ALLOW_ORIGIN` | Browser origin policy: `same-origin` (default), one exact HTTP(S) origin, or explicit `*` |
 | `BLOOM_MEMORY_UTILIZATION` | Fraction of available memory usable at startup |
 | `BLOOM_STRICT_MEMORY_BUDGET` | Fail before loading when the estimate exceeds the budget |
+| `BLOOM_STRICT_SECURITY` | Reject insecure runtime and network configuration instead of allowing development fallbacks |
 
 Inspect the effective configuration and host capabilities without loading a
 model, creating storage, or binding a port:

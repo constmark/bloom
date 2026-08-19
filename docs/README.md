@@ -25,6 +25,7 @@ request.
 - [Server doctor](server-doctor.md)
 - [Intel NPU setup](npu.md)
 - [Production checklist](production.md)
+- [Production readiness gap register](production-readiness.md)
 
 ## Understand and extend Bloom
 

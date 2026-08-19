@@ -6,6 +6,21 @@ real-model and hardware validation.
 ## Server
 
 - Set `BLOOM_API_KEY` or `--api-key`.
+- Non-loopback listeners fail closed without an API key. Do not enable
+  `--allow-unauthenticated-network` or
+  `BLOOM_ALLOW_UNAUTHENTICATED_NETWORK` in production; that explicit escape
+  hatch exists only for isolated development environments and is rejected by
+  strict security mode.
+- The official Dockerfile runs with UID/GID `10001`, uses
+  `/var/lib/bloom` for mutable state, and enables strict security and memory
+  admission. Supply the API key at runtime rather than baking it into an image.
+  Keep those defaults in derived images, use a named volume or make bind mounts
+  writable by `10001:10001`, and preserve a read-only root filesystem whenever
+  the selected external runtimes permit it.
+- Preserve the Docker builder's download-disabled Dioxus CLI and checksummed
+  Linux UI tools. Updating `dx`, `wasm-bindgen`, `esbuild`, or `wasm-opt`
+  requires reviewing both architecture-specific digests and passing the full
+  image build; do not enable Dioxus's runtime tool bootstrap in a derived image.
 - Keep the default `same-origin` browser policy for the embedded UI. For one
   separately hosted UI or an HTTPS reverse proxy, set
   `BLOOM_CORS_ALLOW_ORIGIN` to its exact public HTTP(S) origin. Do not use `*`;

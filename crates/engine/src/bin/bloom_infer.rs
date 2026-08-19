@@ -14,6 +14,7 @@ use std::time::Instant;
 
 use anyhow::{Result, anyhow};
 use bloomai_core::{BenchmarkResult, DType, DeviceKind, GenerationParams};
+use clap::builder::BoolishValueParser;
 use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 use tracing_subscriber::EnvFilter;
@@ -161,15 +162,30 @@ struct Args {
     reserve_memory_bytes: Option<usize>,
 
     /// Disable startup memory preallocation and only log memory estimates.
-    #[arg(long, env = "BLOOM_DISABLE_MEMORY_PREALLOC", default_value_t = false)]
+    #[arg(
+        long,
+        env = "BLOOM_DISABLE_MEMORY_PREALLOC",
+        default_value_t = false,
+        value_parser = BoolishValueParser::new()
+    )]
     disable_memory_prealloc: bool,
 
     /// Enforce strict memory budget check, failing startup if estimate exceeds available memory.
-    #[arg(long, env = "BLOOM_STRICT_MEMORY_BUDGET", default_value_t = false)]
+    #[arg(
+        long,
+        env = "BLOOM_STRICT_MEMORY_BUDGET",
+        default_value_t = false,
+        value_parser = BoolishValueParser::new()
+    )]
     strict_memory_budget: bool,
 
     /// Enforce strict security check, failing startup if external scripts/plugins are not allowlisted.
-    #[arg(long, env = "BLOOM_STRICT_SECURITY", default_value_t = false)]
+    #[arg(
+        long,
+        env = "BLOOM_STRICT_SECURITY",
+        default_value_t = false,
+        value_parser = BoolishValueParser::new()
+    )]
     strict_security: bool,
 
     /// Number of CPU threads to use (passed to the underlying runtime).
@@ -655,8 +671,43 @@ fn build_engine_registry() -> EngineRegistry {
     registry
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn configure_process_environment(args: &Args) {
+    // SAFETY: `main` calls this exactly once before loading a model or starting
+    // any Bloom, Tokio, Rayon, or external-runtime worker threads.
+    unsafe {
+        if args.strict_memory_budget {
+            std::env::set_var("BLOOM_STRICT_MEMORY_BUDGET", "1");
+        }
+        if args.strict_security {
+            std::env::set_var("BLOOM_STRICT_SECURITY", "1");
+        }
+        if let Some(dtype) = &args.dtype {
+            std::env::set_var("BLOOM_DTYPE", dtype);
+        }
+        if let Some(layers) = args.gpu_layers {
+            std::env::set_var("BLOOM_GPU_LAYERS", layers.to_string());
+        }
+        std::env::set_var("BLOOM_SPECULATIVE", &args.speculative);
+        std::env::set_var(
+            "BLOOM_NUM_SPECULATIVE_TOKENS",
+            args.num_speculative_tokens.to_string(),
+        );
+        std::env::set_var(
+            "BLOOM_SPECULATIVE_NGRAM_ORDER",
+            args.speculative_ngram_order.to_string(),
+        );
+        if let Some(draft_model) = &args.draft_model {
+            std::env::set_var("BLOOM_DRAFT_MODEL", draft_model);
+        } else {
+            std::env::remove_var("BLOOM_DRAFT_MODEL");
+        }
+        if let Some(threads) = args.threads {
+            std::env::set_var("RAYON_NUM_THREADS", threads.to_string());
+        }
+    }
+}
+
+fn main() -> Result<()> {
     // Initialize tracing (controlled via RUST_LOG env var).
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -666,14 +717,6 @@ async fn main() -> Result<()> {
         .init();
 
     let (mut args, matches) = parse_args()?;
-    if args.strict_memory_budget {
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("BLOOM_STRICT_MEMORY_BUDGET", "1") };
-    }
-    if args.strict_security {
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("BLOOM_STRICT_SECURITY", "1") };
-    }
     let config_path = bloomai_engine::resolve_config_path(args.config.as_deref())?;
     if args.init_config {
         bloomai_engine::write_default_config(&config_path)?;
@@ -682,6 +725,7 @@ async fn main() -> Result<()> {
     }
     let config = bloomai_engine::load_config(&config_path)?;
     apply_config(&mut args, &matches, &config.infer);
+    configure_process_environment(&args);
 
     // --- Set up Engine Registry ---
     let registry = build_engine_registry();
@@ -697,13 +741,6 @@ async fn main() -> Result<()> {
         )
     })?;
     let model_path = resolve_model_path_arg(model)?;
-
-    // Dtype affects both runtime construction and the device-specific memory
-    // estimate shown by metadata-only inspection.
-    if let Some(ref dt) = args.dtype {
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("BLOOM_DTYPE", dt) };
-    }
 
     // --- Load manifest first to assist in engine auto-selection if needed ---
     let manifest = bloomai_engine::load_manifest(&model_path)?;
@@ -737,41 +774,12 @@ async fn main() -> Result<()> {
         ));
     }
 
-    if let Some(layers) = args.gpu_layers {
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("BLOOM_GPU_LAYERS", layers.to_string()) };
-    }
-    // FIXME: Audit that the environment access only happens in single-threaded code.
-    unsafe { std::env::set_var("BLOOM_SPECULATIVE", &args.speculative) };
-    // FIXME: Audit that the environment access only happens in single-threaded code.
-    unsafe {
-        std::env::set_var(
-            "BLOOM_NUM_SPECULATIVE_TOKENS",
-            args.num_speculative_tokens.to_string(),
-        )
-    };
-    // FIXME: Audit that the environment access only happens in single-threaded code.
-    unsafe {
-        std::env::set_var(
-            "BLOOM_SPECULATIVE_NGRAM_ORDER",
-            args.speculative_ngram_order.to_string(),
-        )
-    };
-    if let Some(ref draft_model) = args.draft_model {
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("BLOOM_DRAFT_MODEL", draft_model) };
-    } else {
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::remove_var("BLOOM_DRAFT_MODEL") };
-    }
-
-    // --- Configure thread pool if requested ---
-    if let Some(threads) = args.threads {
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("RAYON_NUM_THREADS", threads.to_string()) };
-        if !args.quiet && !args.bench_json {
-            tracing::info!("CPU thread pool set to {}", threads);
-        }
+    // --- Report the already-frozen thread-pool configuration if requested ---
+    if let Some(threads) = args.threads
+        && !args.quiet
+        && !args.bench_json
+    {
+        tracing::info!("CPU thread pool set to {}", threads);
     }
 
     if args.bench {

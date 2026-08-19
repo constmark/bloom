@@ -230,6 +230,30 @@ fn apply_config(args: &mut Args, matches: &ArgMatches, config: &bloomai_engine::
     apply_config_value!(args, matches, config, speculative_ngram_order);
 }
 
+fn configure_process_environment(args: &Args) {
+    // SAFETY: `main` calls this exactly once before loading a model or starting
+    // any Bloom, Rayon, or external-runtime worker threads.
+    unsafe {
+        if let Some(dtype) = &args.dtype {
+            std::env::set_var("BLOOM_DTYPE", dtype);
+        }
+        std::env::set_var("BLOOM_SPECULATIVE", &args.speculative);
+        if let Some(draft_model) = &args.draft_model {
+            std::env::set_var("BLOOM_DRAFT_MODEL", draft_model);
+        } else {
+            std::env::remove_var("BLOOM_DRAFT_MODEL");
+        }
+        std::env::set_var(
+            "BLOOM_NUM_SPECULATIVE_TOKENS",
+            args.num_speculative_tokens.to_string(),
+        );
+        std::env::set_var(
+            "BLOOM_SPECULATIVE_NGRAM_ORDER",
+            args.speculative_ngram_order.to_string(),
+        );
+    }
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -245,6 +269,7 @@ fn main() -> Result<()> {
     }
     let config = bloomai_engine::load_config(&config_path)?;
     apply_config(&mut args, &matches, &config.bench);
+    configure_process_environment(&args);
 
     let model_path = args.model.as_ref().ok_or_else(|| {
         anyhow!(
@@ -259,32 +284,6 @@ fn main() -> Result<()> {
             model_path.display()
         ));
     }
-
-    if let Some(ref dt) = args.dtype {
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("BLOOM_DTYPE", dt) };
-    }
-
-    // FIXME: Audit that the environment access only happens in single-threaded code.
-    unsafe { std::env::set_var("BLOOM_SPECULATIVE", &args.speculative) };
-    if let Some(ref path) = args.draft_model {
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("BLOOM_DRAFT_MODEL", path) };
-    }
-    // FIXME: Audit that the environment access only happens in single-threaded code.
-    unsafe {
-        std::env::set_var(
-            "BLOOM_NUM_SPECULATIVE_TOKENS",
-            args.num_speculative_tokens.to_string(),
-        )
-    };
-    // FIXME: Audit that the environment access only happens in single-threaded code.
-    unsafe {
-        std::env::set_var(
-            "BLOOM_SPECULATIVE_NGRAM_ORDER",
-            args.speculative_ngram_order.to_string(),
-        )
-    };
 
     // --- Load manifest first to assist in engine auto-selection if needed ---
     let manifest = bloomai_engine::load_manifest(model_path)?;

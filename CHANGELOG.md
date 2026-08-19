@@ -10,6 +10,21 @@ called out in release notes.
 
 ### Breaking
 
+- Reject non-loopback `bloom_server` listeners without an API key by default.
+  Isolated development environments can opt back into the old behavior only
+  with `--allow-unauthenticated-network` or
+  `BLOOM_ALLOW_UNAUTHENTICATED_NETWORK`; strict security rejects that override.
+- Change the Docker runtime to fixed unprivileged UID/GID `10001`, move its
+  mutable state to `/var/lib/bloom`, and enable strict security and memory
+  admission by default. Existing bind mounts must be writable by `10001:10001`,
+  and public container listeners now require an API key. The Dockerfile
+  frontend and both tagged base images are digest-pinned, with a regression
+  validator for immutable bases and hardened runtime settings.
+- Change the application-layer `bloom_server::run_cli` bootstrap from async to
+  synchronous and unsafe so it can freeze process-wide engine settings before
+  creating Tokio worker threads. Embedders must call it directly from their
+  single-threaded process entry point, uphold its documented environment safety
+  contract, and no longer await it inside an existing runtime.
 - Version successful `GET /v1/model-management/models` responses as strict
   schema version 1 `bloom.model_catalog` documents. Bloom UI now requires the
   complete lifecycle, acquisition, index, storage, and integrity contract;
@@ -68,6 +83,19 @@ called out in release notes.
 
 ### Runtime
 
+- Freeze legacy environment-backed engine settings before constructing the
+  multi-threaded server runtime. The server bootstrap and standalone inference
+  CLI no longer mutate the process environment after worker threads may exist.
+- Accept documented bool-like environment values (`1`/`0`, `yes`/`no`, and
+  `on`/`off` in addition to `true`/`false`) for server and standalone CLI
+  switches. This prevents strict container defaults from failing during Clap
+  parsing before startup validation.
+- Make the Docker UI build fail closed and cacheable: install the Dioxus CLI
+  before copying application sources, compile it with downloads disabled, and
+  verify fixed Linux amd64/arm64 `wasm-bindgen`, `esbuild`, and `wasm-opt`
+  artifacts by SHA-256 before use. Link the compiler from the digest-pinned
+  builder under a local toolchain name so `rust-toolchain.toml` cannot trigger
+  an unnecessary network refresh during the build.
 - Make scheduler token-budget admission overflow-safe across shared admission,
   batch execution, and live prefill/decode accounting. Boundary-sized or
   inconsistent counters now fail closed identically in debug and release builds

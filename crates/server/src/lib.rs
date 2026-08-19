@@ -29,6 +29,7 @@ use bloomai_core::{
     BloomError, DeviceKind, GenerationParams, TokenSchedulingConfig,
     constants::{GIB, MIB},
 };
+use clap::builder::BoolishValueParser;
 use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
 use futures::StreamExt as _;
@@ -1384,11 +1385,20 @@ fn ollama_api_router(state: Arc<ServerState>) -> Router<Arc<ServerState>> {
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
-/// Parse process configuration, assemble the application, and serve requests.
+/// Parse process configuration, freeze process-wide runtime settings, and
+/// serve requests.
 ///
-/// Keeping the Tokio runtime in the binary entry point lets tests and other
-/// launchers reuse the application bootstrap without nesting runtimes.
-pub async fn run_cli() -> Result<()> {
+/// This is a synchronous process entry point and must be called before the
+/// embedding application starts any threads. Bloom applies the legacy
+/// environment-backed engine settings before constructing Tokio because
+/// mutating the process environment after other threads exist is unsafe.
+///
+/// # Safety
+///
+/// The caller must ensure that no other threads are running or can concurrently
+/// read or write the process environment until this function has applied the
+/// configuration and created its Tokio runtime.
+pub unsafe fn run_cli() -> Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -1397,14 +1407,6 @@ pub async fn run_cli() -> Result<()> {
         .init();
 
     let (mut args, matches) = parse_args()?;
-    if args.strict_memory_budget {
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("BLOOM_STRICT_MEMORY_BUDGET", "1") };
-    }
-    if args.strict_security {
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("BLOOM_STRICT_SECURITY", "1") };
-    }
     let config_path = bloomai_engine::resolve_config_path(args.config.as_deref())?;
     if args.init_config {
         bloomai_engine::write_default_config(&config_path)?;
@@ -1417,6 +1419,47 @@ pub async fn run_cli() -> Result<()> {
         args.model_index_state_dir = Some(default_model_index_state_directory(&config_path));
     }
 
+    configure_process_environment(&args);
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| anyhow!("failed to create the Bloom Tokio runtime: {error}"))?;
+    runtime.block_on(run_server(args, config_path))
+}
+
+fn configure_process_environment(args: &Args) {
+    // SAFETY: `run_cli`'s caller must uphold its documented single-threaded
+    // environment contract. This helper runs before constructing Tokio or
+    // starting any Bloom worker.
+    unsafe {
+        if args.strict_memory_budget {
+            std::env::set_var("BLOOM_STRICT_MEMORY_BUDGET", "1");
+        }
+        if args.strict_security {
+            std::env::set_var("BLOOM_STRICT_SECURITY", "1");
+        }
+        if let Some(dtype) = &args.dtype {
+            std::env::set_var("BLOOM_DTYPE", dtype);
+        }
+        std::env::set_var("BLOOM_SPECULATIVE", &args.speculative);
+        std::env::set_var(
+            "BLOOM_NUM_SPECULATIVE_TOKENS",
+            args.num_speculative_tokens.to_string(),
+        );
+        std::env::set_var(
+            "BLOOM_SPECULATIVE_NGRAM_ORDER",
+            args.speculative_ngram_order.to_string(),
+        );
+        if let Some(draft_model) = &args.draft_model {
+            std::env::set_var("BLOOM_DRAFT_MODEL", draft_model);
+        } else {
+            std::env::remove_var("BLOOM_DRAFT_MODEL");
+        }
+    }
+}
+
+async fn run_server(args: Args, config_path: PathBuf) -> Result<()> {
     let models_root = args
         .models_dir
         .clone()
@@ -1547,34 +1590,6 @@ pub async fn run_cli() -> Result<()> {
         None
     };
     let model_integrity = ModelIntegrityManager::new(models_root.clone());
-
-    if let Some(ref dt) = args.dtype {
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("BLOOM_DTYPE", dt) };
-    }
-    // FIXME: Audit that the environment access only happens in single-threaded code.
-    unsafe { std::env::set_var("BLOOM_SPECULATIVE", &args.speculative) };
-    // FIXME: Audit that the environment access only happens in single-threaded code.
-    unsafe {
-        std::env::set_var(
-            "BLOOM_NUM_SPECULATIVE_TOKENS",
-            args.num_speculative_tokens.to_string(),
-        )
-    };
-    // FIXME: Audit that the environment access only happens in single-threaded code.
-    unsafe {
-        std::env::set_var(
-            "BLOOM_SPECULATIVE_NGRAM_ORDER",
-            args.speculative_ngram_order.to_string(),
-        )
-    };
-    if let Some(ref draft_model) = args.draft_model {
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("BLOOM_DRAFT_MODEL", draft_model) };
-    } else {
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::remove_var("BLOOM_DRAFT_MODEL") };
-    }
 
     let model_preflight = ModelPreflightManager::new(
         models_root.clone(),
@@ -1818,21 +1833,20 @@ pub async fn run_cli() -> Result<()> {
         .is_some();
     let is_loopback = addr.ip().is_loopback();
     if !is_loopback && !api_key_set {
-        let strict_security = std::env::var("BLOOM_STRICT_SECURITY")
-            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-            .unwrap_or(false);
         let msg = format!(
             "Security Alert: Server is binding to a non-loopback address ({}) without BLOOM_API_KEY or --api-key. \
              This exposes your endpoints to the network without authentication.",
             addr.ip()
         );
-        if strict_security {
+        if !args.allow_unauthenticated_network || args.strict_security {
             return Err(anyhow!("{}", msg));
         } else {
             tracing::warn!("=====================================================================");
             tracing::warn!("{}", msg);
             tracing::warn!("Please set BLOOM_API_KEY or pass --api-key to secure the server.");
-            tracing::warn!("To fail-fast on this check, run with BLOOM_STRICT_SECURITY=1.");
+            tracing::warn!(
+                "The development-only unauthenticated-network override is enabled; never use it on an untrusted network."
+            );
             tracing::warn!("=====================================================================");
         }
     }

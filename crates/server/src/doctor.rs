@@ -332,6 +332,21 @@ fn server_argument_errors(args: &Args) -> Vec<String> {
     {
         errors.push("The API key cannot be empty or whitespace-only.".to_string());
     }
+    if let Ok(address) = format!("{}:{}", args.host, args.port).parse::<SocketAddr>()
+        && !address.ip().is_loopback()
+        && !args.api_key.as_ref().is_some_and(|key| !key.is_empty())
+    {
+        if !args.allow_unauthenticated_network {
+            errors.push(
+                "A non-loopback listener requires an API key unless the explicit development-only unauthenticated-network override is enabled."
+                    .to_string(),
+            );
+        } else if args.strict_security {
+            errors.push(
+                "Strict security does not allow the unauthenticated-network override.".to_string(),
+            );
+        }
+    }
     if let Some(dtype) = &args.dtype
         && !matches!(
             dtype.trim().to_ascii_lowercase().as_str(),
@@ -431,16 +446,16 @@ fn network_check(args: &Args) -> DoctorCheck {
     if !address.ip().is_loopback() && !api_key_set {
         let remediation =
             "Set BLOOM_API_KEY and a narrow BLOOM_CORS_ALLOW_ORIGIN before exposing the server.";
-        return if args.strict_security {
+        return if !args.allow_unauthenticated_network || args.strict_security {
             DoctorCheck::fail(
                 "network_security",
-                "A non-loopback listener has no API key while strict security is enabled.",
+                "A non-loopback listener has no API key and is not safely admissible.",
                 remediation,
             )
         } else {
             DoctorCheck::warn(
                 "network_security",
-                "A non-loopback listener has no API key.",
+                "A non-loopback listener has no API key under the explicit development-only override.",
                 remediation,
             )
         };
@@ -952,6 +967,46 @@ mod tests {
             .find(|check| check.id == "network_security")
             .unwrap();
         assert_eq!(invalid_network.status, CheckStatus::Fail);
+    }
+
+    #[test]
+    fn unauthenticated_non_loopback_binding_requires_an_explicit_non_strict_override() {
+        let temp = tempfile::tempdir().unwrap();
+        let models = temp.path().join("models");
+        let mut args = default_args();
+        args.host = "0.0.0.0".to_string();
+
+        assert!(validate_server_arguments(&args).is_err());
+        let rejected = inspect_server(&args, false, &models);
+        assert_eq!(
+            rejected
+                .checks
+                .iter()
+                .find(|check| check.id == "network_security")
+                .unwrap()
+                .status,
+            CheckStatus::Fail
+        );
+
+        args.allow_unauthenticated_network = true;
+        assert!(validate_server_arguments(&args).is_ok());
+        let overridden = inspect_server(&args, false, &models);
+        assert_eq!(
+            overridden
+                .checks
+                .iter()
+                .find(|check| check.id == "network_security")
+                .unwrap()
+                .status,
+            CheckStatus::Warn
+        );
+
+        args.strict_security = true;
+        assert!(validate_server_arguments(&args).is_err());
+
+        args.allow_unauthenticated_network = false;
+        args.api_key = Some("configured-secret".to_string());
+        assert!(validate_server_arguments(&args).is_ok());
     }
 
     #[test]

@@ -44,6 +44,10 @@ jobs:
         run: |
           python3 scripts/check_release_workflow_security.py
           python3 scripts/test_release_workflow_security.py
+      - name: Check Dockerfile security baseline
+        run: |
+          python3 scripts/check_dockerfile_security.py
+          python3 scripts/test_dockerfile_security.py
       - name: Test deterministic release archives
         run: python3 scripts/test_create_release_archive.py
       - name: Check Rust toolchain consistency
@@ -143,6 +147,22 @@ jobs:
         run: ./scripts/compare_llamacpp.py
       - name: Docker build smoke
         run: docker build -t bloom:ci .
+      - name: Check hardened Docker runtime defaults
+        run: |
+          docker run --rm --entrypoint sh bloom:ci -c '
+            test "$(id -u)" = "10001"
+            test "$HOME" = "/home/bloom"
+            test -w "$BLOOM_MODELS_DIR"
+            test "$BLOOM_STRICT_MEMORY_BUDGET" = "1"
+            test "$BLOOM_STRICT_SECURITY" = "1"
+          '
+          if docker run --rm bloom:ci; then
+            echo "Docker image unexpectedly allowed a public listener without an API key" >&2
+            exit 1
+          fi
+          docker run --rm \
+            -e BLOOM_API_KEY=bloom-ci-container-key \
+            bloom:ci --host 0.0.0.0 --doctor=json
 
   macos:
     name: Rust (macOS)

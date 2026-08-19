@@ -465,6 +465,10 @@ just ui-build
 The maintained build wrapper disables release DWARF before optimization,
 rejects a silently failed `wasm-opt`, verifies the expected output files, and
 publishes `ui/dist/` only after every check succeeds.
+The repository Dockerfile additionally installs architecture-specific helper
+binaries with fixed SHA-256 digests and sets `NO_DOWNLOADS=1`, so a production
+container build cannot silently fetch a replacement Dioxus tool. Local and
+non-Linux release builders must provision and pin equivalent tools separately.
 
 Configure the deployed UI to use the URL of your separately running
 `bloom_server` instance. The static host must set an equivalent Content Security

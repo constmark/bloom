@@ -218,6 +218,11 @@ component.
   Its engine names, device names, model counts, and deployment warnings are
   still operational metadata; review JSON reports before sharing them.
 - Keep `/metrics` and health endpoints behind an internal network or proxy ACL.
+- Bloom rejects a non-loopback listener without an API key before storage
+  mutation or socket binding. The explicit
+  `BLOOM_ALLOW_UNAUTHENTICATED_NETWORK` development override degrades that
+  failure to a warning only outside strict mode; never enable it on a shared or
+  untrusted network.
 - Keep the default `same-origin` browser policy for the embedded UI. Bloom
   rejects every malformed, opaque, duplicate, untrusted, or loopback
   DNS-rebinding `Origin` before CORS, preflight handling, authentication, or a

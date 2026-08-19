@@ -51,6 +51,14 @@ maintainer-authored changes; automated updates are not trusted implicitly.
 The Rust compiler patch release is updated separately as one reviewed change
 across `rust-toolchain.toml`, CI, and the Docker builder so automated ecosystem
 updates cannot silently split the tested build environment.
+The Dockerfile frontend and both base-image tags are also pinned to immutable
+SHA-256 digests, and CI rejects a mutable base or a root/relaxed runtime stage.
+The Docker UI builder installs fixed amd64/arm64 `wasm-bindgen`, `esbuild`, and
+`wasm-opt` artifacts only after SHA-256 verification, then runs a
+download-disabled Dioxus CLI with the compiler already present in the
+digest-pinned builder instead of refreshing a Rust channel online. CI rejects
+removal of those fail-closed settings or unreviewed drift in pinned versions
+and digests.
 
 CI and release workflows grant read-only repository access by default and pin
 every external Action to a full upstream commit SHA. Only the release-publishing
