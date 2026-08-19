@@ -13,7 +13,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use bloomai_core::{DeviceClass, DeviceKind, GenerationParams, Modality, ModelFamily, ModelFormat};
 
 use crate::{
@@ -179,18 +179,14 @@ fn default_python() -> PathBuf {
 
 fn is_awq_model(model_path: &Path) -> bool {
     let config_path = model_path.join("config.json");
-    if config_path.exists() {
-        if let Ok(config_str) = std::fs::read_to_string(&config_path) {
-            if let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_str) {
-                if let Some(quant_config) = config.get("quantization_config") {
-                    if let Some(quant_method) = quant_config.get("quant_method") {
-                        if quant_method == "awq" {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
+    if config_path.exists()
+        && let Ok(config_str) = std::fs::read_to_string(&config_path)
+        && let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_str)
+        && let Some(quant_config) = config.get("quantization_config")
+        && let Some(quant_method) = quant_config.get("quant_method")
+        && quant_method == "awq"
+    {
+        return true;
     }
     model_path.to_string_lossy().to_lowercase().contains("awq")
 }
@@ -594,11 +590,12 @@ mod tests {
         let non_existent = Path::new("non_existent_npu_model_path_12345");
         let res = engine.load(non_existent, DeviceKind::Npu);
         assert!(res.is_err());
-        assert!(res
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("model path does not exist"));
+        assert!(
+            res.err()
+                .unwrap()
+                .to_string()
+                .contains("model path does not exist")
+        );
     }
 
     #[test]
@@ -618,15 +615,18 @@ mod tests {
         .unwrap();
 
         // Without BLOOM_NPU_AUTO_EXPORT, loading should fail
-        std::env::remove_var("BLOOM_NPU_AUTO_EXPORT");
-        std::env::remove_var("BLOOM_OPENVINO_AUTO_EXPORT");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("BLOOM_NPU_AUTO_EXPORT") };
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("BLOOM_OPENVINO_AUTO_EXPORT") };
         let res = engine.load(model_path, DeviceKind::Npu);
         assert!(res.is_err());
-        assert!(res
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("BLOOM_NPU_AUTO_EXPORT"));
+        assert!(
+            res.err()
+                .unwrap()
+                .to_string()
+                .contains("BLOOM_NPU_AUTO_EXPORT")
+        );
     }
 
     #[test]

@@ -8,16 +8,16 @@ mod storage;
 
 use api::{
     ChatCancellation, ChatMessage, ChatOptions, ChatStreamError, ChatUsage, ConnConfig,
-    EmbeddingBatch, ImageAttachment, ModelImportCancellation, ModelImportClientError, Readiness,
-    RerankBatch, ResponseFormatMode, StreamUpdate, MAX_API_KEY_CHARS, MAX_BASE_URL_CHARS,
-    MAX_CHAT_INPUT_CHARS, MAX_EMBEDDING_CONTENT_BYTES, MAX_EMBEDDING_DIMENSIONS,
-    MAX_IMAGE_ATTACHMENT_BYTES, MAX_RERANK_CONTENT_BYTES, MAX_RERANK_QUERY_CHARS,
-    MAX_RESPONSE_JSON_SCHEMA_BYTES, MAX_SYSTEM_PROMPT_CHARS,
+    EmbeddingBatch, ImageAttachment, MAX_API_KEY_CHARS, MAX_BASE_URL_CHARS, MAX_CHAT_INPUT_CHARS,
+    MAX_EMBEDDING_CONTENT_BYTES, MAX_EMBEDDING_DIMENSIONS, MAX_IMAGE_ATTACHMENT_BYTES,
+    MAX_RERANK_CONTENT_BYTES, MAX_RERANK_QUERY_CHARS, MAX_RESPONSE_JSON_SCHEMA_BYTES,
+    MAX_SYSTEM_PROMPT_CHARS, ModelImportCancellation, ModelImportClientError, Readiness,
+    RerankBatch, ResponseFormatMode, StreamUpdate,
 };
 use chat::{
-    conversation_matches_query, merge_conversation_stores, ConversationStore, DisplayMessage,
-    EmptyGenerationRollback, GenerationOutcome, GenerationStats, CONVERSATION_ARCHIVE_FILENAME,
-    MAX_CONVERSATION_ARCHIVE_BYTES, MAX_RENAMED_TITLE_CHARS,
+    CONVERSATION_ARCHIVE_FILENAME, ConversationStore, DisplayMessage, EmptyGenerationRollback,
+    GenerationOutcome, GenerationStats, MAX_CONVERSATION_ARCHIVE_BYTES, MAX_RENAMED_TITLE_CHARS,
+    conversation_matches_query, merge_conversation_stores,
 };
 use dioxus::prelude::*;
 use gloo_timers::future::TimeoutFuture;
@@ -524,10 +524,9 @@ fn launch_generation(request: GenerationRequest, signals: GenerationSignals) {
                             .conversations
                             .iter_mut()
                             .find(|conversation| conversation.id == conversation_id)
+                            && let Some(message) = conversation.messages.get_mut(assistant_index)
                         {
-                            if let Some(message) = conversation.messages.get_mut(assistant_index) {
-                                message.content.push_str(&delta);
-                            }
+                            message.content.push_str(&delta);
                         }
                     });
                 }
@@ -6199,21 +6198,21 @@ fn ConfirmDialog(
 #[cfg(test)]
 mod tests {
     use super::{
-        api, append_transcript_segment, conversation_context_status, conversation_import_candidate,
-        conversation_model_transition, embedding_vector_norm, embedding_vector_preview,
-        empty_state_view, encoder_input_preview, format_duration, format_duration_seconds,
-        format_generation_millis, format_inventory_changes, format_inventory_drift_severity,
-        format_inventory_drift_status, format_load_phase, format_model_precision,
-        format_model_tasks, format_optional_bytes, format_optional_count, format_parameter_count,
-        format_percent, generation_outcome_label, integrity_phase_label, license_policy_allows,
-        message_window, modal_key_action, model_index_local_state,
+        ChatMessage, ConnectionState, ConversationImportMode, ConversationStore, DisplayMessage,
+        EmptyStateAction, GenerationOutcome, GenerationStats, ModalKeyAction, ModelIndexLocalState,
+        Readiness, api, append_transcript_segment, conversation_context_status,
+        conversation_import_candidate, conversation_model_transition, embedding_vector_norm,
+        embedding_vector_preview, empty_state_view, encoder_input_preview, format_duration,
+        format_duration_seconds, format_generation_millis, format_inventory_changes,
+        format_inventory_drift_severity, format_inventory_drift_status, format_load_phase,
+        format_model_precision, format_model_tasks, format_optional_bytes, format_optional_count,
+        format_parameter_count, format_percent, generation_outcome_label, integrity_phase_label,
+        license_policy_allows, message_window, modal_key_action, model_index_local_state,
         model_index_poll_interval_seconds, model_index_upgrade_source_is_active,
         model_provenance_summary, optional_seed, parse_optional_embedding_dimensions,
         supported_image_mime, supported_model_import_filename,
         unconfirmed_conversation_model_transition, valid_sha256_input,
-        validate_context_reservation, ChatMessage, ConnectionState, ConversationImportMode,
-        ConversationStore, DisplayMessage, EmptyStateAction, GenerationOutcome, GenerationStats,
-        ModalKeyAction, ModelIndexLocalState, Readiness,
+        validate_context_reservation,
     };
     use dioxus::prelude::Key;
 
@@ -6644,18 +6643,14 @@ mod tests {
         let transition = conversation_model_transition(&store, Some("model-b")).unwrap();
         assert_eq!(transition.previous_model, "model-a");
         assert_eq!(transition.current_model, "model-b");
-        assert!(unconfirmed_conversation_model_transition(
-            &store,
-            Some("model-b"),
-            Some(&transition)
-        )
-        .is_none());
-        assert!(unconfirmed_conversation_model_transition(
-            &store,
-            Some("model-c"),
-            Some(&transition)
-        )
-        .is_some());
+        assert!(
+            unconfirmed_conversation_model_transition(&store, Some("model-b"), Some(&transition))
+                .is_none()
+        );
+        assert!(
+            unconfirmed_conversation_model_transition(&store, Some("model-c"), Some(&transition))
+                .is_some()
+        );
         assert!(
             conversation_model_transition(&ConversationStore::default(), Some("model-b")).is_none()
         );

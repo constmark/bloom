@@ -1,6 +1,6 @@
 //! Safe Markdown rendering for model-generated assistant messages.
 
-use pulldown_cmark::{html, CowStr, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, TagEnd, html};
 
 /// Render assistant Markdown into a constrained HTML fragment.
 ///

@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use bloomai_core::{
     DType, DeviceClass, DeviceKind, Modality, ModelFamily, ModelFormat, ModelManifest,
 };
@@ -153,8 +153,8 @@ impl Engine for OnnxRuntimeEngine {
 mod tests {
     use super::*;
     use bloomai_core::{
-        constants::GIB, DeviceCapability, MemoryTopology, ModelFile, ModelIoSchema,
-        ModelMemoryProfile, PowerState, RuntimeHints, ThermalState,
+        DeviceCapability, MemoryTopology, ModelFile, ModelIoSchema, ModelMemoryProfile, PowerState,
+        RuntimeHints, ThermalState, constants::GIB,
     };
 
     fn cpu_capability() -> DeviceCapability {

@@ -30,24 +30,24 @@ pub use crate::cachemesh::{
     CacheMeshTier, FileSystemRemoteCache, InMemoryRemoteCache, RemoteCacheBackend, TierMetrics,
 };
 pub use crate::core::config::{
-    default_config_dir, default_config_path, load_config, resolve_config_path,
-    write_default_config, BenchConfig, BloomConfig, InferConfig, ServerConfig,
+    BenchConfig, BloomConfig, InferConfig, ServerConfig, default_config_dir, default_config_path,
+    load_config, resolve_config_path, write_default_config,
 };
 pub use crate::core::engine::{
-    default_engine_supports, device_kind_from_capability, BackendMaturity, Engine,
-    EngineCapability, EngineRegistry, EngineRouter, RoutingDecision, SupportLevel,
+    BackendMaturity, Engine, EngineCapability, EngineRegistry, EngineRouter, RoutingDecision,
+    SupportLevel, default_engine_supports, device_kind_from_capability,
 };
 pub use crate::core::io::{
     DataBlock, InferenceParams, InferenceRequest, ModelInput, ModelOutput, OutputChunk,
 };
 pub use crate::core::manifest::{
-    estimate_memory, estimate_memory_for_device, format_bytes, infer_quantization, load_manifest,
-    model_manifest_supports_embeddings, model_manifest_tasks, resolve_hf_safetensors_files,
-    MemoryEstimate,
+    MemoryEstimate, estimate_memory, estimate_memory_for_device, format_bytes, infer_quantization,
+    load_manifest, model_manifest_supports_embeddings, model_manifest_tasks,
+    resolve_hf_safetensors_files,
 };
 pub use crate::core::memory::{
-    available_system_memory, default_memory_utilization, plan_memory_preallocation,
-    reserve_memory_for_plan, MemoryPreallocationConfig, MemoryPreallocationPlan, MemoryReservation,
+    MemoryPreallocationConfig, MemoryPreallocationPlan, MemoryReservation, available_system_memory,
+    default_memory_utilization, plan_memory_preallocation, reserve_memory_for_plan,
 };
 pub use crate::core::model::{EchoTextModel, LoadedModel, ModelMetadata, StateBlob};
 pub use crate::core::parallelism::{
@@ -72,9 +72,9 @@ pub use crate::executor::vulkan::VulkanEngine;
 
 #[allow(deprecated)]
 pub use crate::executor::speculative::{
+    DraftModelStrategy, NGramStrategy, SpeculativeMode, SpeculativeResult, SpeculativeStrategy,
     speculative_mode_is_mtp, verify_greedy_tokens, verify_speculative_tokens,
-    verify_with_rejection_sampling, DraftModelStrategy, NGramStrategy, SpeculativeMode,
-    SpeculativeResult, SpeculativeStrategy,
+    verify_with_rejection_sampling,
 };
 pub use crate::plugin::{PluginEntryPoint, PluginManager, PluginManifest, PluginMetadata};
 pub use crate::processor::{

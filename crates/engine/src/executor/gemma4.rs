@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use bloomai_core::BloomError;
-use candle::{DType, Device, Module, Result, Tensor, D};
+use candle::{D, DType, Device, Module, Result, Tensor};
 use candle_core as candle;
 use candle_nn::{Activation, VarBuilder};
 
@@ -1073,8 +1073,10 @@ mod tests {
     fn unavailable_flash_attention_returns_an_error() {
         let tensor = Tensor::zeros((1, 1, 1, 1), DType::F32, &Device::Cpu).unwrap();
         let error = flash_attn(&tensor, &tensor, &tensor, 1.0, true).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("without the `flash-attn` feature"));
+        assert!(
+            error
+                .to_string()
+                .contains("without the `flash-attn` feature")
+        );
     }
 }

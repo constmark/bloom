@@ -1,7 +1,7 @@
 // Streaming attention entry points mirror the model's separate state tensors.
 #![allow(clippy::too_many_arguments)]
 
-use crate::executor::gemma4::{repeat_kv, Config};
+use crate::executor::gemma4::{Config, repeat_kv};
 use candle::{DType, Device, Result, Tensor};
 use candle_core as candle;
 use candle_core::quantized::QTensor;

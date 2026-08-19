@@ -11,23 +11,23 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use axum::{
+    Json, Router,
     extract::{DefaultBodyLimit, Multipart, Request as AxumRequest, State},
-    http::{header, HeaderValue},
+    http::{HeaderValue, header},
     middleware::{self, Next},
     response::sse::{Event, Sse},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
-    Json, Router,
 };
 use bloomai_core::{
-    constants::{GIB, MIB},
     BloomError, DeviceKind, GenerationParams, TokenSchedulingConfig,
+    constants::{GIB, MIB},
 };
 use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
 use std::future::IntoFuture as _;
-use tokio::sync::{mpsc, watch, Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, mpsc, watch};
 use tokio::task;
 use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
 use tokio_util::sync::CancellationToken;
@@ -68,9 +68,9 @@ use bloomai_engine::executor::wan::WanEngine;
 use bloomai_engine::scheduler::paged_cache::{PagedAttentionCache, PagedCacheConfig};
 use bloomai_engine::scheduler::{BloomKvCachePool, InferenceScheduler, Request, RequestState};
 use bloomai_engine::{
-    speculative_mode_is_mtp, CacheMesh, CacheMeshConfig, DataBlock, EngineRegistry,
-    FileSystemRemoteCache, InMemoryRemoteCache, InferenceParams, InferencePipeline,
-    InferenceRequest, KvCachePool, ModelInput, OutputChunk,
+    CacheMesh, CacheMeshConfig, DataBlock, EngineRegistry, FileSystemRemoteCache,
+    InMemoryRemoteCache, InferenceParams, InferencePipeline, InferenceRequest, KvCachePool,
+    ModelInput, OutputChunk, speculative_mode_is_mtp,
 };
 
 mod catalog_lock;
@@ -102,7 +102,7 @@ mod tool_calling;
 mod ui;
 
 use catalog_lock::ModelCatalogLease;
-use chat_template::{select_template_for_metadata, ChatMessage};
+use chat_template::{ChatMessage, select_template_for_metadata};
 use cli::*;
 use doctor::{inspect_server, validate_server_arguments};
 use embedding::*;
@@ -127,8 +127,8 @@ use response_store::ResponseStore;
 #[cfg(test)]
 use shutdown::ShutdownSignal;
 use shutdown::{
-    wait_for_server_or_shutdown_timeout, wait_for_shutdown_notification, ShutdownSignalListener,
-    ShutdownWait,
+    ShutdownSignalListener, ShutdownWait, wait_for_server_or_shutdown_timeout,
+    wait_for_shutdown_notification,
 };
 use tool_calling::*;
 
@@ -283,10 +283,10 @@ impl BrowserOriginGuard {
         if self.policy == BrowserOriginPolicy::Any {
             return true;
         }
-        if let BrowserOriginPolicy::Exact(allowed) = &self.policy {
-            if origin.serialized == allowed.serialized {
-                return true;
-            }
+        if let BrowserOriginPolicy::Exact(allowed) = &self.policy
+            && origin.serialized == allowed.serialized
+        {
+            return true;
         }
         if origin.scheme != "http" {
             return false;
@@ -678,18 +678,16 @@ impl ServerState {
             .active
             .as_ref()
             .is_some_and(|active| active.sequence == sequence)
+            && let Some(active) = lifecycle.active.take()
         {
-            if let Some(active) = lifecycle.active.take() {
-                active.completion.send_replace(outcome);
-            }
+            active.completion.send_replace(outcome);
         }
     }
 
     async fn get_runtime(&self) -> Result<Arc<LoadedRuntime>> {
-        if let Some(runtime) = self.runtime.read().await.clone() {
-            Ok(runtime)
-        } else {
-            Err(anyhow!(self.model_unavailable().await.1))
+        match self.runtime.read().await.clone() {
+            Some(runtime) => Ok(runtime),
+            _ => Err(anyhow!(self.model_unavailable().await.1)),
         }
     }
 
@@ -743,17 +741,15 @@ impl ServerState {
             .map(|manager| manager.catalog_revision())
             .unwrap_or(0);
         let integrity_revision = self.model_integrity.catalog_revision();
-        if !force_refresh {
-            if let Some(cached) = self.model_catalog_cache.read().await.as_ref() {
-                if cached.refreshed_at.elapsed() < MODEL_CATALOG_CACHE_TTL
-                    && cached.active_path == active_path
-                    && cached.download_revision == download_revision
-                    && cached.import_revision == import_revision
-                    && cached.integrity_revision == integrity_revision
-                {
-                    return Ok((cached.catalog.clone(), runtime));
-                }
-            }
+        if !force_refresh
+            && let Some(cached) = self.model_catalog_cache.read().await.as_ref()
+            && cached.refreshed_at.elapsed() < MODEL_CATALOG_CACHE_TTL
+            && cached.active_path == active_path
+            && cached.download_revision == download_revision
+            && cached.import_revision == import_revision
+            && cached.integrity_revision == integrity_revision
+        {
+            return Ok((cached.catalog.clone(), runtime));
         }
 
         let root = self.models_root.clone();
@@ -1402,10 +1398,12 @@ pub async fn run_cli() -> Result<()> {
 
     let (mut args, matches) = parse_args()?;
     if args.strict_memory_budget {
-        std::env::set_var("BLOOM_STRICT_MEMORY_BUDGET", "1");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("BLOOM_STRICT_MEMORY_BUDGET", "1") };
     }
     if args.strict_security {
-        std::env::set_var("BLOOM_STRICT_SECURITY", "1");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("BLOOM_STRICT_SECURITY", "1") };
     }
     let config_path = bloomai_engine::resolve_config_path(args.config.as_deref())?;
     if args.init_config {
@@ -1490,10 +1488,10 @@ pub async fn run_cli() -> Result<()> {
     }
     // Recovery can restore a configured startup path that was moved into the
     // transaction backup immediately before an interrupted commit.
-    if let Some(path) = model_path.as_ref() {
-        if !path.exists() {
-            return Err(anyhow!("model path does not exist: {}", path.display()));
-        }
+    if let Some(path) = model_path.as_ref()
+        && !path.exists()
+    {
+        return Err(anyhow!("model path does not exist: {}", path.display()));
     }
     let removed_staged_sessions = model_storage.cleanup_stale().await?;
     if removed_staged_sessions > 0 {
@@ -1551,21 +1549,31 @@ pub async fn run_cli() -> Result<()> {
     let model_integrity = ModelIntegrityManager::new(models_root.clone());
 
     if let Some(ref dt) = args.dtype {
-        std::env::set_var("BLOOM_DTYPE", dt);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("BLOOM_DTYPE", dt) };
     }
-    std::env::set_var("BLOOM_SPECULATIVE", &args.speculative);
-    std::env::set_var(
-        "BLOOM_NUM_SPECULATIVE_TOKENS",
-        args.num_speculative_tokens.to_string(),
-    );
-    std::env::set_var(
-        "BLOOM_SPECULATIVE_NGRAM_ORDER",
-        args.speculative_ngram_order.to_string(),
-    );
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("BLOOM_SPECULATIVE", &args.speculative) };
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe {
+        std::env::set_var(
+            "BLOOM_NUM_SPECULATIVE_TOKENS",
+            args.num_speculative_tokens.to_string(),
+        )
+    };
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe {
+        std::env::set_var(
+            "BLOOM_SPECULATIVE_NGRAM_ORDER",
+            args.speculative_ngram_order.to_string(),
+        )
+    };
     if let Some(ref draft_model) = args.draft_model {
-        std::env::set_var("BLOOM_DRAFT_MODEL", draft_model);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("BLOOM_DRAFT_MODEL", draft_model) };
     } else {
-        std::env::remove_var("BLOOM_DRAFT_MODEL");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("BLOOM_DRAFT_MODEL") };
     }
 
     let model_preflight = ModelPreflightManager::new(
@@ -2233,11 +2241,11 @@ fn build_scheduling_runtime(
                     }
                 })
             };
-            let result = model
+
+            model
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .forward(input_ids, start_pos);
-            result
+                .forward(input_ids, start_pos)
         },
     );
 
@@ -2812,9 +2820,11 @@ mod tests {
             ]
         }))
         .unwrap();
-        assert!(helpers::normalize_chat_messages(&late.messages)
-            .unwrap_err()
-            .contains("must appear before"));
+        assert!(
+            helpers::normalize_chat_messages(&late.messages)
+                .unwrap_err()
+                .contains("must appear before")
+        );
     }
 
     #[test]
@@ -2933,12 +2943,14 @@ mod tests {
         )
         .unwrap();
         helpers::validate_responses_request_compatibility(&invalid_tool).unwrap();
-        assert!(tool_calling::responses_tool_bridge(
-            invalid_tool.tools.as_ref(),
-            invalid_tool.tool_choice.as_ref(),
-            invalid_tool.parallel_tool_calls,
-        )
-        .is_err());
+        assert!(
+            tool_calling::responses_tool_bridge(
+                invalid_tool.tools.as_ref(),
+                invalid_tool.tool_choice.as_ref(),
+                invalid_tool.parallel_tool_calls,
+            )
+            .is_err()
+        );
         let unsupported = serde_json::from_value::<ResponsesRequest>(
             json!({"input": "Hello", "truncation": "auto"}),
         )
@@ -3254,12 +3266,14 @@ mod tests {
             None,
         )
         .is_err());
-        assert!(tool_calling::responses_tool_bridge(
-            Some(&tools),
-            Some(&json!({"type": "function", "name": "missing"})),
-            None,
-        )
-        .is_err());
+        assert!(
+            tool_calling::responses_tool_bridge(
+                Some(&tools),
+                Some(&json!({"type": "function", "name": "missing"})),
+                None,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -3443,29 +3457,33 @@ mod tests {
                 })))
                 .unwrap(),
         );
-        assert!(adapter
-            .ingest_chat_payload(chat_chunk(json!({
-                "index": 0,
-                "delta": {},
-                "finish_reason": "stop"
-            })))
-            .unwrap()
-            .is_empty());
-        assert!(adapter
-            .ingest_chat_payload(json!({
-                "id": "resp-1700000000-9",
-                "object": "chat.completion.chunk",
-                "created": 1_700_000_000_u64,
-                "model": "tiny.gguf",
-                "choices": [],
-                "usage": {
-                    "prompt_tokens": 3,
-                    "completion_tokens": 2,
-                    "total_tokens": 5
-                }
-            }))
-            .unwrap()
-            .is_empty());
+        assert!(
+            adapter
+                .ingest_chat_payload(chat_chunk(json!({
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                })))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            adapter
+                .ingest_chat_payload(json!({
+                    "id": "resp-1700000000-9",
+                    "object": "chat.completion.chunk",
+                    "created": 1_700_000_000_u64,
+                    "model": "tiny.gguf",
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": 3,
+                        "completion_tokens": 2,
+                        "total_tokens": 5
+                    }
+                }))
+                .unwrap()
+                .is_empty()
+        );
         events.extend(adapter.finish().unwrap());
 
         let event_types = events
@@ -3614,17 +3632,19 @@ mod tests {
                 }))
                 .unwrap(),
         );
-        assert!(adapter
-            .ingest_chat_payload(json!({
-                "id": "resp-function-stream",
-                "object": "chat.completion.chunk",
-                "created": 20_u64,
-                "model": "tiny.gguf",
-                "choices": [],
-                "usage": {"prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12}
-            }))
-            .unwrap()
-            .is_empty());
+        assert!(
+            adapter
+                .ingest_chat_payload(json!({
+                    "id": "resp-function-stream",
+                    "object": "chat.completion.chunk",
+                    "created": 20_u64,
+                    "model": "tiny.gguf",
+                    "choices": [],
+                    "usage": {"prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12}
+                }))
+                .unwrap()
+                .is_empty()
+        );
         events.extend(adapter.finish().unwrap());
 
         assert_eq!(
@@ -3664,10 +3684,12 @@ mod tests {
     #[test]
     fn responses_stream_decoder_and_failures_are_bounded_and_fail_closed() {
         let mut decoder = helpers::ChatSseDecoder::default();
-        assert!(decoder
-            .push(b"event: ignored\r\ndata: {\"value\":")
-            .unwrap()
-            .is_empty());
+        assert!(
+            decoder
+                .push(b"event: ignored\r\ndata: {\"value\":")
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             decoder.push(b"1}\r\n\r\ndata: [DO").unwrap(),
             vec!["{\"value\":1}".to_string()]
@@ -3678,9 +3700,11 @@ mod tests {
         let mut incomplete = helpers::ChatSseDecoder::default();
         incomplete.push(b"data: unfinished").unwrap();
         assert!(incomplete.finish().is_err());
-        assert!(helpers::ChatSseDecoder::default()
-            .push(&vec![b'x'; MAX_RESPONSES_STREAM_FRAME_BYTES + 1])
-            .is_err());
+        assert!(
+            helpers::ChatSseDecoder::default()
+                .push(&vec![b'x'; MAX_RESPONSES_STREAM_FRAME_BYTES + 1])
+                .is_err()
+        );
 
         let mut adapter = helpers::ResponsesStreamAdapter::new(
             "resp-error".to_string(),
@@ -3797,13 +3821,15 @@ mod tests {
             Some(pending_storage),
         );
         assert_eq!(response.status(), axum::http::StatusCode::OK);
-        assert!(response
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .starts_with("text/event-stream"));
+        assert!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("text/event-stream")
+        );
         let bytes = axum::body::to_bytes(response.into_body(), 4 * MIB as usize)
             .await
             .unwrap();
@@ -4645,10 +4671,12 @@ mod tests {
                 .unwrap();
             let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(body["error"]["type"], "invalid_request_error");
-            assert!(!body["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("/etc/passwd"));
+            assert!(
+                !body["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("/etc/passwd")
+            );
         }
 
         assert_eq!(state.metrics.requests_total.load(Ordering::Relaxed), 0);
@@ -4697,10 +4725,12 @@ mod tests {
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["error"]["type"], "model_not_found");
-        assert!(!body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("other.gguf"));
+        assert!(
+            !body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("other.gguf")
+        );
     }
 
     #[tokio::test]
@@ -4837,10 +4867,12 @@ mod tests {
         assert!(helpers::single_completion_prompt(&serde_json::json!(["one", "two"])).is_err());
         assert!(helpers::single_completion_prompt(&serde_json::json!([1, 2])).is_err());
         assert!(helpers::single_completion_prompt(&serde_json::json!("   ")).is_err());
-        assert!(helpers::single_completion_prompt(&serde_json::json!(
-            "x".repeat(MAX_COMPLETION_PROMPT_CHARS + 1)
-        ))
-        .is_err());
+        assert!(
+            helpers::single_completion_prompt(&serde_json::json!(
+                "x".repeat(MAX_COMPLETION_PROMPT_CHARS + 1)
+            ))
+            .is_err()
+        );
         assert!(
             helpers::single_completion_prompt(&serde_json::json!("\u{1f600}".repeat(200_000)))
                 .is_err()
@@ -6036,10 +6068,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(removed.status(), axum::http::StatusCode::OK);
-        assert!(axum::body::to_bytes(removed.into_body(), usize::MAX)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            axum::body::to_bytes(removed.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert!(!removable.exists());
         assert!(retained.exists());
         assert!(state.model_catalog_cache.read().await.is_none());
@@ -6210,9 +6244,11 @@ mod tests {
         assert_eq!(body["cache_status"], "fresh");
         assert_eq!(body["data"][0]["id"], "tiny-q4");
         assert!(body.get("generation_id").is_none());
-        assert!(!String::from_utf8(bytes.to_vec())
-            .unwrap()
-            .contains(index_path.to_string_lossy().as_ref()));
+        assert!(
+            !String::from_utf8(bytes.to_vec())
+                .unwrap()
+                .contains(index_path.to_string_lossy().as_ref())
+        );
     }
 
     async fn test_signed_index(
@@ -7310,10 +7346,12 @@ mod tests {
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["error"]["type"], "invalid_model_inventory");
-        assert!(body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("version"));
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("version")
+        );
     }
 
     #[tokio::test]
@@ -8250,13 +8288,15 @@ mod tests {
         assert!(
             normalize_embedding_input(&json!("x".repeat(MAX_EMBEDDING_INPUT_CHARS + 1))).is_err()
         );
-        assert!(normalize_embedding_input(&json!([
-            "x".repeat(MAX_EMBEDDING_INPUT_CHARS),
-            "x".repeat(MAX_EMBEDDING_INPUT_CHARS),
-            "x".repeat(MAX_EMBEDDING_INPUT_CHARS),
-            "x"
-        ]))
-        .is_err());
+        assert!(
+            normalize_embedding_input(&json!([
+                "x".repeat(MAX_EMBEDDING_INPUT_CHARS),
+                "x".repeat(MAX_EMBEDDING_INPUT_CHARS),
+                "x".repeat(MAX_EMBEDDING_INPUT_CHARS),
+                "x"
+            ]))
+            .is_err()
+        );
     }
 
     #[test]
@@ -8408,11 +8448,13 @@ mod tests {
         );
         assert_eq!(state.semaphore.available_permits(), 1);
         assert_eq!(native_batch_calls.load(Ordering::Relaxed), 2);
-        assert!(state
-            .cancel_tokens
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .is_empty());
+        assert!(
+            state
+                .cancel_tokens
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
 
         let inputs = (0..17)
             .map(|index| {
@@ -8672,11 +8714,13 @@ mod tests {
         assert_eq!(state.metrics.requests_total.load(Ordering::Relaxed), 6);
         assert_eq!(state.metrics.requests_completed.load(Ordering::Relaxed), 6);
         assert_eq!(state.semaphore.available_permits(), 1);
-        assert!(state
-            .cancel_tokens
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .is_empty());
+        assert!(
+            state
+                .cancel_tokens
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
     }
 
     #[test]
@@ -8767,9 +8811,11 @@ mod tests {
             })),
             extensions: BTreeMap::new(),
         };
-        assert!(response_format_mode(Some(&unsupported_keyword))
-            .unwrap_err()
-            .contains("unsupported keyword"));
+        assert!(
+            response_format_mode(Some(&unsupported_keyword))
+                .unwrap_err()
+                .contains("unsupported keyword")
+        );
 
         let unsupported_type = ResponseFormat {
             format_type: "json_schema".to_string(),
@@ -8782,17 +8828,21 @@ mod tests {
             })),
             extensions: BTreeMap::new(),
         };
-        assert!(response_format_mode(Some(&unsupported_type))
-            .unwrap_err()
-            .contains("unsupported type"));
+        assert!(
+            response_format_mode(Some(&unsupported_type))
+                .unwrap_err()
+                .contains("unsupported type")
+        );
 
         let mut extended = json_object;
         extended
             .extensions
             .insert("future".to_string(), json!(true));
-        assert!(response_format_mode(Some(&extended))
-            .unwrap_err()
-            .contains("response_format"));
+        assert!(
+            response_format_mode(Some(&extended))
+                .unwrap_err()
+                .contains("response_format")
+        );
     }
 
     #[test]
@@ -8805,26 +8855,32 @@ mod tests {
             "type": "object",
             "properties": {"nested": nested}
         });
-        assert!(helpers::validate_supported_json_schema(&deep)
-            .unwrap_err()
-            .contains("maximum depth"));
+        assert!(
+            helpers::validate_supported_json_schema(&deep)
+                .unwrap_err()
+                .contains("maximum depth")
+        );
 
         let oversized = json!({
             "type": "object",
             "description": "x".repeat(helpers::MAX_JSON_SCHEMA_BYTES)
         });
-        assert!(helpers::validate_supported_json_schema(&oversized)
-            .unwrap_err()
-            .contains("byte limit"));
+        assert!(
+            helpers::validate_supported_json_schema(&oversized)
+                .unwrap_err()
+                .contains("byte limit")
+        );
 
         let unknown_required = json!({
             "type": "object",
             "properties": {"known": {"type": "string"}},
             "required": ["missing"]
         });
-        assert!(helpers::validate_supported_json_schema(&unknown_required)
-            .unwrap_err()
-            .contains("unknown property"));
+        assert!(
+            helpers::validate_supported_json_schema(&unknown_required)
+                .unwrap_err()
+                .contains("unknown property")
+        );
     }
 
     #[test]
@@ -8850,17 +8906,18 @@ mod tests {
         });
         let mode = ResponseFormatMode::JsonSchema(schema);
 
-        assert!(validate_structured_output(
-            "{\"name\":\"bloom\",\"score\":3,\"tags\":[\"edge\"]}",
-            &mode
-        )
-        .is_ok());
+        assert!(
+            validate_structured_output(
+                "{\"name\":\"bloom\",\"score\":3,\"tags\":[\"edge\"]}",
+                &mode
+            )
+            .is_ok()
+        );
         assert!(validate_structured_output("{\"name\":\"bloom\"}", &mode).is_err());
-        assert!(validate_structured_output(
-            "{\"name\":\"bloom\",\"score\":3,\"extra\":true}",
-            &mode
-        )
-        .is_err());
+        assert!(
+            validate_structured_output("{\"name\":\"bloom\",\"score\":3,\"extra\":true}", &mode)
+                .is_err()
+        );
     }
 
     #[test]
@@ -9011,9 +9068,11 @@ mod tests {
             assert_eq!(rejected.status(), axum::http::StatusCode::FORBIDDEN);
             assert_eq!(rejected.headers()[header::CACHE_CONTROL], "no-store");
             assert!(rejected.headers().contains_key(HTTP_REQUEST_ID_HEADER));
-            assert!(!rejected
-                .headers()
-                .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
+            assert!(
+                !rejected
+                    .headers()
+                    .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            );
             let body: serde_json::Value = serde_json::from_slice(
                 &axum::body::to_bytes(rejected.into_body(), usize::MAX)
                     .await
@@ -9105,15 +9164,21 @@ mod tests {
             .unwrap()
             .to_str()
             .unwrap();
-        assert!(exposed_headers
-            .split(',')
-            .any(|value| value.trim() == HTTP_REQUEST_ID_HEADER));
-        assert!(exposed_headers
-            .split(',')
-            .any(|value| value.trim() == header::RETRY_AFTER.as_str()));
-        assert!(exposed_headers
-            .split(',')
-            .any(|value| value.trim() == header::WWW_AUTHENTICATE.as_str()));
+        assert!(
+            exposed_headers
+                .split(',')
+                .any(|value| value.trim() == HTTP_REQUEST_ID_HEADER)
+        );
+        assert!(
+            exposed_headers
+                .split(',')
+                .any(|value| value.trim() == header::RETRY_AFTER.as_str())
+        );
+        assert!(
+            exposed_headers
+                .split(',')
+                .any(|value| value.trim() == header::WWW_AUTHENTICATE.as_str())
+        );
 
         let second = app
             .clone()
@@ -9207,11 +9272,13 @@ mod tests {
             capacity.headers()[header::RETRY_AFTER],
             DEFAULT_CAPACITY_RETRY_AFTER_SECONDS
         );
-        assert!(capacity.headers()[header::ACCESS_CONTROL_EXPOSE_HEADERS]
-            .to_str()
-            .unwrap()
-            .split(',')
-            .any(|value| value.trim() == header::RETRY_AFTER.as_str()));
+        assert!(
+            capacity.headers()[header::ACCESS_CONTROL_EXPOSE_HEADERS]
+                .to_str()
+                .unwrap()
+                .split(',')
+                .any(|value| value.trim() == header::RETRY_AFTER.as_str())
+        );
 
         let custom = app
             .clone()
@@ -9623,11 +9690,13 @@ mod tests {
         }];
 
         assert!(validate_multimodal_modalities(&[bloomai_core::Modality::Text], &blocks).is_err());
-        assert!(validate_multimodal_modalities(
-            &[bloomai_core::Modality::Text, bloomai_core::Modality::Vision],
-            &blocks
-        )
-        .is_ok());
+        assert!(
+            validate_multimodal_modalities(
+                &[bloomai_core::Modality::Text, bloomai_core::Modality::Vision],
+                &blocks
+            )
+            .is_ok()
+        );
 
         let audio = vec![DataBlock::AudioPcm {
             samples: vec![0.0],
@@ -9738,10 +9807,11 @@ mod tests {
         assert_eq!(hook.kv_dim(), 1024);
         let res = hook.extract_kv(999, 0, 0, 10);
         assert!(res.is_err());
-        assert!(res
-            .unwrap_err()
-            .to_string()
-            .contains("No model wrapper found for handle 999"));
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("No model wrapper found for handle 999")
+        );
     }
 
     #[test]

@@ -145,14 +145,11 @@ fn current_rss_bytes() -> u64 {
         if let Ok(output) = std::process::Command::new("ps")
             .args(["-o", "rss=", "-p", &pid])
             .output()
+            && output.status.success()
+            && let Ok(s) = String::from_utf8(output.stdout)
+            && let Ok(kb) = s.trim().parse::<u64>()
         {
-            if output.status.success() {
-                if let Ok(s) = String::from_utf8(output.stdout) {
-                    if let Ok(kb) = s.trim().parse::<u64>() {
-                        return kb * 1024;
-                    }
-                }
-            }
+            return kb * 1024;
         }
     }
 
@@ -199,12 +196,10 @@ fn total_system_ram() -> u64 {
             .arg("-n")
             .arg("hw.memsize")
             .output()
+            && let Ok(s) = String::from_utf8(output.stdout)
+            && let Ok(total) = s.trim().parse::<u64>()
         {
-            if let Ok(s) = String::from_utf8(output.stdout) {
-                if let Ok(total) = s.trim().parse::<u64>() {
-                    return total;
-                }
-            }
+            return total;
         }
     }
 

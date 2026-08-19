@@ -90,7 +90,7 @@ impl Engine for WanEngine {
             supported_parallel_strategies: vec![crate::core::parallelism::ParallelStrategy::None],
             maturity: crate::engine::BackendMaturity::Experimental,
             diagnostic_tips: vec![
-                "Wan video model requires GGUF or safetensors weights.".to_string()
+                "Wan video model requires GGUF or safetensors weights.".to_string(),
             ],
             construction_guide:
                 "Built-in candle-based Wan video backend. Build with --features candle-engine."

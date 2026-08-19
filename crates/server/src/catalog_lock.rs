@@ -4,7 +4,7 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 
 pub(crate) const CATALOG_LOCK_FILE: &str = ".bloom-catalog.lock";
 
@@ -239,9 +239,11 @@ mod tests {
         let error = ModelCatalogLease::acquire(&root)
             .err()
             .expect("the child process must retain exclusive ownership");
-        assert!(error
-            .to_string()
-            .contains("already owned by another Bloom server"));
+        assert!(
+            error
+                .to_string()
+                .contains("already owned by another Bloom server")
+        );
 
         drop(child.stdin.take());
         assert!(child.wait().unwrap().success());

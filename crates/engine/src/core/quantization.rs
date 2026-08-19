@@ -244,52 +244,52 @@ impl Default for QuantizationConfig {
 impl QuantizationConfig {
     /// Detect quantization config from a model directory's config.json.
     pub fn from_model_config(config: &serde_json::Value) -> Self {
-        if let Some(quant_cfg) = config.get("quantization_config") {
-            if let Some(method) = QuantMethod::from_hf_quant_config(quant_cfg) {
-                let weight_bits = quant_cfg
-                    .get("bits")
-                    .and_then(|v| v.as_u64())
-                    .map(|b| b as u8)
-                    .unwrap_or(match method {
-                        QuantMethod::Awq | QuantMethod::Gptq => 4,
-                        QuantMethod::Fp8 | QuantMethod::Int8 | QuantMethod::Eetq => 8,
-                        QuantMethod::NvFp4 | QuantMethod::Nf4 | QuantMethod::Fp4 => 4,
-                        QuantMethod::Aqlm => 2,
-                        QuantMethod::Hqq
-                        | QuantMethod::Exl2
-                        | QuantMethod::Quanto
-                        | QuantMethod::Torchao => 4,
-                        _ => 16,
-                    });
+        if let Some(quant_cfg) = config.get("quantization_config")
+            && let Some(method) = QuantMethod::from_hf_quant_config(quant_cfg)
+        {
+            let weight_bits = quant_cfg
+                .get("bits")
+                .and_then(|v| v.as_u64())
+                .map(|b| b as u8)
+                .unwrap_or(match method {
+                    QuantMethod::Awq | QuantMethod::Gptq => 4,
+                    QuantMethod::Fp8 | QuantMethod::Int8 | QuantMethod::Eetq => 8,
+                    QuantMethod::NvFp4 | QuantMethod::Nf4 | QuantMethod::Fp4 => 4,
+                    QuantMethod::Aqlm => 2,
+                    QuantMethod::Hqq
+                    | QuantMethod::Exl2
+                    | QuantMethod::Quanto
+                    | QuantMethod::Torchao => 4,
+                    _ => 16,
+                });
 
-                let group_size = quant_cfg
-                    .get("group_size")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(128) as usize;
+            let group_size = quant_cfg
+                .get("group_size")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(128) as usize;
 
-                let kv_cache_dtype = quant_cfg
-                    .get("kv_cache_dtype")
-                    .and_then(|v| v.as_str())
-                    .map(|s| match s {
-                        "int8" => KvCacheDtype::Int8,
-                        "fp8" => KvCacheDtype::Fp8,
-                        "bf16" => KvCacheDtype::BF16,
-                        _ => KvCacheDtype::F16,
-                    })
-                    .unwrap_or_default();
+            let kv_cache_dtype = quant_cfg
+                .get("kv_cache_dtype")
+                .and_then(|v| v.as_str())
+                .map(|s| match s {
+                    "int8" => KvCacheDtype::Int8,
+                    "fp8" => KvCacheDtype::Fp8,
+                    "bf16" => KvCacheDtype::BF16,
+                    _ => KvCacheDtype::F16,
+                })
+                .unwrap_or_default();
 
-                return Self {
-                    weight_method: method,
-                    weight_bits,
-                    group_size,
-                    kv_cache_dtype,
-                    activation_quant: quant_cfg
-                        .get("activation_quant")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false),
-                    source_format: method.label().to_string(),
-                };
-            }
+            return Self {
+                weight_method: method,
+                weight_bits,
+                group_size,
+                kv_cache_dtype,
+                activation_quant: quant_cfg
+                    .get("activation_quant")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                source_format: method.label().to_string(),
+            };
         }
 
         // Check torch_dtype as fallback

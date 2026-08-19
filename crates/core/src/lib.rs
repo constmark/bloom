@@ -46,6 +46,10 @@ pub use scheduler::{
     WorkloadKind,
 };
 pub use token_scheduling::{
+    TokenAdmission,
+    TokenBudget,
+    TokenPhase,
+    TokenSchedulingConfig,
     // Chunked prefill
     chunked_prefill::{
         ChunkedPrefillConfig, ChunkedPrefillQueue, ChunkedPrefillState, PrefillChunk,
@@ -64,10 +68,6 @@ pub use token_scheduling::{
     rate_limiter::{
         RateLimitDecision, RateLimiterConfig, TokenBucketConfig, TokenBucketRateLimiter,
     },
-    TokenAdmission,
-    TokenBudget,
-    TokenPhase,
-    TokenSchedulingConfig,
 };
 pub use types::{
     BenchmarkResult, CacheKind, DType, DeviceCapability, DeviceClass, DeviceKind, GenerationParams,
@@ -76,8 +76,8 @@ pub use types::{
 };
 pub use unified_memory::{MemoryReservation, UnifiedMemoryConfig};
 pub use vram::{
-    global_resource_coordinator, global_vram_coordinator, init_global_resource_coordinator,
-    ResourceCoordinator, VRAMCoordinator,
+    ResourceCoordinator, VRAMCoordinator, global_resource_coordinator, global_vram_coordinator,
+    init_global_resource_coordinator,
 };
 pub use world::{
     Action, PredictedFuture, StateCacheConfig, StateCacheEntry, StateCachePriority, StateDelta,

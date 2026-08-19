@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::path::{Component, Path};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -109,7 +109,7 @@ pub(crate) fn validate_safetensors_layout_names(files: &[ModelPackageFile]) -> R
         ));
     }
     shards.sort_by_key(|(_, (index, _))| *index);
-    let expected_total = shards[0].1 .1;
+    let expected_total = shards[0].1.1;
     if shards.len() != expected_total {
         return Err(anyhow!(
             "Safetensors package declares {expected_total} shards but contains {}",
@@ -298,10 +298,12 @@ mod tests {
                 sha256: "ab".repeat(32),
             },
         ];
-        assert!(normalize_package_files(incomplete, 10)
-            .unwrap_err()
-            .to_string()
-            .contains("complete indexed"));
+        assert!(
+            normalize_package_files(incomplete, 10)
+                .unwrap_err()
+                .to_string()
+                .contains("complete indexed")
+        );
 
         let mut conflicting = package_files();
         conflicting.push(ModelPackageFile {
@@ -309,9 +311,11 @@ mod tests {
             size_bytes: 1,
             sha256: "ef".repeat(32),
         });
-        assert!(normalize_package_files(conflicting, 11)
-            .unwrap_err()
-            .to_string()
-            .contains("cannot be combined"));
+        assert!(
+            normalize_package_files(conflicting, 11)
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be combined")
+        );
     }
 }

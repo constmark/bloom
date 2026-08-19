@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use bloomai_core::DeviceKind;
 
 /// Result of a speculative decoding step.
@@ -414,7 +414,9 @@ impl SpeculativeStrategy for DraftModelStrategy {
         }
         #[cfg(not(feature = "candle-engine"))]
         {
-            bail!("Candle engine feature is not enabled; draft model speculative decoding is unsupported.");
+            bail!(
+                "Candle engine feature is not enabled; draft model speculative decoding is unsupported."
+            );
         }
     }
 
@@ -623,7 +625,7 @@ pub fn verify_speculative_tokens(
 ///   falls back to greedy acceptance against the target argmax.
 /// * `temperature` - Sampling temperature; must match between draft and
 ///   target. When `<= 1e-6`, falls back to greedy verification.
-/// * `rng_state` - Mutable LCG PRNG state (see [`lcg_next_f32`]).
+/// * `rng_state` - Mutable LCG PRNG state (see `lcg_next_f32`).
 ///
 /// # Returns
 /// `(accepted, correction_or_bonus)` where:
@@ -1012,8 +1014,8 @@ mod tests {
         use crate::core::model::{LoadedModel, ModelMetadata};
         use crate::io::{ModelInput, ModelOutput};
         use bloomai_core::{GenerationParams, Modality, ModelManifest};
-        use std::sync::atomic::AtomicUsize;
         use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
 
         struct MockLoadedModel {
             clear_calls: Arc<AtomicUsize>,

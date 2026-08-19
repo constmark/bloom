@@ -3,7 +3,7 @@
 // Multiaxis position construction intentionally indexes coordinate planes.
 #![allow(clippy::needless_range_loop)]
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -15,7 +15,7 @@ use bloomai_core::{
 };
 
 use crate::{
-    engine::{default_engine_supports, Engine, EngineCapability, SupportLevel},
+    engine::{Engine, EngineCapability, SupportLevel, default_engine_supports},
     io::{ModelInput, ModelOutput},
     model::{LoadedModel, ModelMetadata},
 };
@@ -552,7 +552,7 @@ impl VisionAttentionPool {
             return Ok(x.clone());
         }
 
-        if let (Some(ref q_proj), Some(ref k_proj), Some(ref v_proj), Some(ref out_proj)) =
+        if let (Some(q_proj), Some(k_proj), Some(v_proj), Some(out_proj)) =
             (&self.q_proj, &self.k_proj, &self.v_proj, &self.out_proj)
         {
             let indices: Vec<u32> = (0..pooled_len)
@@ -1201,10 +1201,10 @@ impl Qwen3VLModel {
                 mask.as_ref(),
                 &self.device,
             )?;
-            if let Some((_, deepstack_feats)) = &vision_features {
-                if layer_idx < deepstack_feats.len() {
-                    h = add_deepstack_features(&h, &visual_indices, &deepstack_feats[layer_idx])?;
-                }
+            if let Some((_, deepstack_feats)) = &vision_features
+                && layer_idx < deepstack_feats.len()
+            {
+                h = add_deepstack_features(&h, &visual_indices, &deepstack_feats[layer_idx])?;
             }
         }
 
@@ -1267,7 +1267,7 @@ impl LoadedModel for Qwen3VLModel {
             _ => {
                 return Err(anyhow!(
                     "Qwen3-VL model only supports text or image/text input"
-                ))
+                ));
             }
         };
 
@@ -1291,9 +1291,7 @@ impl LoadedModel for Qwen3VLModel {
             let pad_str = "<|image_pad|>".repeat(pad_tokens_count);
             formatted_prompt = format!(
                 "<|im_start|>user\n<|vision_start|>{}{}<|vision_end|>{}\n<|im_end|>\n<|im_start|>assistant\n",
-                pad_str,
-                "",
-                prompt
+                pad_str, "", prompt
             );
             img_bytes_ref = Some(bytes.as_slice());
         }

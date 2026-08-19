@@ -1,6 +1,6 @@
 //! Deployer-defined license admission for writable model acquisitions.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::Serialize;
 
 use super::model_provenance::normalize_license;

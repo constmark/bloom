@@ -915,19 +915,21 @@ fn responses_input_message(
             "Responses input item {item_index} must be a message object."
         ));
     };
-    if let Some(item_type) = object.remove("type") {
-        if !item_type.is_null() && item_type.as_str() != Some("message") {
-            return Err(format!(
-                "Responses input item {item_index} must have type `message`; tool, file, image, and other item types are unsupported."
-            ));
-        }
+    if let Some(item_type) = object.remove("type")
+        && !item_type.is_null()
+        && item_type.as_str() != Some("message")
+    {
+        return Err(format!(
+            "Responses input item {item_index} must have type `message`; tool, file, image, and other item types are unsupported."
+        ));
     }
-    if let Some(status) = object.remove("status") {
-        if !status.is_null() && status.as_str() != Some("completed") {
-            return Err(format!(
-                "Responses input item {item_index} has an unsupported status."
-            ));
-        }
+    if let Some(status) = object.remove("status")
+        && !status.is_null()
+        && status.as_str() != Some("completed")
+    {
+        return Err(format!(
+            "Responses input item {item_index} has an unsupported status."
+        ));
     }
     let id = responses_input_item_id(
         object.remove("id"),
@@ -1665,10 +1667,10 @@ impl ResponsesStreamAdapter {
         if choice.get("index").and_then(serde_json::Value::as_u64) != Some(0) {
             return Err("The internal chat stream emitted an invalid choice index.".to_string());
         }
-        if let Some(role) = choice.pointer("/delta/role") {
-            if role.as_str() != Some("assistant") {
-                return Err("The internal chat stream emitted an invalid delta role.".to_string());
-            }
+        if let Some(role) = choice.pointer("/delta/role")
+            && role.as_str() != Some("assistant")
+        {
+            return Err("The internal chat stream emitted an invalid delta role.".to_string());
         }
         if let Some(tool_calls) = choice.pointer("/delta/tool_calls") {
             if self.text_output_opened || !self.output_text.is_empty() {
@@ -1718,41 +1720,40 @@ impl ResponsesStreamAdapter {
                 )?);
             }
         }
-        if let Some(finish_reason) = choice.get("finish_reason") {
-            if !finish_reason.is_null() {
-                let finish_reason = finish_reason.as_str().ok_or_else(|| {
-                    "The internal chat stream emitted an invalid finish reason.".to_string()
-                })?;
-                if !matches!(finish_reason, "stop" | "length" | "tool_calls") {
-                    return Err(
-                        "The internal chat stream emitted an unsupported finish reason."
-                            .to_string(),
-                    );
-                }
-                if self
-                    .finish_reason
-                    .replace(finish_reason.to_string())
-                    .is_some()
-                {
-                    return Err(
-                        "The internal chat stream emitted duplicate finish reasons.".to_string()
-                    );
-                }
-                if finish_reason == "tool_calls" && self.tool_calls.is_none() {
-                    return Err(
-                        "The internal chat stream finished with tool_calls but omitted function calls."
-                            .to_string(),
-                    );
-                }
-                if finish_reason != "tool_calls"
-                    && self.tool_calls.is_some()
-                    && finish_reason != "length"
-                {
-                    return Err(
+        if let Some(finish_reason) = choice.get("finish_reason")
+            && !finish_reason.is_null()
+        {
+            let finish_reason = finish_reason.as_str().ok_or_else(|| {
+                "The internal chat stream emitted an invalid finish reason.".to_string()
+            })?;
+            if !matches!(finish_reason, "stop" | "length" | "tool_calls") {
+                return Err(
+                    "The internal chat stream emitted an unsupported finish reason.".to_string(),
+                );
+            }
+            if self
+                .finish_reason
+                .replace(finish_reason.to_string())
+                .is_some()
+            {
+                return Err(
+                    "The internal chat stream emitted duplicate finish reasons.".to_string()
+                );
+            }
+            if finish_reason == "tool_calls" && self.tool_calls.is_none() {
+                return Err(
+                    "The internal chat stream finished with tool_calls but omitted function calls."
+                        .to_string(),
+                );
+            }
+            if finish_reason != "tool_calls"
+                && self.tool_calls.is_some()
+                && finish_reason != "length"
+            {
+                return Err(
                         "The internal chat stream emitted function calls with an incompatible finish reason."
                             .to_string(),
                     );
-                }
             }
         }
         Ok(events)
@@ -2685,12 +2686,12 @@ fn validate_supported_json_schema_node(
             }
         }
     }
-    if let Some(additional) = object.get("additionalProperties") {
-        if schema_type != Some("object") || !additional.is_boolean() {
-            return Err(format!(
-                "response JSON Schema at {path}.additionalProperties requires type object and a boolean value."
-            ));
-        }
+    if let Some(additional) = object.get("additionalProperties")
+        && (schema_type != Some("object") || !additional.is_boolean())
+    {
+        return Err(format!(
+            "response JSON Schema at {path}.additionalProperties requires type object and a boolean value."
+        ));
     }
     if let Some(items) = object.get("items") {
         if schema_type != Some("array") {
@@ -2879,8 +2880,7 @@ pub(crate) fn apply_response_format_instruction(
         ),
         ResponseFormatMode::JsonSchema(schema) => format!(
             "{}\n\nReturn a valid JSON object only. It must satisfy this JSON Schema: {}. Do not include Markdown fences or explanatory text.",
-            prompt,
-            schema
+            prompt, schema
         ),
     }
 }
@@ -2919,16 +2919,16 @@ pub(crate) fn validate_json_schema_subset(
     schema: &serde_json::Value,
     path: &str,
 ) -> std::result::Result<(), String> {
-    if let Some(enum_values) = schema.get("enum").and_then(|v| v.as_array()) {
-        if !enum_values.iter().any(|candidate| candidate == value) {
-            return Err(format!("{} does not match any allowed enum value", path));
-        }
+    if let Some(enum_values) = schema.get("enum").and_then(|v| v.as_array())
+        && !enum_values.iter().any(|candidate| candidate == value)
+    {
+        return Err(format!("{} does not match any allowed enum value", path));
     }
 
-    if let Some(schema_type) = schema.get("type").and_then(|v| v.as_str()) {
-        if !json_value_matches_type(value, schema_type) {
-            return Err(format!("{} expected type {}", path, schema_type));
-        }
+    if let Some(schema_type) = schema.get("type").and_then(|v| v.as_str())
+        && !json_value_matches_type(value, schema_type)
+    {
+        return Err(format!("{} expected type {}", path, schema_type));
     }
 
     if let Some(object) = value.as_object() {
@@ -2962,11 +2962,11 @@ pub(crate) fn validate_json_schema_subset(
         }
     }
 
-    if let Some(item_schema) = schema.get("items") {
-        if let Some(items) = value.as_array() {
-            for (idx, item) in items.iter().enumerate() {
-                validate_json_schema_subset(item, item_schema, &format!("{}[{}]", path, idx))?;
-            }
+    if let Some(item_schema) = schema.get("items")
+        && let Some(items) = value.as_array()
+    {
+        for (idx, item) in items.iter().enumerate() {
+            validate_json_schema_subset(item, item_schema, &format!("{}[{}]", path, idx))?;
         }
     }
 
@@ -3051,12 +3051,12 @@ pub(crate) fn collect_embedding(
             Ok(())
         },
     )?;
-    let output = embedding
+
+    embedding
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
-        .ok_or_else(|| anyhow!("model did not produce OutputChunk::Embedding"));
-    output
+        .ok_or_else(|| anyhow!("model did not produce OutputChunk::Embedding"))
 }
 
 pub(crate) fn estimate_delta_tokens(pipeline: &InferencePipeline, text: &str) -> u64 {

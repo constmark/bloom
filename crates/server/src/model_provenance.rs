@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
@@ -11,7 +11,7 @@ use tokio::io::AsyncWriteExt as _;
 
 use super::model_manager::{validate_catalog_id, validate_model_filename};
 use super::model_package::{
-    normalize_package_files, package_digest, validate_package_id, ModelPackageFile,
+    ModelPackageFile, normalize_package_files, package_digest, validate_package_id,
 };
 
 pub(crate) const METADATA_DIRECTORY: &str = ".bloom-metadata";
@@ -736,10 +736,12 @@ mod tests {
         assert!(
             normalize_source_url(Some("https://user:secret@example.com/model".into())).is_err()
         );
-        assert!(normalize_source_identity(
-            Some("https://example.com/model".into()),
-            Some("elsewhere.example".into())
-        )
-        .is_err());
+        assert!(
+            normalize_source_identity(
+                Some("https://example.com/model".into()),
+                Some("elsewhere.example".into())
+            )
+            .is_err()
+        );
     }
 }

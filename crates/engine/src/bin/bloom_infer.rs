@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use bloomai_core::{BenchmarkResult, DType, DeviceKind, GenerationParams};
 use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
@@ -34,8 +34,8 @@ use bloomai_engine::executor::qwen3_vl::Qwen3VLEngine;
 #[cfg(feature = "candle-engine")]
 use bloomai_engine::executor::wan::WanEngine;
 use bloomai_engine::{
-    model_manifest_supports_embeddings, speculative_mode_is_mtp, Engine, EngineRegistry,
-    InferencePipeline, ModelInput,
+    Engine, EngineRegistry, InferencePipeline, ModelInput, model_manifest_supports_embeddings,
+    speculative_mode_is_mtp,
 };
 
 /// Chat completion message.
@@ -271,7 +271,7 @@ struct Args {
 }
 
 macro_rules! apply_config_value {
-    ($args:expr, $matches:expr, $config:expr, $field:ident) => {
+    ($args:expr_2021, $matches:expr_2021, $config:expr_2021, $field:ident) => {
         if should_use_config($matches, stringify!($field)) {
             if let Some(value) = &$config.$field {
                 $args.$field = value.clone();
@@ -281,7 +281,7 @@ macro_rules! apply_config_value {
 }
 
 macro_rules! apply_config_option {
-    ($args:expr, $matches:expr, $config:expr, $field:ident) => {
+    ($args:expr_2021, $matches:expr_2021, $config:expr_2021, $field:ident) => {
         if should_use_config($matches, stringify!($field)) {
             if let Some(value) = &$config.$field {
                 $args.$field = Some(value.clone());
@@ -605,17 +605,17 @@ fn resolve_and_parse_input(args: &Args, template: CliChatTemplate) -> Result<Res
                 seed: json_obj.seed.or(args.seed),
             });
         }
-    } else if trimmed.starts_with('[') {
-        if let Ok(messages) = serde_json::from_str::<Vec<ChatCompletionMessage>>(trimmed) {
-            let prompt = chat_prompt_for_model(&messages, template);
-            return Ok(ResolvedInput {
-                prompt,
-                max_tokens: args.max_tokens,
-                temperature: args.temperature,
-                top_p: args.top_p,
-                seed: args.seed,
-            });
-        }
+    } else if trimmed.starts_with('[')
+        && let Ok(messages) = serde_json::from_str::<Vec<ChatCompletionMessage>>(trimmed)
+    {
+        let prompt = chat_prompt_for_model(&messages, template);
+        return Ok(ResolvedInput {
+            prompt,
+            max_tokens: args.max_tokens,
+            temperature: args.temperature,
+            top_p: args.top_p,
+            seed: args.seed,
+        });
     }
 
     let prompt = build_prompt_for_model(args.system_prompt.as_deref(), &raw_input, template);
@@ -667,10 +667,12 @@ async fn main() -> Result<()> {
 
     let (mut args, matches) = parse_args()?;
     if args.strict_memory_budget {
-        std::env::set_var("BLOOM_STRICT_MEMORY_BUDGET", "1");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("BLOOM_STRICT_MEMORY_BUDGET", "1") };
     }
     if args.strict_security {
-        std::env::set_var("BLOOM_STRICT_SECURITY", "1");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("BLOOM_STRICT_SECURITY", "1") };
     }
     let config_path = bloomai_engine::resolve_config_path(args.config.as_deref())?;
     if args.init_config {
@@ -699,7 +701,8 @@ async fn main() -> Result<()> {
     // Dtype affects both runtime construction and the device-specific memory
     // estimate shown by metadata-only inspection.
     if let Some(ref dt) = args.dtype {
-        std::env::set_var("BLOOM_DTYPE", dt);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("BLOOM_DTYPE", dt) };
     }
 
     // --- Load manifest first to assist in engine auto-selection if needed ---
@@ -735,26 +738,37 @@ async fn main() -> Result<()> {
     }
 
     if let Some(layers) = args.gpu_layers {
-        std::env::set_var("BLOOM_GPU_LAYERS", layers.to_string());
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("BLOOM_GPU_LAYERS", layers.to_string()) };
     }
-    std::env::set_var("BLOOM_SPECULATIVE", &args.speculative);
-    std::env::set_var(
-        "BLOOM_NUM_SPECULATIVE_TOKENS",
-        args.num_speculative_tokens.to_string(),
-    );
-    std::env::set_var(
-        "BLOOM_SPECULATIVE_NGRAM_ORDER",
-        args.speculative_ngram_order.to_string(),
-    );
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("BLOOM_SPECULATIVE", &args.speculative) };
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe {
+        std::env::set_var(
+            "BLOOM_NUM_SPECULATIVE_TOKENS",
+            args.num_speculative_tokens.to_string(),
+        )
+    };
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe {
+        std::env::set_var(
+            "BLOOM_SPECULATIVE_NGRAM_ORDER",
+            args.speculative_ngram_order.to_string(),
+        )
+    };
     if let Some(ref draft_model) = args.draft_model {
-        std::env::set_var("BLOOM_DRAFT_MODEL", draft_model);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("BLOOM_DRAFT_MODEL", draft_model) };
     } else {
-        std::env::remove_var("BLOOM_DRAFT_MODEL");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("BLOOM_DRAFT_MODEL") };
     }
 
     // --- Configure thread pool if requested ---
     if let Some(threads) = args.threads {
-        std::env::set_var("RAYON_NUM_THREADS", threads.to_string());
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("RAYON_NUM_THREADS", threads.to_string()) };
         if !args.quiet && !args.bench_json {
             tracing::info!("CPU thread pool set to {}", threads);
         }
@@ -1251,13 +1265,13 @@ fn build_interactive_prompt(
     template: CliChatTemplate,
 ) -> String {
     let mut messages = Vec::with_capacity(history.len() + 2);
-    if let Some(system) = system_prompt {
-        if !system.is_empty() {
-            messages.push(ChatCompletionMessage {
-                role: "system".to_string(),
-                content: system.to_string(),
-            });
-        }
+    if let Some(system) = system_prompt
+        && !system.is_empty()
+    {
+        messages.push(ChatCompletionMessage {
+            role: "system".to_string(),
+            content: system.to_string(),
+        });
     }
     messages.extend_from_slice(history);
     messages.push(ChatCompletionMessage {
@@ -1782,10 +1796,9 @@ fn get_machine_model() -> String {
         if let Ok(output) = std::process::Command::new("sysctl")
             .args(["-n", "machdep.cpu.brand_string"])
             .output()
+            && let Ok(s) = String::from_utf8(output.stdout)
         {
-            if let Ok(s) = String::from_utf8(output.stdout) {
-                return s.trim().to_string();
-            }
+            return s.trim().to_string();
         }
     }
     std::env::consts::ARCH.to_string()

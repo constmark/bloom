@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use bloomai_core::{BackendLease, DeviceCapability, ResourceError, ResourceTicket};
 
 use crate::backend::{
@@ -215,11 +215,13 @@ mod tests {
         {
             let result = registry.ensure_available("metal");
             assert!(result.is_err());
-            assert!(result
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("metal backend supports macOS only"));
+            assert!(
+                result
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("metal backend supports macOS only")
+            );
         }
 
         // On non-macOS, let's verify cpu is always available.
@@ -248,9 +250,9 @@ mod tests {
             }
         }
         fn availability(&self) -> crate::backend::BackendAvailability {
-            crate::backend::BackendAvailability::available(
-                vec!["dummy is always ready".to_string()],
-            )
+            crate::backend::BackendAvailability::available(vec![
+                "dummy is always ready".to_string(),
+            ])
         }
         fn capability(&self) -> DeviceCapability {
             DeviceCapability {
@@ -354,7 +356,7 @@ mod tests {
         assert!(result.is_ok());
         let lease = result.unwrap();
         let _ = lease; // silence unused variable warning when cuda feature is enabled
-                       // On macOS, cuda is unavailable, so it should have fallen back to cpu
+        // On macOS, cuda is unavailable, so it should have fallen back to cpu
         #[cfg(not(feature = "cuda"))]
         {
             assert!(lease.is_degraded());
@@ -428,7 +430,9 @@ mod tests {
         let registry = BackendRegistry::default();
         let n = registry.get("intel-npu").unwrap();
         if !n.availability().available {
-            println!("Skipping registry reserve with fallback intel-npu test because NPU is not available.");
+            println!(
+                "Skipping registry reserve with fallback intel-npu test because NPU is not available."
+            );
             return;
         }
 

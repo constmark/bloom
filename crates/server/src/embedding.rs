@@ -88,13 +88,13 @@ pub(crate) fn validate_openai_embedding_request(
             "dimensions must be between 1 and {MAX_EMBEDDING_DIMENSIONS}."
         ));
     }
-    if let Some(user) = request.user.as_deref() {
-        if user.is_empty() || user.chars().count() > 256 || user.chars().any(char::is_control) {
-            return Err(
-                "user must contain between 1 and 256 characters without control characters."
-                    .to_string(),
-            );
-        }
+    if let Some(user) = request.user.as_deref()
+        && (user.is_empty() || user.chars().count() > 256 || user.chars().any(char::is_control))
+    {
+        return Err(
+            "user must contain between 1 and 256 characters without control characters."
+                .to_string(),
+        );
     }
     if let Some(field) = request
         .extensions

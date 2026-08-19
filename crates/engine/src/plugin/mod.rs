@@ -667,11 +667,12 @@ mod tests {
 
         let res = PluginManager::validate_native_library(&manifest, temp_dir.path());
         assert!(res.is_err());
-        assert!(res
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("Failed to load dynamic library"));
+        assert!(
+            res.err()
+                .unwrap()
+                .to_string()
+                .contains("Failed to load dynamic library")
+        );
     }
 
     #[test]

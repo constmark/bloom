@@ -19,11 +19,11 @@ use std::time::{Duration, Instant};
 use axum::http::{HeaderName, HeaderValue};
 #[cfg(feature = "serve-ui")]
 use axum::{
+    Router,
     body::Body,
-    http::{header, HeaderMap, Method, StatusCode, Uri},
+    http::{HeaderMap, Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
     routing::get,
-    Router,
 };
 #[cfg(feature = "serve-ui")]
 use rust_embed::Embed;
@@ -133,7 +133,7 @@ fn run_browser_command(spec: &BrowserCommandSpec) -> io::Result<()> {
                 return Err(io::Error::other(format!(
                     "{} exited with {status}",
                     spec.program
-                )))
+                )));
             }
             None if Instant::now() >= deadline => {
                 std::thread::spawn(move || {

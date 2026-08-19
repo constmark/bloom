@@ -405,14 +405,13 @@ impl ConversationStore {
                         );
                     }
                 }
-                if let Some(response_format) = &message.response_format {
-                    if message.role != "assistant"
-                        || !matches!(response_format.as_str(), "json_object" | "json_schema")
-                    {
-                        return Err(
-                            "conversation contains invalid structured-output metadata".to_string()
-                        );
-                    }
+                if let Some(response_format) = &message.response_format
+                    && (message.role != "assistant"
+                        || !matches!(response_format.as_str(), "json_object" | "json_schema"))
+                {
+                    return Err(
+                        "conversation contains invalid structured-output metadata".to_string()
+                    );
                 }
                 if message.content.chars().count() > MAX_ARCHIVE_MESSAGE_CHARS {
                     return Err(format!(
@@ -1160,15 +1159,13 @@ fn validate_archive(archive: &ConversationArchive) -> Result<(), String> {
                     );
                 }
             }
-            if let Some(response_format) = &message.response_format {
-                if message.role != "assistant"
-                    || !matches!(response_format.as_str(), "json_object" | "json_schema")
-                {
-                    return Err(
-                        "conversation archive contains invalid structured-output metadata"
-                            .to_string(),
-                    );
-                }
+            if let Some(response_format) = &message.response_format
+                && (message.role != "assistant"
+                    || !matches!(response_format.as_str(), "json_object" | "json_schema"))
+            {
+                return Err(
+                    "conversation archive contains invalid structured-output metadata".to_string(),
+                );
             }
             if message.content.chars().count() > MAX_ARCHIVE_MESSAGE_CHARS {
                 return Err(format!(
@@ -1242,9 +1239,11 @@ mod tests {
         let renamed = store.clone();
         assert!(store.rename(1, "   ").is_err());
         assert!(store.rename(1, "line\nbreak").is_err());
-        assert!(store
-            .rename(1, &"x".repeat(MAX_RENAMED_TITLE_CHARS + 1))
-            .is_err());
+        assert!(
+            store
+                .rename(1, &"x".repeat(MAX_RENAMED_TITLE_CHARS + 1))
+                .is_err()
+        );
         assert!(store.rename(99, "Missing").is_err());
         assert_eq!(store, renamed);
     }
@@ -1461,9 +1460,11 @@ mod tests {
         message_limited.active_mut().messages =
             vec![DisplayMessage::user("Prompt"); MAX_ARCHIVE_MESSAGES / 2 + 1];
         let message_limited_before = message_limited.clone();
-        assert!(message_limited
-            .branch_active_at(MAX_ARCHIVE_MESSAGES / 2)
-            .is_err());
+        assert!(
+            message_limited
+                .branch_active_at(MAX_ARCHIVE_MESSAGES / 2)
+                .is_err()
+        );
         assert_eq!(message_limited, message_limited_before);
     }
 
@@ -1617,9 +1618,11 @@ mod tests {
                 .collect(),
         };
         let full_before = full.clone();
-        assert!(merge_conversation_stores(&full, &imported)
-            .unwrap_err()
-            .contains("1000-conversation"));
+        assert!(
+            merge_conversation_stores(&full, &imported)
+                .unwrap_err()
+                .contains("1000-conversation")
+        );
         assert_eq!(full, full_before);
 
         let mut nearly_message_limited = ConversationStore::default();
@@ -1640,9 +1643,11 @@ mod tests {
         message_limited.active_mut().messages =
             vec![DisplayMessage::assistant(String::new()); MAX_ARCHIVE_MESSAGES];
         let message_limited_before = message_limited.clone();
-        assert!(merge_conversation_stores(&message_limited, &imported)
-            .unwrap_err()
-            .contains("50000-message"));
+        assert!(
+            merge_conversation_stores(&message_limited, &imported)
+                .unwrap_err()
+                .contains("50000-message")
+        );
         assert_eq!(message_limited, message_limited_before);
 
         let exhausted = ConversationStore {
@@ -1650,9 +1655,11 @@ mod tests {
             ..ConversationStore::default()
         };
         let exhausted_before = exhausted.clone();
-        assert!(merge_conversation_stores(&exhausted, &imported)
-            .unwrap_err()
-            .contains("ID space"));
+        assert!(
+            merge_conversation_stores(&exhausted, &imported)
+                .unwrap_err()
+                .contains("ID space")
+        );
         assert_eq!(exhausted, exhausted_before);
     }
 
@@ -1803,12 +1810,14 @@ mod tests {
         assert!(!store.active().messages[0].attachment_unavailable);
         assert!(store.active().messages[0].generation.is_none());
         assert!(store.active().messages[0].response_format.is_none());
-        assert!(store.active().messages[1]
-            .generation
-            .as_ref()
-            .unwrap()
-            .model
-            .is_none());
+        assert!(
+            store.active().messages[1]
+                .generation
+                .as_ref()
+                .unwrap()
+                .model
+                .is_none()
+        );
         assert_eq!(store.active_execution_model(), None);
     }
 
@@ -1853,9 +1862,11 @@ mod tests {
             None,
             Some("legacy-model".to_string()),
         ));
-        assert!(store.active().messages[assistant_index]
-            .execution_model
-            .is_none());
+        assert!(
+            store.active().messages[assistant_index]
+                .execution_model
+                .is_none()
+        );
 
         let archive = export_conversation_archive(&store).unwrap();
         let imported = import_conversation_archive(&archive).unwrap();
@@ -1901,9 +1912,11 @@ mod tests {
         assert!(archive.contains("\"version\": 2"));
         assert!(archive.contains("\"model\": \"tiny.gguf\""));
         let imported = import_conversation_archive(&archive).unwrap();
-        assert!(imported.active().messages[assistant_index]
-            .generation
-            .is_none());
+        assert!(
+            imported.active().messages[assistant_index]
+                .generation
+                .is_none()
+        );
         assert_eq!(
             imported.active().messages[assistant_index]
                 .execution_model
@@ -2046,9 +2059,11 @@ mod tests {
         image.append_user_with_unavailable_attachment("[Image: photo.png]\nDescribe it.".into());
         image.append_assistant_placeholder();
         let image_before = image.clone();
-        assert!(image
-            .prepare_last_prompt_edit("A different prompt".into())
-            .is_err());
+        assert!(
+            image
+                .prepare_last_prompt_edit("A different prompt".into())
+                .is_err()
+        );
         assert_eq!(image, image_before);
     }
 

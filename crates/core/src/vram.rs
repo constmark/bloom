@@ -450,34 +450,33 @@ impl ResourceCoordinator {
 
             if is_cache {
                 // id is a cache handle_id string
-                if let Ok(handle_id) = id.parse::<u64>() {
-                    if let Some(cache) = inner.caches.remove(&handle_id) {
-                        inner.ram_allocated = inner.ram_allocated.saturating_sub(cache.bytes);
-                        freed_ram += cache.bytes;
-                        tracing::info!(
-                            "Evicted cache handle {} ({} bytes)",
-                            handle_id,
-                            cache.bytes
-                        );
+                if let Ok(handle_id) = id.parse::<u64>()
+                    && let Some(cache) = inner.caches.remove(&handle_id)
+                {
+                    inner.ram_allocated = inner.ram_allocated.saturating_sub(cache.bytes);
+                    freed_ram += cache.bytes;
+                    tracing::info!("Evicted cache handle {} ({} bytes)", handle_id, cache.bytes);
+                }
+            } else {
+                let removed = inner.residencies.remove(id);
+                if let Some(record) = removed {
+                    tracing::info!(
+                        "Evicting model '{}' (priority={:?}, ram={}, vram={})",
+                        id,
+                        priority,
+                        ram,
+                        vram
+                    );
+                    if let Err(e) = (record.offload_cb)() {
+                        tracing::error!("Failed to evict model '{}': {}", id, e);
                     }
+                    inner.ram_allocated = inner.ram_allocated.saturating_sub(record.ram_bytes);
+                    inner.vram_allocated = inner.vram_allocated.saturating_sub(record.vram_bytes);
+                    freed_ram += record.ram_bytes;
+                    freed_vram += record.vram_bytes;
+                    inner.leases.remove(&record.lease_id);
+                    evicted.push(id.clone());
                 }
-            } else if let Some(record) = inner.residencies.remove(id) {
-                tracing::info!(
-                    "Evicting model '{}' (priority={:?}, ram={}, vram={})",
-                    id,
-                    priority,
-                    ram,
-                    vram
-                );
-                if let Err(e) = (record.offload_cb)() {
-                    tracing::error!("Failed to evict model '{}': {}", id, e);
-                }
-                inner.ram_allocated = inner.ram_allocated.saturating_sub(record.ram_bytes);
-                inner.vram_allocated = inner.vram_allocated.saturating_sub(record.vram_bytes);
-                freed_ram += record.ram_bytes;
-                freed_vram += record.vram_bytes;
-                inner.leases.remove(&record.lease_id);
-                evicted.push(id.clone());
             }
         }
 
@@ -581,8 +580,8 @@ pub fn init_global_resource_coordinator(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn make_ticket(
         id: &str,
@@ -831,20 +830,26 @@ mod tests {
             Ok(())
         });
 
-        assert!(coordinator
-            .request_load("model_1", 400, false, cb.clone())
-            .is_ok());
+        assert!(
+            coordinator
+                .request_load("model_1", 400, false, cb.clone())
+                .is_ok()
+        );
         assert_eq!(coordinator.snapshot().vram_allocated, 400);
         assert_eq!(evict_counter.load(Ordering::SeqCst), 0);
 
-        assert!(coordinator
-            .request_load("model_2", 300, false, cb.clone())
-            .is_ok());
+        assert!(
+            coordinator
+                .request_load("model_2", 300, false, cb.clone())
+                .is_ok()
+        );
         assert_eq!(coordinator.snapshot().vram_allocated, 700);
 
-        assert!(coordinator
-            .request_load("model_1", 400, false, cb.clone())
-            .is_ok());
+        assert!(
+            coordinator
+                .request_load("model_1", 400, false, cb.clone())
+                .is_ok()
+        );
         assert_eq!(coordinator.snapshot().vram_allocated, 700);
 
         coordinator.record_unload("model_2");

@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Context, Result};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::{Signature, VerifyingKey};
 use futures::StreamExt as _;
 use reqwest::{Client, StatusCode, Url};
@@ -21,11 +21,11 @@ use super::model_index_state::{
     ModelIndexWatermark, ModelIndexWatermarkAdmission, ModelIndexWatermarkStore,
 };
 use super::model_license::ModelLicensePolicy;
-use super::model_manager::{validate_model_filename, ModelCatalog, ModelCatalogEntry};
+use super::model_manager::{ModelCatalog, ModelCatalogEntry, validate_model_filename};
 use super::model_package::{
-    normalize_package_files, package_digest, validate_package_id, ModelPackageFile,
+    ModelPackageFile, normalize_package_files, package_digest, validate_package_id,
 };
-use super::model_provenance::{normalize_license, ModelAcquisitionKind};
+use super::model_provenance::{ModelAcquisitionKind, normalize_license};
 use super::model_upgrade::{ModelUpgradeEntryKind, ModelUpgradeSource};
 
 pub(crate) const MAX_MODEL_INDEX_ENVELOPE_BYTES: usize = 512 * 1024;
@@ -467,30 +467,26 @@ impl ModelIndexManager {
         force_refresh: bool,
     ) -> std::result::Result<ModelIndexSnapshot, ModelIndexError> {
         let now = unix_time().map_err(|error| ModelIndexError::Internal(error.to_string()))?;
-        if !force_refresh {
-            if let Some(cached) = self.cache.read().await.as_ref() {
-                if cached.refreshed_at.elapsed() < self.refresh_interval
-                    && cached.snapshot.expires_at > now
-                {
-                    let mut snapshot = cached.snapshot.clone();
-                    snapshot.cache_status = "cached";
-                    return Ok(snapshot);
-                }
-            }
+        if !force_refresh
+            && let Some(cached) = self.cache.read().await.as_ref()
+            && cached.refreshed_at.elapsed() < self.refresh_interval
+            && cached.snapshot.expires_at > now
+        {
+            let mut snapshot = cached.snapshot.clone();
+            snapshot.cache_status = "cached";
+            return Ok(snapshot);
         }
 
         let _refresh_guard = self.refresh_gate.lock().await;
         let now = unix_time().map_err(|error| ModelIndexError::Internal(error.to_string()))?;
-        if !force_refresh {
-            if let Some(cached) = self.cache.read().await.as_ref() {
-                if cached.refreshed_at.elapsed() < self.refresh_interval
-                    && cached.snapshot.expires_at > now
-                {
-                    let mut snapshot = cached.snapshot.clone();
-                    snapshot.cache_status = "cached";
-                    return Ok(snapshot);
-                }
-            }
+        if !force_refresh
+            && let Some(cached) = self.cache.read().await.as_ref()
+            && cached.refreshed_at.elapsed() < self.refresh_interval
+            && cached.snapshot.expires_at > now
+        {
+            let mut snapshot = cached.snapshot.clone();
+            snapshot.cache_status = "cached";
+            return Ok(snapshot);
         }
 
         match self.load_snapshot().await {
@@ -535,16 +531,16 @@ impl ModelIndexManager {
             Err(error) => {
                 let fallback_now =
                     unix_time().map_err(|clock| ModelIndexError::Internal(clock.to_string()))?;
-                if let Some(cached) = self.cache.read().await.as_ref() {
-                    if cached.snapshot.expires_at > fallback_now {
-                        let mut snapshot = cached.snapshot.clone();
-                        snapshot.cache_status = "stale";
-                        snapshot.warning = Some(
+                if let Some(cached) = self.cache.read().await.as_ref()
+                    && cached.snapshot.expires_at > fallback_now
+                {
+                    let mut snapshot = cached.snapshot.clone();
+                    snapshot.cache_status = "stale";
+                    snapshot.warning = Some(
                             "The configured index could not be refreshed. Bloom is showing the last verified, unexpired snapshot."
                                 .to_string(),
                         );
-                        return Ok(snapshot);
-                    }
+                    return Ok(snapshot);
                 }
                 Err(error)
             }
@@ -556,19 +552,18 @@ impl ModelIndexManager {
         current: ModelIndexWatermark,
     ) -> std::result::Result<ModelIndexSnapshot, ModelIndexError> {
         let now = unix_time().map_err(|error| ModelIndexError::Internal(error.to_string()))?;
-        if let Some(cached) = self.cache.read().await.as_ref() {
-            if cached.snapshot.generated_at == current.generated_at
-                && cached.snapshot.generation_id == current.generation_id
-                && cached.snapshot.expires_at > now
-            {
-                let mut retained = cached.snapshot.clone();
-                retained.cache_status = "stale";
-                retained.warning = Some(
+        if let Some(cached) = self.cache.read().await.as_ref()
+            && cached.snapshot.generated_at == current.generated_at
+            && cached.snapshot.generation_id == current.generation_id
+            && cached.snapshot.expires_at > now
+        {
+            let mut retained = cached.snapshot.clone();
+            retained.cache_status = "stale";
+            retained.warning = Some(
                     "A signed index rollback or conflicting generation was rejected. Bloom is showing the newer verified, unexpired snapshot."
                         .to_string(),
                 );
-                return Ok(retained);
-            }
+            return Ok(retained);
         }
         Err(ModelIndexError::Invalid(
             "The signed model index is older than, or conflicts with, the persisted verified generation."
@@ -1370,10 +1365,10 @@ mod tests {
     }
 
     fn envelope(payload: &[u8], key: &SigningKey) -> Vec<u8> {
-        let schema_version = serde_json::from_slice::<serde_json::Value>(payload).unwrap()
-            ["schema_version"]
-            .as_u64()
-            .unwrap() as u8;
+        let schema_version =
+            serde_json::from_slice::<serde_json::Value>(payload).unwrap()["schema_version"]
+                .as_u64()
+                .unwrap() as u8;
         let mut message = if schema_version == 1 {
             SIGNATURE_DOMAIN_V1.to_vec()
         } else {
@@ -1409,53 +1404,65 @@ mod tests {
     #[test]
     fn configuration_requires_one_source_and_a_bounded_unique_non_weak_keyring() {
         let key = signing_key();
-        assert!(validate_configuration(None, None, None, vec![], 300)
-            .unwrap()
-            .is_none());
-        assert!(validate_configuration(
-            Some(PathBuf::from("index.json")),
-            Some("https://example.com/index.json".to_string()),
-            Some(key_hex(&key)),
-            vec![],
-            300,
-        )
-        .is_err());
-        assert!(validate_configuration(
-            None,
-            Some("http://example.com/index.json".to_string()),
-            Some(key_hex(&key)),
-            vec![],
-            300,
-        )
-        .is_err());
+        assert!(
+            validate_configuration(None, None, None, vec![], 300)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            validate_configuration(
+                Some(PathBuf::from("index.json")),
+                Some("https://example.com/index.json".to_string()),
+                Some(key_hex(&key)),
+                vec![],
+                300,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_configuration(
+                None,
+                Some("http://example.com/index.json".to_string()),
+                Some(key_hex(&key)),
+                vec![],
+                300,
+            )
+            .is_err()
+        );
         assert!(
             validate_configuration(Some(PathBuf::from("index.json")), None, None, vec![], 300,)
                 .is_err()
         );
-        assert!(validate_configuration(
-            Some(PathBuf::from("index.json")),
-            None,
-            Some("00".repeat(32)),
-            vec![],
-            300,
-        )
-        .is_err());
-        assert!(validate_configuration(
-            Some(PathBuf::from("index.json")),
-            None,
-            Some(key_hex(&key)),
-            vec![key_hex(&key)],
-            300,
-        )
-        .is_err());
-        assert!(validate_configuration(
-            Some(PathBuf::from("index.json")),
-            None,
-            None,
-            vec![key_hex(&key); MAX_TRUSTED_MODEL_INDEX_KEYS + 1],
-            300,
-        )
-        .is_err());
+        assert!(
+            validate_configuration(
+                Some(PathBuf::from("index.json")),
+                None,
+                Some("00".repeat(32)),
+                vec![],
+                300,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_configuration(
+                Some(PathBuf::from("index.json")),
+                None,
+                Some(key_hex(&key)),
+                vec![key_hex(&key)],
+                300,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_configuration(
+                Some(PathBuf::from("index.json")),
+                None,
+                None,
+                vec![key_hex(&key); MAX_TRUSTED_MODEL_INDEX_KEYS + 1],
+                300,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1483,34 +1490,40 @@ mod tests {
         assert!(left.single_key_id.is_none());
         assert_eq!(left.trust_id, right.trust_id);
         let keys = keyring(&[first.verifying_key(), second.verifying_key()]);
-        assert!(decode_signed_index(
-            &envelope(&payload(now, &"56".repeat(20)), &first),
-            &keys,
-            "file",
-            8192,
-            &ModelLicensePolicy::default(),
-            now,
-        )
-        .is_ok());
-        assert!(decode_signed_index(
-            &envelope(&payload(now, &"56".repeat(20)), &second),
-            &keys,
-            "file",
-            8192,
-            &ModelLicensePolicy::default(),
-            now,
-        )
-        .is_ok());
+        assert!(
+            decode_signed_index(
+                &envelope(&payload(now, &"56".repeat(20)), &first),
+                &keys,
+                "file",
+                8192,
+                &ModelLicensePolicy::default(),
+                now,
+            )
+            .is_ok()
+        );
+        assert!(
+            decode_signed_index(
+                &envelope(&payload(now, &"56".repeat(20)), &second),
+                &keys,
+                "file",
+                8192,
+                &ModelLicensePolicy::default(),
+                now,
+            )
+            .is_ok()
+        );
         let unknown = SigningKey::from_bytes(&[9_u8; 32]);
-        assert!(decode_signed_index(
-            &envelope(&payload(now, &"56".repeat(20)), &unknown),
-            &keys,
-            "file",
-            8192,
-            &ModelLicensePolicy::default(),
-            now,
-        )
-        .is_err());
+        assert!(
+            decode_signed_index(
+                &envelope(&payload(now, &"56".repeat(20)), &unknown),
+                &keys,
+                "file",
+                8192,
+                &ModelLicensePolicy::default(),
+                now,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1534,11 +1547,13 @@ mod tests {
         assert_eq!(snapshot.data.len(), 1);
         assert_eq!(snapshot.data[0].format, "gguf");
         assert!(snapshot.data[0].downloadable);
-        assert!(snapshot.data[0]
-            .download_url
-            .as_deref()
-            .unwrap()
-            .contains(&format!("/resolve/{revision}/")));
+        assert!(
+            snapshot.data[0]
+                .download_url
+                .as_deref()
+                .unwrap()
+                .contains(&format!("/resolve/{revision}/"))
+        );
     }
 
     #[test]
@@ -1594,15 +1609,17 @@ mod tests {
                 _ => unreachable!(),
             }
             let payload = serde_json::to_vec(&payload).unwrap();
-            assert!(decode_signed_index(
-                &envelope(&payload, &key),
-                &keyring(&[key.verifying_key()]),
-                "file",
-                8192,
-                &ModelLicensePolicy::default(),
-                now,
-            )
-            .is_err());
+            assert!(
+                decode_signed_index(
+                    &envelope(&payload, &key),
+                    &keyring(&[key.verifying_key()]),
+                    "file",
+                    8192,
+                    &ModelLicensePolicy::default(),
+                    now,
+                )
+                .is_err()
+            );
         }
     }
 
@@ -1640,52 +1657,60 @@ mod tests {
             &encoded[1..]
         ));
         let signed = serde_json::to_vec(&signed).unwrap();
-        assert!(decode_signed_index(
-            &signed,
-            &keyring(&[key.verifying_key()]),
-            "file",
-            8192,
-            &ModelLicensePolicy::default(),
-            now,
-        )
-        .is_err());
+        assert!(
+            decode_signed_index(
+                &signed,
+                &keyring(&[key.verifying_key()]),
+                "file",
+                8192,
+                &ModelLicensePolicy::default(),
+                now,
+            )
+            .is_err()
+        );
 
         let mutable = envelope(&payload(now, "main"), &key);
-        assert!(decode_signed_index(
-            &mutable,
-            &keyring(&[key.verifying_key()]),
-            "file",
-            8192,
-            &ModelLicensePolicy::default(),
-            now,
-        )
-        .is_err());
+        assert!(
+            decode_signed_index(
+                &mutable,
+                &keyring(&[key.verifying_key()]),
+                "file",
+                8192,
+                &ModelLicensePolicy::default(),
+                now,
+            )
+            .is_err()
+        );
 
         let expired_payload = payload(now.saturating_sub(7200), &revision);
         let expired = envelope(&expired_payload, &key);
-        assert!(decode_signed_index(
-            &expired,
-            &keyring(&[key.verifying_key()]),
-            "file",
-            8192,
-            &ModelLicensePolicy::default(),
-            now,
-        )
-        .is_err());
+        assert!(
+            decode_signed_index(
+                &expired,
+                &keyring(&[key.verifying_key()]),
+                "file",
+                8192,
+                &ModelLicensePolicy::default(),
+                now,
+            )
+            .is_err()
+        );
 
         let mut boundary_payload =
             serde_json::from_slice::<serde_json::Value>(&payload(now, &revision)).unwrap();
         boundary_payload["expires_at"] = serde_json::Value::from(now);
         let boundary_payload = serde_json::to_vec(&boundary_payload).unwrap();
-        assert!(decode_signed_index(
-            &envelope(&boundary_payload, &key),
-            &keyring(&[key.verifying_key()]),
-            "file",
-            8192,
-            &ModelLicensePolicy::default(),
-            now,
-        )
-        .is_err());
+        assert!(
+            decode_signed_index(
+                &envelope(&boundary_payload, &key),
+                &keyring(&[key.verifying_key()]),
+                "file",
+                8192,
+                &ModelLicensePolicy::default(),
+                now,
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]

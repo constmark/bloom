@@ -1,8 +1,8 @@
 //! Cancellable, on-demand integrity verification for acquired model files.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use super::model_manager::ModelCatalog;
-use super::model_package::{package_digest, validate_package_path, ModelPackageFile};
+use super::model_package::{ModelPackageFile, package_digest, validate_package_path};
 #[cfg(test)]
 use super::model_provenance::read_provenance;
 use super::model_provenance::{read_provenance_details, record_integrity_result};
@@ -576,8 +576,8 @@ impl VerificationFailure {
 #[cfg(test)]
 mod tests {
     use super::super::model_provenance::{
-        write_package_provenance, write_provenance, ModelAcquisitionKind,
-        ModelPackageProvenanceDraft, ModelProvenanceDraft,
+        ModelAcquisitionKind, ModelPackageProvenanceDraft, ModelProvenanceDraft,
+        write_package_provenance, write_provenance,
     };
     use super::*;
 

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use bloomai_core::{
-    constants::GIB, BackendLease, DType, DeviceCapability, DeviceClass, DeviceKind, MemoryTopology,
-    ModelFormat, PowerState, ResourceError, ResourceTicket, ThermalState,
+    BackendLease, DType, DeviceCapability, DeviceClass, DeviceKind, MemoryTopology, ModelFormat,
+    PowerState, ResourceError, ResourceTicket, ThermalState, constants::GIB,
 };
 
 fn available_parallelism() -> usize {

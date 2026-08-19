@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use bloomai_core::{DeviceClass, DeviceKind, GenerationParams, Modality, ModelFamily, ModelFormat};
 
 use crate::{
@@ -328,7 +328,7 @@ impl Engine for NpuTtsEngine {
             supported_parallel_strategies: vec![crate::core::parallelism::ParallelStrategy::None],
             maturity: crate::engine::BackendMaturity::Experimental,
             diagnostic_tips: vec![
-                "Requires Intel NPU with TTS model in OpenVINO IR format.".to_string()
+                "Requires Intel NPU with TTS model in OpenVINO IR format.".to_string(),
             ],
             construction_guide: "Requires Intel NPU driver. Build with --features npu-tts."
                 .to_string(),

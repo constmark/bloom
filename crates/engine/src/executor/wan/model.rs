@@ -12,7 +12,7 @@
 
 use std::path::Path;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use bloomai_core::{GenerationParams, Modality, ModelManifest};
 use candle_core::{DType, Device, Tensor};
 

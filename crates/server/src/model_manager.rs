@@ -4,10 +4,10 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 
-use super::model_provenance::{read_provenance, remove_provenance, ModelProvenance};
+use super::model_provenance::{ModelProvenance, read_provenance, remove_provenance};
 
 const MAX_DIRECTORY_DEPTH: usize = 4;
 const MAX_SCANNED_FILES: usize = 20_000;
@@ -309,15 +309,14 @@ fn directory_format(path: &Path) -> Result<Option<&'static str>> {
                 }
             }
             _ => {
-                if let Some(format) = model_file_format(&candidate) {
-                    if inferred_format
+                if let Some(format) = model_file_format(&candidate)
+                    && inferred_format
                         .map(|current| {
                             model_format_priority(format) > model_format_priority(current)
                         })
                         .unwrap_or(true)
-                    {
-                        inferred_format = Some(format);
-                    }
+                {
+                    inferred_format = Some(format);
                 }
             }
         }
@@ -386,8 +385,8 @@ fn display_name(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::super::model_provenance::{
-        read_provenance, write_package_provenance, write_provenance, ModelAcquisitionKind,
-        ModelPackageProvenanceDraft, ModelProvenanceDraft, METADATA_DIRECTORY,
+        METADATA_DIRECTORY, ModelAcquisitionKind, ModelPackageProvenanceDraft,
+        ModelProvenanceDraft, read_provenance, write_package_provenance, write_provenance,
     };
     use super::*;
     use sha2::{Digest as _, Sha256};
@@ -568,9 +567,11 @@ mod tests {
         ModelCatalog::remove(temp.path(), "recorded-package", &resolved).unwrap();
 
         assert!(!model.exists());
-        assert!(read_provenance(temp.path(), "recorded-package", size_bytes)
-            .unwrap()
-            .is_none());
+        assert!(
+            read_provenance(temp.path(), "recorded-package", size_bytes)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

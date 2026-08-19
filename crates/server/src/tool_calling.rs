@@ -95,10 +95,10 @@ fn tool_config_from_chat_fields(
         RequestedToolChoice::Disabled => return Ok(None),
         RequestedToolChoice::Active(choice) => choice,
     };
-    if let ToolChoiceMode::Named(name) = &choice {
-        if !tools.iter().any(|tool| tool.name == *name) {
-            return Err(format!("tool_choice names undefined function {name:?}."));
-        }
+    if let ToolChoiceMode::Named(name) = &choice
+        && !tools.iter().any(|tool| tool.name == *name)
+    {
+        return Err(format!("tool_choice names undefined function {name:?}."));
     }
 
     Ok(Some(ToolConfig {
@@ -442,8 +442,10 @@ pub(crate) fn parse_tool_output(
         "message" => {
             reject_non_null_fields(object, &["type", "content"], "function-calling message")?;
             if !matches!(config.choice, ToolChoiceMode::Auto) {
-                return Err("tool_choice requires a function call, but the model returned a message."
-                    .to_string());
+                return Err(
+                    "tool_choice requires a function call, but the model returned a message."
+                        .to_string(),
+                );
             }
             let content = object
                 .get("content")
@@ -458,7 +460,9 @@ pub(crate) fn parse_tool_output(
             let calls = object
                 .get("calls")
                 .and_then(serde_json::Value::as_array)
-                .ok_or_else(|| "function-calling output requires array field `calls`.".to_string())?;
+                .ok_or_else(|| {
+                    "function-calling output requires array field `calls`.".to_string()
+                })?;
             let maximum = if config.parallel {
                 MAX_PARALLEL_TOOL_CALLS
             } else {
@@ -474,9 +478,9 @@ pub(crate) fn parse_tool_output(
             }
             let mut parsed = Vec::with_capacity(calls.len());
             for (index, call) in calls.iter().enumerate() {
-                let call = call.as_object().ok_or_else(|| {
-                    format!("function call at index {index} must be an object.")
-                })?;
+                let call = call
+                    .as_object()
+                    .ok_or_else(|| format!("function call at index {index} must be an object."))?;
                 reject_non_null_fields(
                     call,
                     &["name", "arguments"],
@@ -495,12 +499,12 @@ pub(crate) fn parse_tool_output(
                     .ok_or_else(|| {
                         format!("function call at index {index} names undefined tool {name:?}.")
                     })?;
-                if let ToolChoiceMode::Named(required) = &config.choice {
-                    if name != required {
-                        return Err(format!(
-                            "tool_choice requires function {required:?}, but the model selected {name:?}."
-                        ));
-                    }
+                if let ToolChoiceMode::Named(required) = &config.choice
+                    && name != required
+                {
+                    return Err(format!(
+                        "tool_choice requires function {required:?}, but the model selected {name:?}."
+                    ));
                 }
                 let arguments = call.get("arguments").ok_or_else(|| {
                     format!("function call at index {index} requires field `arguments`.")
@@ -783,10 +787,8 @@ pub(crate) fn tool_calls_json(
                         "arguments": call.arguments
                     }
                 });
-                if include_index {
-                    if let Some(object) = value.as_object_mut() {
-                        object.insert("index".to_string(), json!(index));
-                    }
+                if include_index && let Some(object) = value.as_object_mut() {
+                    object.insert("index".to_string(), json!(index));
                 }
                 value
             })
@@ -979,11 +981,13 @@ mod tests {
                 arguments: r#"{"city":"Paris"}"#.to_string()
             }])
         );
-        assert!(parse_tool_output(
-            r#"{"type":"function_calls","calls":[{"name":"get_weather","arguments":{}}]}"#,
-            &config
-        )
-        .is_err());
+        assert!(
+            parse_tool_output(
+                r#"{"type":"function_calls","calls":[{"name":"get_weather","arguments":{}}]}"#,
+                &config
+            )
+            .is_err()
+        );
         assert_eq!(
             parse_tool_output(r#"{"type":"message","content":"No call needed."}"#, &config)
                 .unwrap(),

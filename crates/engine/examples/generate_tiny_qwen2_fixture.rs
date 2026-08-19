@@ -10,12 +10,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use candle_core::{DType, Device, Shape, Tensor};
 use clap::{Parser, ValueEnum};
+use tokenizers::Tokenizer;
 use tokenizers::models::wordlevel::WordLevel;
 use tokenizers::pre_tokenizers::whitespace::Whitespace;
-use tokenizers::Tokenizer;
 
 const HIDDEN_SIZE: usize = 8;
 const INTERMEDIATE_SIZE: usize = 16;

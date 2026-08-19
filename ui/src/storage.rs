@@ -69,11 +69,10 @@ pub fn load_connection() -> ConnConfig {
         .ok()
         .flatten()
         .is_none()
+        && let Ok(Some(legacy)) = storage.get_item(LEGACY_CONNECTION_STORAGE_KEY)
     {
-        if let Ok(Some(legacy)) = storage.get_item(LEGACY_CONNECTION_STORAGE_KEY) {
-            let _ = storage.set_item(CONNECTION_STORAGE_KEY, &legacy);
-            let _ = storage.remove_item(LEGACY_CONNECTION_STORAGE_KEY);
-        }
+        let _ = storage.set_item(CONNECTION_STORAGE_KEY, &legacy);
+        let _ = storage.remove_item(LEGACY_CONNECTION_STORAGE_KEY);
     }
     let Ok(Some(text)) = storage.get_item(CONNECTION_STORAGE_KEY) else {
         return ConnConfig::default();
@@ -85,15 +84,15 @@ pub fn load_connection() -> ConnConfig {
     let Some(config) = decode_connection_settings(&text, session_api_key.as_deref()) else {
         return ConnConfig::default();
     };
-    if config.remember_api_key || (config.api_key.is_empty() && session_api_key.is_some()) {
-        if let Some(session) = session.as_ref() {
-            let _ = session.remove_item(SESSION_API_KEY_STORAGE_KEY);
-        }
+    if (config.remember_api_key || (config.api_key.is_empty() && session_api_key.is_some()))
+        && let Some(session) = session.as_ref()
+    {
+        let _ = session.remove_item(SESSION_API_KEY_STORAGE_KEY);
     }
-    if let Ok(normalized) = encode_connection_settings(&config) {
-        if normalized != text {
-            let _ = storage.set_item(CONNECTION_STORAGE_KEY, &normalized);
-        }
+    if let Ok(normalized) = encode_connection_settings(&config)
+        && normalized != text
+    {
+        let _ = storage.set_item(CONNECTION_STORAGE_KEY, &normalized);
     }
     config
 }
@@ -139,10 +138,10 @@ pub fn save_connection(config: &ConnConfig) -> Result<(), String> {
         restore_session_api_key(session.as_ref(), previous_session_api_key.as_deref());
         return Err(format!("failed to save connection settings: {error:?}"));
     }
-    if config.remember_api_key {
-        if let Some(session) = session.as_ref() {
-            let _ = session.remove_item(SESSION_API_KEY_STORAGE_KEY);
-        }
+    if config.remember_api_key
+        && let Some(session) = session.as_ref()
+    {
+        let _ = session.remove_item(SESSION_API_KEY_STORAGE_KEY);
     }
     Ok(())
 }
@@ -400,9 +399,11 @@ mod tests {
 
         assert_eq!(decoded.api_key, "legacy-token");
         assert!(decoded.remember_api_key);
-        assert!(encode_connection_settings(&decoded)
-            .unwrap()
-            .contains("\"remember_api_key\":true"));
+        assert!(
+            encode_connection_settings(&decoded)
+                .unwrap()
+                .contains("\"remember_api_key\":true")
+        );
     }
 
     #[test]
@@ -492,10 +493,12 @@ mod tests {
     #[test]
     fn generation_storage_rejects_invalid_persisted_settings() {
         assert!(decode_generation_options("{not-json}").is_none());
-        assert!(decode_generation_options(
-            r#"{"max_tokens":0,"temperature":0.7,"top_p":0.9,"system_prompt":""}"#
-        )
-        .is_none());
+        assert!(
+            decode_generation_options(
+                r#"{"max_tokens":0,"temperature":0.7,"top_p":0.9,"system_prompt":""}"#
+            )
+            .is_none()
+        );
         let oversized = serde_json::json!({
             "max_tokens": 512,
             "temperature": 0.7,

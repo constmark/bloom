@@ -122,19 +122,19 @@ impl ChatTemplate for LlamaChatTemplate {
         let mut i = 0;
 
         // Handle system message specially
-        if let Some(first) = messages.first() {
-            if first.role == "system" {
-                let system_msg = &first.content;
-                if let Some(second) = messages.get(1).filter(|message| message.role == "user") {
-                    prompt.push_str(&format!(
-                        "[INST] <<SYS>>\n{}\n<</SYS>>\n\n{} [/INST]",
-                        system_msg, second.content
-                    ));
-                    i = 2;
-                } else {
-                    prompt.push_str(&format!("[INST] <<SYS>>\n{}\n<</SYS>> [/INST]", system_msg));
-                    i = 1;
-                }
+        if let Some(first) = messages.first()
+            && first.role == "system"
+        {
+            let system_msg = &first.content;
+            if let Some(second) = messages.get(1).filter(|message| message.role == "user") {
+                prompt.push_str(&format!(
+                    "[INST] <<SYS>>\n{}\n<</SYS>>\n\n{} [/INST]",
+                    system_msg, second.content
+                ));
+                i = 2;
+            } else {
+                prompt.push_str(&format!("[INST] <<SYS>>\n{}\n<</SYS>> [/INST]", system_msg));
+                i = 1;
             }
         }
 

@@ -433,12 +433,12 @@ fn validate_response_schema_node(
             }
         }
     }
-    if let Some(additional) = object.get("additionalProperties") {
-        if schema_type != Some("object") || !additional.is_boolean() {
-            return Err(format!(
-                "JSON Schema at {path}.additionalProperties requires type object and a boolean value."
-            ));
-        }
+    if let Some(additional) = object.get("additionalProperties")
+        && (schema_type != Some("object") || !additional.is_boolean())
+    {
+        return Err(format!(
+            "JSON Schema at {path}.additionalProperties requires type object and a boolean value."
+        ));
     }
     if let Some(items) = object.get("items") {
         if schema_type != Some("array") {
@@ -1724,7 +1724,7 @@ impl ModelCatalog {
                     _ => {
                         return Err(
                             "model catalog response has inconsistent provenance kind".to_string()
-                        )
+                        );
                     }
                 }
             }
@@ -3270,7 +3270,7 @@ fn validate_package_safetensors_layout(files: &[ModelIndexFile]) -> Result<(), S
         );
     }
     shards.sort_by_key(|(_, (index, _))| *index);
-    let expected_total = shards[0].1 .1;
+    let expected_total = shards[0].1.1;
     if shards.len() != expected_total
         || shards
             .iter()
@@ -3793,22 +3793,24 @@ impl ModelDownloadSource {
                 "model download source returned inconsistent verification metadata".to_string(),
             );
         }
-        if let Some(commit) = self.commit_hash.as_deref() {
-            if !self.download_url.contains(&format!("/resolve/{commit}/")) {
-                return Err(
-                    "model download source URL is not pinned to its declared commit".to_string(),
-                );
-            }
+        if let Some(commit) = self.commit_hash.as_deref()
+            && !self.download_url.contains(&format!("/resolve/{commit}/"))
+        {
+            return Err(
+                "model download source URL is not pinned to its declared commit".to_string(),
+            );
         }
         match self.warning.as_deref() {
             Some(warning)
                 if warning.trim().is_empty()
                     || warning.chars().count() > MAX_MODEL_DOWNLOAD_SOURCE_WARNING_CHARS =>
             {
-                return Err("model download source returned an invalid warning".to_string())
+                return Err("model download source returned an invalid warning".to_string());
             }
             None if !self.verification_ready => {
-                return Err("unverified model download source did not include a warning".to_string())
+                return Err(
+                    "unverified model download source did not include a warning".to_string()
+                );
             }
             _ => {}
         }
@@ -4834,13 +4836,12 @@ where
     {
         *observed_asr_partial = true;
         append_speech_text(accumulated, partial, on_update)?;
-    } else if !*observed_asr_partial {
-        if let Some(delta) = chunk
+    } else if !*observed_asr_partial
+        && let Some(delta) = chunk
             .and_then(|chunk| chunk.get("TextDelta"))
             .and_then(serde_json::Value::as_str)
-        {
-            append_speech_text(accumulated, delta, on_update)?;
-        }
+    {
+        append_speech_text(accumulated, delta, on_update)?;
     }
     Ok(false)
 }
@@ -5171,17 +5172,16 @@ fn non_empty(value: &str) -> Option<&str> {
 }
 
 fn response_error(status: u16, text: &str) -> String {
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
-        if let Some(message) = value.get("error").and_then(|error| {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
+        && let Some(message) = value.get("error").and_then(|error| {
             error
                 .get("message")
                 .and_then(serde_json::Value::as_str)
                 .or_else(|| error.as_str())
-        }) {
-            if !message.trim().is_empty() {
-                return format_response_error_detail(status, message);
-            }
-        }
+        })
+        && !message.trim().is_empty()
+    {
+        return format_response_error_detail(status, message);
     }
     format_response_error_detail(status, text)
 }
@@ -5566,9 +5566,11 @@ mod tests {
         ] {
             let mut invalid = valid_readiness_value();
             invalid[field] = value;
-            assert!(decode_readiness(&invalid.to_string())
-                .unwrap_err()
-                .contains("unsupported readiness contract"));
+            assert!(
+                decode_readiness(&invalid.to_string())
+                    .unwrap_err()
+                    .contains("unsupported readiness contract")
+            );
         }
 
         let mut future_compatible = valid_readiness_value();
@@ -5585,45 +5587,57 @@ mod tests {
         incompatible["protocol_version"] = serde_json::json!(4);
         incompatible["minimum_ui_protocol_version"] = serde_json::json!(4);
         incompatible["maximum_ui_protocol_version"] = serde_json::json!(4);
-        assert!(decode_readiness(&incompatible.to_string())
-            .unwrap_err()
-            .contains("this UI implements protocol 3"));
+        assert!(
+            decode_readiness(&incompatible.to_string())
+                .unwrap_err()
+                .contains("this UI implements protocol 3")
+        );
 
         for (minimum, maximum, protocol) in [(0, 3, 3), (4, 3, 3), (3, 4, 5)] {
             let mut invalid = valid_readiness_value();
             invalid["minimum_ui_protocol_version"] = serde_json::json!(minimum);
             invalid["maximum_ui_protocol_version"] = serde_json::json!(maximum);
             invalid["protocol_version"] = serde_json::json!(protocol);
-            assert!(decode_readiness(&invalid.to_string())
-                .unwrap_err()
-                .contains("compatibility range is invalid"));
+            assert!(
+                decode_readiness(&invalid.to_string())
+                    .unwrap_err()
+                    .contains("compatibility range is invalid")
+            );
         }
 
         for field in ["minimum_ui_protocol_version", "maximum_ui_protocol_version"] {
             let mut missing = valid_readiness_value();
             missing.as_object_mut().unwrap().remove(field);
-            assert!(decode_readiness(&missing.to_string())
-                .unwrap_err()
-                .contains("missing field"));
+            assert!(
+                decode_readiness(&missing.to_string())
+                    .unwrap_err()
+                    .contains("missing field")
+            );
         }
 
         let mut missing = valid_readiness_value();
         missing.as_object_mut().unwrap().remove("available_permits");
-        assert!(decode_readiness(&missing.to_string())
-            .unwrap_err()
-            .contains("missing field"));
+        assert!(
+            decode_readiness(&missing.to_string())
+                .unwrap_err()
+                .contains("missing field")
+        );
 
         let mut inconsistent = valid_readiness_value();
         inconsistent["loading"] = serde_json::Value::Bool(true);
-        assert!(decode_readiness(&inconsistent.to_string())
-            .unwrap_err()
-            .contains("internally inconsistent"));
+        assert!(
+            decode_readiness(&inconsistent.to_string())
+                .unwrap_err()
+                .contains("internally inconsistent")
+        );
 
         let mut invalid_version = valid_readiness_value();
         invalid_version["server_version"] = serde_json::json!(" 0.1.0");
-        assert!(decode_readiness(&invalid_version.to_string())
-            .unwrap_err()
-            .contains("server version"));
+        assert!(
+            decode_readiness(&invalid_version.to_string())
+                .unwrap_err()
+                .contains("server version")
+        );
 
         assert!(
             decode_readiness(&"x".repeat(MAX_READINESS_RESPONSE_BYTES + 1))
@@ -5719,9 +5733,11 @@ mod tests {
             "caf\u{e9}".to_string(),
             "x".repeat(MAX_API_KEY_CHARS + 1),
         ] {
-            assert!(test_connection("http://localhost", &api_key)
-                .validate()
-                .is_err());
+            assert!(
+                test_connection("http://localhost", &api_key)
+                    .validate()
+                    .is_err()
+            );
         }
     }
 
@@ -5815,27 +5831,19 @@ mod tests {
             response_format: ResponseFormatMode::JsonObject,
             ..ChatOptions::default()
         };
-        assert!(preflight_chat_submission(
-            &cfg,
-            "tiny.gguf",
-            &messages,
-            &structured,
-            Some(&attachment)
-        )
-        .is_err());
+        assert!(
+            preflight_chat_submission(&cfg, "tiny.gguf", &messages, &structured, Some(&attachment))
+                .is_err()
+        );
         let stopped = ChatOptions {
             stop_sequences: vec!["END".to_string()],
             ..ChatOptions::default()
         };
-        assert!(preflight_chat_submission(
-            &cfg,
-            "tiny.gguf",
-            &messages,
-            &stopped,
-            Some(&attachment)
-        )
-        .unwrap_err()
-        .contains("text chat only"));
+        assert!(
+            preflight_chat_submission(&cfg, "tiny.gguf", &messages, &stopped, Some(&attachment))
+                .unwrap_err()
+                .contains("text chat only")
+        );
         assert!(preflight_chat_submission(&cfg, "tiny.gguf", &messages, &stopped, None).is_ok());
         assert!(preflight_chat_submission(&cfg, " bad ", &messages, &options, None).is_err());
 
@@ -5878,30 +5886,38 @@ mod tests {
             validate_multimodal_request(&"x".repeat(MAX_MULTIMODAL_PROMPT_BYTES + 1), &valid)
                 .is_err()
         );
-        assert!(validate_multimodal_request(
-            "Describe this.",
-            &test_attachment("empty.png", "image/png", 0)
-        )
-        .is_err());
-        assert!(validate_multimodal_request(
-            "Describe this.",
-            &test_attachment(
-                "large.png",
-                "image/png",
-                MAX_IMAGE_ATTACHMENT_BYTES as usize + 1
+        assert!(
+            validate_multimodal_request(
+                "Describe this.",
+                &test_attachment("empty.png", "image/png", 0)
             )
-        )
-        .is_err());
-        assert!(validate_multimodal_request(
-            "Describe this.",
-            &test_attachment("photo.gif", "image/gif", 1)
-        )
-        .is_err());
-        assert!(validate_multimodal_request(
-            "Describe this.",
-            &test_attachment("../photo.png", "image/png", 1)
-        )
-        .is_err());
+            .is_err()
+        );
+        assert!(
+            validate_multimodal_request(
+                "Describe this.",
+                &test_attachment(
+                    "large.png",
+                    "image/png",
+                    MAX_IMAGE_ATTACHMENT_BYTES as usize + 1
+                )
+            )
+            .is_err()
+        );
+        assert!(
+            validate_multimodal_request(
+                "Describe this.",
+                &test_attachment("photo.gif", "image/gif", 1)
+            )
+            .is_err()
+        );
+        assert!(
+            validate_multimodal_request(
+                "Describe this.",
+                &test_attachment("../photo.png", "image/png", 1)
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -5912,12 +5928,14 @@ mod tests {
             MAX_CHAT_REQUEST_BYTES,
         )
         .unwrap();
-        assert!(validate_request_body_size(
-            "Chat request",
-            MAX_CHAT_REQUEST_BYTES + 1,
-            MAX_CHAT_REQUEST_BYTES
-        )
-        .is_err());
+        assert!(
+            validate_request_body_size(
+                "Chat request",
+                MAX_CHAT_REQUEST_BYTES + 1,
+                MAX_CHAT_REQUEST_BYTES
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -6225,15 +6243,17 @@ mod tests {
         .unwrap();
         assert!(!finished);
 
-        assert!(process_multimodal_frame(
-            "data: [DONE]",
-            "vision.gguf",
-            &mut observed_model,
-            &mut observed_request_id,
-            &mut accumulated,
-            &mut |_| {},
-        )
-        .unwrap());
+        assert!(
+            process_multimodal_frame(
+                "data: [DONE]",
+                "vision.gguf",
+                &mut observed_model,
+                &mut observed_request_id,
+                &mut accumulated,
+                &mut |_| {},
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -6550,22 +6570,26 @@ mod tests {
             "verification_ready":true,
             "warning":null
         }"#;
-        assert!(decode_model_download_source(inconsistent)
-            .unwrap_err()
-            .contains("inconsistent"));
+        assert!(
+            decode_model_download_source(inconsistent)
+                .unwrap_err()
+                .contains("inconsistent")
+        );
 
         let unexpected = inconsistent.replace(
             "\"warning\":null",
             "\"warning\":null,\"api_key\":\"secret\"",
         );
-        assert!(decode_model_download_source(&unexpected)
-            .unwrap_err()
-            .contains("unknown field"));
-        assert!(decode_model_download_source(
-            &"x".repeat(MAX_MODEL_DOWNLOAD_SOURCE_RESPONSE_BYTES + 1)
-        )
-        .unwrap_err()
-        .contains("must be between"));
+        assert!(
+            decode_model_download_source(&unexpected)
+                .unwrap_err()
+                .contains("unknown field")
+        );
+        assert!(
+            decode_model_download_source(&"x".repeat(MAX_MODEL_DOWNLOAD_SOURCE_RESPONSE_BYTES + 1))
+                .unwrap_err()
+                .contains("must be between")
+        );
     }
 
     #[test]
@@ -6608,15 +6632,19 @@ mod tests {
         mutable["data"][0]["download_url"] = serde_json::Value::String(
             "https://huggingface.co/acme/tiny/resolve/main/tiny-q4.gguf".to_string(),
         );
-        assert!(decode_model_index(&mutable.to_string())
-            .unwrap_err()
-            .contains("immutable commit"));
+        assert!(
+            decode_model_index(&mutable.to_string())
+                .unwrap_err()
+                .contains("immutable commit")
+        );
 
         let mut inconsistent = snapshot;
         inconsistent["data"][0]["downloadable"] = serde_json::Value::Bool(false);
-        assert!(decode_model_index(&inconsistent.to_string())
-            .unwrap_err()
-            .contains("policy state"));
+        assert!(
+            decode_model_index(&inconsistent.to_string())
+                .unwrap_err()
+                .contains("policy state")
+        );
         assert!(
             decode_model_index(&"x".repeat(MAX_MODEL_INDEX_RESPONSE_BYTES + 1))
                 .unwrap_err()
@@ -6680,31 +6708,39 @@ mod tests {
             serde_json::Value::from(format!(
                 "https://huggingface.co/acme/tiny/resolve/{commit}/model-00001-of-00001.safetensors"
             ));
-        assert!(decode_model_index(&missing_shard_index.to_string())
-            .unwrap_err()
-            .contains("incomplete Safetensors layout"));
+        assert!(
+            decode_model_index(&missing_shard_index.to_string())
+                .unwrap_err()
+                .contains("incomplete Safetensors layout")
+        );
 
         let mut wrong_total = snapshot.clone();
         wrong_total["data"][0]["size_bytes"] = serde_json::Value::from(11);
-        assert!(decode_model_index(&wrong_total.to_string())
-            .unwrap_err()
-            .contains("incomplete"));
+        assert!(
+            decode_model_index(&wrong_total.to_string())
+                .unwrap_err()
+                .contains("incomplete")
+        );
 
         let mut mixed_commit = snapshot.clone();
         mixed_commit["data"][0]["files"][1]["download_url"] = serde_json::Value::from(format!(
             "https://huggingface.co/acme/tiny/resolve/{}/model.safetensors",
             "34".repeat(20)
         ));
-        assert!(decode_model_index(&mixed_commit.to_string())
-            .unwrap_err()
-            .contains("different commits"));
+        assert!(
+            decode_model_index(&mixed_commit.to_string())
+                .unwrap_err()
+                .contains("different commits")
+        );
 
         let mut unsafe_path = snapshot;
         unsafe_path["data"][0]["files"][1]["filename"] =
             serde_json::Value::from("../model.safetensors");
-        assert!(decode_model_index(&unsafe_path.to_string())
-            .unwrap_err()
-            .contains("package filename"));
+        assert!(
+            decode_model_index(&unsafe_path.to_string())
+                .unwrap_err()
+                .contains("package filename")
+        );
     }
 
     #[test]
@@ -6735,10 +6771,12 @@ mod tests {
             json_schema: r#"{"type":"object","minProperties":1}"#.into(),
             ..ChatOptions::default()
         };
-        assert!(unsupported
-            .validate()
-            .unwrap_err()
-            .contains("unsupported keyword"));
+        assert!(
+            unsupported
+                .validate()
+                .unwrap_err()
+                .contains("unsupported keyword")
+        );
 
         let oversized = ChatOptions {
             response_format: ResponseFormatMode::JsonSchema,
@@ -6763,9 +6801,11 @@ mod tests {
 
         let mut missing = valid_readiness_value();
         missing.as_object_mut().unwrap().remove("context_window");
-        assert!(decode_readiness(&missing.to_string())
-            .unwrap_err()
-            .contains("missing field"));
+        assert!(
+            decode_readiness(&missing.to_string())
+                .unwrap_err()
+                .contains("missing field")
+        );
     }
 
     #[test]
@@ -6792,9 +6832,11 @@ mod tests {
 
         let mut missing = valid_readiness_value();
         missing.as_object_mut().unwrap().remove("model_tasks");
-        assert!(decode_readiness(&missing.to_string())
-            .unwrap_err()
-            .contains("missing field"));
+        assert!(
+            decode_readiness(&missing.to_string())
+                .unwrap_err()
+                .contains("missing field")
+        );
     }
 
     #[test]
@@ -6848,9 +6890,11 @@ mod tests {
 
         let mut invalid_export = decoded;
         invalid_export.vectors[1].index = 0;
-        assert!(encode_embedding_export(&invalid_export)
-            .unwrap_err()
-            .contains("non-contiguous"));
+        assert!(
+            encode_embedding_export(&invalid_export)
+                .unwrap_err()
+                .contains("non-contiguous")
+        );
     }
 
     #[test]
@@ -6894,31 +6938,37 @@ mod tests {
         assert_eq!(artifact["query"], "local runtime");
         let mut invalid_export = decoded.clone();
         invalid_export.results.reverse();
-        assert!(encode_rerank_export(&invalid_export)
-            .unwrap_err()
-            .contains("stable score order"));
+        assert!(
+            encode_rerank_export(&invalid_export)
+                .unwrap_err()
+                .contains("stable score order")
+        );
 
         let mut out_of_order = response.clone();
         out_of_order["results"].as_array_mut().unwrap().reverse();
-        assert!(decode_rerank_response(
-            &out_of_order.to_string(),
-            "encoder",
-            "local runtime",
-            &["first".into(), "second".into(), "third".into()],
-            2,
-        )
-        .is_err());
+        assert!(
+            decode_rerank_response(
+                &out_of_order.to_string(),
+                "encoder",
+                "local runtime",
+                &["first".into(), "second".into(), "third".into()],
+                2,
+            )
+            .is_err()
+        );
         let mut substituted = response;
         substituted["results"][0]["document"]["text"] = serde_json::json!("changed");
-        assert!(decode_rerank_response(
-            &substituted.to_string(),
-            "encoder",
-            "local runtime",
-            &["first".into(), "second".into(), "third".into()],
-            2,
-        )
-        .unwrap_err()
-        .contains("does not match"));
+        assert!(
+            decode_rerank_response(
+                &substituted.to_string(),
+                "encoder",
+                "local runtime",
+                &["first".into(), "second".into(), "third".into()],
+                2,
+            )
+            .unwrap_err()
+            .contains("does not match")
+        );
     }
 
     #[test]
@@ -7001,9 +7051,11 @@ mod tests {
             "created":1,
             "server":{"version":"0.1.0","uptime_seconds":1,"api_key":"secret"}
         }"#;
-        assert!(decode_observability_snapshot(unexpected)
-            .unwrap_err()
-            .contains("unknown field `api_key`"));
+        assert!(
+            decode_observability_snapshot(unexpected)
+                .unwrap_err()
+                .contains("unknown field `api_key`")
+        );
 
         assert!(
             decode_observability_snapshot(&"x".repeat(MAX_OBSERVABILITY_RESPONSE_BYTES + 1))
@@ -7233,33 +7285,43 @@ mod tests {
 
         let mut future: serde_json::Value = serde_json::from_str(example).unwrap();
         future["schema_version"] = serde_json::json!(2);
-        assert!(decode_model_catalog(&future.to_string())
-            .unwrap_err()
-            .contains("unsupported schema version"));
+        assert!(
+            decode_model_catalog(&future.to_string())
+                .unwrap_err()
+                .contains("unsupported schema version")
+        );
 
         let mut unknown: serde_json::Value = serde_json::from_str(example).unwrap();
         unknown["storage"]["future_field"] = serde_json::json!(true);
-        assert!(decode_model_catalog(&unknown.to_string())
-            .unwrap_err()
-            .contains("unknown field"));
+        assert!(
+            decode_model_catalog(&unknown.to_string())
+                .unwrap_err()
+                .contains("unknown field")
+        );
 
         let mut missing: serde_json::Value = serde_json::from_str(example).unwrap();
         missing.as_object_mut().unwrap().remove("root_exists");
-        assert!(decode_model_catalog(&missing.to_string())
-            .unwrap_err()
-            .contains("missing field"));
+        assert!(
+            decode_model_catalog(&missing.to_string())
+                .unwrap_err()
+                .contains("missing field")
+        );
 
         let mut inconsistent: serde_json::Value = serde_json::from_str(example).unwrap();
         inconsistent["storage"]["committed_bytes"] = serde_json::json!(751);
-        assert!(decode_model_catalog(&inconsistent.to_string())
-            .unwrap_err()
-            .contains("storage accounting"));
+        assert!(
+            decode_model_catalog(&inconsistent.to_string())
+                .unwrap_err()
+                .contains("storage accounting")
+        );
 
         let mut wrong_active: serde_json::Value = serde_json::from_str(example).unwrap();
         wrong_active["active_model"]["catalog_id"] = serde_json::json!("other.gguf");
-        assert!(decode_model_catalog(&wrong_active.to_string())
-            .unwrap_err()
-            .contains("active catalog state"));
+        assert!(
+            decode_model_catalog(&wrong_active.to_string())
+                .unwrap_err()
+                .contains("active catalog state")
+        );
     }
 
     #[test]

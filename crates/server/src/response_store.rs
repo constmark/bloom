@@ -367,11 +367,15 @@ mod tests {
                 inserted_at,
             )
             .unwrap();
-        assert!(store
-            .get_at("resp-one", inserted_at + Duration::from_secs(4))
-            .is_some());
-        assert!(store
-            .get_at("resp-one", inserted_at + Duration::from_secs(5))
-            .is_none());
+        assert!(
+            store
+                .get_at("resp-one", inserted_at + Duration::from_secs(4))
+                .is_some()
+        );
+        assert!(
+            store
+                .get_at("resp-one", inserted_at + Duration::from_secs(5))
+                .is_none()
+        );
     }
 }

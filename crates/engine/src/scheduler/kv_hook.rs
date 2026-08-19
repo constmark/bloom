@@ -322,20 +322,20 @@ impl KvHook for InMemoryKvHook {
     fn rollback_kv_cache(&self, handle: usize, length: usize) -> Result<()> {
         let keys = self.keys.lock().unwrap_or_else(|e| e.into_inner());
         let values = self.values.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(per_layer_k) = keys.get(&handle) {
-            if let Some(per_layer_v) = values.get(&handle) {
-                for layer_idx in 0..self.num_layers {
-                    let mut k = per_layer_k[layer_idx]
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    let mut v = per_layer_v[layer_idx]
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    let end = length * self.kv_dim;
-                    if k.len() > end {
-                        k.truncate(end);
-                        v.truncate(end);
-                    }
+        if let Some(per_layer_k) = keys.get(&handle)
+            && let Some(per_layer_v) = values.get(&handle)
+        {
+            for layer_idx in 0..self.num_layers {
+                let mut k = per_layer_k[layer_idx]
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let mut v = per_layer_v[layer_idx]
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let end = length * self.kv_dim;
+                if k.len() > end {
+                    k.truncate(end);
+                    v.truncate(end);
                 }
             }
         }

@@ -615,9 +615,11 @@ mod tests {
             priority: bloomai_core::ResourcePriority::Normal,
         };
         let export_err = model.export_state(&handle).unwrap_err();
-        assert!(export_err
-            .to_string()
-            .contains("does not support state export"));
+        assert!(
+            export_err
+                .to_string()
+                .contains("does not support state export")
+        );
 
         let blob = StateBlob {
             handle_id: 1,
@@ -626,9 +628,11 @@ mod tests {
             kind: "kv_cache".to_string(),
         };
         let import_err = model.import_state(blob).unwrap_err();
-        assert!(import_err
-            .to_string()
-            .contains("does not support state import"));
+        assert!(
+            import_err
+                .to_string()
+                .contains("does not support state import")
+        );
     }
 
     #[test]

@@ -3,8 +3,8 @@
 //! Provides counters, gauges, and histograms for monitoring inference
 //! performance, KV cache utilization, and request lifecycle.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 const MAX_OBSERVATIONS: usize = 4096;

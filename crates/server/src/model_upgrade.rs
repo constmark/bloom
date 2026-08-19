@@ -3,22 +3,21 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::fs;
 use tokio::io::AsyncWriteExt as _;
 
-use super::model_manager::{validate_catalog_id, validate_model_filename, ModelCatalog};
+use super::model_manager::{ModelCatalog, validate_catalog_id, validate_model_filename};
 use super::model_package::{
-    normalize_package_files, package_digest, validate_package_id, validate_package_path,
-    ModelPackageFile,
+    ModelPackageFile, normalize_package_files, package_digest, validate_package_id,
+    validate_package_path,
 };
 use super::model_provenance::{
-    backup_provenance, normalize_license, normalize_model_index_id, normalize_source_url,
-    read_provenance_details, remove_provenance, restore_provenance_backup,
-    write_package_provenance, write_provenance, ModelAcquisitionKind, ModelPackageProvenanceDraft,
-    ModelProvenanceDraft,
+    ModelAcquisitionKind, ModelPackageProvenanceDraft, ModelProvenanceDraft, backup_provenance,
+    normalize_license, normalize_model_index_id, normalize_source_url, read_provenance_details,
+    remove_provenance, restore_provenance_backup, write_package_provenance, write_provenance,
 };
 
 pub(crate) const UPGRADE_DIRECTORY: &str = ".bloom-upgrade";
@@ -124,14 +123,14 @@ pub(crate) async fn commit_model_upgrade(
                 error.context("failed to publish upgraded model provenance")
             ));
     }
-    if transaction.source.catalog_id != transaction.target.catalog_id {
-        if let Err(error) = remove_provenance(models_root, &transaction.source.catalog_id) {
-            return rollback_transaction(models_root, &paths, &transaction)
-                .await
-                .and(Err(
-                    error.context("failed to retire previous model provenance")
-                ));
-        }
+    if transaction.source.catalog_id != transaction.target.catalog_id
+        && let Err(error) = remove_provenance(models_root, &transaction.source.catalog_id)
+    {
+        return rollback_transaction(models_root, &paths, &transaction)
+            .await
+            .and(Err(
+                error.context("failed to retire previous model provenance")
+            ));
     }
 
     finish_transaction(models_root, &paths).await
@@ -319,7 +318,7 @@ async fn verify_upgrade_source(models_root: &Path, source: &ModelUpgradeSource) 
         _ => {
             return Err(anyhow!(
                 "installed model kind no longer matches the upgrade source"
-            ))
+            ));
         }
     };
     verify_entry(
@@ -587,7 +586,7 @@ async fn create_transaction_marker(
     match fs::create_dir(&paths.upgrade_root).await {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(anyhow!("another model upgrade transaction already exists"))
+            return Err(anyhow!("another model upgrade transaction already exists"));
         }
         Err(error) => return Err(error).context("failed to create model upgrade transaction"),
     }
@@ -701,10 +700,10 @@ async fn move_entry(source: &Path, destination: &Path) -> Result<()> {
     if let Some(parent) = source.parent() {
         sync_directory(parent).await?;
     }
-    if let Some(parent) = destination.parent() {
-        if source.parent() != Some(parent) {
-            sync_directory(parent).await?;
-        }
+    if let Some(parent) = destination.parent()
+        && source.parent() != Some(parent)
+    {
+        sync_directory(parent).await?;
     }
     Ok(())
 }
@@ -822,7 +821,7 @@ impl UpgradePaths {
 
 #[cfg(test)]
 mod tests {
-    use super::super::model_provenance::{read_provenance, ModelProvenanceDraft};
+    use super::super::model_provenance::{ModelProvenanceDraft, read_provenance};
     use super::*;
 
     fn sha256(bytes: &[u8]) -> String {
@@ -1007,9 +1006,11 @@ mod tests {
                 .unwrap(),
             config
         );
-        assert!(read_provenance(temp.path(), "old.gguf", old.len() as u64)
-            .unwrap()
-            .is_none());
+        assert!(
+            read_provenance(temp.path(), "old.gguf", old.len() as u64)
+                .unwrap()
+                .is_none()
+        );
         let provenance = read_provenance(temp.path(), "new-package", target.size_bytes)
             .unwrap()
             .unwrap();

@@ -3,14 +3,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use bloomai_core::{
     DeviceCapability, DeviceClass, DeviceKind, GenerationParams, Modality, ModelFamily,
     ModelManifest,
 };
 
 use crate::{
-    engine::{default_engine_supports, Engine, EngineCapability, SupportLevel},
+    engine::{Engine, EngineCapability, SupportLevel, default_engine_supports},
     io::{ModelInput, ModelOutput},
     model::{LoadedModel, ModelMetadata},
 };
@@ -346,10 +346,10 @@ struct FunASRModel {
 
 impl Drop for FunASRModel {
     fn drop(&mut self) {
-        if let Some(ref child_mutex) = self.child {
-            if let Ok(mut child) = child_mutex.lock() {
-                let _ = child.kill();
-            }
+        if let Some(ref child_mutex) = self.child
+            && let Ok(mut child) = child_mutex.lock()
+        {
+            let _ = child.kill();
         }
     }
 }
@@ -524,22 +524,26 @@ mod tests {
         let non_existent = Path::new("non_existent_model_dir_path_bloom_123");
         let result = engine.load(non_existent, DeviceKind::Cpu);
         assert!(result.is_err());
-        assert!(result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("model path does not exist"));
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("model path does not exist")
+        );
 
         // Unsupported layout
         let dir_holder = tempfile::tempdir().unwrap();
         let dir = dir_holder.path();
         let result2 = engine.load(dir, DeviceKind::Cpu);
         assert!(result2.is_err());
-        assert!(result2
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("unsupported ASR model layout"));
+        assert!(
+            result2
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("unsupported ASR model layout")
+        );
     }
 
     #[test]
@@ -592,12 +596,14 @@ mod tests {
         FORCE_SPAWN_DAEMON.with(|f| f.set(true));
 
         // Set invalid script path. Loading the model should fail during daemon spawning.
-        std::env::set_var("BLOOM_FUN_ASR_SCRIPT", "/tmp/nonexistent_script_bloom.py");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("BLOOM_FUN_ASR_SCRIPT", "/tmp/nonexistent_script_bloom.py") };
         let res = engine.load(dir, DeviceKind::Cpu);
         assert!(res.is_err());
 
         // Restore state
         FORCE_SPAWN_DAEMON.with(|f| f.set(false));
-        std::env::remove_var("BLOOM_FUN_ASR_SCRIPT");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("BLOOM_FUN_ASR_SCRIPT") };
     }
 }

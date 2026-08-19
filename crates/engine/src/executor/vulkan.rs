@@ -7,14 +7,14 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use bloomai_core::{
     DType, DeviceClass, DeviceKind, Modality, ModelFamily, ModelFormat, ModelManifest,
 };
 
 use crate::{
     core::parallelism::ParallelStrategy,
-    engine::{default_engine_supports, Engine, EngineCapability, SupportLevel},
+    engine::{Engine, EngineCapability, SupportLevel, default_engine_supports},
     model::LoadedModel,
 };
 
@@ -50,10 +50,10 @@ pub struct VulkanEngine;
 impl VulkanEngine {
     pub fn discover_model_file(model_path: &Path) -> Result<PathBuf> {
         if model_path.is_file() {
-            if let Some(ext) = model_path.extension().and_then(|e| e.to_str()) {
-                if ext.eq_ignore_ascii_case("spv") || ext.eq_ignore_ascii_case("spirv") {
-                    return Ok(model_path.to_path_buf());
-                }
+            if let Some(ext) = model_path.extension().and_then(|e| e.to_str())
+                && (ext.eq_ignore_ascii_case("spv") || ext.eq_ignore_ascii_case("spirv"))
+            {
+                return Ok(model_path.to_path_buf());
             }
             return Err(anyhow!(
                 "Vulkan engine expects a .spv/.spirv file or a directory containing one: {}",
@@ -72,10 +72,10 @@ impl VulkanEngine {
         let mut candidates = Vec::new();
         for entry in std::fs::read_dir(model_path)?.flatten() {
             let path = entry.path();
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if ext.eq_ignore_ascii_case("spv") || ext.eq_ignore_ascii_case("spirv") {
-                    candidates.push(path);
-                }
+            if let Some(ext) = path.extension().and_then(|e| e.to_str())
+                && (ext.eq_ignore_ascii_case("spv") || ext.eq_ignore_ascii_case("spirv"))
+            {
+                candidates.push(path);
             }
         }
         candidates.sort();
@@ -167,36 +167,34 @@ impl Engine for VulkanEngine {
         ];
 
         for path in plugin_paths {
-            if path.exists() {
-                if let Ok(lib) = unsafe { libloading::Library::new(&path) } {
-                    let lib = Arc::new(lib);
-                    unsafe {
-                        if let Ok(load_fn) = lib.get::<unsafe extern "C" fn(
-                            *const u8,
-                            usize,
+            if path.exists()
+                && let Ok(lib) = unsafe { libloading::Library::new(&path) }
+            {
+                let lib = Arc::new(lib);
+                unsafe {
+                    if let Ok(load_fn) =
+                        lib.get::<unsafe extern "C" fn(*const u8, usize) -> *mut std::ffi::c_void>(
+                            b"bloom_vulkan_load\0",
                         )
-                            -> *mut std::ffi::c_void>(
-                            b"bloom_vulkan_load\0"
-                        ) {
-                            let path_str = vulkan_file.to_string_lossy();
-                            let handle = load_fn(path_str.as_ptr(), path_str.len());
-                            if !handle.is_null() {
-                                let manifest = crate::manifest_adapter::load_manifest(model_path)?;
-                                return Ok(Box::new(VulkanPluginModel {
-                                    lib: lib.clone(),
-                                    handle,
-                                    metadata: ModelMetadata {
-                                        id: vulkan_file
-                                            .file_name()
-                                            .and_then(|n| n.to_str())
-                                            .unwrap_or("unknown")
-                                            .to_string(),
-                                        modality: Modality::Text,
-                                        quantized: true,
-                                        manifest,
-                                    },
-                                }));
-                            }
+                    {
+                        let path_str = vulkan_file.to_string_lossy();
+                        let handle = load_fn(path_str.as_ptr(), path_str.len());
+                        if !handle.is_null() {
+                            let manifest = crate::manifest_adapter::load_manifest(model_path)?;
+                            return Ok(Box::new(VulkanPluginModel {
+                                lib: lib.clone(),
+                                handle,
+                                metadata: ModelMetadata {
+                                    id: vulkan_file
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("unknown")
+                                        .to_string(),
+                                    modality: Modality::Text,
+                                    quantized: true,
+                                    manifest,
+                                },
+                            }));
                         }
                     }
                 }

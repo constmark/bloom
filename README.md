@@ -2,9 +2,8 @@
 
 [![CI](https://github.com/constmark/bloom/actions/workflows/ci.yml/badge.svg)](https://github.com/constmark/bloom/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![crates.io](https://img.shields.io/crates/v/bloomai-engine.svg)](https://crates.io/crates/bloomai-engine)
-[![docs.rs](https://docs.rs/bloomai-engine/badge.svg)](https://docs.rs/bloomai-engine)
-[![Rust](https://img.shields.io/badge/rust-2021-orange.svg)](rust-toolchain.toml)
+[![Documentation](https://img.shields.io/badge/docs-available-brightgreen.svg)](docs/README.md)
+[![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](rust-toolchain.toml)
 
 Bloom is a standalone, multimodal inference engine written in Rust. It loads
 local models directly, runs inference without an external scheduler, and

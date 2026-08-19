@@ -5,10 +5,10 @@ use std::fs;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::path::Path;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use bloomai_core::{
-    constants::GIB, DType, DeviceCapability, DeviceClass, DeviceKind, MemoryTopology, ModelFormat,
-    PowerState, ThermalState,
+    DType, DeviceCapability, DeviceClass, DeviceKind, MemoryTopology, ModelFormat, PowerState,
+    ThermalState, constants::GIB,
 };
 
 use crate::backend::{Backend, BackendAvailability, BackendInfo};
@@ -304,9 +304,11 @@ impl Backend for IntelNpuBackend {
         if availability.available {
             Ok(())
         } else {
-            Err(anyhow!(availability
-                .reason
-                .unwrap_or_else(|| "intel npu unavailable".to_string())))
+            Err(anyhow!(
+                availability
+                    .reason
+                    .unwrap_or_else(|| "intel npu unavailable".to_string())
+            ))
         }
     }
 }
@@ -323,7 +325,9 @@ mod tests {
         println!("Intel NPU Availability details: {:?}", availability.details);
 
         if !availability.available {
-            println!("Skipping availability assertion since no physical Intel NPU is present on this machine.");
+            println!(
+                "Skipping availability assertion since no physical Intel NPU is present on this machine."
+            );
             return;
         }
 
@@ -487,9 +491,11 @@ mod tests {
         assert!(capability.supported_dtypes.contains(&DType::F16));
         assert!(capability.supported_dtypes.contains(&DType::Q4));
         assert!(capability.supported_dtypes.contains(&DType::Q8));
-        assert!(capability
-            .supported_formats
-            .contains(&ModelFormat::OpenVinoIr));
+        assert!(
+            capability
+                .supported_formats
+                .contains(&ModelFormat::OpenVinoIr)
+        );
         assert!(capability.supports_mmap);
         assert!(capability.has_quantization_kernels);
     }

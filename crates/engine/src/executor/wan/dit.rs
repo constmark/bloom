@@ -69,7 +69,7 @@ impl Module for Linear {
             Self::F32 { bias, .. } => bias,
             Self::Quantized { bias, .. } => bias,
         };
-        if let Some(ref b) = bias {
+        if let Some(b) = bias {
             out = out.broadcast_add(b)?;
         }
         Ok(out)
@@ -86,13 +86,12 @@ pub fn linear(in_dim: usize, out_dim: usize, vb: nn::VarBuilder) -> Result<Linea
 
     let qmatmul = QTENSOR_MAP
         .with(|map| {
-            if let Some(m) = map.borrow().as_ref() {
-                if let Some(qt) = m.get(&weight_name) {
-                    return Some(
-                        candle_core::quantized::QMatMul::from_arc(qt.clone())
-                            .map(std::sync::Arc::new),
-                    );
-                }
+            if let Some(m) = map.borrow().as_ref()
+                && let Some(qt) = m.get(&weight_name)
+            {
+                return Some(
+                    candle_core::quantized::QMatMul::from_arc(qt.clone()).map(std::sync::Arc::new),
+                );
             }
             None
         })
@@ -806,7 +805,7 @@ impl Head {
         // e: [batch, dim] -> [batch, 1, dim] for broadcasting with modulation [1, 2, dim]
         let e_3d = e.unsqueeze(1)?;
         let e_mod = self.modulation.broadcast_add(&e_3d)?; // [batch, 2, dim]
-                                                           // Keep dim 1 as size 1 for broadcasting with x [batch, seq_len, dim]
+        // Keep dim 1 as size 1 for broadcasting with x [batch, seq_len, dim]
         let e0 = e_mod.narrow(1, 0, 1)?; // [batch, 1, dim]
         let e1 = e_mod.narrow(1, 1, 1)?; // [batch, 1, dim]
 
@@ -931,11 +930,11 @@ impl WanModel {
 
     /// Forward pass through the DiT.
     ///
-    /// x: latent tensor [batch, in_dim, F, H, W] (or list of such)
-    /// t: timestep tensor [batch]
-    /// context: text embeddings [batch, text_len, text_dim]
+    /// x: latent tensor `[batch, in_dim, F, H, W]` (or list of such)
+    /// t: timestep tensor `[batch]`
+    /// context: text embeddings `[batch, text_len, text_dim]`
     ///
-    /// Returns: denoised latent [batch, out_dim, F, H, W]
+    /// Returns: denoised latent `[batch, out_dim, F, H, W]`
     pub fn forward(&self, x: &Tensor, t: &Tensor, context: &Tensor) -> Result<Tensor> {
         let cfg = &self.config;
         let (b, _c, f, h, w) = x.dims5()?;

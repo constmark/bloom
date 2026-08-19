@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use bloomai_core::{BenchmarkResult, DType, DeviceKind, GenerationParams};
 use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
@@ -32,8 +32,8 @@ use bloomai_engine::executor::vulkan::VulkanEngine;
 #[cfg(feature = "candle-engine")]
 use bloomai_engine::executor::wan::WanEngine;
 use bloomai_engine::{
-    model_manifest_supports_embeddings, EngineRegistry, InferencePipeline, MemoryEstimate,
-    ModelInput,
+    EngineRegistry, InferencePipeline, MemoryEstimate, ModelInput,
+    model_manifest_supports_embeddings,
 };
 
 /// Extended benchmark result with additional timing and hardware metrics.
@@ -181,7 +181,7 @@ struct Args {
 }
 
 macro_rules! apply_config_value {
-    ($args:expr, $matches:expr, $config:expr, $field:ident) => {
+    ($args:expr_2021, $matches:expr_2021, $config:expr_2021, $field:ident) => {
         if should_use_config($matches, stringify!($field)) {
             if let Some(value) = &$config.$field {
                 $args.$field = value.clone();
@@ -191,7 +191,7 @@ macro_rules! apply_config_value {
 }
 
 macro_rules! apply_config_option {
-    ($args:expr, $matches:expr, $config:expr, $field:ident) => {
+    ($args:expr_2021, $matches:expr_2021, $config:expr_2021, $field:ident) => {
         if should_use_config($matches, stringify!($field)) {
             if let Some(value) = &$config.$field {
                 $args.$field = Some(value.clone());
@@ -261,21 +261,30 @@ fn main() -> Result<()> {
     }
 
     if let Some(ref dt) = args.dtype {
-        std::env::set_var("BLOOM_DTYPE", dt);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("BLOOM_DTYPE", dt) };
     }
 
-    std::env::set_var("BLOOM_SPECULATIVE", &args.speculative);
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("BLOOM_SPECULATIVE", &args.speculative) };
     if let Some(ref path) = args.draft_model {
-        std::env::set_var("BLOOM_DRAFT_MODEL", path);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("BLOOM_DRAFT_MODEL", path) };
     }
-    std::env::set_var(
-        "BLOOM_NUM_SPECULATIVE_TOKENS",
-        args.num_speculative_tokens.to_string(),
-    );
-    std::env::set_var(
-        "BLOOM_SPECULATIVE_NGRAM_ORDER",
-        args.speculative_ngram_order.to_string(),
-    );
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe {
+        std::env::set_var(
+            "BLOOM_NUM_SPECULATIVE_TOKENS",
+            args.num_speculative_tokens.to_string(),
+        )
+    };
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe {
+        std::env::set_var(
+            "BLOOM_SPECULATIVE_NGRAM_ORDER",
+            args.speculative_ngram_order.to_string(),
+        )
+    };
 
     // --- Load manifest first to assist in engine auto-selection if needed ---
     let manifest = bloomai_engine::load_manifest(model_path)?;
@@ -516,10 +525,10 @@ fn main() -> Result<()> {
                 if let Some(a) = accepted {
                     all_speculative_accepted.push(a);
                 }
-                if let (Some(d), Some(a)) = (draft, accepted) {
-                    if d > 0 {
-                        all_speculative_rates.push(a as f64 / d as f64);
-                    }
+                if let (Some(d), Some(a)) = (draft, accepted)
+                    && d > 0
+                {
+                    all_speculative_rates.push(a as f64 / d as f64);
                 }
             }
 
@@ -739,7 +748,11 @@ fn main() -> Result<()> {
             args.repetitions,
             prompts.len(),
             speed_variance,
-            if observed_peak_rss.is_some() { "observed_process_rss_hwm" } else { "model_estimate_fallback" }
+            if observed_peak_rss.is_some() {
+                "observed_process_rss_hwm"
+            } else {
+                "model_estimate_fallback"
+            }
         )),
     };
 

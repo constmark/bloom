@@ -1,17 +1,17 @@
 #![cfg_attr(not(test), warn(clippy::unwrap_used))]
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 
 use bloomai_core::{
     DType, DeviceClass, DeviceKind, GenerationParams, Modality, ModelFamily, ModelFormat,
 };
+use bloomai_engine::InferencePipeline;
 use bloomai_engine::core::engine::{BackendMaturity, Engine, EngineCapability, EngineRegistry};
 use bloomai_engine::core::io::{ModelInput, OutputChunk};
 use bloomai_engine::model::{EchoTextModel, LoadedModel, OutputSink};
-use bloomai_engine::InferencePipeline;
 
 #[cfg(feature = "candle-engine")]
 use bloomai_engine::executor::candle::CandleEngine;
@@ -144,18 +144,20 @@ static ENGINE_REGISTRY: once_cell::sync::Lazy<EngineRegistry> = once_cell::sync:
 });
 
 unsafe fn write_error(err: &str, error_buffer: *mut c_char, error_buffer_len: usize) {
-    if error_buffer.is_null() || error_buffer_len == 0 {
-        return;
-    }
-    let err_c = match CString::new(err) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    let bytes = err_c.as_bytes_with_nul();
-    let to_copy = std::cmp::min(bytes.len(), error_buffer_len);
-    std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, error_buffer, to_copy);
-    if to_copy > 0 {
-        *error_buffer.add(to_copy - 1) = 0;
+    unsafe {
+        if error_buffer.is_null() || error_buffer_len == 0 {
+            return;
+        }
+        let err_c = match CString::new(err) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let bytes = err_c.as_bytes_with_nul();
+        let to_copy = std::cmp::min(bytes.len(), error_buffer_len);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, error_buffer, to_copy);
+        if to_copy > 0 {
+            *error_buffer.add(to_copy - 1) = 0;
+        }
     }
 }
 
@@ -173,7 +175,7 @@ fn catch_ffi_panic<T>(operation: impl FnOnce() -> T, on_panic: impl FnOnce() -> 
 /// Each non-NULL input pointer must reference a valid NUL-terminated C string
 /// for the duration of the call. When non-NULL, `error_buffer` must reference
 /// `error_buffer_len` writable bytes.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn bloom_pipeline_load(
     model_path: *const c_char,
     engine_name: *const c_char,
@@ -182,26 +184,28 @@ pub unsafe extern "C" fn bloom_pipeline_load(
     error_buffer: *mut c_char,
     error_buffer_len: usize,
 ) -> *mut BloomPipeline {
-    catch_ffi_panic(
-        || {
-            bloom_pipeline_load_impl(
-                model_path,
-                engine_name,
-                device_name,
-                context_size,
-                error_buffer,
-                error_buffer_len,
-            )
-        },
-        || {
-            write_error(
-                "Bloom caught an internal panic while loading the pipeline",
-                error_buffer,
-                error_buffer_len,
-            );
-            std::ptr::null_mut()
-        },
-    )
+    unsafe {
+        catch_ffi_panic(
+            || {
+                bloom_pipeline_load_impl(
+                    model_path,
+                    engine_name,
+                    device_name,
+                    context_size,
+                    error_buffer,
+                    error_buffer_len,
+                )
+            },
+            || {
+                write_error(
+                    "Bloom caught an internal panic while loading the pipeline",
+                    error_buffer,
+                    error_buffer_len,
+                );
+                std::ptr::null_mut()
+            },
+        )
+    }
 }
 
 unsafe fn bloom_pipeline_load_impl(
@@ -212,95 +216,97 @@ unsafe fn bloom_pipeline_load_impl(
     error_buffer: *mut c_char,
     error_buffer_len: usize,
 ) -> *mut BloomPipeline {
-    if model_path.is_null() || engine_name.is_null() || device_name.is_null() {
-        write_error(
-            "Null argument passed to bloom_pipeline_load",
-            error_buffer,
-            error_buffer_len,
-        );
-        return std::ptr::null_mut();
-    }
-    if context_size == 0 {
-        write_error(
-            "context_size must be greater than zero",
-            error_buffer,
-            error_buffer_len,
-        );
-        return std::ptr::null_mut();
-    }
-
-    let model_path_str = match CStr::from_ptr(model_path).to_str() {
-        Ok(s) => s,
-        Err(e) => {
+    unsafe {
+        if model_path.is_null() || engine_name.is_null() || device_name.is_null() {
             write_error(
-                &format!("Invalid model_path UTF-8: {}", e),
+                "Null argument passed to bloom_pipeline_load",
                 error_buffer,
                 error_buffer_len,
             );
             return std::ptr::null_mut();
         }
-    };
-
-    let engine_name_str = match CStr::from_ptr(engine_name).to_str() {
-        Ok(s) => s,
-        Err(e) => {
+        if context_size == 0 {
             write_error(
-                &format!("Invalid engine_name UTF-8: {}", e),
+                "context_size must be greater than zero",
                 error_buffer,
                 error_buffer_len,
             );
             return std::ptr::null_mut();
         }
-    };
 
-    let device_name_str = match CStr::from_ptr(device_name).to_str() {
-        Ok(s) => s,
-        Err(e) => {
-            write_error(
-                &format!("Invalid device_name UTF-8: {}", e),
-                error_buffer,
-                error_buffer_len,
-            );
-            return std::ptr::null_mut();
-        }
-    };
+        let model_path_str = match CStr::from_ptr(model_path).to_str() {
+            Ok(s) => s,
+            Err(e) => {
+                write_error(
+                    &format!("Invalid model_path UTF-8: {}", e),
+                    error_buffer,
+                    error_buffer_len,
+                );
+                return std::ptr::null_mut();
+            }
+        };
 
-    let device = match device_name_str.to_lowercase().as_str() {
-        "cpu" => DeviceKind::Cpu,
-        "gpu" => DeviceKind::Gpu,
-        "npu" => DeviceKind::Npu,
-        other => {
-            write_error(
-                &format!("Unknown device kind: {}", other),
-                error_buffer,
-                error_buffer_len,
-            );
-            return std::ptr::null_mut();
-        }
-    };
+        let engine_name_str = match CStr::from_ptr(engine_name).to_str() {
+            Ok(s) => s,
+            Err(e) => {
+                write_error(
+                    &format!("Invalid engine_name UTF-8: {}", e),
+                    error_buffer,
+                    error_buffer_len,
+                );
+                return std::ptr::null_mut();
+            }
+        };
 
-    let engine = match ENGINE_REGISTRY.get(engine_name_str) {
-        Ok(eng) => eng,
-        Err(e) => {
-            write_error(
-                &format!("Engine registry failed: {}", e),
-                error_buffer,
-                error_buffer_len,
-            );
-            return std::ptr::null_mut();
-        }
-    };
+        let device_name_str = match CStr::from_ptr(device_name).to_str() {
+            Ok(s) => s,
+            Err(e) => {
+                write_error(
+                    &format!("Invalid device_name UTF-8: {}", e),
+                    error_buffer,
+                    error_buffer_len,
+                );
+                return std::ptr::null_mut();
+            }
+        };
 
-    let path = Path::new(model_path_str);
-    match InferencePipeline::load_standalone_with_context(engine, device, path, context_size) {
-        Ok(pipeline) => Box::into_raw(Box::new(BloomPipeline { inner: pipeline })),
-        Err(e) => {
-            write_error(
-                &format!("Failed to load standalone pipeline: {}", e),
-                error_buffer,
-                error_buffer_len,
-            );
-            std::ptr::null_mut()
+        let device = match device_name_str.to_lowercase().as_str() {
+            "cpu" => DeviceKind::Cpu,
+            "gpu" => DeviceKind::Gpu,
+            "npu" => DeviceKind::Npu,
+            other => {
+                write_error(
+                    &format!("Unknown device kind: {}", other),
+                    error_buffer,
+                    error_buffer_len,
+                );
+                return std::ptr::null_mut();
+            }
+        };
+
+        let engine = match ENGINE_REGISTRY.get(engine_name_str) {
+            Ok(eng) => eng,
+            Err(e) => {
+                write_error(
+                    &format!("Engine registry failed: {}", e),
+                    error_buffer,
+                    error_buffer_len,
+                );
+                return std::ptr::null_mut();
+            }
+        };
+
+        let path = Path::new(model_path_str);
+        match InferencePipeline::load_standalone_with_context(engine, device, path, context_size) {
+            Ok(pipeline) => Box::into_raw(Box::new(BloomPipeline { inner: pipeline })),
+            Err(e) => {
+                write_error(
+                    &format!("Failed to load standalone pipeline: {}", e),
+                    error_buffer,
+                    error_buffer_len,
+                );
+                std::ptr::null_mut()
+            }
         }
     }
 }
@@ -312,10 +318,12 @@ unsafe fn bloom_pipeline_load_impl(
 /// `pipeline` must be NULL or a live pointer returned by
 /// [`bloom_pipeline_load`]. A live pointer must be freed exactly once and must
 /// not be in use by another thread during this call.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn bloom_pipeline_free(pipeline: *mut BloomPipeline) {
-    if !pipeline.is_null() {
-        catch_ffi_panic(|| drop(Box::from_raw(pipeline)), || ());
+    unsafe {
+        if !pipeline.is_null() {
+            catch_ffi_panic(|| drop(Box::from_raw(pipeline)), || ());
+        }
     }
 }
 
@@ -330,7 +338,7 @@ pub unsafe extern "C" fn bloom_pipeline_free(pipeline: *mut BloomPipeline) {
 /// of the call. When non-NULL, `error_buffer` must reference
 /// `error_buffer_len` writable bytes. The pipeline must not be freed
 /// concurrently.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn bloom_pipeline_run(
     pipeline: *mut BloomPipeline,
     input_json: *const c_char,
@@ -338,25 +346,27 @@ pub unsafe extern "C" fn bloom_pipeline_run(
     error_buffer: *mut c_char,
     error_buffer_len: usize,
 ) -> *mut c_char {
-    catch_ffi_panic(
-        || {
-            bloom_pipeline_run_impl(
-                pipeline,
-                input_json,
-                params_json,
-                error_buffer,
-                error_buffer_len,
-            )
-        },
-        || {
-            write_error(
-                "Bloom caught an internal panic while running inference",
-                error_buffer,
-                error_buffer_len,
-            );
-            std::ptr::null_mut()
-        },
-    )
+    unsafe {
+        catch_ffi_panic(
+            || {
+                bloom_pipeline_run_impl(
+                    pipeline,
+                    input_json,
+                    params_json,
+                    error_buffer,
+                    error_buffer_len,
+                )
+            },
+            || {
+                write_error(
+                    "Bloom caught an internal panic while running inference",
+                    error_buffer,
+                    error_buffer_len,
+                );
+                std::ptr::null_mut()
+            },
+        )
+    }
 }
 
 unsafe fn bloom_pipeline_run_impl(
@@ -366,97 +376,99 @@ unsafe fn bloom_pipeline_run_impl(
     error_buffer: *mut c_char,
     error_buffer_len: usize,
 ) -> *mut c_char {
-    if pipeline.is_null() || input_json.is_null() || params_json.is_null() {
-        write_error(
-            "Null argument passed to bloom_pipeline_run",
-            error_buffer,
-            error_buffer_len,
-        );
-        return std::ptr::null_mut();
-    }
-
-    let pipe = &*pipeline;
-
-    let input_json_str = match CStr::from_ptr(input_json).to_str() {
-        Ok(s) => s,
-        Err(e) => {
+    unsafe {
+        if pipeline.is_null() || input_json.is_null() || params_json.is_null() {
             write_error(
-                &format!("Invalid input JSON UTF-8: {}", e),
+                "Null argument passed to bloom_pipeline_run",
                 error_buffer,
                 error_buffer_len,
             );
             return std::ptr::null_mut();
         }
-    };
 
-    let params_json_str = match CStr::from_ptr(params_json).to_str() {
-        Ok(s) => s,
-        Err(e) => {
-            write_error(
-                &format!("Invalid params JSON UTF-8: {}", e),
-                error_buffer,
-                error_buffer_len,
-            );
-            return std::ptr::null_mut();
-        }
-    };
+        let pipe = &*pipeline;
 
-    let input: ModelInput = match serde_json::from_str(input_json_str) {
-        Ok(i) => i,
-        Err(e) => {
-            write_error(
-                &format!("Failed to parse input JSON: {}", e),
-                error_buffer,
-                error_buffer_len,
-            );
-            return std::ptr::null_mut();
-        }
-    };
+        let input_json_str = match CStr::from_ptr(input_json).to_str() {
+            Ok(s) => s,
+            Err(e) => {
+                write_error(
+                    &format!("Invalid input JSON UTF-8: {}", e),
+                    error_buffer,
+                    error_buffer_len,
+                );
+                return std::ptr::null_mut();
+            }
+        };
 
-    let params: GenerationParams = match serde_json::from_str(params_json_str) {
-        Ok(p) => p,
-        Err(e) => {
-            write_error(
-                &format!("Failed to parse params JSON: {}", e),
-                error_buffer,
-                error_buffer_len,
-            );
-            return std::ptr::null_mut();
-        }
-    };
+        let params_json_str = match CStr::from_ptr(params_json).to_str() {
+            Ok(s) => s,
+            Err(e) => {
+                write_error(
+                    &format!("Invalid params JSON UTF-8: {}", e),
+                    error_buffer,
+                    error_buffer_len,
+                );
+                return std::ptr::null_mut();
+            }
+        };
 
-    match pipe.inner.run(input, &params) {
-        Ok(output) => {
-            let output_json = match serde_json::to_string(&output) {
-                Ok(s) => s,
-                Err(e) => {
-                    write_error(
-                        &format!("Failed to serialize ModelOutput: {}", e),
-                        error_buffer,
-                        error_buffer_len,
-                    );
-                    return std::ptr::null_mut();
-                }
-            };
-            match CString::new(output_json) {
-                Ok(c) => c.into_raw(),
-                Err(e) => {
-                    write_error(
-                        &format!("CString conversion failed: {}", e),
-                        error_buffer,
-                        error_buffer_len,
-                    );
-                    std::ptr::null_mut()
+        let input: ModelInput = match serde_json::from_str(input_json_str) {
+            Ok(i) => i,
+            Err(e) => {
+                write_error(
+                    &format!("Failed to parse input JSON: {}", e),
+                    error_buffer,
+                    error_buffer_len,
+                );
+                return std::ptr::null_mut();
+            }
+        };
+
+        let params: GenerationParams = match serde_json::from_str(params_json_str) {
+            Ok(p) => p,
+            Err(e) => {
+                write_error(
+                    &format!("Failed to parse params JSON: {}", e),
+                    error_buffer,
+                    error_buffer_len,
+                );
+                return std::ptr::null_mut();
+            }
+        };
+
+        match pipe.inner.run(input, &params) {
+            Ok(output) => {
+                let output_json = match serde_json::to_string(&output) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        write_error(
+                            &format!("Failed to serialize ModelOutput: {}", e),
+                            error_buffer,
+                            error_buffer_len,
+                        );
+                        return std::ptr::null_mut();
+                    }
+                };
+                match CString::new(output_json) {
+                    Ok(c) => c.into_raw(),
+                    Err(e) => {
+                        write_error(
+                            &format!("CString conversion failed: {}", e),
+                            error_buffer,
+                            error_buffer_len,
+                        );
+                        std::ptr::null_mut()
+                    }
                 }
             }
-        }
-        Err(e) => {
-            write_error(
-                &format!("Inference failed: {}", e),
-                error_buffer,
-                error_buffer_len,
-            );
-            std::ptr::null_mut()
+            Err(e) => {
+                write_error(
+                    &format!("Inference failed: {}", e),
+                    error_buffer,
+                    error_buffer_len,
+                );
+                std::ptr::null_mut()
+            }
         }
     }
 }
@@ -473,7 +485,7 @@ unsafe fn bloom_pipeline_run_impl(
 /// invocation. When non-NULL, `error_buffer` must reference
 /// `error_buffer_len` writable bytes. The pipeline must not be freed
 /// concurrently.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn bloom_pipeline_run_stream(
     pipeline: *mut BloomPipeline,
     input_json: *const c_char,
@@ -483,27 +495,29 @@ pub unsafe extern "C" fn bloom_pipeline_run_stream(
     error_buffer: *mut c_char,
     error_buffer_len: usize,
 ) -> i32 {
-    catch_ffi_panic(
-        || {
-            bloom_pipeline_run_stream_impl(
-                pipeline,
-                input_json,
-                params_json,
-                callback,
-                user_data,
-                error_buffer,
-                error_buffer_len,
-            )
-        },
-        || {
-            write_error(
-                "Bloom caught an internal panic while streaming inference",
-                error_buffer,
-                error_buffer_len,
-            );
-            -7
-        },
-    )
+    unsafe {
+        catch_ffi_panic(
+            || {
+                bloom_pipeline_run_stream_impl(
+                    pipeline,
+                    input_json,
+                    params_json,
+                    callback,
+                    user_data,
+                    error_buffer,
+                    error_buffer_len,
+                )
+            },
+            || {
+                write_error(
+                    "Bloom caught an internal panic while streaming inference",
+                    error_buffer,
+                    error_buffer_len,
+                );
+                -7
+            },
+        )
+    }
 }
 
 unsafe fn bloom_pipeline_run_stream_impl(
@@ -515,9 +529,19 @@ unsafe fn bloom_pipeline_run_stream_impl(
     error_buffer: *mut c_char,
     error_buffer_len: usize,
 ) -> i32 {
-    let callback = match callback {
-        Some(callback) => callback,
-        None => {
+    unsafe {
+        let callback = match callback {
+            Some(callback) => callback,
+            None => {
+                write_error(
+                    "Null argument passed to bloom_pipeline_run_stream",
+                    error_buffer,
+                    error_buffer_len,
+                );
+                return -1;
+            }
+        };
+        if pipeline.is_null() || input_json.is_null() || params_json.is_null() {
             write_error(
                 "Null argument passed to bloom_pipeline_run_stream",
                 error_buffer,
@@ -525,79 +549,71 @@ unsafe fn bloom_pipeline_run_stream_impl(
             );
             return -1;
         }
-    };
-    if pipeline.is_null() || input_json.is_null() || params_json.is_null() {
-        write_error(
-            "Null argument passed to bloom_pipeline_run_stream",
-            error_buffer,
-            error_buffer_len,
-        );
-        return -1;
-    }
 
-    let pipe = &*pipeline;
+        let pipe = &*pipeline;
 
-    let input_json_str = match CStr::from_ptr(input_json).to_str() {
-        Ok(s) => s,
-        Err(e) => {
-            write_error(
-                &format!("Invalid input JSON UTF-8: {}", e),
-                error_buffer,
-                error_buffer_len,
-            );
-            return -2;
-        }
-    };
+        let input_json_str = match CStr::from_ptr(input_json).to_str() {
+            Ok(s) => s,
+            Err(e) => {
+                write_error(
+                    &format!("Invalid input JSON UTF-8: {}", e),
+                    error_buffer,
+                    error_buffer_len,
+                );
+                return -2;
+            }
+        };
 
-    let params_json_str = match CStr::from_ptr(params_json).to_str() {
-        Ok(s) => s,
-        Err(e) => {
-            write_error(
-                &format!("Invalid params JSON UTF-8: {}", e),
-                error_buffer,
-                error_buffer_len,
-            );
-            return -3;
-        }
-    };
+        let params_json_str = match CStr::from_ptr(params_json).to_str() {
+            Ok(s) => s,
+            Err(e) => {
+                write_error(
+                    &format!("Invalid params JSON UTF-8: {}", e),
+                    error_buffer,
+                    error_buffer_len,
+                );
+                return -3;
+            }
+        };
 
-    let input: ModelInput = match serde_json::from_str(input_json_str) {
-        Ok(i) => i,
-        Err(e) => {
-            write_error(
-                &format!("Failed to parse input JSON: {}", e),
-                error_buffer,
-                error_buffer_len,
-            );
-            return -4;
-        }
-    };
+        let input: ModelInput = match serde_json::from_str(input_json_str) {
+            Ok(i) => i,
+            Err(e) => {
+                write_error(
+                    &format!("Failed to parse input JSON: {}", e),
+                    error_buffer,
+                    error_buffer_len,
+                );
+                return -4;
+            }
+        };
 
-    let params: GenerationParams = match serde_json::from_str(params_json_str) {
-        Ok(p) => p,
-        Err(e) => {
-            write_error(
-                &format!("Failed to parse params JSON: {}", e),
-                error_buffer,
-                error_buffer_len,
-            );
-            return -5;
-        }
-    };
+        let params: GenerationParams = match serde_json::from_str(params_json_str) {
+            Ok(p) => p,
+            Err(e) => {
+                write_error(
+                    &format!("Failed to parse params JSON: {}", e),
+                    error_buffer,
+                    error_buffer_len,
+                );
+                return -5;
+            }
+        };
 
-    let mut sink = FfiOutputSink {
-        callback,
-        user_data,
-    };
-    match pipe.inner.run_stream(input, &params, &mut sink) {
-        Ok(()) => 0,
-        Err(e) => {
-            write_error(
-                &format!("Streaming inference failed: {}", e),
-                error_buffer,
-                error_buffer_len,
-            );
-            -6
+        let mut sink = FfiOutputSink {
+            callback,
+            user_data,
+        };
+        match pipe.inner.run_stream(input, &params, &mut sink) {
+            Ok(()) => 0,
+            Err(e) => {
+                write_error(
+                    &format!("Streaming inference failed: {}", e),
+                    error_buffer,
+                    error_buffer_len,
+                );
+                -6
+            }
         }
     }
 }
@@ -608,10 +624,12 @@ unsafe fn bloom_pipeline_run_stream_impl(
 ///
 /// `s` must be NULL or a live pointer returned by [`bloom_pipeline_run`]. A
 /// live pointer must be freed exactly once.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn bloom_string_free(s: *mut c_char) {
-    if !s.is_null() {
-        catch_ffi_panic(|| drop(CString::from_raw(s)), || ());
+    unsafe {
+        if !s.is_null() {
+            catch_ffi_panic(|| drop(CString::from_raw(s)), || ());
+        }
     }
 }
 

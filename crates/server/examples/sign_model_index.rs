@@ -4,9 +4,9 @@ use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use clap::Parser;
 use ed25519_dalek::{Signer as _, SigningKey};
 use reqwest::Url;
@@ -116,10 +116,9 @@ fn main() -> Result<()> {
         .output
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
+        && !parent.is_dir()
     {
-        if !parent.is_dir() {
-            return Err(anyhow!("output parent directory does not exist"));
-        }
+        return Err(anyhow!("output parent directory does not exist"));
     }
     let mut output = OpenOptions::new()
         .write(true)
@@ -364,7 +363,7 @@ fn validate_package_safetensors_layout(files: &[ModelIndexFile]) -> Result<()> {
         ));
     }
     shards.sort_by_key(|(_, (index, _))| *index);
-    let expected_total = shards[0].1 .1;
+    let expected_total = shards[0].1.1;
     if shards.len() != expected_total
         || shards
             .iter()

@@ -250,7 +250,7 @@ pub(crate) struct Args {
 }
 
 macro_rules! apply_config_value {
-    ($args:expr, $matches:expr, $config:expr, $field:ident) => {
+    ($args:expr_2021, $matches:expr_2021, $config:expr_2021, $field:ident) => {
         if should_use_config($matches, stringify!($field)) {
             if let Some(value) = &$config.$field {
                 $args.$field = value.clone();
@@ -260,7 +260,7 @@ macro_rules! apply_config_value {
 }
 
 macro_rules! apply_config_option {
-    ($args:expr, $matches:expr, $config:expr, $field:ident) => {
+    ($args:expr_2021, $matches:expr_2021, $config:expr_2021, $field:ident) => {
         if should_use_config($matches, stringify!($field)) {
             if let Some(value) = &$config.$field {
                 $args.$field = Some(value.clone());

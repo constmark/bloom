@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use bloomai_core::constants::GIB;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -441,13 +441,13 @@ impl CacheMesh {
             return Ok(());
         }
 
-        if self.config.write_through_l3 {
-            if let Err(err) = self.offload_to_l3(block.clone()) {
-                self.l3_metrics
-                    .failed_offloads
-                    .fetch_add(1, Ordering::Relaxed);
-                return Err(err);
-            }
+        if self.config.write_through_l3
+            && let Err(err) = self.offload_to_l3(block.clone())
+        {
+            self.l3_metrics
+                .failed_offloads
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(err);
         }
 
         if let Some(old) = state.blocks.remove(&block.key) {

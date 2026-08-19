@@ -281,7 +281,7 @@ pub(crate) async fn handle_model_retrieve(
                 axum::http::StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 "The model query parameters are invalid.",
-            )
+            );
         }
     };
     if !query.parameters.is_empty() {
@@ -649,21 +649,21 @@ pub(crate) async fn handle_model_index_download(
                 axum::http::StatusCode::BAD_GATEWAY,
                 "invalid_model_index",
                 message,
-            )
+            );
         }
         Err(ModelIndexError::Unavailable(message)) => {
             return error_response(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 "model_index_unavailable",
                 message,
-            )
+            );
         }
         Err(ModelIndexError::Internal(message)) => {
             return error_response(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "model_index_error",
                 message,
-            )
+            );
         }
     };
     let Some(entry) = snapshot.data.into_iter().find(|entry| entry.id == id) else {
@@ -722,7 +722,7 @@ pub(crate) async fn handle_model_index_download(
                     return api_error(
                         ApiError::InternalError,
                         "The signed-model upgrade identity could not be prepared.",
-                    )
+                    );
                 }
             }
         }
@@ -927,35 +927,35 @@ pub(crate) async fn handle_model_inventory_restore(
                     axum::http::StatusCode::BAD_REQUEST,
                     "invalid_model_inventory",
                     message,
-                )
+                );
             }
             Err(model_inventory::ModelInventoryRestoreError::Invalid(message)) => {
                 return error_response(
                     axum::http::StatusCode::BAD_REQUEST,
                     "invalid_model_inventory_restore",
                     message,
-                )
+                );
             }
             Err(model_inventory::ModelInventoryRestoreError::NotFound(message)) => {
                 return error_response(
                     axum::http::StatusCode::NOT_FOUND,
                     "model_inventory_restore_not_found",
                     message,
-                )
+                );
             }
             Err(model_inventory::ModelInventoryRestoreError::Conflict(message)) => {
                 return error_response(
                     axum::http::StatusCode::CONFLICT,
                     "model_inventory_restore_conflict",
                     message,
-                )
+                );
             }
             Err(model_inventory::ModelInventoryRestoreError::Unavailable(message)) => {
                 return error_response(
                     axum::http::StatusCode::UNPROCESSABLE_ENTITY,
                     "model_inventory_restore_unavailable",
                     message,
-                )
+                );
             }
         };
     if candidate.size_bytes > manager.max_bytes() {
@@ -1200,7 +1200,7 @@ pub(crate) async fn handle_model_import_chunk(
                 axum::http::StatusCode::BAD_REQUEST,
                 "invalid_model_import",
                 "A valid Upload-Offset header is required.",
-            )
+            );
         }
     };
     match manager.append_chunk(&filename, offset, &bytes).await {
@@ -1326,14 +1326,14 @@ pub(crate) async fn prepare_catalog_model_load(
     state: &Arc<ServerState>,
     model_id: &str,
 ) -> std::result::Result<PathBuf, ModelActivationError> {
-    if let Some(downloads) = state.model_downloads.as_ref() {
-        if downloads.upgrade_source_active(model_id).await {
-            return Err(ModelActivationError::new(
-                axum::http::StatusCode::CONFLICT,
-                "model_upgrade_in_progress",
-                "Wait for the signed-model upgrade to finish before loading this model.",
-            ));
-        }
+    if let Some(downloads) = state.model_downloads.as_ref()
+        && downloads.upgrade_source_active(model_id).await
+    {
+        return Err(ModelActivationError::new(
+            axum::http::StatusCode::CONFLICT,
+            "model_upgrade_in_progress",
+            "Wait for the signed-model upgrade to finish before loading this model.",
+        ));
     }
     if state.model_integrity.is_active(model_id).await {
         return Err(ModelActivationError::new(
@@ -1372,7 +1372,7 @@ pub(crate) async fn prepare_catalog_model_load(
                 axum::http::StatusCode::BAD_REQUEST,
                 "invalid_model",
                 error.to_string(),
-            ))
+            ));
         }
         Err(error) => {
             return Err(ModelActivationError::new(
@@ -1514,14 +1514,14 @@ pub(crate) async fn remove_catalog_model(
 
     let id = requested_id.to_string();
     let _storage_guard = state.model_storage.serial().await;
-    if let Some(downloads) = state.model_downloads.as_ref() {
-        if downloads.upgrade_source_active(&id).await {
-            return Err(ModelRemovalError::Conflict {
-                code: "model_upgrade_in_progress",
-                message: "Wait for the signed-model upgrade to finish before removing this model."
-                    .to_string(),
-            });
-        }
+    if let Some(downloads) = state.model_downloads.as_ref()
+        && downloads.upgrade_source_active(&id).await
+    {
+        return Err(ModelRemovalError::Conflict {
+            code: "model_upgrade_in_progress",
+            message: "Wait for the signed-model upgrade to finish before removing this model."
+                .to_string(),
+        });
     }
     if state.load_in_progress.load(Ordering::Acquire) {
         return Err(ModelRemovalError::Conflict {
@@ -1629,14 +1629,14 @@ pub(crate) async fn handle_model_integrity_start(
         );
     }
     let model_id = payload.id.trim().to_string();
-    if let Some(downloads) = state.model_downloads.as_ref() {
-        if downloads.upgrade_source_active(&model_id).await {
-            return error_response(
-                axum::http::StatusCode::CONFLICT,
-                "model_upgrade_in_progress",
-                "Wait for the signed-model upgrade to finish before verifying this model.",
-            );
-        }
+    if let Some(downloads) = state.model_downloads.as_ref()
+        && downloads.upgrade_source_active(&model_id).await
+    {
+        return error_response(
+            axum::http::StatusCode::CONFLICT,
+            "model_upgrade_in_progress",
+            "Wait for the signed-model upgrade to finish before verifying this model.",
+        );
     }
     let root = state.models_root.clone();
     let resolve_id = model_id.clone();
@@ -1871,10 +1871,10 @@ fn run_cancellable_text_inference(
         Ok(())
     });
     let stopped = filter.stopped();
-    if let Err(error) = run_result {
-        if !stopped {
-            return Err(error);
-        }
+    if let Err(error) = run_result
+        && !stopped
+    {
+        return Err(error);
     }
     if cancel_token.is_cancelled() {
         return Err(anyhow!("request cancelled"));
@@ -2910,10 +2910,10 @@ pub(crate) async fn handle_response_input_items(
     if !matches!(order, "asc" | "desc") {
         return responses_bad_request("The input-items order must be `asc` or `desc`.");
     }
-    if let Some(after) = query.after.as_deref() {
-        if validate_request_id(after).is_err() {
-            return responses_bad_request("The input-items cursor is invalid.");
-        }
+    if let Some(after) = query.after.as_deref()
+        && validate_request_id(after).is_err()
+    {
+        return responses_bad_request("The input-items cursor is invalid.");
     }
 
     let Some(stored) = state.response_store.get(&response_id) else {
@@ -3073,10 +3073,10 @@ pub(crate) async fn handle_responses(
         );
     }
     let store = payload.store.unwrap_or(false);
-    if let Some(previous_response_id) = payload.previous_response_id.as_deref() {
-        if !valid_stored_response_id(previous_response_id) {
-            return invalid_stored_response_id();
-        }
+    if let Some(previous_response_id) = payload.previous_response_id.as_deref()
+        && !valid_stored_response_id(previous_response_id)
+    {
+        return invalid_stored_response_id();
     }
     let previous_response_id = payload.previous_response_id.clone();
     let response_state = ResponsesStateOptions::new(store, previous_response_id.clone())
@@ -3089,18 +3089,17 @@ pub(crate) async fn handle_responses(
         },
         None => None,
     };
-    if let Some(previous) = previous.as_ref() {
-        if payload
+    if let Some(previous) = previous.as_ref()
+        && payload
             .model
             .as_deref()
             .is_some_and(|model| model != "default" && model != previous.model)
-        {
-            return error_response(
-                axum::http::StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "A chained local response must use the same model as its previous response.",
-            );
-        }
+    {
+        return error_response(
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "A chained local response must use the same model as its previous response.",
+        );
     }
 
     let response_instructions = payload.instructions.clone();
@@ -3237,14 +3236,14 @@ pub(crate) async fn handle_responses(
         &response_state,
     ) {
         Ok(payload) => {
-            if let Some(pending_storage) = pending_storage {
-                if let Err(error) = pending_storage.commit(&payload) {
-                    return error_response(
-                        axum::http::StatusCode::INSUFFICIENT_STORAGE,
-                        "server_error",
-                        error.to_string(),
-                    );
-                }
+            if let Some(pending_storage) = pending_storage
+                && let Err(error) = pending_storage.commit(&payload)
+            {
+                return error_response(
+                    axum::http::StatusCode::INSUFFICIENT_STORAGE,
+                    "server_error",
+                    error.to_string(),
+                );
             }
             private_responses_json(payload)
         }
@@ -3320,12 +3319,11 @@ pub(crate) fn responses_stream_from_chat_response(
                             return;
                         }
                     };
-                    if let Some(storage) = pending_storage.take() {
-                        if let Err(error) = storage.commit(&terminal_response) {
-                            send_responses_stream_failure(&tx, &mut adapter, &error.to_string())
-                                .await;
-                            return;
-                        }
+                    if let Some(storage) = pending_storage.take()
+                        && let Err(error) = storage.commit(&terminal_response)
+                    {
+                        send_responses_stream_failure(&tx, &mut adapter, &error.to_string()).await;
+                        return;
                     }
                     let events = match adapter.finish_with_response(terminal_response) {
                         Ok(events) => events,
@@ -4874,10 +4872,9 @@ pub(crate) async fn handle_cancel(
     if let Some(scheduler) = runtime
         .as_ref()
         .and_then(|runtime| runtime.scheduler.as_ref())
+        && scheduler.cancel_request(&request_id)
     {
-        if scheduler.cancel_request(&request_id) {
-            cancelled = true;
-        }
+        cancelled = true;
     }
 
     // Try cancel token

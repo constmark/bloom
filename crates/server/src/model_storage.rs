@@ -2,11 +2,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
@@ -137,10 +137,11 @@ impl ModelStorageManager {
 
     pub(crate) async fn snapshot(&self) -> Result<ModelStorageStatus> {
         let revision = self.revision.load(Ordering::Acquire);
-        if let Some(cached) = self.cache.read().await.as_ref() {
-            if cached.revision == revision && cached.refreshed_at.elapsed() < SNAPSHOT_TTL {
-                return Ok(cached.status.clone());
-            }
+        if let Some(cached) = self.cache.read().await.as_ref()
+            && cached.revision == revision
+            && cached.refreshed_at.elapsed() < SNAPSHOT_TTL
+        {
+            return Ok(cached.status.clone());
         }
 
         let state = self.state.lock().await;
@@ -633,7 +634,7 @@ fn cleanup_stale_sessions(
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
-                return Err(error).context("failed to inspect model staging cleanup root")
+                return Err(error).context("failed to inspect model staging cleanup root");
             }
         };
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -847,9 +848,11 @@ mod tests {
 
         let error = manager.snapshot().await.unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("exceeded the maximum directory depth"));
+        assert!(
+            error
+                .to_string()
+                .contains("exceeded the maximum directory depth")
+        );
     }
 
     #[cfg(unix)]

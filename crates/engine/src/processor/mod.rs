@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use bloomai_core::{Modality, ProcessorKind, ProcessorSpec};
 
 use crate::io::DataBlock;

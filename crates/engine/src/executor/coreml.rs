@@ -7,14 +7,14 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use bloomai_core::{
     DType, DeviceClass, DeviceKind, Modality, ModelFamily, ModelFormat, ModelManifest,
 };
 
 use crate::{
     core::parallelism::ParallelStrategy,
-    engine::{default_engine_supports, Engine, EngineCapability, SupportLevel},
+    engine::{Engine, EngineCapability, SupportLevel, default_engine_supports},
     model::LoadedModel,
 };
 
@@ -23,10 +23,10 @@ pub struct CoreMlEngine;
 impl CoreMlEngine {
     pub fn discover_model_file(model_path: &Path) -> Result<PathBuf> {
         if model_path.is_file() {
-            if let Some(ext) = model_path.extension().and_then(|e| e.to_str()) {
-                if ext.eq_ignore_ascii_case("mlmodel") || ext.eq_ignore_ascii_case("mlpackage") {
-                    return Ok(model_path.to_path_buf());
-                }
+            if let Some(ext) = model_path.extension().and_then(|e| e.to_str())
+                && (ext.eq_ignore_ascii_case("mlmodel") || ext.eq_ignore_ascii_case("mlpackage"))
+            {
+                return Ok(model_path.to_path_buf());
             }
             return Err(anyhow!(
                 "CoreML engine expects a .mlmodel/.mlpackage file or a directory containing one: {}",
@@ -45,10 +45,10 @@ impl CoreMlEngine {
         let mut candidates = Vec::new();
         for entry in std::fs::read_dir(model_path)?.flatten() {
             let path = entry.path();
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if ext.eq_ignore_ascii_case("mlpackage") || ext.eq_ignore_ascii_case("mlmodel") {
-                    candidates.push(path);
-                }
+            if let Some(ext) = path.extension().and_then(|e| e.to_str())
+                && (ext.eq_ignore_ascii_case("mlpackage") || ext.eq_ignore_ascii_case("mlmodel"))
+            {
+                candidates.push(path);
             }
         }
         candidates.sort();

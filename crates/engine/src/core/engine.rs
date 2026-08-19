@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use bloomai_core::{
     DType, DeviceCapability, DeviceClass, DeviceKind, Modality, ModelFamily, ModelFormat,
     ModelManifest,
@@ -344,7 +344,11 @@ impl EngineRouter {
                     return Ok(RoutingDecision {
                         explanation: format!(
                             "engine '{}' natively supports model '{}' (family={:?}, dtype={:?}) on backend '{}'",
-                            engine_name, manifest.id, manifest.family, manifest.primary_dtype, device_cap.backend_name
+                            engine_name,
+                            manifest.id,
+                            manifest.family,
+                            manifest.primary_dtype,
+                            device_cap.backend_name
                         ),
                         engine_name: engine_name.clone(),
                         support_level: SupportLevel::Native,
@@ -408,9 +412,9 @@ mod tests {
     use crate::pipeline::InferencePipeline;
     use bloomai_backend::CpuBackend;
     use bloomai_core::{
-        constants::GIB, DType, DeviceCapability, DeviceClass, DeviceKind, GenerationParams,
-        MemoryTopology, Modality, ModelFamily, ModelFormat, ModelIoSchema, ModelManifest,
-        ModelMemoryProfile, PowerState, RuntimeHints, ThermalState,
+        DType, DeviceCapability, DeviceClass, DeviceKind, GenerationParams, MemoryTopology,
+        Modality, ModelFamily, ModelFormat, ModelIoSchema, ModelManifest, ModelMemoryProfile,
+        PowerState, RuntimeHints, ThermalState, constants::GIB,
     };
 
     struct MockEngine;

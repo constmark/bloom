@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::Module;
 
@@ -120,10 +120,10 @@ impl T5TextEncoder {
         ];
 
         for path in &candidates {
-            if path.exists() {
-                if let Ok(tok) = tokenizers::Tokenizer::from_file(path) {
-                    return Some(tok);
-                }
+            if path.exists()
+                && let Ok(tok) = tokenizers::Tokenizer::from_file(path)
+            {
+                return Some(tok);
             }
         }
         None
@@ -236,13 +236,16 @@ impl T5TextEncoder {
     ///
     /// Returns tensor of shape [batch, max_length, d_model].
     pub fn encode(&self, texts: &[String]) -> Result<Tensor> {
-        if let Some(model) = Self::load_model(&self.config, &self.model_path, &self.device) {
-            let res = self.encode_with_model(&model, texts)?;
-            // model is dropped here, releasing VRAM!
-            Ok(res)
-        } else {
-            // Fallback: create deterministic pseudo-embeddings from text hash
-            self.encode_fallback(texts)
+        match Self::load_model(&self.config, &self.model_path, &self.device) {
+            Some(model) => {
+                let res = self.encode_with_model(&model, texts)?;
+                // model is dropped here, releasing VRAM!
+                Ok(res)
+            }
+            _ => {
+                // Fallback: create deterministic pseudo-embeddings from text hash
+                self.encode_fallback(texts)
+            }
         }
     }
 

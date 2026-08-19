@@ -4,8 +4,8 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 
 use super::model_index::validate_index_id;
-use super::model_manager::{validate_catalog_id, ModelCatalog, ModelCatalogEntry};
-use super::model_provenance::{normalize_license, ModelAcquisitionKind, ModelProvenance};
+use super::model_manager::{ModelCatalog, ModelCatalogEntry, validate_catalog_id};
+use super::model_provenance::{ModelAcquisitionKind, ModelProvenance, normalize_license};
 
 pub(crate) const MODEL_INVENTORY_SCHEMA_VERSION: u8 = 2;
 const MIN_MODEL_INVENTORY_SCHEMA_VERSION: u8 = 1;
@@ -479,17 +479,16 @@ fn validate_inventory_entry(model: &ModelInventoryEntry) -> Result<(), String> {
             model.id
         ));
     }
-    if let Some(sha256) = model.sha256.as_deref() {
-        if sha256.len() != 64
+    if let Some(sha256) = model.sha256.as_deref()
+        && (sha256.len() != 64
             || !sha256
                 .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err(format!(
-                "model inventory SHA-256 is invalid for '{}'",
-                model.id
-            ));
-        }
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    {
+        return Err(format!(
+            "model inventory SHA-256 is invalid for '{}'",
+            model.id
+        ));
     }
     let normalized_license = normalize_license(model.license.clone())
         .map_err(|_| format!("model inventory license is invalid for '{}'", model.id))?;
@@ -852,9 +851,7 @@ mod tests {
                 ),
                 entry(
                     "alpha.gguf",
-                    Some(
-                        "https://huggingface.co/acme/model/resolve/main/alpha.gguf".to_string(),
-                    ),
+                    Some("https://huggingface.co/acme/model/resolve/main/alpha.gguf".to_string()),
                 ),
             ],
         };
@@ -986,10 +983,12 @@ mod tests {
         inventory.models[0].source.as_mut().unwrap().url =
             Some("https://huggingface.co/acme/model/resolve/main/model.gguf".to_string());
         inventory.models[0].kind = "directory".to_string();
-        assert!(inventory
-            .validate_import()
-            .unwrap_err()
-            .contains("complete non-empty file"));
+        assert!(
+            inventory
+                .validate_import()
+                .unwrap_err()
+                .contains("complete non-empty file")
+        );
     }
 
     #[test]

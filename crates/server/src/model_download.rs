@@ -2,11 +2,11 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use futures::StreamExt as _;
 use reqwest::header::{ACCEPT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, ETAG, LOCATION, RANGE};
 use reqwest::{Client, StatusCode, Url};
@@ -20,15 +20,15 @@ use tokio_util::sync::CancellationToken;
 use super::model_license::{ModelLicensePolicy, ModelLicensePolicyStatus};
 use super::model_manager::validate_model_filename;
 use super::model_package::{
-    decode_sha256 as decode_package_sha256, normalize_package_files, package_digest,
-    validate_package_id, validate_package_path, ModelPackageFile,
+    ModelPackageFile, decode_sha256 as decode_package_sha256, normalize_package_files,
+    package_digest, validate_package_id, validate_package_path,
 };
 use super::model_provenance::{
-    remove_provenance, sanitized_download_source, write_package_provenance, write_provenance,
-    ModelAcquisitionKind, ModelPackageProvenanceDraft, ModelProvenanceDraft,
+    ModelAcquisitionKind, ModelPackageProvenanceDraft, ModelProvenanceDraft, remove_provenance,
+    sanitized_download_source, write_package_provenance, write_provenance,
 };
 use super::model_storage::ModelStorageManager;
-use super::model_upgrade::{commit_model_upgrade, ModelUpgradeSource, ModelUpgradeTarget};
+use super::model_upgrade::{ModelUpgradeSource, ModelUpgradeTarget, commit_model_upgrade};
 
 const STAGING_DIRECTORY: &str = ".bloom-downloads";
 const STATUS_UPDATE_BYTES: u64 = 1024 * 1024;
@@ -882,13 +882,13 @@ impl ModelDownloadManager {
             Ok(_) => secure_staging_directory(&staging_root).await?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => {
-                return Err(error).context("failed to inspect model download staging directory")
+                return Err(error).context("failed to inspect model download staging directory");
             }
         }
         let mut entries = match fs::read_dir(&staging_root).await {
             Ok(entries) => entries,
             Err(error) => {
-                return Err(error).context("failed to open model download staging directory")
+                return Err(error).context("failed to open model download staging directory");
             }
         };
         let mut staged = Vec::new();
@@ -1597,14 +1597,14 @@ impl ModelDownloadManager {
                 "model download returned HTTP {response_status}"
             )));
         };
-        if let (Some(expected), Some(total)) = (prepared.expected_size_bytes, total_bytes) {
-            if total != expected {
-                let _storage = self.storage.serial().await;
-                cleanup_staging(&part_path, &metadata_path).await;
-                return Err(DownloadFailure::terminal(format!(
-                    "Model download declared {total} bytes; the signed index requires {expected} bytes."
-                )));
-            }
+        if let (Some(expected), Some(total)) = (prepared.expected_size_bytes, total_bytes)
+            && total != expected
+        {
+            let _storage = self.storage.serial().await;
+            cleanup_staging(&part_path, &metadata_path).await;
+            return Err(DownloadFailure::terminal(format!(
+                "Model download declared {total} bytes; the signed index requires {expected} bytes."
+            )));
         }
         if total_bytes.is_some_and(|total| total > self.max_bytes) {
             let _storage = self.storage.serial().await;
@@ -1695,21 +1695,21 @@ impl ModelDownloadManager {
         })?;
         drop(file);
 
-        if let Some(total) = total_bytes {
-            if downloaded != total {
-                return Err(DownloadFailure::resumable(format!(
-                    "Model download ended at {downloaded} bytes; expected {total} bytes."
-                )));
-            }
+        if let Some(total) = total_bytes
+            && downloaded != total
+        {
+            return Err(DownloadFailure::resumable(format!(
+                "Model download ended at {downloaded} bytes; expected {total} bytes."
+            )));
         }
-        if let Some(expected) = prepared.expected_size_bytes {
-            if downloaded != expected {
-                let _storage = self.storage.serial().await;
-                cleanup_staging(&part_path, &metadata_path).await;
-                return Err(DownloadFailure::terminal(format!(
-                    "Model download ended at {downloaded} bytes; the signed index requires {expected} bytes."
-                )));
-            }
+        if let Some(expected) = prepared.expected_size_bytes
+            && downloaded != expected
+        {
+            let _storage = self.storage.serial().await;
+            cleanup_staging(&part_path, &metadata_path).await;
+            return Err(DownloadFailure::terminal(format!(
+                "Model download ended at {downloaded} bytes; the signed index requires {expected} bytes."
+            )));
         }
         self.update_progress(
             ModelDownloadPhase::Verifying,
@@ -2385,10 +2385,10 @@ async fn cleanup_staging(part_path: &Path, metadata_path: &Path) {
         metadata_path,
         &metadata_path.with_extension("json.tmp"),
     ] {
-        if let Err(error) = fs::remove_file(path).await {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(path = %path.display(), %error, "Failed to clean model download staging file");
-            }
+        if let Err(error) = fs::remove_file(path).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %path.display(), %error, "Failed to clean model download staging file");
         }
     }
 }
@@ -2429,7 +2429,7 @@ async fn prepare_package_staging(
                 secure_package_directory(package_root).await?;
             }
             Err(error) => {
-                return Err(error).context("failed to inspect model package staging directory")
+                return Err(error).context("failed to inspect model package staging directory");
             }
         }
     }
@@ -2451,7 +2451,7 @@ async fn safe_package_file_path(package_root: &Path, relative: &str) -> Result<P
                 Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
                     return Err(anyhow!(
                         "model package staging parent must be a real directory"
-                    ))
+                    ));
                 }
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -2460,7 +2460,7 @@ async fn safe_package_file_path(package_root: &Path, relative: &str) -> Result<P
                         .context("failed to create model package staging parent")?;
                 }
                 Err(error) => {
-                    return Err(error).context("failed to inspect model package staging parent")
+                    return Err(error).context("failed to inspect model package staging parent");
                 }
             }
         }
@@ -2705,10 +2705,10 @@ async fn cleanup_package_staging(package_root: &Path, metadata_path: &Path) {
 
 async fn cleanup_package_metadata(metadata_path: &Path) {
     for path in [metadata_path, &metadata_path.with_extension("json.tmp")] {
-        if let Err(error) = fs::remove_file(path).await {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(path = %path.display(), %error, "Failed to clean model package metadata");
-            }
+        if let Err(error) = fs::remove_file(path).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %path.display(), %error, "Failed to clean model package metadata");
         }
     }
 }
@@ -2860,11 +2860,11 @@ async fn remove_staged_file(path: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Router;
     use axum::body::Body;
     use axum::extract::{Path as AxumPath, State};
     use axum::http::{HeaderMap, Response};
     use axum::routing::get;
-    use axum::Router;
 
     struct PackageServerFixture {
         files: BTreeMap<String, Vec<u8>>,
@@ -3121,31 +3121,41 @@ mod tests {
     #[test]
     fn accepts_only_trusted_https_download_urls() {
         let policy = DownloadUrlPolicy::default();
-        assert!(validate_download_url(
-            &Url::parse("https://huggingface.co/acme/model/resolve/main/model.gguf").unwrap(),
-            &policy
-        )
-        .is_ok());
-        assert!(validate_download_url(
-            &Url::parse("https://cdn-lfs.hf.co/model.gguf").unwrap(),
-            &policy
-        )
-        .is_ok());
-        assert!(validate_download_url(
-            &Url::parse("http://huggingface.co/model.gguf").unwrap(),
-            &policy
-        )
-        .is_err());
-        assert!(validate_download_url(
-            &Url::parse("https://huggingface.co.evil.example/model.gguf").unwrap(),
-            &policy
-        )
-        .is_err());
-        assert!(validate_download_url(
-            &Url::parse("https://user:secret@huggingface.co/model.gguf").unwrap(),
-            &policy
-        )
-        .is_err());
+        assert!(
+            validate_download_url(
+                &Url::parse("https://huggingface.co/acme/model/resolve/main/model.gguf").unwrap(),
+                &policy
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_download_url(
+                &Url::parse("https://cdn-lfs.hf.co/model.gguf").unwrap(),
+                &policy
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_download_url(
+                &Url::parse("http://huggingface.co/model.gguf").unwrap(),
+                &policy
+            )
+            .is_err()
+        );
+        assert!(
+            validate_download_url(
+                &Url::parse("https://huggingface.co.evil.example/model.gguf").unwrap(),
+                &policy
+            )
+            .is_err()
+        );
+        assert!(
+            validate_download_url(
+                &Url::parse("https://user:secret@huggingface.co/model.gguf").unwrap(),
+                &policy
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -3197,9 +3207,11 @@ mod tests {
         assert_eq!(source.commit_hash.as_deref(), Some(commit.as_str()));
         assert!(source.verification_ready);
         assert!(source.warning.is_none());
-        assert!(source
-            .download_url
-            .contains(&format!("/resolve/{commit}/model.gguf")));
+        assert!(
+            source
+                .download_url
+                .contains(&format!("/resolve/{commit}/model.gguf"))
+        );
         server.abort();
     }
 
@@ -3435,23 +3447,29 @@ mod tests {
 
         assert_eq!(status.phase, ModelDownloadPhase::Error);
         assert!(!status.resumable);
-        assert!(status
-            .error
-            .unwrap()
-            .contains("weight_map does not match tensor headers"));
+        assert!(
+            status
+                .error
+                .unwrap()
+                .contains("weight_map does not match tensor headers")
+        );
         assert!(!temp.path().join("incomplete-shards").exists());
-        assert!(!temp
-            .path()
-            .join(STAGING_DIRECTORY)
-            .join("incomplete-shards.package")
-            .exists());
-        assert!(super::super::model_provenance::read_provenance(
-            temp.path(),
-            "incomplete-shards",
-            expected_size,
-        )
-        .unwrap()
-        .is_none());
+        assert!(
+            !temp
+                .path()
+                .join(STAGING_DIRECTORY)
+                .join("incomplete-shards.package")
+                .exists()
+        );
+        assert!(
+            super::super::model_provenance::read_provenance(
+                temp.path(),
+                "incomplete-shards",
+                expected_size,
+            )
+            .unwrap()
+            .is_none()
+        );
         assert_eq!(manager.catalog_revision(), 0);
         server.abort();
     }
@@ -3495,28 +3513,36 @@ mod tests {
 
         assert_eq!(status.phase, ModelDownloadPhase::Error);
         assert!(!status.resumable);
-        assert!(status
-            .error
-            .unwrap()
-            .contains("SHA-256 verification failed"));
+        assert!(
+            status
+                .error
+                .unwrap()
+                .contains("SHA-256 verification failed")
+        );
         assert!(!temp.path().join("rejected-package").exists());
-        assert!(!temp
-            .path()
-            .join(STAGING_DIRECTORY)
-            .join("rejected-package.package")
-            .exists());
-        assert!(!temp
-            .path()
-            .join(STAGING_DIRECTORY)
-            .join("rejected-package.package.json")
-            .exists());
-        assert!(super::super::model_provenance::read_provenance(
-            temp.path(),
-            "rejected-package",
-            expected_size,
-        )
-        .unwrap()
-        .is_none());
+        assert!(
+            !temp
+                .path()
+                .join(STAGING_DIRECTORY)
+                .join("rejected-package.package")
+                .exists()
+        );
+        assert!(
+            !temp
+                .path()
+                .join(STAGING_DIRECTORY)
+                .join("rejected-package.package.json")
+                .exists()
+        );
+        assert!(
+            super::super::model_provenance::read_provenance(
+                temp.path(),
+                "rejected-package",
+                expected_size,
+            )
+            .unwrap()
+            .is_none()
+        );
         assert_eq!(manager.catalog_revision(), 0);
         server.abort();
     }
@@ -3841,10 +3867,12 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(provenance.model_index_id.as_deref(), Some(index_id));
-        assert!(!temp
-            .path()
-            .join(super::super::model_upgrade::UPGRADE_DIRECTORY)
-            .exists());
+        assert!(
+            !temp
+                .path()
+                .join(super::super::model_upgrade::UPGRADE_DIRECTORY)
+                .exists()
+        );
         server.abort();
     }
 
@@ -3905,10 +3933,12 @@ mod tests {
 
         assert_eq!(status.phase, ModelDownloadPhase::Error);
         assert!(!status.resumable);
-        assert!(status
-            .error
-            .unwrap()
-            .contains("SHA-256 verification failed"));
+        assert!(
+            status
+                .error
+                .unwrap()
+                .contains("SHA-256 verification failed")
+        );
         assert_eq!(fs::read(temp.path().join(filename)).await.unwrap(), old);
         let provenance = super::super::model_provenance::read_provenance(
             temp.path(),
@@ -3918,10 +3948,12 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(provenance.sha256, old_sha256);
-        assert!(!temp
-            .path()
-            .join(super::super::model_upgrade::UPGRADE_DIRECTORY)
-            .exists());
+        assert!(
+            !temp
+                .path()
+                .join(super::super::model_upgrade::UPGRADE_DIRECTORY)
+                .exists()
+        );
         server.abort();
     }
 

@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use bloomai_core::{
     DeviceClass, DeviceKind, GenerationParams, Modality, ModelFamily, ModelFormat,
     ResidencyStrategy,
@@ -19,8 +19,8 @@ use crate::{
 };
 
 use super::speculative::{
-    config_supports_mtp, verify_greedy_tokens, verify_with_rejection_sampling, NGramStrategy,
-    SpeculativeMode, SpeculativeStrategy,
+    NGramStrategy, SpeculativeMode, SpeculativeStrategy, config_supports_mtp, verify_greedy_tokens,
+    verify_with_rejection_sampling,
 };
 
 /// Model type enum for supported variants
@@ -348,7 +348,7 @@ impl Engine for CandleEngine {
                     "candle engine currently only supports CPU and GPU (CUDA/Metal), got {:?}.\n\
                      [Diagnostic Tip] Use --device cpu or --device gpu.",
                     other
-                ))
+                ));
             }
         };
 
@@ -558,7 +558,10 @@ impl Engine for CandleEngine {
         // --- Verify loading: execute a small dummy forward pass ---
         match model.verify_loading() {
             Ok(()) => tracing::info!("Model loading verification passed (dummy forward pass OK)"),
-            Err(e) => tracing::warn!("Model loading verification failed: {}. Model may still work but results could be incorrect.", e),
+            Err(e) => tracing::warn!(
+                "Model loading verification failed: {}. Model may still work but results could be incorrect.",
+                e
+            ),
         }
 
         Ok(Box::new(model))
@@ -740,13 +743,13 @@ fn synthesize_config_from_gguf(gguf_path: &Path) -> Result<(serde_json::Value, S
         "tie_word_embeddings": false,
         "torch_dtype": "float16",
     });
-    if let Some(nextn) = nextn_predict_layers {
-        if let Some(obj) = config.as_object_mut() {
-            obj.insert(
-                "num_nextn_predict_layers".to_string(),
-                serde_json::Value::from(nextn),
-            );
-        }
+    if let Some(nextn) = nextn_predict_layers
+        && let Some(obj) = config.as_object_mut()
+    {
+        obj.insert(
+            "num_nextn_predict_layers".to_string(),
+            serde_json::Value::from(nextn),
+        );
     }
 
     Ok((config, arch))
@@ -1082,7 +1085,7 @@ impl QwenModelWrapper {
     }
 }
 
-/// Handle-keyed [`KvHook`] for the production IFB path.
+/// Handle-keyed [`crate::KvHook`] for the production IFB path.
 ///
 /// Unlike [`crate::executor::qwen_streaming::QwenKvHook`], which is bound to
 /// a single shared model instance, this hook dispatches by `handle` into the
@@ -1412,7 +1415,9 @@ impl CandleTextModel {
         }
 
         if is_large_cuda && self.model_type == ModelType::Gemma4 {
-            tracing::info!("Initializing memory-efficient layer-wise weight streaming on CUDA for Gemma-4 GGUF...");
+            tracing::info!(
+                "Initializing memory-efficient layer-wise weight streaming on CUDA for Gemma-4 GGUF..."
+            );
             let gguf_path = gguf_path.ok_or_else(|| {
                 anyhow!(
                     "no GGUF file found for streaming Gemma-4 in {:?}",
@@ -2270,182 +2275,181 @@ impl CandleTextModel {
             let _span_decode =
                 tracing::info_span!("decode", max_tokens = params.max_tokens).entered();
             while generated < params.max_tokens {
-                if let Some(strategy) = &speculative_strategy {
-                    if params.response_format.is_none() {
-                        let remaining = params.max_tokens - generated;
-                        let draft_budget = match speculative_mode {
-                            SpeculativeMode::NGram {
-                                num_speculative, ..
-                            } => num_speculative.min(remaining.saturating_sub(1)),
-                            SpeculativeMode::DraftModel {
-                                num_speculative, ..
-                            } => num_speculative.min(remaining.saturating_sub(1)),
-                            _ => 0,
-                        };
-                        let proposed_with_logits: Vec<(u32, Vec<f32>)> = if draft_budget > 0 {
-                            if params.temperature > 1e-6 {
-                                strategy.propose_with_logits(
-                                    &all_tokens,
-                                    draft_budget,
-                                    params.temperature,
-                                )?
-                            } else {
-                                strategy
-                                    .propose(&all_tokens, draft_budget)?
-                                    .into_iter()
-                                    .map(|t| (t, Vec::new()))
-                                    .collect()
-                            }
+                if let Some(strategy) = &speculative_strategy
+                    && params.response_format.is_none()
+                {
+                    let remaining = params.max_tokens - generated;
+                    let draft_budget = match speculative_mode {
+                        SpeculativeMode::NGram {
+                            num_speculative, ..
+                        } => num_speculative.min(remaining.saturating_sub(1)),
+                        SpeculativeMode::DraftModel {
+                            num_speculative, ..
+                        } => num_speculative.min(remaining.saturating_sub(1)),
+                        _ => 0,
+                    };
+                    let proposed_with_logits: Vec<(u32, Vec<f32>)> = if draft_budget > 0 {
+                        if params.temperature > 1e-6 {
+                            strategy.propose_with_logits(
+                                &all_tokens,
+                                draft_budget,
+                                params.temperature,
+                            )?
                         } else {
-                            Vec::new()
+                            strategy
+                                .propose(&all_tokens, draft_budget)?
+                                .into_iter()
+                                .map(|t| (t, Vec::new()))
+                                .collect()
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    if !proposed_with_logits.is_empty() {
+                        let proposed: Vec<u32> =
+                            proposed_with_logits.iter().map(|(t, _)| *t).collect();
+                        let has_draft_logits =
+                            proposed_with_logits.iter().any(|(_, l)| !l.is_empty());
+
+                        let last = *all_tokens
+                            .last()
+                            .ok_or_else(|| anyhow!("generation token history is empty"))?;
+                        let mut verify_tokens = Vec::with_capacity(proposed.len() + 1);
+                        verify_tokens.push(last);
+                        verify_tokens.extend_from_slice(&proposed);
+
+                        let input_ids =
+                            Tensor::new(verify_tokens.as_slice(), &self.device)?.unsqueeze(0)?;
+                        let verifier_logits = model_guard
+                            .as_mut()
+                            .ok_or_else(|| anyhow!("model is not loaded"))?
+                            .forward(&input_ids, start_pos)?;
+                        let verifier_logits = Self::logits_sequence(verifier_logits)?;
+
+                        // Decide acceptance and the correction/bonus token.
+                        //
+                        // Use standard rejection sampling (`min(1, p/q)` +
+                        // residual correction) when the draft strategy
+                        // exposes per-position logits and the sampling
+                        // temperature is non-zero. Otherwise fall back to
+                        // greedy exact-match verification, which only
+                        // accepts draft tokens that equal the target argmax.
+                        let (accepted, correction_token) = if params.temperature > 1e-6
+                            && has_draft_logits
+                        {
+                            let verifier_vecs = Self::verifier_logits_to_vecs(&verifier_logits)?;
+                            // Derive an independent PRNG seed from the
+                            // request seed so rejection sampling
+                            // doesn't share state with `logits_processor`.
+                            let mut rng_state =
+                                params.seed.unwrap_or(42).wrapping_add(0x9E3779B97F4A7C15);
+                            verify_with_rejection_sampling(
+                                &verifier_vecs,
+                                &proposed_with_logits,
+                                params.temperature,
+                                &mut rng_state,
+                            )
+                        } else {
+                            let mut verifier_greedy = Vec::with_capacity(proposed.len());
+                            for idx in 0..proposed.len() {
+                                verifier_greedy
+                                    .push(Self::greedy_token(&verifier_logits.get(idx)?)?);
+                            }
+                            let accepted = verify_greedy_tokens(proposed.len(), &proposed, |idx| {
+                                verifier_greedy.get(idx).copied()
+                            });
+                            (accepted, None)
                         };
-                        if !proposed_with_logits.is_empty() {
-                            let proposed: Vec<u32> =
-                                proposed_with_logits.iter().map(|(t, _)| *t).collect();
-                            let has_draft_logits =
-                                proposed_with_logits.iter().any(|(_, l)| !l.is_empty());
 
-                            let last = *all_tokens
-                                .last()
-                                .ok_or_else(|| anyhow!("generation token history is empty"))?;
-                            let mut verify_tokens = Vec::with_capacity(proposed.len() + 1);
-                            verify_tokens.push(last);
-                            verify_tokens.extend_from_slice(&proposed);
+                        total_draft_tokens += proposed.len();
+                        total_accepted_tokens += accepted;
 
-                            let input_ids = Tensor::new(verify_tokens.as_slice(), &self.device)?
-                                .unsqueeze(0)?;
-                            let verifier_logits = model_guard
-                                .as_mut()
-                                .ok_or_else(|| anyhow!("model is not loaded"))?
-                                .forward(&input_ids, start_pos)?;
-                            let verifier_logits = Self::logits_sequence(verifier_logits)?;
-
-                            // Decide acceptance and the correction/bonus token.
-                            //
-                            // Use standard rejection sampling (`min(1, p/q)` +
-                            // residual correction) when the draft strategy
-                            // exposes per-position logits and the sampling
-                            // temperature is non-zero. Otherwise fall back to
-                            // greedy exact-match verification, which only
-                            // accepts draft tokens that equal the target argmax.
-                            let (accepted, correction_token) =
-                                if params.temperature > 1e-6 && has_draft_logits {
-                                    let verifier_vecs =
-                                        Self::verifier_logits_to_vecs(&verifier_logits)?;
-                                    // Derive an independent PRNG seed from the
-                                    // request seed so rejection sampling
-                                    // doesn't share state with `logits_processor`.
-                                    let mut rng_state =
-                                        params.seed.unwrap_or(42).wrapping_add(0x9E3779B97F4A7C15);
-                                    verify_with_rejection_sampling(
-                                        &verifier_vecs,
-                                        &proposed_with_logits,
-                                        params.temperature,
-                                        &mut rng_state,
-                                    )
-                                } else {
-                                    let mut verifier_greedy = Vec::with_capacity(proposed.len());
-                                    for idx in 0..proposed.len() {
-                                        verifier_greedy
-                                            .push(Self::greedy_token(&verifier_logits.get(idx)?)?);
-                                    }
-                                    let accepted =
-                                        verify_greedy_tokens(proposed.len(), &proposed, |idx| {
-                                            verifier_greedy.get(idx).copied()
-                                        });
-                                    (accepted, None)
-                                };
-
-                            total_draft_tokens += proposed.len();
-                            total_accepted_tokens += accepted;
-
-                            start_pos += verify_tokens.len();
-                            if accepted > 0 {
-                                let accepted_tokens = &proposed[..accepted];
-                                all_tokens.extend_from_slice(accepted_tokens);
-                                current_prefix_guard.extend_from_slice(accepted_tokens);
-                                strategy.update_context(accepted_tokens);
-                                generated += accepted;
-                                self.decode_and_emit_delta(
-                                    &all_tokens,
-                                    token_ids.len(),
-                                    &mut prev_text,
-                                    sink,
-                                )?;
-                            }
-
-                            if generated >= params.max_tokens {
-                                break;
-                            }
-
-                            // Determine the next token to emit.
-                            //
-                            // When rejection sampling produced a correction or
-                            // bonus token, use it directly — the token is already
-                            // temperature-scaled and (for corrections) drawn
-                            // from the residual `norm(max(0, p - q))`. When some
-                            // draft tokens were rejected, the model's KV cache
-                            // contains stale entries for the rejected tokens,
-                            // so we replay the accepted prefix to restore a
-                            // consistent cache state before emitting the token.
-                            //
-                            // When no correction/bonus token is available
-                            // (greedy path, or rejection sampling with no bonus
-                            // slot), fall back to sampling from the verifier
-                            // logits at the appropriate position — matching the
-                            // pre-existing behaviour.
-                            let next_tok = if let Some(tok) = correction_token {
-                                if accepted < proposed.len() {
-                                    let replay_len = all_tokens.len();
-                                    start_pos = self.replay_generation_prefix(
-                                        &mut model_guard,
-                                        &all_tokens[..replay_len],
-                                    )?;
-                                }
-                                tok
-                            } else {
-                                let correction_logits = if accepted == proposed.len() {
-                                    verifier_logits.get(proposed.len())?
-                                } else {
-                                    let replay_len = all_tokens.len();
-                                    start_pos = self.replay_generation_prefix(
-                                        &mut model_guard,
-                                        &all_tokens[..replay_len],
-                                    )?;
-                                    verifier_logits.get(accepted)?
-                                };
-
-                                let filtered = if let Some(ref fmt) = params.response_format {
-                                    filter_logits_by_grammar(
-                                        &correction_logits,
-                                        &prev_text,
-                                        fmt,
-                                        &self.vocab_strings,
-                                        &self.eos_token_ids,
-                                        &self.device,
-                                    )?
-                                } else {
-                                    correction_logits.clone()
-                                };
-                                logits_processor.sample(&filtered)?
-                            };
-
-                            if self.eos_token_ids.contains(&next_tok) {
-                                break;
-                            }
-
-                            all_tokens.push(next_tok);
-                            current_prefix_guard.push(next_tok);
-                            strategy.update_context(&[next_tok]);
-                            generated += 1;
+                        start_pos += verify_tokens.len();
+                        if accepted > 0 {
+                            let accepted_tokens = &proposed[..accepted];
+                            all_tokens.extend_from_slice(accepted_tokens);
+                            current_prefix_guard.extend_from_slice(accepted_tokens);
+                            strategy.update_context(accepted_tokens);
+                            generated += accepted;
                             self.decode_and_emit_delta(
                                 &all_tokens,
                                 token_ids.len(),
                                 &mut prev_text,
                                 sink,
                             )?;
-                            continue;
                         }
+
+                        if generated >= params.max_tokens {
+                            break;
+                        }
+
+                        // Determine the next token to emit.
+                        //
+                        // When rejection sampling produced a correction or
+                        // bonus token, use it directly — the token is already
+                        // temperature-scaled and (for corrections) drawn
+                        // from the residual `norm(max(0, p - q))`. When some
+                        // draft tokens were rejected, the model's KV cache
+                        // contains stale entries for the rejected tokens,
+                        // so we replay the accepted prefix to restore a
+                        // consistent cache state before emitting the token.
+                        //
+                        // When no correction/bonus token is available
+                        // (greedy path, or rejection sampling with no bonus
+                        // slot), fall back to sampling from the verifier
+                        // logits at the appropriate position — matching the
+                        // pre-existing behaviour.
+                        let next_tok = if let Some(tok) = correction_token {
+                            if accepted < proposed.len() {
+                                let replay_len = all_tokens.len();
+                                start_pos = self.replay_generation_prefix(
+                                    &mut model_guard,
+                                    &all_tokens[..replay_len],
+                                )?;
+                            }
+                            tok
+                        } else {
+                            let correction_logits = if accepted == proposed.len() {
+                                verifier_logits.get(proposed.len())?
+                            } else {
+                                let replay_len = all_tokens.len();
+                                start_pos = self.replay_generation_prefix(
+                                    &mut model_guard,
+                                    &all_tokens[..replay_len],
+                                )?;
+                                verifier_logits.get(accepted)?
+                            };
+
+                            let filtered = if let Some(ref fmt) = params.response_format {
+                                filter_logits_by_grammar(
+                                    &correction_logits,
+                                    &prev_text,
+                                    fmt,
+                                    &self.vocab_strings,
+                                    &self.eos_token_ids,
+                                    &self.device,
+                                )?
+                            } else {
+                                correction_logits.clone()
+                            };
+                            logits_processor.sample(&filtered)?
+                        };
+
+                        if self.eos_token_ids.contains(&next_tok) {
+                            break;
+                        }
+
+                        all_tokens.push(next_tok);
+                        current_prefix_guard.push(next_tok);
+                        strategy.update_context(&[next_tok]);
+                        generated += 1;
+                        self.decode_and_emit_delta(
+                            &all_tokens,
+                            token_ids.len(),
+                            &mut prev_text,
+                            sink,
+                        )?;
+                        continue;
                     }
                 }
 
@@ -2560,12 +2564,11 @@ fn autocomplete_json(text: &str) -> String {
             stack.push('}');
         } else if c == '[' {
             stack.push(']');
-        } else if c == '}' || c == ']' {
-            if let Some(&last) = stack.last() {
-                if last == c {
-                    stack.pop();
-                }
-            }
+        } else if (c == '}' || c == ']')
+            && let Some(&last) = stack.last()
+            && last == c
+        {
+            stack.pop();
         }
         i += 1;
     }
@@ -2618,41 +2621,42 @@ fn validate_partial_json_schema(
         }
     }
 
-    if let Some(schema_type) = schema.get("type").and_then(|v| v.as_str()) {
-        if value != &serde_json::Value::Null && !json_value_matches_type(value, schema_type) {
-            return Err(format!("{} expected type {}", path, schema_type));
+    if let Some(schema_type) = schema.get("type").and_then(|v| v.as_str())
+        && value != &serde_json::Value::Null
+        && !json_value_matches_type(value, schema_type)
+    {
+        return Err(format!("{} expected type {}", path, schema_type));
+    }
+
+    if let Some(object) = value.as_object()
+        && let Some(properties) = schema.get("properties").and_then(|v| v.as_object())
+    {
+        for (field, property_schema) in properties {
+            if let Some(field_value) = object.get(field) {
+                validate_partial_json_schema(
+                    field_value,
+                    property_schema,
+                    &format!("{}.{}", path, field),
+                )?;
+            }
+        }
+        if schema.get("additionalProperties").and_then(|v| v.as_bool()) == Some(false) {
+            for field in object.keys() {
+                if field != "_dummy" && !properties.contains_key(field) {
+                    return Err(format!(
+                        "{} contains unsupported property '{}'",
+                        path, field
+                    ));
+                }
+            }
         }
     }
 
-    if let Some(object) = value.as_object() {
-        if let Some(properties) = schema.get("properties").and_then(|v| v.as_object()) {
-            for (field, property_schema) in properties {
-                if let Some(field_value) = object.get(field) {
-                    validate_partial_json_schema(
-                        field_value,
-                        property_schema,
-                        &format!("{}.{}", path, field),
-                    )?;
-                }
-            }
-            if schema.get("additionalProperties").and_then(|v| v.as_bool()) == Some(false) {
-                for field in object.keys() {
-                    if field != "_dummy" && !properties.contains_key(field) {
-                        return Err(format!(
-                            "{} contains unsupported property '{}'",
-                            path, field
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    if let Some(item_schema) = schema.get("items") {
-        if let Some(items) = value.as_array() {
-            for (idx, item) in items.iter().enumerate() {
-                validate_partial_json_schema(item, item_schema, &format!("{}[{}]", path, idx))?;
-            }
+    if let Some(item_schema) = schema.get("items")
+        && let Some(items) = value.as_array()
+    {
+        for (idx, item) in items.iter().enumerate() {
+            validate_partial_json_schema(item, item_schema, &format!("{}[{}]", path, idx))?;
         }
     }
 
@@ -2664,16 +2668,16 @@ fn validate_complete_json_schema(
     schema: &serde_json::Value,
     path: &str,
 ) -> std::result::Result<(), String> {
-    if let Some(enum_values) = schema.get("enum").and_then(|v| v.as_array()) {
-        if !enum_values.iter().any(|candidate| candidate == value) {
-            return Err(format!("{} does not match any allowed enum value", path));
-        }
+    if let Some(enum_values) = schema.get("enum").and_then(|v| v.as_array())
+        && !enum_values.iter().any(|candidate| candidate == value)
+    {
+        return Err(format!("{} does not match any allowed enum value", path));
     }
 
-    if let Some(schema_type) = schema.get("type").and_then(|v| v.as_str()) {
-        if !json_value_matches_type(value, schema_type) {
-            return Err(format!("{} expected type {}", path, schema_type));
-        }
+    if let Some(schema_type) = schema.get("type").and_then(|v| v.as_str())
+        && !json_value_matches_type(value, schema_type)
+    {
+        return Err(format!("{} expected type {}", path, schema_type));
     }
 
     if let Some(object) = value.as_object() {
@@ -2707,11 +2711,11 @@ fn validate_complete_json_schema(
         }
     }
 
-    if let Some(item_schema) = schema.get("items") {
-        if let Some(items) = value.as_array() {
-            for (idx, item) in items.iter().enumerate() {
-                validate_complete_json_schema(item, item_schema, &format!("{}[{}]", path, idx))?;
-            }
+    if let Some(item_schema) = schema.get("items")
+        && let Some(items) = value.as_array()
+    {
+        for (idx, item) in items.iter().enumerate() {
+            validate_complete_json_schema(item, item_schema, &format!("{}[{}]", path, idx))?;
         }
     }
 
@@ -3630,11 +3634,13 @@ mod tests {
         let dir = create_temp_dir();
         let res_device = engine.load(&dir, DeviceKind::Npu);
         assert!(res_device.is_err());
-        assert!(res_device
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("only supports CPU"));
+        assert!(
+            res_device
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("only supports CPU")
+        );
         let _ = fs::remove_dir_all(dir);
     }
 

@@ -2,8 +2,8 @@
 
 use super::model_download::{ModelDownloadPhase, ModelDownloadStatus};
 use super::model_index::{
-    model_index_installation_state, validate_index_id, ModelIndexEntry,
-    ModelIndexInstallationState as InstalledPullState,
+    ModelIndexEntry, ModelIndexInstallationState as InstalledPullState,
+    model_index_installation_state, validate_index_id,
 };
 use super::*;
 use std::collections::VecDeque;
@@ -342,7 +342,7 @@ pub(crate) async fn handle_ollama_tags(
             return ollama_error_response(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "failed to inspect the local model catalog",
-            )
+            );
         }
     };
     let mut models = catalog
@@ -377,7 +377,7 @@ pub(crate) async fn handle_ollama_ps(
             return ollama_error_response(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "failed to inspect the active local model",
-            )
+            );
         }
     };
     let expires_at = match runtime.as_ref() {
@@ -431,7 +431,7 @@ pub(crate) async fn handle_ollama_show(
     }
     let requested = match (payload.model.as_deref(), payload.name.as_deref()) {
         (Some(model), Some(name)) if model != name => {
-            return ollama_bad_request("model and legacy name selectors must match")
+            return ollama_bad_request("model and legacy name selectors must match");
         }
         (Some(model), _) | (_, Some(model)) if !model.is_empty() => model,
         _ => return ollama_bad_request("model is required"),
@@ -445,7 +445,7 @@ pub(crate) async fn handle_ollama_show(
             return ollama_error_response(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "failed to inspect the local model catalog",
-            )
+            );
         }
     };
     let requested = if requested == "default" {
@@ -460,7 +460,7 @@ pub(crate) async fn handle_ollama_show(
                 return ollama_error_response(
                     axum::http::StatusCode::NOT_FOUND,
                     "model 'default' not found",
-                )
+                );
             }
         }
     } else {
@@ -561,7 +561,7 @@ pub(crate) async fn handle_ollama_delete(
             return ollama_error_response(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "failed to inspect the local model catalog",
-            )
+            );
         }
     };
     let matches = catalog
@@ -631,19 +631,19 @@ pub(crate) async fn handle_ollama_pull(
             return ollama_error_response(
                 axum::http::StatusCode::BAD_GATEWAY,
                 "the configured signed model index is invalid",
-            )
+            );
         }
         Err(ModelIndexError::Unavailable(_)) => {
             return ollama_error_response(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 "the configured signed model index is unavailable",
-            )
+            );
         }
         Err(ModelIndexError::Internal(_)) => {
             return ollama_error_response(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "the signed model index could not be inspected",
-            )
+            );
         }
     };
     let Some(entry) = snapshot.data.into_iter().find(|entry| entry.id == model) else {
@@ -716,7 +716,7 @@ async fn admit_ollama_pull(
                     "catalog entry {:?} already exists but does not match the signed model entry",
                     entry.filename
                 ),
-            ))
+            ));
         }
         InstalledPullState::Missing => None,
         InstalledPullState::Upgradable => {
@@ -924,13 +924,13 @@ async fn wait_for_ollama_pull(
                         axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                         "the verified download completed without a matching catalog entry",
                     )),
-                }
+                };
             }
             ModelDownloadPhase::Cancelled => {
                 return Err(OllamaPullError::new(
                     axum::http::StatusCode::CONFLICT,
                     "the model download was cancelled and can be resumed",
-                ))
+                ));
             }
             ModelDownloadPhase::Error => {
                 return Err(OllamaPullError::new(
@@ -938,13 +938,13 @@ async fn wait_for_ollama_pull(
                     status
                         .error
                         .unwrap_or_else(|| "the verified model download failed".to_string()),
-                ))
+                ));
             }
             ModelDownloadPhase::Idle => {
                 return Err(OllamaPullError::new(
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                     "the verified model download ended without a terminal status",
-                ))
+                ));
             }
         }
     }
@@ -1153,24 +1153,24 @@ pub(crate) async fn activate_ollama_model(
         .filter(|entry| ollama_catalog_entry_matches_selector(entry, requested))
         .collect::<Vec<_>>();
 
-    if candidates.is_empty() && validate_index_id(requested).is_ok() {
-        if let Some(index) = state.model_index.as_ref() {
-            let snapshot = index.snapshot(false).await.map_err(|_| {
-                OllamaActivationError::new(
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                    "the signed model index is temporarily unavailable",
-                )
-            })?;
-            if let Some(index_entry) = snapshot.data.iter().find(|entry| entry.id == requested) {
-                if let Some(entry) = catalog
-                    .models
-                    .iter()
-                    .find(|entry| entry.id == index_entry.filename)
-                    .filter(|entry| catalog_entry_matches_signed_index(entry, index_entry))
-                {
-                    candidates.push(entry);
-                }
-            }
+    if candidates.is_empty()
+        && validate_index_id(requested).is_ok()
+        && let Some(index) = state.model_index.as_ref()
+    {
+        let snapshot = index.snapshot(false).await.map_err(|_| {
+            OllamaActivationError::new(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "the signed model index is temporarily unavailable",
+            )
+        })?;
+        if let Some(index_entry) = snapshot.data.iter().find(|entry| entry.id == requested)
+            && let Some(entry) = catalog
+                .models
+                .iter()
+                .find(|entry| entry.id == index_entry.filename)
+                .filter(|entry| catalog_entry_matches_signed_index(entry, index_entry))
+        {
+            candidates.push(entry);
         }
     }
 
@@ -1263,7 +1263,7 @@ pub(crate) async fn wait_for_model_activation(
                 return Err(OllamaActivationError::new(
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,
                     format!("model activation failed: {message}"),
-                ))
+                ));
             }
         }
         completion.changed().await.map_err(|_| {
@@ -1419,7 +1419,7 @@ async fn handle_ollama_lifecycle(
                     return ollama_error_response(
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,
                         message,
-                    )
+                    );
                 }
             };
             residency_lease = Some(lease);
@@ -1438,7 +1438,7 @@ async fn handle_ollama_lifecycle(
                     return ollama_error_response(
                         axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                         "failed to inspect the active local model",
-                    )
+                    );
                 }
             };
             let Some(runtime) = runtime else {
@@ -1502,7 +1502,7 @@ pub(crate) async fn handle_ollama_chat(
                 OllamaOutputKind::Chat,
                 started,
             )
-            .await
+            .await;
         }
         Ok(None) => {}
         Err(message) => return ollama_bad_request(message),
@@ -1535,7 +1535,7 @@ pub(crate) async fn handle_ollama_chat(
     {
         Ok(lease) => lease,
         Err(message) => {
-            return ollama_error_response(axum::http::StatusCode::SERVICE_UNAVAILABLE, message)
+            return ollama_error_response(axum::http::StatusCode::SERVICE_UNAVAILABLE, message);
         }
     };
     let mut chat_request = chat_request;
@@ -1575,7 +1575,7 @@ pub(crate) async fn handle_ollama_generate(
                 OllamaOutputKind::Generate,
                 started,
             )
-            .await
+            .await;
         }
         Ok(None) => {}
         Err(message) => return ollama_bad_request(message),
@@ -1608,7 +1608,7 @@ pub(crate) async fn handle_ollama_generate(
     {
         Ok(lease) => lease,
         Err(message) => {
-            return ollama_error_response(axum::http::StatusCode::SERVICE_UNAVAILABLE, message)
+            return ollama_error_response(axum::http::StatusCode::SERVICE_UNAVAILABLE, message);
         }
     };
     let mut chat_request = chat_request;
@@ -1684,7 +1684,7 @@ pub(crate) async fn handle_ollama_embed(
     {
         Ok(lease) => lease,
         Err(message) => {
-            return ollama_error_response(axum::http::StatusCode::SERVICE_UNAVAILABLE, message)
+            return ollama_error_response(axum::http::StatusCode::SERVICE_UNAVAILABLE, message);
         }
     };
     let mut result = match execute_embedding_batch(
@@ -1764,7 +1764,7 @@ pub(crate) async fn handle_ollama_legacy_embeddings(
     {
         Ok(lease) => lease,
         Err(message) => {
-            return ollama_error_response(axum::http::StatusCode::SERVICE_UNAVAILABLE, message)
+            return ollama_error_response(axum::http::StatusCode::SERVICE_UNAVAILABLE, message);
         }
     };
     let result = match execute_embedding_batch(
@@ -2032,8 +2032,8 @@ fn ollama_chat_messages(
                     None if extensions.contains_key("tool_calls") => serde_json::Value::Null,
                     None => {
                         return Err(format!(
-                        "assistant message at index {message_index} requires content or tool_calls"
-                    ))
+                            "assistant message at index {message_index} requires content or tool_calls"
+                        ));
                     }
                 };
                 converted.push(ChatCompletionMessage {
@@ -2082,8 +2082,8 @@ fn ollama_chat_messages(
             }
             _ => {
                 return Err(format!(
-                "message at index {message_index} must use role system, user, assistant, or tool"
-            ))
+                    "message at index {message_index} must use role system, user, assistant, or tool"
+                ));
             }
         }
     }
@@ -2450,7 +2450,7 @@ async fn ollama_from_chat_response(
             return ollama_error_response(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "failed to read the bounded internal generation response",
-            )
+            );
         }
     };
     let mut chat = match serde_json::from_slice::<serde_json::Value>(&body) {
@@ -2459,7 +2459,7 @@ async fn ollama_from_chat_response(
             return ollama_error_response(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "the internal generation response was invalid",
-            )
+            );
         }
     };
     chat["model"] = json!(requested_model);
@@ -3673,10 +3673,12 @@ mod tests {
             "choices": [],
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
         });
-        assert!(state
-            .ingest(early_usage)
-            .unwrap_err()
-            .contains("before its finish reason"));
+        assert!(
+            state
+                .ingest(early_usage)
+                .unwrap_err()
+                .contains("before its finish reason")
+        );
 
         let mut state = OllamaStreamState::new(OllamaOutputKind::Chat, Instant::now());
         let extended_delta = json!({
@@ -3690,9 +3692,11 @@ mod tests {
                 "finish_reason": null
             }]
         });
-        assert!(state
-            .ingest(extended_delta)
-            .unwrap_err()
-            .contains("unsupported field"));
+        assert!(
+            state
+                .ingest(extended_delta)
+                .unwrap_err()
+                .contains("unsupported field")
+        );
     }
 }

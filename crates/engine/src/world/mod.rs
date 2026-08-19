@@ -416,16 +416,16 @@ impl WorldModelLoop {
                 }
             }
             WorldObservation::Scalar { name, value } => {
-                if let Some(&(min, max)) = schema.scalar_ranges.get(name) {
-                    if *value < min || *value > max {
-                        anyhow::bail!(
-                            "Scalar observation '{}' value {} is out of range [{}, {}]",
-                            name,
-                            value,
-                            min,
-                            max
-                        );
-                    }
+                if let Some(&(min, max)) = schema.scalar_ranges.get(name)
+                    && (*value < min || *value > max)
+                {
+                    anyhow::bail!(
+                        "Scalar observation '{}' value {} is out of range [{}, {}]",
+                        name,
+                        value,
+                        min,
+                        max
+                    );
                 }
             }
         }
@@ -445,15 +445,15 @@ impl WorldModelLoop {
                 action.action_space
             );
         }
-        if let Some(&expected_dim) = schema.action_dimensions.get(&action.action_space) {
-            if action.values.len() != expected_dim {
-                anyhow::bail!(
-                    "Action space '{}' expected dimension {}, got {}",
-                    action.action_space,
-                    expected_dim,
-                    action.values.len()
-                );
-            }
+        if let Some(&expected_dim) = schema.action_dimensions.get(&action.action_space)
+            && action.values.len() != expected_dim
+        {
+            anyhow::bail!(
+                "Action space '{}' expected dimension {}, got {}",
+                action.action_space,
+                expected_dim,
+                action.values.len()
+            );
         }
         if let Some((min, max)) = schema.value_range {
             for &val in &action.values {
@@ -1033,7 +1033,7 @@ mod tests {
             WorldModelConstraints::from_thermal_power(ThermalState::Serious, PowerState::PluggedIn);
         assert!(c.is_degraded());
         assert_eq!(c.effective_horizon(10), 4); // max_degraded_horizon = 4
-                                                // Skip every other step
+        // Skip every other step
         assert!(!c.should_skip_observation(2)); // step 2 % 2 == 0 -> no skip
         assert!(c.should_skip_observation(1)); // step 1 % 2 != 0 -> skip
     }

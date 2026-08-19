@@ -1,11 +1,11 @@
 //! Bounded, resumable local-file imports into the model catalog.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::fs::{self, OpenOptions};
@@ -15,7 +15,7 @@ use tokio::sync::{Mutex, RwLock};
 use super::model_license::{ModelLicensePolicy, ModelLicensePolicyStatus};
 use super::model_manager::validate_model_filename;
 use super::model_provenance::{
-    normalize_source_url, write_provenance, ModelAcquisitionKind, ModelProvenanceDraft,
+    ModelAcquisitionKind, ModelProvenanceDraft, normalize_source_url, write_provenance,
 };
 use super::model_storage::{ModelStorageError, ModelStorageManager};
 
@@ -220,17 +220,17 @@ impl ModelImportManager {
             Err(error) => {
                 return Err(ModelImportError::Internal(format!(
                     "failed to read staged model import metadata: {error}"
-                )))
+                )));
             }
         };
-        if let Some(existing) = existing.as_ref() {
-            if existing.filename != request.filename || existing.total_bytes != request.total_bytes
-            {
-                return Err(ModelImportError::Conflict(
+        if let Some(existing) = existing.as_ref()
+            && (existing.filename != request.filename
+                || existing.total_bytes != request.total_bytes)
+        {
+            return Err(ModelImportError::Conflict(
                     "A staged import with the same filename has different metadata. Discard it before starting a different file."
                         .to_string(),
                 ));
-            }
         }
 
         let uploaded_bytes = if existing.is_none() {
@@ -549,12 +549,12 @@ impl ModelImportManager {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(ModelImportError::NotFound(format!(
                     "No staged import exists for '{filename}'."
-                )))
+                )));
             }
             Err(error) => {
                 return Err(ModelImportError::Internal(format!(
                     "failed to inspect model import staging directory: {error}"
-                )))
+                )));
             }
         }
         Ok(staging_root)
@@ -830,10 +830,10 @@ async fn cleanup_staging(part_path: &Path, metadata_path: &Path) {
         metadata_path,
         &metadata_path.with_extension("json.tmp"),
     ] {
-        if let Err(error) = fs::remove_file(path).await {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(path = %path.display(), %error, "Failed to clean model import staging file");
-            }
+        if let Err(error) = fs::remove_file(path).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %path.display(), %error, "Failed to clean model import staging file");
         }
     }
 }
@@ -1005,11 +1005,13 @@ mod tests {
             manager.begin(request("too-large.gguf", &[0_u8; 41])).await,
             Err(ModelImportError::Conflict(_))
         ));
-        assert!(!temp
-            .path()
-            .join(STAGING_DIRECTORY)
-            .join("too-large.gguf.json")
-            .exists());
+        assert!(
+            !temp
+                .path()
+                .join(STAGING_DIRECTORY)
+                .join("too-large.gguf.json")
+                .exists()
+        );
         manager
             .begin(request("fits.gguf", &[0_u8; 40]))
             .await

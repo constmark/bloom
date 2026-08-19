@@ -7,7 +7,7 @@ use bloomai_core::{
 };
 
 use crate::core::memory::{available_system_memory, error_text_indicates_oom};
-use crate::{model::OutputSink, Engine, InferenceRequest, LoadedModel, ModelInput, ModelOutput};
+use crate::{Engine, InferenceRequest, LoadedModel, ModelInput, ModelOutput, model::OutputSink};
 
 /// Default context size used for memory pre-checks when none is specified.
 const DEFAULT_CONTEXT_SIZE: usize = 2048;
@@ -398,13 +398,13 @@ impl InferencePipeline {
 
         if let Some(registry) = self.model.processors() {
             for name in registry.specs().iter().map(|s| &s.name) {
-                if name.contains("tokenizer") {
-                    if let Ok(proc) = registry.get(name) {
-                        let blocks =
-                            proc.process(vec![crate::io::DataBlock::Text(text.to_string())])?;
-                        if let Some(crate::io::DataBlock::Tokens(ids)) = blocks.first() {
-                            return Ok(ids.clone());
-                        }
+                if name.contains("tokenizer")
+                    && let Ok(proc) = registry.get(name)
+                {
+                    let blocks =
+                        proc.process(vec![crate::io::DataBlock::Text(text.to_string())])?;
+                    if let Some(crate::io::DataBlock::Tokens(ids)) = blocks.first() {
+                        return Ok(ids.clone());
                     }
                 }
             }
@@ -417,13 +417,13 @@ impl InferencePipeline {
     pub fn detokenize(&self, tokens: &[u32]) -> Result<String> {
         if let Some(registry) = self.model.processors() {
             for name in registry.specs().iter().map(|s| &s.name) {
-                if name.contains("tokenizer") {
-                    if let Ok(proc) = registry.get(name) {
-                        let blocks =
-                            proc.process(vec![crate::io::DataBlock::Tokens(tokens.to_vec())])?;
-                        if let Some(crate::io::DataBlock::Text(text)) = blocks.first() {
-                            return Ok(text.clone());
-                        }
+                if name.contains("tokenizer")
+                    && let Ok(proc) = registry.get(name)
+                {
+                    let blocks =
+                        proc.process(vec![crate::io::DataBlock::Tokens(tokens.to_vec())])?;
+                    if let Some(crate::io::DataBlock::Text(text)) = blocks.first() {
+                        return Ok(text.clone());
                     }
                 }
             }
@@ -464,8 +464,8 @@ mod tests {
         ModelManifest,
     };
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     };
 
     #[test]
@@ -666,7 +666,8 @@ mod tests {
         };
 
         // If strict memory budget is NOT set, it should fallback to CPU and succeed
-        std::env::remove_var("BLOOM_STRICT_MEMORY_BUDGET");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("BLOOM_STRICT_MEMORY_BUDGET") };
         let pipeline = InferencePipeline::load_standalone_with_context(
             &engine,
             DeviceKind::Gpu,

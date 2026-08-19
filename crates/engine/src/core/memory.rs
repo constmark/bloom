@@ -1,9 +1,9 @@
 // Placement loops intentionally index parallel vectors by device/chunk coordinate.
 #![allow(clippy::needless_range_loop)]
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 
-use crate::core::manifest::{format_bytes, suggest_memory_downgrade, MemoryEstimate};
+use crate::core::manifest::{MemoryEstimate, format_bytes, suggest_memory_downgrade};
 
 const DEFAULT_MEMORY_UTILIZATION: f64 = 0.75;
 const MIN_MEMORY_UTILIZATION: f64 = 0.05;
@@ -125,21 +125,21 @@ pub fn plan_memory_preallocation(
     let budget_bytes = available_bytes
         .map(|available| ((available as f64) * memory_utilization).floor().max(0.0) as usize);
 
-    if let Some(budget) = budget_bytes {
-        if estimate.total_bytes > budget {
-            let mut message = format!(
-                "memory budget exceeded before model load: estimated {} but conservative budget is {} (utilization {:.0}% of available {})",
-                estimate.display_summary(),
-                format_bytes(budget),
-                memory_utilization * 100.0,
-                format_bytes(available_bytes.unwrap_or_default())
-            );
-            for suggestion in suggest_memory_downgrade(&estimate, budget) {
-                message.push_str("\n  - ");
-                message.push_str(&suggestion);
-            }
-            bail!(message);
+    if let Some(budget) = budget_bytes
+        && estimate.total_bytes > budget
+    {
+        let mut message = format!(
+            "memory budget exceeded before model load: estimated {} but conservative budget is {} (utilization {:.0}% of available {})",
+            estimate.display_summary(),
+            format_bytes(budget),
+            memory_utilization * 100.0,
+            format_bytes(available_bytes.unwrap_or_default())
+        );
+        for suggestion in suggest_memory_downgrade(&estimate, budget) {
+            message.push_str("\n  - ");
+            message.push_str(&suggestion);
         }
+        bail!(message);
     }
 
     let reserve_bytes = config.reserve_memory_bytes.unwrap_or_else(|| {
@@ -156,14 +156,14 @@ pub fn plan_memory_preallocation(
         );
     }
 
-    if let Some(budget) = budget_bytes {
-        if reserve_bytes > budget {
-            bail!(
-                "requested startup memory reservation {} exceeds conservative budget {}",
-                format_bytes(reserve_bytes),
-                format_bytes(budget)
-            );
-        }
+    if let Some(budget) = budget_bytes
+        && reserve_bytes > budget
+    {
+        bail!(
+            "requested startup memory reservation {} exceeds conservative budget {}",
+            format_bytes(reserve_bytes),
+            format_bytes(budget)
+        );
     }
 
     Ok(MemoryPreallocationPlan {
@@ -194,12 +194,11 @@ pub fn available_system_memory() -> Option<usize> {
     #[cfg(target_os = "macos")]
     {
         let output = std::process::Command::new("vm_stat").output().ok()?;
-        if output.status.success() {
-            if let Some(bytes) =
+        if output.status.success()
+            && let Some(bytes) =
                 parse_macos_vm_stat_available(&String::from_utf8_lossy(&output.stdout))
-            {
-                return Some(bytes);
-            }
+        {
+            return Some(bytes);
         }
 
         let output = std::process::Command::new("sysctl")
@@ -421,11 +420,15 @@ mod tests {
         assert_eq!(strategy.placements[2], DevicePlacement::Cpu);
         assert_eq!(strategy.placements[7], DevicePlacement::Cpu);
 
-        std::env::set_var("BLOOM_GPU_LAYERS", "4");
-        std::env::set_var("BLOOM_NPU_LAYERS", "2");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("BLOOM_GPU_LAYERS", "4") };
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("BLOOM_NPU_LAYERS", "2") };
         let strategy_env = LayerPlacementStrategy::new(8, None);
-        std::env::remove_var("BLOOM_GPU_LAYERS");
-        std::env::remove_var("BLOOM_NPU_LAYERS");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("BLOOM_GPU_LAYERS") };
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("BLOOM_NPU_LAYERS") };
 
         assert_eq!(strategy_env.placements[0], DevicePlacement::Gpu);
         assert_eq!(strategy_env.placements[3], DevicePlacement::Gpu);

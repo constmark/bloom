@@ -10,15 +10,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use bloomai_core::{
-    constants::{GIB, GIB_F64, MIB_F64},
     DType, DeviceCapability, DeviceClass, DeviceKind, GenerationParams, Modality, ModelFamily,
     ModelFormat,
+    constants::{GIB, GIB_F64, MIB_F64},
 };
 
 use crate::engine::{
-    default_engine_supports, BackendMaturity, Engine, EngineCapability, SupportLevel,
+    BackendMaturity, Engine, EngineCapability, SupportLevel, default_engine_supports,
 };
 use crate::io::{ModelInput, ModelOutput, OutputChunk};
 use crate::model::{LoadedModel, ModelMetadata, OutputSink};
@@ -263,12 +263,10 @@ impl LoadedModel for LongCatImageEditModel {
                 audio: None,
                 video: None,
             }),
-            Err(native_err) => {
-                Err(anyhow!(
-                    "LongCat-Image-Edit package and GPU startup were validated, but full image generation still needs a native non-PyTorch runner or a complete Bloom-native DiT/VAE/text-encoder graph.\nProbe: {}\nNative runner: {native_err}",
-                    self.probe
-                ))
-            }
+            Err(native_err) => Err(anyhow!(
+                "LongCat-Image-Edit package and GPU startup were validated, but full image generation still needs a native non-PyTorch runner or a complete Bloom-native DiT/VAE/text-encoder graph.\nProbe: {}\nNative runner: {native_err}",
+                self.probe
+            )),
         }
     }
 
@@ -805,9 +803,11 @@ fn set_gpu_tilelang_backend_if_unset() {
         return;
     }
     if cfg!(target_os = "macos") {
-        std::env::set_var("TILELANG_BACKEND", "mlx");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("TILELANG_BACKEND", "mlx") };
     } else {
-        std::env::set_var("TILELANG_BACKEND", "cuda");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("TILELANG_BACKEND", "cuda") };
     }
 }
 
@@ -850,28 +850,32 @@ mod tests {
         fs::write(dir.path().join("text_encoder/model.pt"), "").unwrap();
 
         let err = validate_no_pytorch_artifacts(dir.path()).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("refusing PyTorch checkpoint artifact"));
+        assert!(
+            err.to_string()
+                .contains("refusing PyTorch checkpoint artifact")
+        );
     }
 
     #[test]
     fn rejects_pytorch_named_runner() {
         let err = reject_pytorch_runner(Path::new("/tmp/python")).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("refusing PyTorch/Diffusers runner"));
+        assert!(
+            err.to_string()
+                .contains("refusing PyTorch/Diffusers runner")
+        );
     }
 
     #[test]
     fn longcat_backend_is_gpu_only() {
         let engine = LongCatImageEditEngine;
         assert_eq!(engine.supported_devices(), vec![DeviceKind::Gpu]);
-        assert!(engine
-            .capability()
-            .supported_devices
-            .iter()
-            .all(|device| !matches!(device, DeviceClass::Cpu)));
+        assert!(
+            engine
+                .capability()
+                .supported_devices
+                .iter()
+                .all(|device| !matches!(device, DeviceClass::Cpu))
+        );
     }
 
     #[test]

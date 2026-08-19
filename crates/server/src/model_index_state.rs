@@ -6,7 +6,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 const WATERMARK_SCHEMA_VERSION: u8 = 1;
@@ -111,10 +111,10 @@ fn admit_sync(
         match candidate.generated_at.cmp(&current.generated_at) {
             std::cmp::Ordering::Less => return Ok(ModelIndexWatermarkAdmission::Rollback(current)),
             std::cmp::Ordering::Equal if candidate.generation_id == current.generation_id => {
-                return Ok(ModelIndexWatermarkAdmission::Accepted)
+                return Ok(ModelIndexWatermarkAdmission::Accepted);
             }
             std::cmp::Ordering::Equal => {
-                return Ok(ModelIndexWatermarkAdmission::Conflict(current))
+                return Ok(ModelIndexWatermarkAdmission::Conflict(current));
             }
             std::cmp::Ordering::Greater => {}
         }
@@ -166,7 +166,7 @@ fn admit_sync(
         std::cmp::Ordering::Greater => {
             return Err(anyhow!(
                 "persisted model index watermark moved backwards during publication"
-            ))
+            ));
         }
     };
     Ok(admission)
@@ -240,7 +240,7 @@ fn publish_record(directory: &Path, record: &WatermarkRecord) -> Result<PublishO
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
-                return Err(error).context("failed to create model index watermark temporary file")
+                return Err(error).context("failed to create model index watermark temporary file");
             }
         }
     }
@@ -263,7 +263,7 @@ fn publish_record(directory: &Path, record: &WatermarkRecord) -> Result<PublishO
                 }
             }
             Err(error) => {
-                return Err(error).context("failed to publish model index watermark atomically")
+                return Err(error).context("failed to publish model index watermark atomically");
             }
         }
         Ok(PublishOutcome::Published)
@@ -319,7 +319,7 @@ fn read_records(directory: &Path) -> Result<Vec<WatermarkRecord>> {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => {
-            return Err(error).context("failed to inspect model index watermark directory")
+            return Err(error).context("failed to inspect model index watermark directory");
         }
     };
     if metadata.file_type().is_symlink() || !metadata.is_dir() {

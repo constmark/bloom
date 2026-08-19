@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use bloomai_backend::BackendRegistry;
 use bloomai_core::DeviceKind;
 use bloomai_engine::{MemoryPreallocationConfig, SpeculativeMode, SupportLevel};
@@ -16,8 +16,8 @@ use super::model_index::validate_configuration as validate_model_index_configura
 use super::model_index_state::inspect_model_index_watermark_directory;
 use super::model_license::ModelLicensePolicy;
 use super::{
-    engine_registry, parse_browser_origin_policy, select_backend_name, BrowserOriginPolicy,
-    ModelCatalog, MAX_SHUTDOWN_TIMEOUT_SECONDS,
+    BrowserOriginPolicy, MAX_SHUTDOWN_TIMEOUT_SECONDS, ModelCatalog, engine_registry,
+    parse_browser_origin_policy, select_backend_name,
 };
 
 const DOCTOR_SCHEMA_VERSION: u32 = 1;
@@ -332,13 +332,13 @@ fn server_argument_errors(args: &Args) -> Vec<String> {
     {
         errors.push("The API key cannot be empty or whitespace-only.".to_string());
     }
-    if let Some(dtype) = &args.dtype {
-        if !matches!(
+    if let Some(dtype) = &args.dtype
+        && !matches!(
             dtype.trim().to_ascii_lowercase().as_str(),
             "f32" | "float32" | "f16" | "float16" | "bf16" | "bfloat16"
-        ) {
-            errors.push("Dtype must be f32/float32, f16/float16, or bf16/bfloat16.".to_string());
-        }
+        )
+    {
+        errors.push("Dtype must be f32/float32, f16/float16, or bf16/bfloat16.".to_string());
     }
     if let Err(error) = SpeculativeMode::from_parts(
         &args.speculative,
@@ -788,7 +788,7 @@ fn license_policy_check(args: &Args) -> DoctorCheck {
                 "model_license_policy",
                 format!("The model license policy is invalid: {error}."),
                 "Remove empty, oversized, or excessive license declarations.",
-            )
+            );
         }
     };
     let status = policy.status();
@@ -1023,12 +1023,14 @@ mod tests {
         assert!(!valid_check.message.contains("ea4a6c63e29c520abef5507b"));
 
         let second = ed25519_dalek::SigningKey::from_bytes(&[8_u8; 32]);
-        args.model_index_public_keys = vec![second
-            .verifying_key()
-            .as_bytes()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()];
+        args.model_index_public_keys = vec![
+            second
+                .verifying_key()
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        ];
         let rotating = inspect_server(&args, false, &temp.path().join("models"));
         let rotating_check = rotating
             .checks
@@ -1044,9 +1046,11 @@ mod tests {
             .find(|check| check.id == "model_index_state")
             .unwrap();
         assert_eq!(state_check.status, CheckStatus::Warn);
-        assert!(!state_check
-            .message
-            .contains(temp.path().to_string_lossy().as_ref()));
+        assert!(
+            !state_check
+                .message
+                .contains(temp.path().to_string_lossy().as_ref())
+        );
     }
 
     #[test]
@@ -1083,9 +1087,11 @@ mod tests {
             .find(|check| check.id == "model_index_state")
             .unwrap();
         assert_eq!(invalid_check.status, CheckStatus::Fail);
-        assert!(!invalid_check
-            .message
-            .contains(temp.path().to_string_lossy().as_ref()));
+        assert!(
+            !invalid_check
+                .message
+                .contains(temp.path().to_string_lossy().as_ref())
+        );
     }
 
     #[test]
@@ -1232,10 +1238,12 @@ mod tests {
         assert_eq!(report.status, "warn");
         assert_eq!(report.summary.failures, 0);
         assert!(report.summary.warnings >= 2);
-        assert!(report
-            .checks
-            .iter()
-            .any(|check| check.id == "device_backend" && check.status == CheckStatus::Pass));
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.id == "device_backend" && check.status == CheckStatus::Pass)
+        );
     }
 
     #[test]

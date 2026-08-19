@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use bloomai_core::{DeviceClass, DeviceKind, GenerationParams, Modality, ModelFamily, ModelFormat};
 use serde_json::json;
 
@@ -263,10 +263,10 @@ impl LlamaCppModel {
             &body,
             DEFAULT_COMPLETION_TIMEOUT,
             |event: &serde_json::Value| {
-                if let Some(content) = event.get("content").and_then(|v| v.as_str()) {
-                    if !content.is_empty() {
-                        sink.on_chunk(OutputChunk::TextDelta(content.to_string()))?;
-                    }
+                if let Some(content) = event.get("content").and_then(|v| v.as_str())
+                    && !content.is_empty()
+                {
+                    sink.on_chunk(OutputChunk::TextDelta(content.to_string()))?;
                 }
                 if event
                     .pointer("/generation_settings/speculative.types")
@@ -310,11 +310,11 @@ impl LlamaCppModel {
 
 impl Drop for LlamaCppModel {
     fn drop(&mut self) {
-        if let Ok(mut child) = self.child.lock() {
-            if let Some(mut child) = child.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+        if let Ok(mut child) = self.child.lock()
+            && let Some(mut child) = child.take()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 }
@@ -907,10 +907,12 @@ mod tests {
             },
             spec_type: "draft-mtp".to_string(),
         };
-        assert!(model
-            .validate_speculative_response(&serde_json::json!({
-                "generation_settings": { "speculative.types": ["draft-mtp"] }
-            }))
-            .is_ok());
+        assert!(
+            model
+                .validate_speculative_response(&serde_json::json!({
+                    "generation_settings": { "speculative.types": ["draft-mtp"] }
+                }))
+                .is_ok()
+        );
     }
 }

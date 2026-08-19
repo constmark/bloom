@@ -172,11 +172,13 @@ mod tests {
             .insert("detached".to_string(), sender);
 
         assert!(scheduler.cancel_request("detached"));
-        assert!(!scheduler
-            .token_senders
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key("detached"));
+        assert!(
+            !scheduler
+                .token_senders
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key("detached")
+        );
         assert_eq!(
             receiver.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)

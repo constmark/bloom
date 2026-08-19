@@ -7,14 +7,14 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use bloomai_core::{
     DType, DeviceClass, DeviceKind, Modality, ModelFamily, ModelFormat, ModelManifest,
 };
 
 use crate::{
     core::parallelism::ParallelStrategy,
-    engine::{default_engine_supports, Engine, EngineCapability, SupportLevel},
+    engine::{Engine, EngineCapability, SupportLevel, default_engine_supports},
     model::LoadedModel,
 };
 
@@ -23,13 +23,12 @@ pub struct MlxEngine;
 impl MlxEngine {
     pub fn discover_model_file(model_path: &Path) -> Result<PathBuf> {
         if model_path.is_file() {
-            if let Some(ext) = model_path.extension().and_then(|e| e.to_str()) {
-                if ext.eq_ignore_ascii_case("mlx")
+            if let Some(ext) = model_path.extension().and_then(|e| e.to_str())
+                && (ext.eq_ignore_ascii_case("mlx")
                     || ext.eq_ignore_ascii_case("npz")
-                    || ext.eq_ignore_ascii_case("safetensors")
-                {
-                    return Ok(model_path.to_path_buf());
-                }
+                    || ext.eq_ignore_ascii_case("safetensors"))
+            {
+                return Ok(model_path.to_path_buf());
             }
             return Err(anyhow!(
                 "MLX engine expects a .mlx/.npz/.safetensors file or a directory containing them: {}",
@@ -56,13 +55,12 @@ impl MlxEngine {
         let mut candidates = Vec::new();
         for entry in std::fs::read_dir(model_path)?.flatten() {
             let path = entry.path();
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if ext.eq_ignore_ascii_case("mlx")
+            if let Some(ext) = path.extension().and_then(|e| e.to_str())
+                && (ext.eq_ignore_ascii_case("mlx")
                     || ext.eq_ignore_ascii_case("npz")
-                    || ext.eq_ignore_ascii_case("safetensors")
-                {
-                    candidates.push(path);
-                }
+                    || ext.eq_ignore_ascii_case("safetensors"))
+            {
+                candidates.push(path);
             }
         }
         candidates.sort();

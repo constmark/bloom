@@ -5,8 +5,8 @@ use std::sync::Mutex;
 
 // Import the FFI declarations directly
 use bloom_ffi::{
-    bloom_pipeline_free, bloom_pipeline_load, bloom_pipeline_run, bloom_pipeline_run_stream,
-    bloom_string_free, BloomPipeline,
+    BloomPipeline, bloom_pipeline_free, bloom_pipeline_load, bloom_pipeline_run,
+    bloom_pipeline_run_stream, bloom_string_free,
 };
 
 static CALLBACK_DATA: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
@@ -15,12 +15,14 @@ unsafe extern "C" fn test_stream_callback(
     user_data: *mut std::ffi::c_void,
     chunk_json: *const c_char,
 ) {
-    // Assert user_data is correct
-    assert_eq!(user_data as usize, 0x12345678);
-    if !chunk_json.is_null() {
-        let s = CStr::from_ptr(chunk_json).to_string_lossy().into_owned();
-        let mut data = CALLBACK_DATA.lock().unwrap();
-        data.push(s);
+    unsafe {
+        // Assert user_data is correct
+        assert_eq!(user_data as usize, 0x12345678);
+        if !chunk_json.is_null() {
+            let s = CStr::from_ptr(chunk_json).to_string_lossy().into_owned();
+            let mut data = CALLBACK_DATA.lock().unwrap();
+            data.push(s);
+        }
     }
 }
 

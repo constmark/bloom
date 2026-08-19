@@ -13,7 +13,7 @@
 
 use std::path::Path;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{self as nn, Module};
 
@@ -385,14 +385,16 @@ impl WanVAE {
     /// Input:  [batch, C=16, F', H', W'] latent tensor
     /// Output: [batch, 3, F, H, W] decoded video tensor
     pub fn decode(&self, latent: &Tensor) -> Result<Tensor> {
-        if let Some(decoder) = Self::try_load_decoder(&self.config, &self.model_path, &self.device)
-        {
-            let res = self.decode_with_model(&decoder, latent)?;
-            // decoder is dropped here, releasing VRAM!
-            Ok(res)
-        } else {
-            // Fallback: simple linear projection from latent space
-            self.decode_fallback(latent)
+        match Self::try_load_decoder(&self.config, &self.model_path, &self.device) {
+            Some(decoder) => {
+                let res = self.decode_with_model(&decoder, latent)?;
+                // decoder is dropped here, releasing VRAM!
+                Ok(res)
+            }
+            _ => {
+                // Fallback: simple linear projection from latent space
+                self.decode_fallback(latent)
+            }
         }
     }
 
@@ -514,7 +516,7 @@ impl WanVAE {
         // Spatial upsampling via repeat (max 5D tensors)
         let bf = b * f;
         let proj_4d = projected.reshape((bf, 3, h, w))?; // [bf, 3, h, w]
-                                                         // Upsample h
+        // Upsample h
         let proj_4d = proj_4d
             .unsqueeze(3)? // [bf, 3, h, 1, w]
             .expand((bf, 3, h, cfg.spatial_stride, w))?
@@ -566,8 +568,8 @@ impl WanVAE {
 
 /// Convert float tensor video frames to uint8 RGB bytes.
 ///
-/// Input: tensor with values in [-1, 1], shape [C, H, W] or [3, H, W]
-/// Output: Vec<u8> of RGB pixel data, H*W*3 bytes.
+/// Input: tensor with values in `[-1, 1]`, shape `[C, H, W]` or `[3, H, W]`.
+/// Output: `Vec<u8>` of RGB pixel data, `H * W * 3` bytes.
 pub fn tensor_to_rgb_frame(frame: &Tensor) -> Result<Vec<u8>> {
     // Ensure 3D: [C, H, W]
     let frame = if frame.dims().len() == 4 {

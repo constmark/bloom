@@ -26,17 +26,17 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use bloomai_core::{GenerationParams, ResponseFormat};
 use candle_core::{Device, Tensor};
 
 use super::speculative::{
-    verify_greedy_tokens, DraftModelStrategy, NGramStrategy, SpeculativeMode, SpeculativeStrategy,
+    DraftModelStrategy, NGramStrategy, SpeculativeMode, SpeculativeStrategy, verify_greedy_tokens,
 };
 use crate::scheduler::kv_hook::KvHook;
 use crate::scheduler::paged_cache::PagedAttentionCache;
 use crate::scheduler::{
-    token_budget_allows, BatchResult, EngineExecutor, ExecutionBatch, ExecutionPhase,
+    BatchResult, EngineExecutor, ExecutionBatch, ExecutionPhase, token_budget_allows,
 };
 
 /// Shared state between the batch executor and the loaded model.
@@ -550,11 +550,11 @@ impl CandleBatchExecutor {
                         let final_len = accepted + 1;
                         self.write_request_kv(handle, start_pos, final_len)?;
 
-                        if accepted < proposed.len() {
-                            if let Some(ref hook) = self.kv_hook {
-                                let rollback_len = start_pos + accepted + 1;
-                                let _ = hook.rollback_kv_cache(handle, rollback_len);
-                            }
+                        if accepted < proposed.len()
+                            && let Some(ref hook) = self.kv_hook
+                        {
+                            let rollback_len = start_pos + accepted + 1;
+                            let _ = hook.rollback_kv_cache(handle, rollback_len);
                         }
 
                         let mut all_yielded = final_accepted_tokens;
@@ -697,25 +697,28 @@ impl CandleBatchExecutor {
                         let Some(block_id) = cache.block_for_handle(handle, block_token_idx) else {
                             continue;
                         };
-                        if let (Ok(k_chunk), Ok(v_chunk)) = (
+                        match (
                             k_tensor.narrow(2, offset, chunk),
                             v_tensor.narrow(2, offset, chunk),
                         ) {
-                            if let Err(e) =
-                                cache.write_kv_tensor(layer_idx, block_id, k_chunk, v_chunk, chunk)
-                            {
-                                tracing::warn!(
-                                    "Failed to write KV tensor for layer {} block {}: {:?}",
-                                    layer_idx,
-                                    block_id,
-                                    e
-                                );
+                            (Ok(k_chunk), Ok(v_chunk)) => {
+                                if let Err(e) = cache
+                                    .write_kv_tensor(layer_idx, block_id, k_chunk, v_chunk, chunk)
+                                {
+                                    tracing::warn!(
+                                        "Failed to write KV tensor for layer {} block {}: {:?}",
+                                        layer_idx,
+                                        block_id,
+                                        e
+                                    );
+                                    tensor_path_succeeded = false;
+                                    break;
+                                }
+                            }
+                            _ => {
                                 tensor_path_succeeded = false;
                                 break;
                             }
-                        } else {
-                            tensor_path_succeeded = false;
-                            break;
                         }
                     }
                 }
@@ -785,23 +788,24 @@ impl CandleBatchExecutor {
             match cache.read_kv_tensor(layer_idx, block_id) {
                 Ok(Some((k_cached, v_cached))) => {
                     let slot = start_pos % block_size;
-                    if let (Ok(k_slot), Ok(v_slot)) =
-                        (k_cached.narrow(2, slot, 1), v_cached.narrow(2, slot, 1))
-                    {
-                        if let Err(e) =
-                            hook.inject_kv_tensor(handle, layer_idx, start_pos, &k_slot, &v_slot)
-                        {
-                            tracing::warn!(
-                                "Failed to inject KV tensor for layer {}: {:?}",
-                                layer_idx,
-                                e
-                            );
+                    match (k_cached.narrow(2, slot, 1), v_cached.narrow(2, slot, 1)) {
+                        (Ok(k_slot), Ok(v_slot)) => {
+                            if let Err(e) = hook
+                                .inject_kv_tensor(handle, layer_idx, start_pos, &k_slot, &v_slot)
+                            {
+                                tracing::warn!(
+                                    "Failed to inject KV tensor for layer {}: {:?}",
+                                    layer_idx,
+                                    e
+                                );
+                                tensor_path_succeeded = false;
+                                break;
+                            }
+                        }
+                        _ => {
                             tensor_path_succeeded = false;
                             break;
                         }
-                    } else {
-                        tensor_path_succeeded = false;
-                        break;
                     }
                 }
                 _ => {

@@ -6,8 +6,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use bloomai_core::{
-    constants::GIB, BloomError, DType, DeviceKind, Modality, ModelFamily, ModelFile, ModelFormat,
-    ModelIoSchema, ModelManifest, QuantScheme, QuantizationInfo,
+    BloomError, DType, DeviceKind, Modality, ModelFamily, ModelFile, ModelFormat, ModelIoSchema,
+    ModelManifest, QuantScheme, QuantizationInfo, constants::GIB,
 };
 
 const GENERATION_MODEL_TASKS: &[&str] = &["generation"];
@@ -999,13 +999,14 @@ fn infer_from_hf_config(model_path: &Path, config: serde_json::Value) -> Result<
             .parameters
             .get("num_attention_heads")
             .and_then(serde_json::Value::as_u64);
-        if let (Some(hidden_size), Some(attention_heads)) = (hidden_size, attention_heads) {
-            if attention_heads > 0 && hidden_size % attention_heads == 0 {
-                manifest.parameters.insert(
-                    "head_dim".to_string(),
-                    serde_json::json!(hidden_size / attention_heads),
-                );
-            }
+        if let (Some(hidden_size), Some(attention_heads)) = (hidden_size, attention_heads)
+            && attention_heads > 0
+            && hidden_size % attention_heads == 0
+        {
+            manifest.parameters.insert(
+                "head_dim".to_string(),
+                serde_json::json!(hidden_size / attention_heads),
+            );
         }
     }
 
@@ -1068,17 +1069,15 @@ fn infer_sentence_transformer_config(
     if let Some(value) = read_optional_sentence_transformer_json(
         &model_path.join("sentence_bert_config.json"),
         "sentence_bert_config.json",
-    )? {
-        if let Some(max_seq_length) = value
-            .get("max_seq_length")
-            .and_then(serde_json::Value::as_u64)
-            .filter(|value| *value > 0)
-        {
-            manifest.parameters.insert(
-                "max_seq_length".to_string(),
-                serde_json::Value::from(max_seq_length),
-            );
-        }
+    )? && let Some(max_seq_length) = value
+        .get("max_seq_length")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|value| *value > 0)
+    {
+        manifest.parameters.insert(
+            "max_seq_length".to_string(),
+            serde_json::Value::from(max_seq_length),
+        );
     }
 
     let modules =
@@ -1832,10 +1831,10 @@ fn find_vulkan_spv_in_dir(model_path: &Path) -> Option<std::path::PathBuf> {
         .flatten()
         .find(|e| {
             let p = e.path();
-            if p.is_file() {
-                if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
-                    return ext.eq_ignore_ascii_case("spv") || ext.eq_ignore_ascii_case("spirv");
-                }
+            if p.is_file()
+                && let Some(ext) = p.extension().and_then(|s| s.to_str())
+            {
+                return ext.eq_ignore_ascii_case("spv") || ext.eq_ignore_ascii_case("spirv");
             }
             false
         })
@@ -2267,7 +2266,8 @@ mod tests {
     impl EnvVarGuard {
         fn set(key: &'static str, value: &str) -> Self {
             let previous = std::env::var(key).ok();
-            std::env::set_var(key, value);
+            // FIXME: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::set_var(key, value) };
             Self { key, previous }
         }
     }
@@ -2275,8 +2275,10 @@ mod tests {
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             match &self.previous {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
+                // FIXME: Audit that the environment access only happens in single-threaded code.
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                // FIXME: Audit that the environment access only happens in single-threaded code.
+                None => unsafe { std::env::remove_var(self.key) },
             }
         }
     }
@@ -2378,9 +2380,11 @@ mod tests {
         );
 
         let error = resolve_hf_safetensors_files(directory.path()).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("require model.safetensors.index.json"));
+        assert!(
+            error
+                .to_string()
+                .contains("require model.safetensors.index.json")
+        );
     }
 
     #[test]
@@ -2392,9 +2396,11 @@ mod tests {
         write_test_safetensors_index(directory.path(), &[("weight", shard)], 4);
 
         let error = resolve_hf_safetensors_files(directory.path()).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("cannot be combined with a sharded"));
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be combined with a sharded")
+        );
     }
 
     #[test]
@@ -2573,10 +2579,12 @@ mod tests {
         assert_eq!(manifest.files[0].format, ModelFormat::Onnx);
         assert_eq!(manifest.files[0].name, "classifier.onnx");
         assert_eq!(manifest.io_schema.inputs, vec![Modality::Multi]);
-        assert!(manifest
-            .runtime_hints
-            .preferred_backends
-            .contains(&"onnxruntime".to_string()));
+        assert!(
+            manifest
+                .runtime_hints
+                .preferred_backends
+                .contains(&"onnxruntime".to_string())
+        );
     }
 
     #[test]
@@ -2601,10 +2609,12 @@ mod tests {
         assert_eq!(manifest.files[0].format, ModelFormat::TensorRtEngine);
         assert_eq!(manifest.files[0].name, "llama.plan");
         assert_eq!(manifest.io_schema.inputs, vec![Modality::Text]);
-        assert!(manifest
-            .runtime_hints
-            .preferred_backends
-            .contains(&"tensorrt".to_string()));
+        assert!(
+            manifest
+                .runtime_hints
+                .preferred_backends
+                .contains(&"tensorrt".to_string())
+        );
     }
 
     #[test]
@@ -3092,7 +3102,8 @@ mod tests {
     fn test_memory_estimate_applies_mmap_residency() {
         let _guard = ENV_LOCK.lock().unwrap();
         let previous = std::env::var("BLOOM_GPU_LAYERS").ok();
-        std::env::remove_var("BLOOM_GPU_LAYERS");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("BLOOM_GPU_LAYERS") };
 
         let mut m = ModelManifest::default();
         m.runtime_hints.supports_mmap = true;
@@ -3116,9 +3127,11 @@ mod tests {
         });
 
         if let Some(val) = previous {
-            std::env::set_var("BLOOM_GPU_LAYERS", val);
+            // FIXME: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::set_var("BLOOM_GPU_LAYERS", val) };
         } else {
-            std::env::remove_var("BLOOM_GPU_LAYERS");
+            // FIXME: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::remove_var("BLOOM_GPU_LAYERS") };
         }
 
         if let Err(err) = result {

@@ -9,7 +9,7 @@ use bloomai_backend::BackendRegistry;
 use bloomai_core::{
     DType, DeviceKind, Modality, ModelFamily, ModelFormat, ModelManifest, QuantScheme,
 };
-use bloomai_engine::{model_manifest_tasks, MemoryPreallocationConfig, SupportLevel};
+use bloomai_engine::{MemoryPreallocationConfig, SupportLevel, model_manifest_tasks};
 use serde::Serialize;
 use tokio::sync::{Mutex, Semaphore};
 
@@ -199,14 +199,14 @@ impl ModelPreflightManager {
     ) {
         let mut cache = self.cache.lock().await;
         cache.retain(|_, entry| entry.cached_at.elapsed() <= PREFLIGHT_CACHE_TTL);
-        if cache.len() >= MAX_PREFLIGHT_CACHE_ENTRIES && !cache.contains_key(&model_id) {
-            if let Some(oldest) = cache
+        if cache.len() >= MAX_PREFLIGHT_CACHE_ENTRIES
+            && !cache.contains_key(&model_id)
+            && let Some(oldest) = cache
                 .iter()
                 .min_by_key(|(_, entry)| entry.cached_at)
                 .map(|(key, _)| key.clone())
-            {
-                cache.remove(&oldest);
-            }
+        {
+            cache.remove(&oldest);
         }
         cache.insert(
             model_id,
@@ -857,11 +857,13 @@ mod tests {
         assert!(!report.loadable);
         assert_eq!(report.runtime.selected_engine, "onnxruntime");
         assert_eq!(report.runtime.engine_maturity, "skeleton");
-        assert!(report
-            .load_blocker
-            .as_deref()
-            .unwrap()
-            .contains("skeleton adapter"));
+        assert!(
+            report
+                .load_blocker
+                .as_deref()
+                .unwrap()
+                .contains("skeleton adapter")
+        );
     }
 
     #[tokio::test]
@@ -876,11 +878,13 @@ mod tests {
 
         assert!(!report.loadable);
         assert!(!report.memory.fits_budget);
-        assert!(report
-            .load_blocker
-            .as_deref()
-            .unwrap()
-            .contains("reservation"));
+        assert!(
+            report
+                .load_blocker
+                .as_deref()
+                .unwrap()
+                .contains("reservation")
+        );
     }
 
     #[tokio::test]

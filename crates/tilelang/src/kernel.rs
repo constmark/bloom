@@ -40,33 +40,36 @@ impl TileLangKernel {
     /// current process and ABI. The exported symbols must match the signatures
     /// expected by this wrapper.
     pub unsafe fn load(path: &Path) -> Result<Self> {
-        let lib = Library::new(path)?;
+        unsafe {
+            let lib = Library::new(path)?;
 
-        let vector_add_fn: Option<VectorAddFn> = {
-            lib.get::<VectorAddFn>(b"vector_add_launch")
-                .ok()
-                .map(|s| *s)
-        };
+            let vector_add_fn: Option<VectorAddFn> = {
+                lib.get::<VectorAddFn>(b"vector_add_launch")
+                    .ok()
+                    .map(|s| *s)
+            };
 
-        let matmul_fn: Option<MatmulFn> =
-            { lib.get::<MatmulFn>(b"matmul_launch").ok().map(|s| *s) };
+            let matmul_fn: Option<MatmulFn> =
+                { lib.get::<MatmulFn>(b"matmul_launch").ok().map(|s| *s) };
 
-        let softmax_fn: Option<SoftmaxFn> =
-            { lib.get::<SoftmaxFn>(b"softmax_launch").ok().map(|s| *s) };
+            let softmax_fn: Option<SoftmaxFn> =
+                { lib.get::<SoftmaxFn>(b"softmax_launch").ok().map(|s| *s) };
 
-        let attention_fn: Option<AttentionFn> =
-            { lib.get::<AttentionFn>(b"attention_launch").ok().map(|s| *s) };
+            let attention_fn: Option<AttentionFn> =
+                { lib.get::<AttentionFn>(b"attention_launch").ok().map(|s| *s) };
 
-        let mrope_fn: Option<MropeFn> = { lib.get::<MropeFn>(b"mrope_launch").ok().map(|s| *s) };
+            let mrope_fn: Option<MropeFn> =
+                { lib.get::<MropeFn>(b"mrope_launch").ok().map(|s| *s) };
 
-        Ok(Self {
-            lib,
-            vector_add_fn,
-            matmul_fn,
-            softmax_fn,
-            attention_fn,
-            mrope_fn,
-        })
+            Ok(Self {
+                lib,
+                vector_add_fn,
+                matmul_fn,
+                softmax_fn,
+                attention_fn,
+                mrope_fn,
+            })
+        }
     }
 
     pub fn vector_add(&self, a: &[f32], b: &[f32], c: &mut [f32]) -> Result<i32> {

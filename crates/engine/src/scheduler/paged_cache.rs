@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 use crate::cachemesh::{CacheMesh, CacheMeshBlock, CacheMeshKey, CacheMeshMetrics};
 use crate::core::quantization::{Int8QuantizedKv, KvCacheDtype};
@@ -322,10 +322,10 @@ impl PagedAttentionCache {
         }
 
         let layer_data = self.layer_data.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(block) = layer_data[layer_idx].get(&block_id) {
-            if let (Some(k), Some(v)) = (&block.keys_tensor, &block.values_tensor) {
-                return Ok(Some((k.clone(), v.clone())));
-            }
+        if let Some(block) = layer_data[layer_idx].get(&block_id)
+            && let (Some(k), Some(v)) = (&block.keys_tensor, &block.values_tensor)
+        {
+            return Ok(Some((k.clone(), v.clone())));
         }
         Ok(None)
     }
@@ -346,34 +346,41 @@ impl PagedAttentionCache {
         let mut all_values = Vec::new();
 
         for &block_id in &self.visible_blocks(block_ids) {
-            if let Some(block) = self.get_l1_block(layer_idx, block_id) {
-                if let Some(mesh) = &self.cachemesh {
-                    mesh.record_l1_lookup(true);
-                }
-                if self.config.kv_dtype.needs_dequant() {
-                    // Dequantize on read
-                    if let (Some(qk), Some(qv)) = (&block.quantized_keys, &block.quantized_values) {
-                        all_keys.extend(qk.dequantize_f32());
-                        all_values.extend(qv.dequantize_f32());
+            match self.get_l1_block(layer_idx, block_id) {
+                Some(block) => {
+                    if let Some(mesh) = &self.cachemesh {
+                        mesh.record_l1_lookup(true);
                     }
-                } else {
-                    all_keys.extend(&block.keys);
-                    all_values.extend(&block.values);
-                }
-            } else if let Some(block) = self.restore_from_cachemesh(layer_idx, block_id)? {
-                all_keys.extend(&block.keys);
-                all_values.extend(&block.values);
-            } else {
-                if let Some(mesh) = &self.cachemesh {
-                    if self.cachemesh_key(layer_idx, block_id).is_none() {
-                        mesh.record_l1_lookup(false);
+                    if self.config.kv_dtype.needs_dequant() {
+                        // Dequantize on read
+                        if let (Some(qk), Some(qv)) =
+                            (&block.quantized_keys, &block.quantized_values)
+                        {
+                            all_keys.extend(qk.dequantize_f32());
+                            all_values.extend(qv.dequantize_f32());
+                        }
+                    } else {
+                        all_keys.extend(&block.keys);
+                        all_values.extend(&block.values);
                     }
                 }
-                // Block not yet populated — fill with zeros
-                let block_tokens = self.config.block_size;
-                let block_elements = block_tokens * self.config.kv_dim;
-                all_keys.extend(std::iter::repeat_n(0.0f32, block_elements));
-                all_values.extend(std::iter::repeat_n(0.0f32, block_elements));
+                _ => {
+                    if let Some(block) = self.restore_from_cachemesh(layer_idx, block_id)? {
+                        all_keys.extend(&block.keys);
+                        all_values.extend(&block.values);
+                    } else {
+                        if let Some(mesh) = &self.cachemesh
+                            && self.cachemesh_key(layer_idx, block_id).is_none()
+                        {
+                            mesh.record_l1_lookup(false);
+                        }
+                        // Block not yet populated — fill with zeros
+                        let block_tokens = self.config.block_size;
+                        let block_elements = block_tokens * self.config.kv_dim;
+                        all_keys.extend(std::iter::repeat_n(0.0f32, block_elements));
+                        all_values.extend(std::iter::repeat_n(0.0f32, block_elements));
+                    }
+                }
             }
         }
 
@@ -400,7 +407,10 @@ impl PagedAttentionCache {
         if k.len() < expected_elements || v.len() < expected_elements {
             anyhow::bail!(
                 "Paged cache blocks contain fewer elements than expected for seq_len {} and head_dim {} (K: {}, V: {})",
-                seq_len, head_dim, k.len(), v.len()
+                seq_len,
+                head_dim,
+                k.len(),
+                v.len()
             );
         }
 
@@ -654,12 +664,12 @@ impl PagedAttentionCache {
             let mut got_tensor = false;
             {
                 let layer_data = self.layer_data.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(block) = layer_data[layer_idx].get(&block_id) {
-                    if let (Some(k), Some(v)) = (&block.keys_tensor, &block.values_tensor) {
-                        keys_tensors.push(k.clone());
-                        values_tensors.push(v.clone());
-                        got_tensor = true;
-                    }
+                if let Some(block) = layer_data[layer_idx].get(&block_id)
+                    && let (Some(k), Some(v)) = (&block.keys_tensor, &block.values_tensor)
+                {
+                    keys_tensors.push(k.clone());
+                    values_tensors.push(v.clone());
+                    got_tensor = true;
                 }
             }
 
@@ -1143,10 +1153,12 @@ mod tests {
         let (read_keys, read_values) = cache.read_kv(0, &[block_id]).unwrap();
         assert_eq!(read_keys.len(), keys.len());
         assert_eq!(read_values.len(), values.len());
-        assert!(read_keys
-            .iter()
-            .zip(keys.iter())
-            .all(|(a, b)| (a - b).abs() < 0.01));
+        assert!(
+            read_keys
+                .iter()
+                .zip(keys.iter())
+                .all(|(a, b)| (a - b).abs() < 0.01)
+        );
     }
 
     #[test]

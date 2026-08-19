@@ -1,8 +1,8 @@
 use anyhow::Result;
-use bloomai_backend::{Backend, BackendInfo, BackendAvailability};
+use bloomai_backend::{Backend, BackendAvailability, BackendInfo};
 use bloomai_core::{
-    BackendLease, DeviceCapability, DeviceClass, DeviceKind, MemoryTopology, PowerState, ResourceError,
-    ResourceTicket, ThermalState, ModelFormat,
+    DeviceCapability, DeviceClass, DeviceKind, MemoryTopology, ModelFormat, PowerState,
+    ThermalState,
 };
 
 /// Skeleton struct for a vendor custom NPU/DSP accelerator backend.
@@ -21,15 +21,18 @@ impl Backend for VendorSdkBackend {
     fn availability(&self) -> BackendAvailability {
         // Here, a vendor would query the driver, sysfs, or PCIe registration
         // to detect if their specific NPU/DSP chip is physically connected.
-        let device_detected = true; 
-        
+        let device_detected = true;
+
         if device_detected {
             BackendAvailability::available(vec![
                 "Vendor Custom NPU chip detected on PCIe bus".to_string(),
                 "Driver version: v2.4.0".to_string(),
             ])
         } else {
-            BackendAvailability::unavailable("No Vendor Custom NPU hardware found".to_string(), vec![])
+            BackendAvailability::unavailable(
+                "No Vendor Custom NPU hardware found".to_string(),
+                vec![],
+            )
         }
     }
 
@@ -40,15 +43,10 @@ impl Backend for VendorSdkBackend {
             vendor: Some("VendorCorp".to_string()),
             device_class: DeviceClass::Npu,
             memory_topology: MemoryTopology::Discrete,
-            max_memory: 8 * 1024 * 1024 * 1024,      // 8 GB
-            available_memory: 8 * 1024 * 1024 * 1024,  // 8 GB
-            supported_dtypes: vec![
-                bloomai_core::DType::F16,
-                bloomai_core::DType::I8,
-            ],
-            supported_formats: vec![
-                ModelFormat::Onnx,
-            ],
+            max_memory: 8 * 1024 * 1024 * 1024,       // 8 GB
+            available_memory: 8 * 1024 * 1024 * 1024, // 8 GB
+            supported_dtypes: vec![bloomai_core::DType::F16, bloomai_core::DType::I8],
+            supported_formats: vec![ModelFormat::Onnx],
             supports_mmap: false,
             has_quantization_kernels: true,
             supports_streaming: false,
@@ -68,7 +66,7 @@ impl Backend for VendorSdkBackend {
 }
 
 // Expose the dynamic plugin factory entry point for Bloom loader
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn bloomai_backend_plugin_init() -> *mut fn() -> Box<dyn Backend> {
     let factory: fn() -> Box<dyn Backend> = || Box::new(VendorSdkBackend);
     Box::into_raw(Box::new(factory))

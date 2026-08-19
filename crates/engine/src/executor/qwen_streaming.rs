@@ -3,7 +3,7 @@
 
 use bloomai_core::BloomError;
 use candle_core::{DType, Device, Result, Tensor};
-use candle_nn::{kv_cache::ConcatKvCache, Activation, VarBuilder};
+use candle_nn::{Activation, VarBuilder, kv_cache::ConcatKvCache};
 use candle_transformers::models::qwen3::Config;
 use std::sync::{Arc, Mutex};
 
@@ -588,15 +588,13 @@ impl StreamingQwenModel {
                     quantizer.as_ref(),
                 )?;
 
-                let q_norm = if let Ok(w) = vb_attn.pp("q_norm").get(cfg.head_dim, "weight") {
-                    Some(StreamingRmsNorm::new(w, cfg.rms_norm_eps))
-                } else {
-                    None
+                let q_norm = match vb_attn.pp("q_norm").get(cfg.head_dim, "weight") {
+                    Ok(w) => Some(StreamingRmsNorm::new(w, cfg.rms_norm_eps)),
+                    _ => None,
                 };
-                let k_norm = if let Ok(w) = vb_attn.pp("k_norm").get(cfg.head_dim, "weight") {
-                    Some(StreamingRmsNorm::new(w, cfg.rms_norm_eps))
-                } else {
-                    None
+                let k_norm = match vb_attn.pp("k_norm").get(cfg.head_dim, "weight") {
+                    Ok(w) => Some(StreamingRmsNorm::new(w, cfg.rms_norm_eps)),
+                    _ => None,
                 };
 
                 let num_heads = cfg.num_attention_heads;
@@ -970,7 +968,7 @@ impl QwenStreamingModelForCausalLM {
         Ok(())
     }
 
-    /// Wrapper around [`inject_kv_to_layer`] preserving the legacy
+    /// Wrapper around [`Self::inject_kv_to_layer`] preserving the legacy
     /// `inject_kv` name and candle `Result` return type. The `_kv_dim`
     /// parameter is retained for callers (e.g. `PerRequestKvHook` in
     /// `crate::executor::candle`) that pass the derived

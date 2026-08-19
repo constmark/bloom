@@ -12,8 +12,8 @@ use std::fmt;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context, Result};
-use candle_core::{DType, Device, Tensor, D};
+use anyhow::{Context, Result, anyhow, bail};
+use candle_core::{D, DType, Device, Tensor};
 use candle_nn::{Module, VarBuilder};
 use candle_transformers::models::z_image::{AutoEncoderKL, VaeConfig as CandleVaeConfig};
 use tokenizers::Tokenizer;
