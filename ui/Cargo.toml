@@ -64,7 +64,7 @@ web-sys = { version = "0.3", features = [
   "ScrollBehavior",
   "ScrollToOptions",
 ] }
-gloo-net = { version = "0.6", features = ["http"] }
+gloo-net = { version = "0.7", features = ["http"] }
 gloo-timers = { version = "0.3", features = ["futures"] }
 futures-util = "0.3"
 js-sys = "0.3"
