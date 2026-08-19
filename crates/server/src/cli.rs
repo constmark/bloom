@@ -106,9 +106,13 @@ pub(crate) struct Args {
     #[arg(long, env = "BLOOM_SHUTDOWN_TIMEOUT_SECONDS", default_value_t = 30)]
     pub shutdown_timeout_seconds: u64,
 
-    /// Optional API key for /v1 routes. Can also be set with BLOOM_API_KEY.
+    /// Optional inference API key for protected routes. Can also be set with BLOOM_API_KEY.
     #[arg(long, env = "BLOOM_API_KEY")]
     pub api_key: Option<String>,
+
+    /// Optional operator API key for model management. Can also be set with BLOOM_OPERATOR_API_KEY.
+    #[arg(long, env = "BLOOM_OPERATOR_API_KEY")]
+    pub operator_api_key: Option<String>,
 
     /// Explicitly allow a non-loopback listener without authentication (unsafe; development only).
     #[arg(

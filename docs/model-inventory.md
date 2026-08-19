@@ -4,7 +4,7 @@ Bloom can export its authenticated local catalog as a portable JSON inventory:
 
 ```bash
 curl http://127.0.0.1:3000/v1/model-management/inventory \
-  -H "Authorization: Bearer $BLOOM_API_KEY" \
+  -H "Authorization: Bearer $BLOOM_OPERATOR_API_KEY" \
   --output bloom-model-inventory.json
 ```
 
@@ -61,7 +61,7 @@ Compare a saved version `1` or `2` inventory with the current catalog:
 
 ```bash
 curl http://127.0.0.1:3000/v1/model-management/inventory/reconcile \
-  -H "Authorization: Bearer $BLOOM_API_KEY" \
+  -H "Authorization: Bearer $BLOOM_OPERATOR_API_KEY" \
   -H "Content-Type: application/json" \
   --data-binary @bloom-model-inventory.json
 ```
@@ -98,7 +98,7 @@ then restore one eligible missing model from the Models drawer. The API form is:
 ```bash
 curl -X POST \
   http://127.0.0.1:3000/v1/model-management/inventory/restore/tiny-q4.gguf \
-  -H "Authorization: Bearer $BLOOM_API_KEY" \
+  -H "Authorization: Bearer $BLOOM_OPERATOR_API_KEY" \
   -H "Content-Type: application/json" \
   --data-binary @bloom-model-inventory.json
 ```

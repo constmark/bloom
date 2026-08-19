@@ -151,13 +151,14 @@ reference.
 The container image runs as the fixed unprivileged UID/GID `10001`, stores
 mutable configuration and catalog data under `/var/lib/bloom`, and enables
 strict security and memory admission. Because its listener is public inside the
-container, an API key is required:
+container, distinct inference and operator API keys are required:
 
 ```bash
 docker build -t bloom:local .
 docker volume create bloom-data
 docker run --rm -p 127.0.0.1:3000:3000 \
-  -e BLOOM_API_KEY="replace-with-a-long-random-secret" \
+  -e BLOOM_API_KEY="replace-with-a-long-random-inference-secret" \
+  -e BLOOM_OPERATOR_API_KEY="replace-with-a-different-operator-secret" \
   -v bloom-data:/var/lib/bloom \
   bloom:local
 ```
@@ -217,7 +218,7 @@ download URL when Hugging Face publishes the commit metadata:
 
 ```bash
 curl -X POST http://127.0.0.1:3000/v1/model-management/downloads/inspect \
-  -H "Authorization: Bearer $BLOOM_API_KEY" \
+  -H "Authorization: Bearer $BLOOM_OPERATOR_API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"url":"https://huggingface.co/OWNER/REPO/blob/main/model.gguf"}'
 ```
@@ -228,7 +229,7 @@ hexadecimal characters:
 
 ```bash
 curl -X POST http://127.0.0.1:3000/v1/model-management/downloads \
-  -H "Authorization: Bearer $BLOOM_API_KEY" \
+  -H "Authorization: Bearer $BLOOM_OPERATOR_API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{
     "url": "https://huggingface.co/OWNER/REPO/resolve/REVISION/model.gguf",
@@ -678,19 +679,24 @@ and never presents an encoder-only model as chat-capable. See the
 [readiness contract](docs/readiness-contract.md) and its
 [JSON Schema](examples/readiness.schema.json).
 
-For anything beyond localhost, set `BLOOM_API_KEY`, restrict
+For anything beyond localhost, set distinct `BLOOM_API_KEY` and
+`BLOOM_OPERATOR_API_KEY` values, restrict
 `BLOOM_CORS_ALLOW_ORIGIN`, and protect health and metrics endpoints with a
 reverse proxy or network ACL. Bloom fails startup when a non-loopback listener
-has no key. The explicit `BLOOM_ALLOW_UNAUTHENTICATED_NETWORK` escape hatch is
-for isolated development only and cannot be combined with strict security. See
-the [production guide](docs/production.md) and [security policy](SECURITY.md).
+has no credential; strict security additionally requires both keys to be set
+and different. The explicit `BLOOM_ALLOW_UNAUTHENTICATED_NETWORK` escape hatch
+is for isolated development only and cannot be combined with strict security.
+See the [production guide](docs/production.md) and [security policy](SECURITY.md).
 
 Protected OpenAI and Ollama routes accept `Authorization: Bearer ...` or
 `X-API-Key`. A rejected credential returns the protocol's JSON 401 plus
 `WWW-Authenticate: Bearer realm="Bloom"`, a correlation ID, and `no-store`;
-CORS exposes the challenge. The UI validates `/ready` first and then probes the
-bounded protected Models API, so a missing or invalid key becomes an explicit
-**API key required** state instead of a false successful connection.
+CORS exposes the challenge. `BLOOM_OPERATOR_API_KEY` is accepted for inference
+and is required by `/v1/model-management/*`, `/api/pull`, `/api/delete`, and
+Ollama lifecycle changes. `BLOOM_API_KEY` receives HTTP 403 on those operations
+when a separate operator key is configured. Omitting the operator key retains
+the legacy single-key behavior outside strict non-loopback deployments. The UI
+is an operator surface and should be configured with the operator key.
 
 Browser access is same-origin by default. Bloom validates a single `Origin`
 before CORS or routing, permits the embedded HTTP origin, and rejects malformed,
@@ -715,7 +721,8 @@ Common environment variables include:
 | Variable | Purpose |
 | --- | --- |
 | `BLOOM_CONFIG` | Runtime configuration path |
-| `BLOOM_API_KEY` | API key required by `/v1/*` and `/api/*` routes |
+| `BLOOM_API_KEY` | Inference API key for protected `/v1/*` and `/api/*` routes |
+| `BLOOM_OPERATOR_API_KEY` | Distinct operator key for `/v1/model-management/*`, Ollama acquisition/removal, and model-residency changes; also accepted for inference |
 | `BLOOM_ALLOW_UNAUTHENTICATED_NETWORK` | Development-only override for a non-loopback listener without an API key (default false) |
 | `BLOOM_OPEN_BROWSER` | Open the embedded local UI after the listener is ready |
 | `BLOOM_SHUTDOWN_TIMEOUT_SECONDS` | Maximum graceful HTTP drain before forced exit (default 30 seconds) |

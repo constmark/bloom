@@ -332,18 +332,44 @@ fn server_argument_errors(args: &Args) -> Vec<String> {
     {
         errors.push("The API key cannot be empty or whitespace-only.".to_string());
     }
+    if args
+        .operator_api_key
+        .as_ref()
+        .is_some_and(|key| key.trim().is_empty())
+    {
+        errors.push("The operator API key cannot be empty or whitespace-only.".to_string());
+    }
+    let api_key_set = args.api_key.as_ref().is_some_and(|key| !key.is_empty());
+    let operator_api_key_set = args
+        .operator_api_key
+        .as_ref()
+        .is_some_and(|key| !key.is_empty());
+    if let (Some(api_key), Some(operator_api_key)) =
+        (args.api_key.as_deref(), args.operator_api_key.as_deref())
+        && !api_key.is_empty()
+        && api_key == operator_api_key
+    {
+        errors.push("The inference and operator API keys must be different.".to_string());
+    }
     if let Ok(address) = format!("{}:{}", args.host, args.port).parse::<SocketAddr>()
         && !address.ip().is_loopback()
-        && !args.api_key.as_ref().is_some_and(|key| !key.is_empty())
     {
-        if !args.allow_unauthenticated_network {
+        if !api_key_set && !operator_api_key_set {
+            if !args.allow_unauthenticated_network {
+                errors.push(
+                    "A non-loopback listener requires an API credential unless the explicit development-only unauthenticated-network override is enabled."
+                        .to_string(),
+                );
+            } else if args.strict_security {
+                errors.push(
+                    "Strict security does not allow the unauthenticated-network override."
+                        .to_string(),
+                );
+            }
+        } else if args.strict_security && (!api_key_set || !operator_api_key_set) {
             errors.push(
-                "A non-loopback listener requires an API key unless the explicit development-only unauthenticated-network override is enabled."
+                "Strict security on a non-loopback listener requires distinct inference and operator API keys."
                     .to_string(),
-            );
-        } else if args.strict_security {
-            errors.push(
-                "Strict security does not allow the unauthenticated-network override.".to_string(),
             );
         }
     }
@@ -443,19 +469,23 @@ fn network_check(args: &Args) -> DoctorCheck {
         }
     };
     let api_key_set = args.api_key.as_ref().is_some_and(|key| !key.is_empty());
-    if !address.ip().is_loopback() && !api_key_set {
-        let remediation =
-            "Set BLOOM_API_KEY and a narrow BLOOM_CORS_ALLOW_ORIGIN before exposing the server.";
+    let operator_api_key_set = args
+        .operator_api_key
+        .as_ref()
+        .is_some_and(|key| !key.is_empty());
+    let authentication_set = api_key_set || operator_api_key_set;
+    if !address.ip().is_loopback() && !authentication_set {
+        let remediation = "Set distinct BLOOM_API_KEY and BLOOM_OPERATOR_API_KEY values plus a narrow BLOOM_CORS_ALLOW_ORIGIN before exposing the server.";
         return if !args.allow_unauthenticated_network || args.strict_security {
             DoctorCheck::fail(
                 "network_security",
-                "A non-loopback listener has no API key and is not safely admissible.",
+                "A non-loopback listener has no API credential and is not safely admissible.",
                 remediation,
             )
         } else {
             DoctorCheck::warn(
                 "network_security",
-                "A non-loopback listener has no API key under the explicit development-only override.",
+                "A non-loopback listener has no API credential under the explicit development-only override.",
                 remediation,
             )
         };
@@ -475,11 +505,33 @@ fn network_check(args: &Args) -> DoctorCheck {
             )
         };
     }
-    if (args.enable_model_downloads || args.enable_model_imports) && !api_key_set {
+    if !address.ip().is_loopback() && (!api_key_set || !operator_api_key_set) {
+        return if args.strict_security {
+            DoctorCheck::fail(
+                "network_security",
+                "Strict security requires separate inference and operator credentials on a non-loopback listener.",
+                "Set different BLOOM_API_KEY and BLOOM_OPERATOR_API_KEY values before starting the server.",
+            )
+        } else {
+            DoctorCheck::warn(
+                "network_security",
+                "The non-loopback listener uses one credential scope for both inference and model management.",
+                "Set a distinct BLOOM_OPERATOR_API_KEY so inference clients cannot access the control plane.",
+            )
+        };
+    }
+    if (args.enable_model_downloads || args.enable_model_imports) && !authentication_set {
         return DoctorCheck::warn(
             "network_security",
-            "Model catalog writes are enabled without an API key.",
-            "Set BLOOM_API_KEY even on localhost when untrusted local users or browser origins are possible.",
+            "Model catalog writes are enabled without an API credential.",
+            "Set BLOOM_OPERATOR_API_KEY even on localhost when untrusted local users or browser origins are possible.",
+        );
+    }
+    if api_key_set && !operator_api_key_set {
+        return DoctorCheck::warn(
+            "network_security",
+            "The inference API key also has legacy operator authority because no operator key is configured.",
+            "Set a distinct BLOOM_OPERATOR_API_KEY to separate inference from model-management access.",
         );
     }
     DoctorCheck::pass(
@@ -1006,6 +1058,24 @@ mod tests {
 
         args.allow_unauthenticated_network = false;
         args.api_key = Some("configured-secret".to_string());
+        assert!(validate_server_arguments(&args).is_err());
+        args.operator_api_key = Some("configured-operator-secret".to_string());
+        assert!(validate_server_arguments(&args).is_ok());
+    }
+
+    #[test]
+    fn operator_credential_must_be_nonempty_and_distinct() {
+        let mut args = default_args();
+        args.api_key = Some("shared-secret".to_string());
+        args.operator_api_key = Some("  ".to_string());
+        let empty_error = validate_server_arguments(&args).unwrap_err().to_string();
+        assert!(empty_error.contains("operator API key cannot be empty"));
+
+        args.operator_api_key = Some("shared-secret".to_string());
+        let shared_error = validate_server_arguments(&args).unwrap_err().to_string();
+        assert!(shared_error.contains("inference and operator API keys must be different"));
+
+        args.operator_api_key = Some("operator-secret".to_string());
         assert!(validate_server_arguments(&args).is_ok());
     }
 
@@ -1322,6 +1392,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut args = default_args();
         args.api_key = Some("doctor-secret-value".to_string());
+        args.operator_api_key = Some("doctor-operator-secret-value".to_string());
         let report = inspect_server(&args, false, &temp.path().join("models"));
 
         let json = report.render(DoctorFormat::Json).unwrap();
@@ -1331,6 +1402,7 @@ mod tests {
         assert_eq!(value["schema_version"], 1);
         assert_eq!(value["object"], "bloom.server_doctor");
         assert!(!json.contains("doctor-secret-value"));
+        assert!(!json.contains("doctor-operator-secret-value"));
         assert!(text.starts_with("Bloom server doctor"));
         assert!(text.contains("Summary:"));
     }

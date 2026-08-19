@@ -29,7 +29,9 @@ advisory on the repository.
 
 Before exposing `bloom_server` outside localhost:
 
-- Set `BLOOM_API_KEY` or pass `--api-key`.
+- Set different `BLOOM_API_KEY` and `BLOOM_OPERATOR_API_KEY` values (or pass
+  `--api-key` and `--operator-api-key`). Give inference clients only the former;
+  reserve the latter for the UI and model-management automation.
 - Keep the default `same-origin` browser policy for the embedded UI, or set
   `BLOOM_CORS_ALLOW_ORIGIN` to the separately hosted UI's one exact HTTP(S)
   origin. Never deploy the explicit `*` wildcard without a reviewed exception.

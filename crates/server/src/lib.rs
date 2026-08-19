@@ -593,8 +593,10 @@ struct ServerState {
     cancel_tokens: Arc<std::sync::Mutex<HashMap<String, CancellationToken>>>,
     /// Monotonic suffix for OpenAI-compatible request IDs.
     request_counter: AtomicU64,
-    /// Optional shared secret for OpenAI-compatible /v1 endpoints.
+    /// Optional inference credential for protected OpenAI- and Ollama-compatible endpoints.
     api_key: Option<String>,
+    /// Optional privileged credential for the model-management control plane.
+    operator_api_key: Option<String>,
     /// Explicitly retained Responses API state; bounded and process-local.
     response_store: ResponseStore,
 }
@@ -959,6 +961,7 @@ impl Drop for InferenceWorkerGuard {
 pub enum ApiError {
     InvalidRequest,
     AuthenticationError,
+    PermissionDenied,
     RateLimitExceeded,
     InternalError,
     ServiceUnavailable,
@@ -971,6 +974,7 @@ impl ApiError {
         match self {
             Self::InvalidRequest => axum::http::StatusCode::BAD_REQUEST,
             Self::AuthenticationError => axum::http::StatusCode::UNAUTHORIZED,
+            Self::PermissionDenied => axum::http::StatusCode::FORBIDDEN,
             Self::RateLimitExceeded => axum::http::StatusCode::TOO_MANY_REQUESTS,
             Self::InternalError => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             Self::ServiceUnavailable => axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -983,6 +987,7 @@ impl ApiError {
         match self {
             Self::InvalidRequest => "invalid_request_error",
             Self::AuthenticationError => "authentication_error",
+            Self::PermissionDenied => "permission_error",
             Self::RateLimitExceeded => "rate_limit_exceeded",
             Self::InternalError => "internal_error",
             Self::ServiceUnavailable => "service_unavailable",
@@ -1270,48 +1275,13 @@ async fn enforce_browser_origin(
     }
 }
 
-async fn require_api_key(
-    State(state): State<Arc<ServerState>>,
-    req: AxumRequest,
-    next: Next,
-) -> Response {
-    let Some(expected) = state.api_key.as_deref() else {
-        return next.run(req).await;
-    };
-
-    let bearer = format!("Bearer {}", expected);
-    let authorization_ok = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| constant_time_eq(value.as_bytes(), bearer.as_bytes()))
-        .unwrap_or(false);
-    let x_api_key_ok = req
-        .headers()
-        .get("x-api-key")
-        .and_then(|value| value.to_str().ok())
-        .map(|value| constant_time_eq(value.as_bytes(), expected.as_bytes()))
-        .unwrap_or(false);
-
-    if authorization_ok || x_api_key_ok {
-        next.run(req).await
-    } else {
-        api_error(
-            ApiError::AuthenticationError,
-            "Missing or invalid API key for protected API endpoint.",
-        )
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialScope {
+    Inference,
+    Operator,
 }
 
-async fn require_ollama_api_key(
-    State(state): State<Arc<ServerState>>,
-    req: AxumRequest,
-    next: Next,
-) -> Response {
-    let Some(expected) = state.api_key.as_deref() else {
-        return next.run(req).await;
-    };
-
+fn request_matches_api_key(req: &AxumRequest, expected: &str) -> bool {
     let bearer = format!("Bearer {expected}");
     let authorization_ok = req
         .headers()
@@ -1323,14 +1293,121 @@ async fn require_ollama_api_key(
         .get("x-api-key")
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| constant_time_eq(value.as_bytes(), expected.as_bytes()));
+    authorization_ok || x_api_key_ok
+}
 
-    if authorization_ok || x_api_key_ok {
-        next.run(req).await
-    } else {
-        ollama_error_response(
+fn request_credential_scope(state: &ServerState, req: &AxumRequest) -> Option<CredentialScope> {
+    if state
+        .operator_api_key
+        .as_deref()
+        .is_some_and(|key| request_matches_api_key(req, key))
+    {
+        return Some(CredentialScope::Operator);
+    }
+    if state
+        .api_key
+        .as_deref()
+        .is_some_and(|key| request_matches_api_key(req, key))
+    {
+        return Some(if state.operator_api_key.is_some() {
+            CredentialScope::Inference
+        } else {
+            CredentialScope::Operator
+        });
+    }
+    None
+}
+
+fn authentication_disabled(state: &ServerState) -> bool {
+    state.api_key.is_none() && state.operator_api_key.is_none()
+}
+
+async fn continue_with_scope(mut req: AxumRequest, next: Next, scope: CredentialScope) -> Response {
+    req.extensions_mut().insert(scope);
+    next.run(req).await
+}
+
+async fn require_api_key(
+    State(state): State<Arc<ServerState>>,
+    req: AxumRequest,
+    next: Next,
+) -> Response {
+    if authentication_disabled(&state) {
+        return continue_with_scope(req, next, CredentialScope::Operator).await;
+    }
+
+    match request_credential_scope(&state, &req) {
+        Some(scope) => continue_with_scope(req, next, scope).await,
+        None => api_error(
+            ApiError::AuthenticationError,
+            "Missing or invalid API key for protected API endpoint.",
+        ),
+    }
+}
+
+async fn require_operator_api_key(
+    State(state): State<Arc<ServerState>>,
+    req: AxumRequest,
+    next: Next,
+) -> Response {
+    if authentication_disabled(&state) {
+        return continue_with_scope(req, next, CredentialScope::Operator).await;
+    }
+
+    match request_credential_scope(&state, &req) {
+        Some(CredentialScope::Operator) => {
+            continue_with_scope(req, next, CredentialScope::Operator).await
+        }
+        Some(CredentialScope::Inference) => api_error(
+            ApiError::PermissionDenied,
+            "The inference API key cannot access operator model-management endpoints.",
+        ),
+        None => api_error(
+            ApiError::AuthenticationError,
+            "Missing or invalid operator API key for model-management endpoint.",
+        ),
+    }
+}
+
+async fn require_ollama_api_key(
+    State(state): State<Arc<ServerState>>,
+    req: AxumRequest,
+    next: Next,
+) -> Response {
+    if authentication_disabled(&state) {
+        return continue_with_scope(req, next, CredentialScope::Operator).await;
+    }
+
+    match request_credential_scope(&state, &req) {
+        Some(scope) => continue_with_scope(req, next, scope).await,
+        None => ollama_error_response(
             axum::http::StatusCode::UNAUTHORIZED,
             "missing or invalid API key for protected API endpoint",
-        )
+        ),
+    }
+}
+
+async fn require_ollama_operator_api_key(
+    State(state): State<Arc<ServerState>>,
+    req: AxumRequest,
+    next: Next,
+) -> Response {
+    if authentication_disabled(&state) {
+        return continue_with_scope(req, next, CredentialScope::Operator).await;
+    }
+
+    match request_credential_scope(&state, &req) {
+        Some(CredentialScope::Operator) => {
+            continue_with_scope(req, next, CredentialScope::Operator).await
+        }
+        Some(CredentialScope::Inference) => ollama_error_response(
+            axum::http::StatusCode::FORBIDDEN,
+            "the inference API key cannot access operator model-management endpoints",
+        ),
+        None => ollama_error_response(
+            axum::http::StatusCode::UNAUTHORIZED,
+            "missing or invalid operator API key for model-management endpoint",
+        ),
     }
 }
 
@@ -1364,21 +1441,29 @@ async fn handle_ollama_method_not_allowed() -> Response {
 }
 
 fn ollama_api_router(state: Arc<ServerState>) -> Router<Arc<ServerState>> {
-    Router::new()
+    let inference_routes = Router::new()
         .route("/version", get(handle_ollama_version))
         .route("/tags", get(handle_ollama_tags))
         .route("/ps", get(handle_ollama_ps))
         .route("/show", post(handle_ollama_show))
-        .route("/pull", post(handle_ollama_pull))
-        .route("/delete", delete(handle_ollama_delete))
         .route("/chat", post(handle_ollama_chat))
         .route("/generate", post(handle_ollama_generate))
         .route("/embed", post(handle_ollama_embed))
         .route("/embeddings", post(handle_ollama_legacy_embeddings))
         .route_layer(middleware::from_fn_with_state(
-            state,
+            Arc::clone(&state),
             require_ollama_api_key,
-        ))
+        ));
+    let operator_routes = Router::new()
+        .route("/pull", post(handle_ollama_pull))
+        .route("/delete", delete(handle_ollama_delete))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            require_ollama_operator_api_key,
+        ));
+
+    inference_routes
+        .merge(operator_routes)
         .fallback(handle_ollama_route_not_found)
         .method_not_allowed_fallback(handle_ollama_method_not_allowed)
 }
@@ -1632,6 +1717,10 @@ async fn run_server(args: Args, config_path: PathBuf) -> Result<()> {
         cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
         request_counter: AtomicU64::new(0),
         api_key: args.api_key.clone().filter(|value| !value.is_empty()),
+        operator_api_key: args
+            .operator_api_key
+            .clone()
+            .filter(|value| !value.is_empty()),
         response_store: ResponseStore::default(),
     });
 
@@ -1666,10 +1755,7 @@ async fn run_server(args: Args, config_path: PathBuf) -> Result<()> {
     };
     let cors = configured_cors_layer(&browser_origin_policy);
 
-    let v1_routes = Router::new()
-        .route("/observability", get(handle_observability))
-        .route("/models", get(handle_models))
-        .route("/models/{model}", get(handle_model_retrieve))
+    let operator_routes = Router::new()
         .route("/model-management/models", get(handle_model_catalog))
         .route(
             "/model-management/index",
@@ -1727,6 +1813,15 @@ async fn run_server(args: Args, config_path: PathBuf) -> Result<()> {
             "/model-management/imports/{filename}/complete",
             post(handle_model_import_complete),
         )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            require_operator_api_key,
+        ));
+
+    let v1_routes = Router::new()
+        .route("/observability", get(handle_observability))
+        .route("/models", get(handle_models))
+        .route("/models/{model}", get(handle_model_retrieve))
         .route("/chat/completions", post(handle_chat_completions))
         .route("/responses", post(handle_responses))
         .route(
@@ -1753,6 +1848,7 @@ async fn run_server(args: Args, config_path: PathBuf) -> Result<()> {
             Arc::clone(&state),
             require_api_key,
         ))
+        .merge(operator_routes)
         .fallback(handle_openai_route_not_found)
         .method_not_allowed_fallback(handle_openai_method_not_allowed);
 
@@ -1831,10 +1927,16 @@ async fn run_server(args: Args, config_path: PathBuf) -> Result<()> {
         .as_ref()
         .filter(|value| !value.is_empty())
         .is_some();
+    let operator_api_key_set = args
+        .operator_api_key
+        .as_ref()
+        .filter(|value| !value.is_empty())
+        .is_some();
+    let authentication_set = api_key_set || operator_api_key_set;
     let is_loopback = addr.ip().is_loopback();
-    if !is_loopback && !api_key_set {
+    if !is_loopback && !authentication_set {
         let msg = format!(
-            "Security Alert: Server is binding to a non-loopback address ({}) without BLOOM_API_KEY or --api-key. \
+            "Security Alert: Server is binding to a non-loopback address ({}) without an API credential. \
              This exposes your endpoints to the network without authentication.",
             addr.ip()
         );
@@ -1843,7 +1945,9 @@ async fn run_server(args: Args, config_path: PathBuf) -> Result<()> {
         } else {
             tracing::warn!("=====================================================================");
             tracing::warn!("{}", msg);
-            tracing::warn!("Please set BLOOM_API_KEY or pass --api-key to secure the server.");
+            tracing::warn!(
+                "Please set BLOOM_API_KEY, BLOOM_OPERATOR_API_KEY, or the corresponding CLI flag to secure the server."
+            );
             tracing::warn!(
                 "The development-only unauthenticated-network override is enabled; never use it on an untrusted network."
             );
@@ -5059,6 +5163,7 @@ mod tests {
                 cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
                 request_counter: AtomicU64::new(0),
                 api_key: None,
+                operator_api_key: None,
                 response_store: ResponseStore::default(),
             }),
             receiver,
@@ -5820,6 +5925,255 @@ mod tests {
             .unwrap();
         assert_eq!(authorized_delete.status(), axum::http::StatusCode::OK);
         assert!(!protected_model.exists());
+    }
+
+    #[tokio::test]
+    async fn inference_and_operator_credentials_enforce_distinct_scopes() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut state, _receiver) = test_server_state(temp.path().to_path_buf());
+        let mutable_state = Arc::get_mut(&mut state).unwrap();
+        mutable_state.api_key = Some("inference-secret".to_string());
+        mutable_state.operator_api_key = Some("operator-secret".to_string());
+
+        let openai_inference = Router::new()
+            .route(
+                "/inference",
+                get(|| async { axum::http::StatusCode::NO_CONTENT }),
+            )
+            .route_layer(middleware::from_fn_with_state(
+                Arc::clone(&state),
+                require_api_key,
+            ));
+        let openai_operator = Router::new()
+            .route(
+                "/operator",
+                get(|| async { axum::http::StatusCode::NO_CONTENT }),
+            )
+            .route_layer(middleware::from_fn_with_state(
+                Arc::clone(&state),
+                require_operator_api_key,
+            ));
+        let ollama_inference = Router::new()
+            .route(
+                "/inference",
+                get(|| async { axum::http::StatusCode::NO_CONTENT }),
+            )
+            .route_layer(middleware::from_fn_with_state(
+                Arc::clone(&state),
+                require_ollama_api_key,
+            ));
+        let ollama_operator = Router::new()
+            .route(
+                "/operator",
+                get(|| async { axum::http::StatusCode::NO_CONTENT }),
+            )
+            .route_layer(middleware::from_fn_with_state(
+                Arc::clone(&state),
+                require_ollama_operator_api_key,
+            ));
+        let app = Router::new()
+            .nest("/v1", openai_inference.merge(openai_operator))
+            .nest("/api", ollama_inference.merge(ollama_operator))
+            .with_state(state)
+            .layer(middleware::from_fn(publish_authentication_challenge));
+
+        for (path, header_name, header_value) in [
+            (
+                "/v1/inference",
+                header::AUTHORIZATION.as_str(),
+                "Bearer inference-secret",
+            ),
+            ("/v1/inference", "x-api-key", "operator-secret"),
+            (
+                "/api/inference",
+                header::AUTHORIZATION.as_str(),
+                "Bearer inference-secret",
+            ),
+            ("/api/operator", "x-api-key", "operator-secret"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(path)
+                        .header(header_name, header_value)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::NO_CONTENT);
+        }
+
+        let forbidden_openai = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/operator")
+                    .header(header::AUTHORIZATION, "Bearer inference-secret")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forbidden_openai.status(), axum::http::StatusCode::FORBIDDEN);
+        assert!(
+            forbidden_openai
+                .headers()
+                .get(header::WWW_AUTHENTICATE)
+                .is_none()
+        );
+        let forbidden_openai: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(forbidden_openai.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(forbidden_openai["error"]["type"], "permission_error");
+
+        let forbidden_ollama = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/operator")
+                    .header("x-api-key", "inference-secret")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forbidden_ollama.status(), axum::http::StatusCode::FORBIDDEN);
+        let forbidden_ollama: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(forbidden_ollama.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(forbidden_ollama["error"].is_string());
+        assert!(forbidden_ollama.get("type").is_none());
+
+        let unauthenticated = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/operator")
+                    .header(header::AUTHORIZATION, "Bearer invalid-secret")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            unauthenticated.status(),
+            axum::http::StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            unauthenticated.headers()[header::WWW_AUTHENTICATE],
+            DEFAULT_BEARER_AUTHENTICATION_CHALLENGE
+        );
+    }
+
+    #[tokio::test]
+    async fn ollama_inference_scope_cannot_change_model_residency() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut state, _receiver) = test_server_state(temp.path().to_path_buf());
+        let mutable_state = Arc::get_mut(&mut state).unwrap();
+        mutable_state.api_key = Some("inference-secret".to_string());
+        mutable_state.operator_api_key = Some("operator-secret".to_string());
+        let app = Router::new()
+            .nest("/api", ollama_api_router(Arc::clone(&state)))
+            .with_state(state);
+
+        for body in [
+            json!({"model": "inactive.gguf", "prompt": "hello", "stream": false}),
+            json!({"model": "inactive.gguf", "prompt": "", "keep_alive": 0, "stream": false}),
+            json!({"model": "default", "prompt": "hello", "keep_alive": "10m", "stream": false}),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/api/generate")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::AUTHORIZATION, "Bearer inference-secret")
+                        .body(axum::body::Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(body["error"].is_string());
+        }
+
+        let operator_request = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/generate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-api-key", "operator-secret")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "default",
+                            "prompt": "",
+                            "keep_alive": 0,
+                            "stream": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(operator_request.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn ollama_inference_scope_uses_active_model_without_resetting_residency() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = test_server_state_with_text_runtime(
+            temp.path().to_path_buf(),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await;
+        let mutable_state = Arc::get_mut(&mut state).unwrap();
+        mutable_state.api_key = Some("inference-secret".to_string());
+        mutable_state.operator_api_key = Some("operator-secret".to_string());
+        let app = Router::new()
+            .nest("/api", ollama_api_router(Arc::clone(&state)))
+            .with_state(Arc::clone(&state));
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/generate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer inference-secret")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "default",
+                            "prompt": "hello",
+                            "stream": false,
+                            "options": {"num_predict": 8}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let residency = state.ollama_residency.lock().await;
+        assert_eq!(residency.revision, 0);
+        assert!(residency.expiry.is_none());
     }
 
     #[tokio::test]

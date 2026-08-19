@@ -10,14 +10,22 @@ called out in release notes.
 
 ### Breaking
 
-- Reject non-loopback `bloom_server` listeners without an API key by default.
+- Add `BLOOM_OPERATOR_API_KEY`/`--operator-api-key` and enforce a separate
+  operator scope for `/v1/model-management/*`, Ollama pull/delete, inactive
+  model activation, empty-prompt load/unload, and explicit `keep_alive`.
+  Operator credentials remain valid for inference; inference credentials now
+  receive protocol-shaped HTTP 403 responses for control-plane operations when
+  both keys are configured. Omitting the operator key retains legacy single-key
+  behavior, while strict non-loopback deployments require two different keys.
+- Reject non-loopback `bloom_server` listeners without an API credential by default.
   Isolated development environments can opt back into the old behavior only
   with `--allow-unauthenticated-network` or
   `BLOOM_ALLOW_UNAUTHENTICATED_NETWORK`; strict security rejects that override.
 - Change the Docker runtime to fixed unprivileged UID/GID `10001`, move its
   mutable state to `/var/lib/bloom`, and enable strict security and memory
   admission by default. Existing bind mounts must be writable by `10001:10001`,
-  and public container listeners now require an API key. The Dockerfile
+  and public container listeners in strict mode now require distinct inference
+  and operator API keys. The Dockerfile
   frontend and both tagged base images are digest-pinned, with a regression
   validator for immutable bases and hardened runtime settings.
 - Change the application-layer `bloom_server::run_cli` bootstrap from async to

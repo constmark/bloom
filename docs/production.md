@@ -5,15 +5,20 @@ real-model and hardware validation.
 
 ## Server
 
-- Set `BLOOM_API_KEY` or `--api-key`.
-- Non-loopback listeners fail closed without an API key. Do not enable
+- Set different `BLOOM_API_KEY` and `BLOOM_OPERATOR_API_KEY` values (or their
+  CLI equivalents). The operator key is a superset used by the Bloom UI,
+  `/v1/model-management/*`, `/api/pull`, `DELETE /api/delete`, and Ollama
+  model-residency changes. Give ordinary clients only the inference key.
+- Non-loopback listeners fail closed without an API credential. Strict mode
+  requires both scopes and rejects identical values. Do not enable
   `--allow-unauthenticated-network` or
   `BLOOM_ALLOW_UNAUTHENTICATED_NETWORK` in production; that explicit escape
   hatch exists only for isolated development environments and is rejected by
   strict security mode.
 - The official Dockerfile runs with UID/GID `10001`, uses
   `/var/lib/bloom` for mutable state, and enables strict security and memory
-  admission. Supply the API key at runtime rather than baking it into an image.
+  admission. Supply both API keys at runtime rather than baking them into an
+  image.
   Keep those defaults in derived images, use a named volume or make bind mounts
   writable by `10001:10001`, and preserve a read-only root filesystem whenever
   the selected external runtimes permit it.
@@ -86,9 +91,9 @@ real-model and hardware validation.
   lock ownership—not its presence—identifies a live owner. Verify advisory-lock
   behavior on the exact network or userspace filesystem before deployment;
   local CPU tests cannot establish a remote filesystem's lock guarantees.
-- Restrict model removal and staged-acquisition discard endpoints to operators;
-  they permanently delete server-side data. This includes
-  `DELETE /api/delete`, which has no browser confirmation step.
+- Keep the operator key out of inference clients. Model removal and
+  staged-acquisition discard endpoints permanently delete server-side data;
+  this includes `DELETE /api/delete`, which has no browser confirmation step.
 - Reverify acquired models after transfer or restore and before first load in a
   new environment. Investigate rather than bypass a persistent integrity
   mismatch; replace the file from a trusted source and verify it again.

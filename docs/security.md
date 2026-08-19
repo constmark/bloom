@@ -213,13 +213,14 @@ component.
 
 ## Network and data
 
-- `bloom_server --doctor` is side-effect-free and does not serialize API keys,
+- `bloom_server --doctor` is side-effect-free and does not serialize either API key,
   absolute model paths, source URLs, prompts, responses, or raw loader errors.
   Its engine names, device names, model counts, and deployment warnings are
   still operational metadata; review JSON reports before sharing them.
 - Keep `/metrics` and health endpoints behind an internal network or proxy ACL.
-- Bloom rejects a non-loopback listener without an API key before storage
-  mutation or socket binding. The explicit
+- Bloom rejects a non-loopback listener without an API credential before
+  storage mutation or socket binding. Strict mode also requires different
+  inference and operator keys. The explicit
   `BLOOM_ALLOW_UNAUTHENTICATED_NETWORK` development override degrades that
   failure to a warning only outside strict mode; never enable it on a shared or
   untrusted network.
@@ -391,7 +392,9 @@ component.
 - Treat `/api/*` as an authenticated compatibility view over the same Bloom
   runtime, not as an unauthenticated Ollama daemon. Unknown and non-neutral
   Ollama fields fail closed, tool calls remain untrusted model output, and the
-  server never executes a client-declared function. `/api/tags` can reveal
+  server never executes a client-declared function. Configure a distinct
+  operator key so inference clients cannot mutate the catalog or model
+  lifecycle. `/api/tags` can reveal
   inactive catalog identifiers; restrict it to the same principals as `/v1`.
   `DELETE /api/delete` is intentionally destructive and delegates to Bloom's
   guarded removal operation; authorize it only for operators. `/api/pull`
@@ -401,9 +404,11 @@ component.
   never accept a client URL, registry fallback, insecure transport, or silent
   policy downgrade. The signed ID persisted in provenance is a public selector,
   not a path; reject duplicate aliases and never derive a destination from it.
-  Chat, generate, and embedding requests may activate only an exact contained
-  catalog ID or that validated persisted alias, after the shared integrity and
-  preflight gates. Same-target concurrent requests may join only their own
+  Operator-scoped chat, generate, and embedding requests may activate only an
+  exact contained catalog ID or that validated persisted alias, after the
+  shared integrity and preflight gates. Inference-scoped requests must use the
+  already active runtime and cannot set `keep_alive`. Same-target concurrent
+  requests may join only their own
   sequenced terminal channel; never infer completion from mutable global load
   status or let a different selector join. Empty lifecycle requests may preload
   or synchronously unload the exact active runtime. Timed expiry must remain

@@ -162,6 +162,7 @@ jobs:
           fi
           docker run --rm \
             -e BLOOM_API_KEY=bloom-ci-container-key \
+            -e BLOOM_OPERATOR_API_KEY=bloom-ci-container-operator-key \
             bloom:ci --host 0.0.0.0 --doctor=json
 
   macos:

@@ -18,6 +18,10 @@ criteria that cut across those capabilities.
 - Non-loopback listeners fail closed without authentication. The Dockerfile
   uses immutable base-image digests, a non-root runtime, isolated mutable state,
   and strict security and memory admission.
+- Distinct inference and operator credentials are enforced across native model
+  management and Ollama acquisition, deletion, activation, unload, and
+  residency controls. Strict non-loopback deployments require different values;
+  legacy single-key behavior remains available only outside that baseline.
 
 ## Blocking gaps
 
@@ -37,15 +41,6 @@ quantization, backend, device, operating system, and client set, then publish:
 
 Promotion should apply only to that measured cell. It must not implicitly
 promote other model families, accelerators, or external-runtime adapters.
-
-### P0: separate inference and operator authority
-
-The current shared API key protects both inference and destructive model
-management. A production control plane needs a distinct operator credential or
-an authenticated proxy policy that can deny catalog mutation, load/unload,
-download/import, and integrity administration to inference clients. The server
-contract should eventually enforce this separation directly and test both
-credential scopes through the OpenAI and Ollama namespaces.
 
 ### P0: complete the chosen deployment artifact
 

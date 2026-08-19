@@ -114,7 +114,7 @@ response = client.chat(
 )
 ```
 
-If Bloom has an API key, pass it as a client header:
+For inference, pass the inference API key as a client header:
 
 ```python
 client = Client(
@@ -128,15 +128,26 @@ client = Client(
 Ollama installation. Keep `/health`, `/ready`, and `/metrics` behind a network
 ACL or reverse proxy when the server is not localhost-only.
 
+Set `BLOOM_OPERATOR_API_KEY` to a different value and use it for `/api/pull`,
+`DELETE /api/delete`, empty-prompt load/unload requests, explicit `keep_alive`,
+or any request that must switch to an inactive model. The operator key is also
+accepted for ordinary inference. Once separation is configured, the inference
+key can query the catalog and use the already active model but receives HTTP
+403 for lifecycle or destructive operations. Omitting the operator key retains
+the pre-separation single-key behavior; strict non-loopback deployments reject
+that compatibility mode.
+
 ## Model identity and lifecycle
 
 Bloom owns one active model runtime. `default` aliases that runtime. Any other
 chat, generation, or embedding selector must resolve exactly to one safe local
-catalog ID or persisted signed-index alias. If it is inactive, Bloom runs the
-same integrity and preflight checks as an explicit native switch, closes
-inference admission, drains the previous runtime, and waits for the requested
-load to finish before inference. The previous runtime remains published if the
-replacement fails.
+catalog ID or persisted signed-index alias. If it is inactive and the request
+has operator authority, Bloom runs the same integrity and preflight checks as
+an explicit native switch, closes inference admission, drains the previous
+runtime, and waits for the requested
+load to finish before inference. An inference-scoped credential receives HTTP
+403 instead of changing the runtime. The previous runtime remains published if
+the replacement fails.
 
 Every load has a monotonic process-local sequence and its own terminal result.
 Concurrent requests for the same canonical path and selector join that result;
@@ -174,7 +185,9 @@ unloads only after its buffered response or stream has completed.
 Each successfully activated Ollama request cancels the previous residency
 timer. Activation and unload commit their new residency policy atomically;
 validation, lookup, or load failure leaves the current deadline unchanged.
-Timers bind to the exact loaded runtime instance, never unload a replacement
+Inference-scoped requests use the active model without changing an
+operator-established deadline. Timers bind to the exact loaded runtime instance,
+never unload a replacement
 that happens to use the same path, retry while other requests are in flight,
 and publish their deadline as `expires_at` through `/api/ps`. Infinite or
 non-Ollama-managed residency retains the documented far-future marker.

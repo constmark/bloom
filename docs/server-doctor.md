@@ -48,7 +48,7 @@ a pinned real-model smoke test on the deployment hardware.
 
 ## Privacy and automation
 
-The report does not serialize the API key, absolute model paths, source URLs,
+The report does not serialize either API key, absolute model paths, source URLs,
 prompts, responses, or raw loader errors. It may contain selected engine and
 device names, model counts, Bloom's version, and general remediation guidance.
 Review it as deployment metadata before publishing it.

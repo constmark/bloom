@@ -1116,6 +1116,14 @@ pub(crate) async fn activate_ollama_model(
     state: &Arc<ServerState>,
     requested: &str,
 ) -> std::result::Result<String, OllamaActivationError> {
+    activate_ollama_model_with_permission(state, requested, true).await
+}
+
+async fn activate_ollama_model_with_permission(
+    state: &Arc<ServerState>,
+    requested: &str,
+    allow_lifecycle_change: bool,
+) -> std::result::Result<String, OllamaActivationError> {
     if validate_ollama_model_selector(requested).is_err() {
         return Err(OllamaActivationError::new(
             axum::http::StatusCode::BAD_REQUEST,
@@ -1145,6 +1153,12 @@ pub(crate) async fn activate_ollama_model(
         runtime.model_id == requested || runtime.catalog_id.as_deref() == Some(requested)
     }) {
         return Ok(runtime.model_id.clone());
+    }
+    if !allow_lifecycle_change {
+        return Err(OllamaActivationError::new(
+            axum::http::StatusCode::FORBIDDEN,
+            "the inference API key cannot load or switch the active model",
+        ));
     }
 
     let mut candidates = catalog
@@ -1484,10 +1498,54 @@ async fn handle_ollama_lifecycle(
     response
 }
 
+fn ollama_has_operator_scope(scope: Option<axum::extract::Extension<CredentialScope>>) -> bool {
+    scope
+        .map(|axum::extract::Extension(scope)| scope == CredentialScope::Operator)
+        .unwrap_or(true)
+}
+
+fn ollama_operator_permission_error(operation: &str) -> axum::response::Response {
+    ollama_error_response(
+        axum::http::StatusCode::FORBIDDEN,
+        format!("the inference API key cannot {operation}"),
+    )
+}
+
+async fn activate_ollama_model_for_request(
+    state: &Arc<ServerState>,
+    requested_model: &str,
+    operator_scope: bool,
+    keep_alive: OllamaKeepAlive,
+) -> std::result::Result<(String, Option<OllamaResidencyLease>), OllamaActivationError> {
+    let mut residency = state.ollama_residency.lock().await;
+    let active_model =
+        activate_ollama_model_with_permission(state, requested_model, operator_scope).await?;
+    if !operator_scope {
+        return Ok((active_model, None));
+    }
+
+    let (residency_revision, residency_timer_cancel) =
+        commit_ollama_residency_request(&mut residency);
+    drop(residency);
+    let lease = ollama_residency_lease(
+        Arc::clone(state),
+        residency_revision,
+        residency_timer_cancel,
+        keep_alive,
+    )
+    .await
+    .map_err(|message| {
+        OllamaActivationError::new(axum::http::StatusCode::SERVICE_UNAVAILABLE, message)
+    })?;
+    Ok((active_model, Some(lease)))
+}
+
 pub(crate) async fn handle_ollama_chat(
     State(state): State<Arc<ServerState>>,
+    scope: Option<axum::extract::Extension<CredentialScope>>,
     payload: std::result::Result<Json<OllamaChatRequest>, axum::extract::rejection::JsonRejection>,
 ) -> axum::response::Response {
+    let operator_scope = ollama_has_operator_scope(scope);
     let Json(payload) = match payload {
         Ok(payload) => payload,
         Err(error) => return ollama_json_rejection_response(error),
@@ -1495,6 +1553,9 @@ pub(crate) async fn handle_ollama_chat(
     let started = Instant::now();
     match ollama_chat_lifecycle_action(&payload) {
         Ok(Some(action)) => {
+            if !operator_scope {
+                return ollama_operator_permission_error("change model residency");
+            }
             return handle_ollama_lifecycle(
                 &state,
                 payload.model.clone(),
@@ -1507,6 +1568,14 @@ pub(crate) async fn handle_ollama_chat(
         Ok(None) => {}
         Err(message) => return ollama_bad_request(message),
     }
+    if !operator_scope
+        && payload
+            .keep_alive
+            .as_ref()
+            .is_some_and(|value| !value.is_null())
+    {
+        return ollama_operator_permission_error("set keep_alive");
+    }
     let stream = payload.stream.unwrap_or(true);
     let keep_alive = match parse_ollama_keep_alive(payload.keep_alive.as_ref()) {
         Ok(keep_alive) => keep_alive,
@@ -1517,26 +1586,16 @@ pub(crate) async fn handle_ollama_chat(
         Err(message) => return ollama_bad_request(message),
     };
     let requested_model = chat_request.model.clone().unwrap_or_default();
-    let mut residency = state.ollama_residency.lock().await;
-    let active_model = match activate_ollama_model(&state, &requested_model).await {
-        Ok(model) => model,
-        Err(error) => return ollama_error_response(error.status, error.message),
-    };
-    let (residency_revision, residency_timer_cancel) =
-        commit_ollama_residency_request(&mut residency);
-    drop(residency);
-    let residency_lease = match ollama_residency_lease(
-        Arc::clone(&state),
-        residency_revision,
-        residency_timer_cancel,
+    let (active_model, residency_lease) = match activate_ollama_model_for_request(
+        &state,
+        &requested_model,
+        operator_scope,
         keep_alive,
     )
     .await
     {
-        Ok(lease) => lease,
-        Err(message) => {
-            return ollama_error_response(axum::http::StatusCode::SERVICE_UNAVAILABLE, message);
-        }
+        Ok(activation) => activation,
+        Err(error) => return ollama_error_response(error.status, error.message),
     };
     let mut chat_request = chat_request;
     chat_request.model = Some(active_model);
@@ -1556,11 +1615,13 @@ pub(crate) async fn handle_ollama_chat(
 
 pub(crate) async fn handle_ollama_generate(
     State(state): State<Arc<ServerState>>,
+    scope: Option<axum::extract::Extension<CredentialScope>>,
     payload: std::result::Result<
         Json<OllamaGenerateRequest>,
         axum::extract::rejection::JsonRejection,
     >,
 ) -> axum::response::Response {
+    let operator_scope = ollama_has_operator_scope(scope);
     let Json(payload) = match payload {
         Ok(payload) => payload,
         Err(error) => return ollama_json_rejection_response(error),
@@ -1568,6 +1629,9 @@ pub(crate) async fn handle_ollama_generate(
     let started = Instant::now();
     match ollama_generate_lifecycle_action(&payload) {
         Ok(Some(action)) => {
+            if !operator_scope {
+                return ollama_operator_permission_error("change model residency");
+            }
             return handle_ollama_lifecycle(
                 &state,
                 payload.model.clone(),
@@ -1580,6 +1644,14 @@ pub(crate) async fn handle_ollama_generate(
         Ok(None) => {}
         Err(message) => return ollama_bad_request(message),
     }
+    if !operator_scope
+        && payload
+            .keep_alive
+            .as_ref()
+            .is_some_and(|value| !value.is_null())
+    {
+        return ollama_operator_permission_error("set keep_alive");
+    }
     let stream = payload.stream.unwrap_or(true);
     let keep_alive = match parse_ollama_keep_alive(payload.keep_alive.as_ref()) {
         Ok(keep_alive) => keep_alive,
@@ -1590,26 +1662,16 @@ pub(crate) async fn handle_ollama_generate(
         Err(message) => return ollama_bad_request(message),
     };
     let requested_model = chat_request.model.clone().unwrap_or_default();
-    let mut residency = state.ollama_residency.lock().await;
-    let active_model = match activate_ollama_model(&state, &requested_model).await {
-        Ok(model) => model,
-        Err(error) => return ollama_error_response(error.status, error.message),
-    };
-    let (residency_revision, residency_timer_cancel) =
-        commit_ollama_residency_request(&mut residency);
-    drop(residency);
-    let residency_lease = match ollama_residency_lease(
-        Arc::clone(&state),
-        residency_revision,
-        residency_timer_cancel,
+    let (active_model, residency_lease) = match activate_ollama_model_for_request(
+        &state,
+        &requested_model,
+        operator_scope,
         keep_alive,
     )
     .await
     {
-        Ok(lease) => lease,
-        Err(message) => {
-            return ollama_error_response(axum::http::StatusCode::SERVICE_UNAVAILABLE, message);
-        }
+        Ok(activation) => activation,
+        Err(error) => return ollama_error_response(error.status, error.message),
     };
     let mut chat_request = chat_request;
     chat_request.model = Some(active_model);
@@ -1629,12 +1691,22 @@ pub(crate) async fn handle_ollama_generate(
 
 pub(crate) async fn handle_ollama_embed(
     State(state): State<Arc<ServerState>>,
+    scope: Option<axum::extract::Extension<CredentialScope>>,
     payload: std::result::Result<Json<OllamaEmbedRequest>, axum::extract::rejection::JsonRejection>,
 ) -> axum::response::Response {
+    let operator_scope = ollama_has_operator_scope(scope);
     let Json(payload) = match payload {
         Ok(payload) => payload,
         Err(error) => return ollama_json_rejection_response(error),
     };
+    if !operator_scope
+        && payload
+            .keep_alive
+            .as_ref()
+            .is_some_and(|value| !value.is_null())
+    {
+        return ollama_operator_permission_error("set keep_alive");
+    }
     let keep_alive = match parse_ollama_keep_alive(payload.keep_alive.as_ref()) {
         Ok(keep_alive) => keep_alive,
         Err(message) => return ollama_bad_request(message),
@@ -1666,27 +1738,11 @@ pub(crate) async fn handle_ollama_embed(
         Ok(inputs) => inputs,
         Err(message) => return ollama_bad_request(message),
     };
-    let mut residency = state.ollama_residency.lock().await;
-    let active_model = match activate_ollama_model(&state, &model).await {
-        Ok(active_model) => active_model,
-        Err(error) => return ollama_error_response(error.status, error.message),
-    };
-    let (residency_revision, residency_timer_cancel) =
-        commit_ollama_residency_request(&mut residency);
-    drop(residency);
-    let _residency_lease = match ollama_residency_lease(
-        Arc::clone(&state),
-        residency_revision,
-        residency_timer_cancel,
-        keep_alive,
-    )
-    .await
-    {
-        Ok(lease) => lease,
-        Err(message) => {
-            return ollama_error_response(axum::http::StatusCode::SERVICE_UNAVAILABLE, message);
-        }
-    };
+    let (active_model, _residency_lease) =
+        match activate_ollama_model_for_request(&state, &model, operator_scope, keep_alive).await {
+            Ok(activation) => activation,
+            Err(error) => return ollama_error_response(error.status, error.message),
+        };
     let mut result = match execute_embedding_batch(
         state,
         Some(active_model),
@@ -1713,15 +1769,25 @@ pub(crate) async fn handle_ollama_embed(
 
 pub(crate) async fn handle_ollama_legacy_embeddings(
     State(state): State<Arc<ServerState>>,
+    scope: Option<axum::extract::Extension<CredentialScope>>,
     payload: std::result::Result<
         Json<OllamaLegacyEmbeddingRequest>,
         axum::extract::rejection::JsonRejection,
     >,
 ) -> axum::response::Response {
+    let operator_scope = ollama_has_operator_scope(scope);
     let Json(payload) = match payload {
         Ok(payload) => payload,
         Err(error) => return ollama_json_rejection_response(error),
     };
+    if !operator_scope
+        && payload
+            .keep_alive
+            .as_ref()
+            .is_some_and(|value| !value.is_null())
+    {
+        return ollama_operator_permission_error("set keep_alive");
+    }
     let keep_alive = match parse_ollama_keep_alive(payload.keep_alive.as_ref()) {
         Ok(keep_alive) => keep_alive,
         Err(message) => return ollama_bad_request(message),
@@ -1746,27 +1812,11 @@ pub(crate) async fn handle_ollama_legacy_embeddings(
         Ok(inputs) => inputs,
         Err(message) => return ollama_bad_request(message),
     };
-    let mut residency = state.ollama_residency.lock().await;
-    let active_model = match activate_ollama_model(&state, &model).await {
-        Ok(active_model) => active_model,
-        Err(error) => return ollama_error_response(error.status, error.message),
-    };
-    let (residency_revision, residency_timer_cancel) =
-        commit_ollama_residency_request(&mut residency);
-    drop(residency);
-    let _residency_lease = match ollama_residency_lease(
-        Arc::clone(&state),
-        residency_revision,
-        residency_timer_cancel,
-        keep_alive,
-    )
-    .await
-    {
-        Ok(lease) => lease,
-        Err(message) => {
-            return ollama_error_response(axum::http::StatusCode::SERVICE_UNAVAILABLE, message);
-        }
-    };
+    let (active_model, _residency_lease) =
+        match activate_ollama_model_for_request(&state, &model, operator_scope, keep_alive).await {
+            Ok(activation) => activation,
+            Err(error) => return ollama_error_response(error.status, error.message),
+        };
     let result = match execute_embedding_batch(
         state,
         Some(active_model),
@@ -2429,19 +2479,13 @@ async fn ollama_from_chat_response(
     stream: bool,
     started: Instant,
     requested_model: String,
-    residency_lease: OllamaResidencyLease,
+    residency_lease: Option<OllamaResidencyLease>,
 ) -> axum::response::Response {
     if !response.status().is_success() {
         return adapt_ollama_error_response(response).await;
     }
     if stream {
-        return ollama_stream_from_chat(
-            response,
-            kind,
-            started,
-            requested_model,
-            Some(residency_lease),
-        );
+        return ollama_stream_from_chat(response, kind, started, requested_model, residency_lease);
     }
     let body = match axum::body::to_bytes(response.into_body(), MAX_OLLAMA_ADAPTER_BODY_BYTES).await
     {

@@ -152,7 +152,7 @@ other extracted files after installation.
 ## Headless and network deployments
 
 Omit `--open-browser` for a headless service. Before binding beyond localhost,
-read `docs/production.md` and `docs/security.md`, set an API key, restrict
-writes, configure the separately hosted UI's exact browser origin, and place
-TLS and network policy in front of Bloom. Do not expose a
+read `docs/production.md` and `docs/security.md`, set distinct inference and
+operator API keys, restrict writes, configure the separately hosted UI's exact
+browser origin, and place TLS and network policy in front of Bloom. Do not expose a
 writable model catalog without authentication and explicit storage limits.
