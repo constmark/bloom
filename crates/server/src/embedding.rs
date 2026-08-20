@@ -156,8 +156,7 @@ async fn execute_embedding_batch_inner(
     truncate_inputs: bool,
     projection: EmbeddingProjection,
 ) -> std::result::Result<EmbeddingBatchResult, EmbeddingExecutionError> {
-    let admission_guard = state.inference_admission.read().await;
-    if !state.ready.load(Ordering::Relaxed) {
+    if !state.ready.load(Ordering::Acquire) {
         let (error_type, message) = state.model_unavailable().await;
         return Err(EmbeddingExecutionError::new(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -234,7 +233,6 @@ async fn execute_embedding_batch_inner(
         })?;
 
     state.metrics.record_request_start();
-    drop(admission_guard);
     let request_start = Instant::now();
     let request_id = next_request_id(&state, "embed");
     let Some(cancel_guard) = CancelTokenGuard::register(&state, request_id, None) else {

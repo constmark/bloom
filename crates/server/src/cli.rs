@@ -75,7 +75,7 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = 4)]
     pub max_concurrent: usize,
 
-    /// Maximum inference runtimes retained in memory. The default preserves single-model behavior.
+    /// Maximum discoverable inference runtimes. At most one extra physical generation may drain.
     #[arg(long, env = "BLOOM_MAX_LOADED_MODELS", default_value_t = 1)]
     pub max_loaded_models: usize,
 

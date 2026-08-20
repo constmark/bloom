@@ -365,7 +365,8 @@ async fn arm_ollama_residency_expiry(
             return;
         }
 
-        let response = handle_model_unload_exact(Arc::clone(&state), expected_runtime).await;
+        let response =
+            handle_model_unload_exact_if_idle(Arc::clone(&state), expected_runtime).await;
         if response.status().is_success() {
             residency.clear_if_current(&runtime, revision);
             tracing::info!("Ollama keep_alive deadline unloaded its resident model");

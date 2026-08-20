@@ -162,12 +162,10 @@ impl<R> RuntimePool<R> {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn capacity(&self) -> usize {
         self.capacity.get()
     }
 
-    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }

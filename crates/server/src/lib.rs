@@ -504,7 +504,9 @@ struct LoadedRuntime {
     published_at: u64,
     source_path: PathBuf,
     catalog_id: Option<String>,
-    active_request_leases: AtomicU64,
+    /// Declared last so its final strong reference is released only after all
+    /// heavyweight runtime fields have finished teardown.
+    active_request_leases: Arc<AtomicU64>,
 }
 
 impl Drop for LoadedRuntime {
@@ -644,6 +646,15 @@ enum ModelLoadAdmissionError {
     Unavailable(String),
 }
 
+/// One physical generation beyond the discoverable pool capacity lets a
+/// replacement become available while already-admitted requests finish,
+/// without allowing repeated switches to retain unbounded model weights.
+const RUNTIME_DRAINING_HEADROOM: usize = 1;
+const RUNTIME_DRAINING_CAPACITY_ERROR: &str =
+    "runtime capacity is temporarily exhausted while a retired model generation is draining";
+const RUNTIME_SOURCE_DRAINING_ERROR: &str =
+    "the selected model source is still draining requests from an earlier unload";
+
 struct CachedModelCatalog {
     refreshed_at: Instant,
     active_paths: Vec<PathBuf>,
@@ -653,9 +664,20 @@ struct CachedModelCatalog {
     catalog: ModelCatalog,
 }
 
+struct DrainingRuntime {
+    runtime: Weak<LoadedRuntime>,
+    source_path: PathBuf,
+    /// This weak lifetime marker outlives heavyweight field teardown. It lets
+    /// registry inspection avoid upgrading/dropping the runtime under locks.
+    active_request_leases: Weak<AtomicU64>,
+}
+
 struct ServerState {
     runtime_pool: RwLock<RuntimePool>,
-    inference_admission: RwLock<()>,
+    /// Runtime generations removed from discovery but still retained by an
+    /// admitted request. Weak references preserve storage safety without
+    /// extending their physical lifetime.
+    draining_runtimes: std::sync::Mutex<Vec<DrainingRuntime>>,
     semaphore: Arc<Semaphore>,
     ready: AtomicBool,
     load_in_progress: AtomicBool,
@@ -690,12 +712,102 @@ struct ServerState {
 }
 
 impl ServerState {
+    fn track_draining_runtimes(&self, runtimes: &[Arc<LoadedRuntime>]) {
+        if runtimes.is_empty() {
+            return;
+        }
+        let mut draining = self
+            .draining_runtimes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        draining.retain(|runtime| runtime.active_request_leases.strong_count() > 0);
+        for runtime in runtimes {
+            let weak_runtime = Arc::downgrade(runtime);
+            if !draining
+                .iter()
+                .any(|current| Weak::ptr_eq(&current.runtime, &weak_runtime))
+            {
+                draining.push(DrainingRuntime {
+                    runtime: weak_runtime,
+                    source_path: runtime.source_path.clone(),
+                    active_request_leases: Arc::downgrade(&runtime.active_request_leases),
+                });
+            }
+        }
+    }
+
+    fn append_draining_sources(&self, sources: &mut Vec<PathBuf>) {
+        let mut draining = self
+            .draining_runtimes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        draining.retain(|runtime| {
+            let alive = runtime.active_request_leases.strong_count() > 0;
+            if alive {
+                sources.push(runtime.source_path.clone());
+            }
+            alive
+        });
+    }
+
+    fn inspect_draining_runtimes(&self, source: Option<&Path>) -> (usize, u64, bool) {
+        let mut draining = self
+            .draining_runtimes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut generations = 0usize;
+        let mut request_leases = 0u64;
+        let mut source_is_draining = false;
+        draining.retain(|runtime| {
+            let Some(active_request_leases) = runtime.active_request_leases.upgrade() else {
+                return false;
+            };
+            generations = generations.saturating_add(1);
+            request_leases =
+                request_leases.saturating_add(active_request_leases.load(Ordering::Acquire));
+            source_is_draining |= source.is_some_and(|source| runtime.source_path == source);
+            true
+        });
+        (generations, request_leases, source_is_draining)
+    }
+
+    fn draining_runtime_stats(&self) -> (usize, u64) {
+        let (generations, request_leases, _) = self.inspect_draining_runtimes(None);
+        (generations, request_leases)
+    }
+
+    async fn source_is_resident_or_draining(&self, source: &Path) -> bool {
+        let runtime_pool = self.runtime_pool.read().await;
+        if runtime_pool.contains_source(source) {
+            return true;
+        }
+        let mut draining = self
+            .draining_runtimes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut found = false;
+        draining.retain(|runtime| {
+            let alive = runtime.active_request_leases.strong_count() > 0;
+            if alive {
+                found |= runtime.source_path == source;
+            }
+            alive
+        });
+        found
+    }
+
     async fn admit_model_load(
         &self,
         path: PathBuf,
         catalog_id: Option<String>,
         join_matching: bool,
     ) -> std::result::Result<ModelLoadAdmission, ModelLoadAdmissionError> {
+        // Catalog paths are already canonical. Normalizing an explicitly
+        // configured startup path here gives resident and draining identity
+        // checks the same source representation without doing I/O under a
+        // lifecycle or pool lock. A missing path is left for the loader to
+        // report through the existing asynchronous failure contract.
+        let path = tokio::fs::canonicalize(&path).await.unwrap_or(path);
         let selector = catalog_id
             .clone()
             .unwrap_or_else(|| model_path_label(&path));
@@ -714,18 +826,36 @@ impl ServerState {
         if self.load_in_progress.load(Ordering::Acquire) {
             return Err(ModelLoadAdmissionError::Busy);
         }
-        let resident = {
+        let (resident, source_is_draining, has_physical_capacity) = {
             let mut runtime_pool = self.runtime_pool.write().await;
-            let resident = runtime_pool.find_source(&path);
-            if let Some(runtime) = resident.as_ref() {
-                runtime_pool.promote_exact(runtime);
+            if let Some(runtime) = runtime_pool.find_source(&path) {
+                runtime_pool.promote_exact(&runtime);
+                (Some(runtime), false, true)
+            } else {
+                let (draining_generations, _, source_is_draining) =
+                    self.inspect_draining_runtimes(Some(&path));
+                let physical_limit = runtime_pool
+                    .capacity()
+                    .saturating_add(RUNTIME_DRAINING_HEADROOM);
+                let has_physical_capacity =
+                    runtime_pool.len().saturating_add(draining_generations) < physical_limit;
+                (None, source_is_draining, has_physical_capacity)
             }
-            resident
         };
         if let Some(runtime) = resident {
             *self.requested_model.write().await = Some(selector);
             self.ready.store(true, Ordering::Release);
             return Ok(ModelLoadAdmission::AlreadyReady { runtime });
+        }
+        if source_is_draining {
+            return Err(ModelLoadAdmissionError::Unavailable(
+                RUNTIME_SOURCE_DRAINING_ERROR.to_string(),
+            ));
+        }
+        if !has_physical_capacity {
+            return Err(ModelLoadAdmissionError::Unavailable(
+                RUNTIME_DRAINING_CAPACITY_ERROR.to_string(),
+            ));
         }
 
         lifecycle.next_sequence = lifecycle.next_sequence.saturating_add(1).max(1);
@@ -806,6 +936,24 @@ impl ServerState {
             .and_then(RuntimeRequestLease::try_new)
     }
 
+    async fn publish_default_runtime(
+        &self,
+        runtime: Arc<LoadedRuntime>,
+    ) -> std::result::Result<Vec<Arc<LoadedRuntime>>, String> {
+        let mut runtime_pool = self.runtime_pool.write().await;
+        let (draining_generations, _, _) = self.inspect_draining_runtimes(None);
+        let physical_limit = runtime_pool
+            .capacity()
+            .saturating_add(RUNTIME_DRAINING_HEADROOM);
+        if runtime_pool.len().saturating_add(draining_generations) >= physical_limit {
+            return Err(RUNTIME_DRAINING_CAPACITY_ERROR.to_string());
+        }
+        let retired = runtime_pool.publish_default(runtime);
+        self.track_draining_runtimes(&retired);
+        self.ready.store(true, Ordering::Release);
+        Ok(retired)
+    }
+
     async fn model_unavailable(&self) -> (&'static str, String) {
         if self.load_in_progress.load(Ordering::Acquire) {
             (
@@ -849,6 +997,7 @@ impl ServerState {
             .active_sources()
             .map(Path::to_path_buf)
             .collect::<Vec<_>>();
+        self.append_draining_sources(&mut active_paths);
         drop(runtime_pool);
         active_paths.sort();
         active_paths.dedup();
@@ -1871,7 +2020,7 @@ async fn run_server(args: Args, config_path: PathBuf) -> Result<()> {
     let (model_loader, model_load_requests) = mpsc::channel(1);
     let state = Arc::new(ServerState {
         runtime_pool: RwLock::new(RuntimePool::with_capacity(runtime_pool_capacity)),
-        inference_admission: RwLock::new(()),
+        draining_runtimes: std::sync::Mutex::new(Vec::new()),
         semaphore: Arc::new(Semaphore::new(args.max_concurrent)),
         ready: AtomicBool::new(false),
         load_in_progress: AtomicBool::new(false),
@@ -2266,26 +2415,41 @@ async fn model_loader_loop(
             Ok(runtime) => {
                 // Runtime preparation is isolated from publication so an
                 // existing resident remains available during a long load.
-                // Close admission only for the atomic publish/evict boundary.
-                let admission_guard = state.inference_admission.write().await;
-                while state.metrics.in_flight_requests.load(Ordering::Acquire) > 0 {
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
+                // Publication under the pool write lock is the admission
+                // boundary. Existing request leases keep retired generations
+                // alive without blocking unrelated model traffic.
                 let runtime = Arc::new(runtime);
                 let model_id = runtime.model_id.clone();
-                let retired = state
-                    .runtime_pool
-                    .write()
-                    .await
-                    .publish_default(Arc::clone(&runtime));
-                drop(retired);
-                state.load_progress.store(100, Ordering::Release);
-                state.ready.store(true, Ordering::Release);
-                drop(admission_guard);
-                state
-                    .finish_model_load(request.sequence, ModelLoadOutcome::Ready { runtime })
-                    .await;
-                tracing::info!(model = %model_id, "Model load completed");
+                match state.publish_default_runtime(Arc::clone(&runtime)).await {
+                    Ok(retired) => {
+                        drop(retired);
+                        state.load_progress.store(100, Ordering::Release);
+                        state
+                            .finish_model_load(
+                                request.sequence,
+                                ModelLoadOutcome::Ready { runtime },
+                            )
+                            .await;
+                        tracing::info!(model = %model_id, "Model load completed");
+                    }
+                    Err(message) => {
+                        tracing::error!(model = %model_id, error = %message, "Model publication failed");
+                        // The candidate was never registered as resident or
+                        // draining. Tear it down before reopening lifecycle
+                        // operations that may remove or replace its source.
+                        drop(runtime);
+                        *state.load_error.write().await = Some(message.clone());
+                        state.load_progress.store(0, Ordering::Release);
+                        let has_fallback = !state.runtime_pool.read().await.is_empty();
+                        state.ready.store(has_fallback, Ordering::Release);
+                        state
+                            .finish_model_load(
+                                request.sequence,
+                                ModelLoadOutcome::Failed { message },
+                            )
+                            .await;
+                    }
+                }
             }
             Err(error) => {
                 let message = error.to_string();
@@ -2342,6 +2506,9 @@ async fn prepare_loaded_runtime(
     model_path: PathBuf,
     catalog_id: Option<String>,
 ) -> Result<LoadedRuntime> {
+    let model_path = tokio::fs::canonicalize(&model_path)
+        .await
+        .map_err(|error| anyhow!("failed to resolve the model source: {error}"))?;
     state.load_progress.store(5, Ordering::Release);
     let manifest = bloomai_engine::load_manifest(&model_path)?;
     let backend_name = select_backend_name(&args.backend, &args.speculative, &manifest);
@@ -2433,7 +2600,7 @@ async fn prepare_loaded_runtime(
         published_at: unix_seconds(),
         source_path: model_path,
         catalog_id,
-        active_request_leases: AtomicU64::new(0),
+        active_request_leases: Arc::new(AtomicU64::new(0)),
     })
 }
 
@@ -5618,7 +5785,7 @@ mod tests {
             published_at: unix_seconds(),
             source_path: model_path,
             catalog_id: None,
-            active_request_leases: AtomicU64::new(0),
+            active_request_leases: Arc::new(AtomicU64::new(0)),
         });
         let previous = state.runtime_pool.write().await.publish_default(runtime);
         assert!(previous.is_empty());
@@ -5678,7 +5845,7 @@ mod tests {
             published_at: unix_seconds(),
             source_path: model_path,
             catalog_id: None,
-            active_request_leases: AtomicU64::new(0),
+            active_request_leases: Arc::new(AtomicU64::new(0)),
         });
         assert!(
             state
@@ -5727,7 +5894,7 @@ mod tests {
             published_at: unix_seconds(),
             source_path: model_path,
             catalog_id: None,
-            active_request_leases: AtomicU64::new(0),
+            active_request_leases: Arc::new(AtomicU64::new(0)),
         });
         assert!(
             state
@@ -5754,6 +5921,7 @@ mod tests {
         emitted_chunks: Arc<AtomicU64>,
     ) -> Arc<LoadedRuntime> {
         std::fs::write(&model_path, b"bounded text fixture").unwrap();
+        let model_path = model_path.canonicalize().unwrap();
         let pipeline = Arc::new(
             InferencePipeline::load_standalone_with_context(
                 &TestTextEngine {
@@ -5783,7 +5951,7 @@ mod tests {
             published_at: unix_seconds(),
             source_path: model_path,
             catalog_id: None,
-            active_request_leases: AtomicU64::new(0),
+            active_request_leases: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -5843,7 +6011,7 @@ mod tests {
         (
             Arc::new(ServerState {
                 runtime_pool: RwLock::new(RuntimePool::new()),
-                inference_admission: RwLock::new(()),
+                draining_runtimes: std::sync::Mutex::new(Vec::new()),
                 semaphore: Arc::new(Semaphore::new(1)),
                 ready: AtomicBool::new(false),
                 load_in_progress: AtomicBool::new(false),
@@ -7203,6 +7371,263 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn logical_unload_defers_runtime_drop_and_storage_release_until_request_drain() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, _receiver) = test_server_state(temp.path().to_path_buf());
+        let runtime = test_text_runtime(
+            temp.path().join("draining.gguf"),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let source = runtime.source_path.clone();
+        let shutdown = runtime.scheduler_shutdown.clone();
+        assert!(
+            state
+                .runtime_pool
+                .write()
+                .await
+                .publish_default(Arc::clone(&runtime))
+                .is_empty()
+        );
+        state.ready.store(true, Ordering::Release);
+        let lease = state.lease_exact_runtime(&runtime).await.unwrap();
+
+        let response = handle_model_unload_exact(Arc::clone(&state), runtime).await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert!(state.runtime_pool.read().await.is_empty());
+        assert!(!state.ready.load(Ordering::Acquire));
+        assert!(!shutdown.is_cancelled());
+        assert_eq!(
+            lease
+                .runtime()
+                .active_request_leases
+                .load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(state.draining_runtime_stats(), (1, 1));
+        assert!(state.source_is_resident_or_draining(&source).await);
+        let (catalog, _) = state.fresh_model_catalog_snapshot().await.unwrap();
+        assert!(
+            catalog
+                .models
+                .iter()
+                .any(|entry| entry.id == "draining.gguf" && entry.active)
+        );
+        assert!(matches!(
+            remove_catalog_model(&state, "draining.gguf").await,
+            Err(ModelRemovalError::Conflict {
+                code: "model_is_active",
+                ..
+            })
+        ));
+
+        drop(lease);
+
+        assert!(shutdown.is_cancelled());
+        assert_eq!(state.draining_runtime_stats(), (0, 0));
+        assert!(!state.source_is_resident_or_draining(&source).await);
+        let (catalog, _) = state.fresh_model_catalog_snapshot().await.unwrap();
+        assert!(
+            catalog
+                .models
+                .iter()
+                .any(|entry| entry.id == "draining.gguf" && !entry.active)
+        );
+    }
+
+    #[tokio::test]
+    async fn load_admission_rejects_a_still_draining_generation_without_reanimation() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, mut receiver) = test_server_state(temp.path().to_path_buf());
+        let source = temp.path().join("reclaim.gguf");
+        std::fs::write(&source, b"runtime-source").unwrap();
+        let canonical_source = source.canonicalize().unwrap();
+        let runtime = test_text_runtime_with_id(
+            canonical_source.clone(),
+            "reclaim-runtime",
+            Arc::new(AtomicU64::new(0)),
+        );
+        let shutdown = runtime.scheduler_shutdown.clone();
+        assert!(
+            state
+                .publish_default_runtime(Arc::clone(&runtime))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let lease = state.lease_exact_runtime(&runtime).await.unwrap();
+        let response = handle_model_unload_exact(Arc::clone(&state), runtime).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert!(!shutdown.is_cancelled());
+
+        let error = state
+            .admit_model_load(
+                temp.path().join(".").join("reclaim.gguf"),
+                Some("reclaim.gguf".to_string()),
+                false,
+            )
+            .await
+            .expect_err("a live draining generation must not be reanimated");
+        assert!(matches!(
+            error,
+            ModelLoadAdmissionError::Unavailable(message)
+                if message == RUNTIME_SOURCE_DRAINING_ERROR
+        ));
+        assert!(state.runtime_pool.read().await.is_empty());
+        assert!(!state.ready.load(Ordering::Acquire));
+        assert!(receiver.try_recv().is_err());
+        drop(lease);
+        assert!(shutdown.is_cancelled());
+
+        let admission = state
+            .admit_model_load(source, Some("reclaim.gguf".to_string()), false)
+            .await
+            .expect("the source becomes loadable after the old generation drains");
+        assert!(matches!(
+            admission,
+            ModelLoadAdmission::Loading { queued: true, .. }
+        ));
+        let queued = receiver.recv().await.unwrap();
+        assert_eq!(queued.path, canonical_source);
+    }
+
+    #[tokio::test]
+    async fn unloading_an_in_use_runtime_promotes_fallback_without_cross_model_blocking() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut state, _receiver) = test_server_state(temp.path().to_path_buf());
+        Arc::get_mut(&mut state).unwrap().runtime_pool = RwLock::new(RuntimePool::with_capacity(
+            NonZeroUsize::new(2).expect("non-zero test capacity"),
+        ));
+        let runtime_a = test_text_runtime_with_id(
+            temp.path().join("runtime-a.gguf"),
+            "runtime-a",
+            Arc::new(AtomicU64::new(0)),
+        );
+        let runtime_b = test_text_runtime_with_id(
+            temp.path().join("runtime-b.gguf"),
+            "runtime-b",
+            Arc::new(AtomicU64::new(0)),
+        );
+        let shutdown_a = runtime_a.scheduler_shutdown.clone();
+        {
+            let mut pool = state.runtime_pool.write().await;
+            assert!(pool.publish_default(Arc::clone(&runtime_a)).is_empty());
+            assert!(
+                pool.publish(Arc::clone(&runtime_b), false)
+                    .into_retired()
+                    .is_empty()
+            );
+        }
+        state.ready.store(true, Ordering::Release);
+        let lease_a = state.lease_exact_runtime(&runtime_a).await.unwrap();
+        state.metrics.record_request_start();
+
+        let response = handle_model_unload_exact(Arc::clone(&state), runtime_a).await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(state.metrics.in_flight_requests.load(Ordering::Acquire), 1);
+        assert!(state.ready.load(Ordering::Acquire));
+        let default = state.runtime_pool.read().await.default_runtime().unwrap();
+        assert!(Arc::ptr_eq(&default, &runtime_b));
+        assert!(!shutdown_a.is_cancelled());
+
+        drop(lease_a);
+        assert!(shutdown_a.is_cancelled());
+        state.metrics.record_request_end(false, 0.0, 0, 0);
+    }
+
+    #[tokio::test]
+    async fn runtime_publication_does_not_wait_for_an_unrelated_in_flight_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, mut receiver) = test_server_state(temp.path().to_path_buf());
+        let fallback = test_text_runtime_with_id(
+            temp.path().join("fallback.gguf"),
+            "fallback",
+            Arc::new(AtomicU64::new(0)),
+        );
+        let fallback_shutdown = fallback.scheduler_shutdown.clone();
+        assert!(
+            state
+                .publish_default_runtime(Arc::clone(&fallback))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let fallback_lease = state.lease_exact_runtime(&fallback).await.unwrap();
+        drop(fallback);
+        state.metrics.record_request_start();
+        let replacement = test_text_runtime_with_id(
+            temp.path().join("replacement.gguf"),
+            "replacement",
+            Arc::new(AtomicU64::new(0)),
+        );
+
+        let retired = tokio::time::timeout(
+            Duration::from_secs(1),
+            state.publish_default_runtime(Arc::clone(&replacement)),
+        )
+        .await
+        .expect("publication must not wait for another generation's request")
+        .expect("one draining generation is permitted");
+
+        assert_eq!(retired.len(), 1);
+        drop(retired);
+        assert!(!fallback_shutdown.is_cancelled());
+        let default = state.runtime_pool.read().await.default_runtime().unwrap();
+        assert!(Arc::ptr_eq(&default, &replacement));
+        assert_eq!(state.metrics.in_flight_requests.load(Ordering::Acquire), 1);
+
+        let blocked = test_text_runtime_with_id(
+            temp.path().join("blocked.gguf"),
+            "blocked",
+            Arc::new(AtomicU64::new(0)),
+        );
+        let Err(publication_error) = state.publish_default_runtime(Arc::clone(&blocked)).await
+        else {
+            panic!("a second draining generation must exceed physical capacity");
+        };
+        assert_eq!(publication_error, RUNTIME_DRAINING_CAPACITY_ERROR);
+        let default = state.runtime_pool.read().await.default_runtime().unwrap();
+        assert!(Arc::ptr_eq(&default, &replacement));
+
+        let queued_source = write_test_model_manifest(temp.path(), "queued-after-drain");
+        let admission_error = state
+            .admit_model_load(
+                queued_source.clone(),
+                Some("queued-after-drain".to_string()),
+                false,
+            )
+            .await
+            .expect_err("load admission must enforce physical capacity before preparation");
+        assert!(matches!(
+            admission_error,
+            ModelLoadAdmissionError::Unavailable(message)
+                if message == RUNTIME_DRAINING_CAPACITY_ERROR
+        ));
+        assert!(receiver.try_recv().is_err());
+
+        drop(fallback_lease);
+        assert!(fallback_shutdown.is_cancelled());
+        let admission = state
+            .admit_model_load(
+                queued_source.clone(),
+                Some("queued-after-drain".to_string()),
+                false,
+            )
+            .await
+            .expect("capacity must recover when the retired generation drains");
+        assert!(matches!(
+            admission,
+            ModelLoadAdmission::Loading { queued: true, .. }
+        ));
+        assert_eq!(
+            receiver.recv().await.unwrap().path,
+            queued_source.canonicalize().unwrap()
+        );
+        state.metrics.record_request_end(false, 0.0, 0, 0);
+    }
+
+    #[tokio::test]
     async fn ollama_empty_prompt_keep_alive_zero_unloads_the_active_runtime() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_server_state_with_text_runtime(
@@ -7375,6 +7800,56 @@ mod tests {
         assert!(runtime_pool.contains_exact(&first));
         assert!(Arc::ptr_eq(runtime_pool.default_ref().unwrap(), &first));
         assert!(state.ready.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn ollama_expiry_waits_until_the_exact_runtime_is_idle() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_server_state_with_text_runtime(
+            temp.path().to_path_buf(),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await;
+        let runtime = state.runtime_pool.read().await.default_runtime().unwrap();
+        let app = Router::new()
+            .nest("/api", ollama_api_router(Arc::clone(&state)))
+            .with_state(Arc::clone(&state));
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/generate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "default",
+                            "prompt": "",
+                            "keep_alive": "40ms",
+                            "stream": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let request_lease = state
+            .lease_exact_runtime(&runtime)
+            .await
+            .expect("the runtime must still be resident before its deadline");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(state.runtime_pool.read().await.contains_exact(&runtime));
+
+        drop(request_lease);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while state.runtime_pool.read().await.contains_exact(&runtime) && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!state.runtime_pool.read().await.contains_exact(&runtime));
     }
 
     #[tokio::test]
@@ -8854,6 +9329,9 @@ mod tests {
         assert_eq!(body["server"]["version"], env!("CARGO_PKG_VERSION"));
         assert!(body["server"]["uptime_seconds"].is_u64());
         assert_eq!(body["model"], "not loaded");
+        assert_eq!(body["runtime_pool"]["resident_generations"], 0);
+        assert_eq!(body["runtime_pool"]["draining_generations"], 0);
+        assert_eq!(body["runtime_pool"]["draining_request_leases"], 0);
         assert_eq!(body["load"]["phase"], "loading");
         assert_eq!(body["load"]["progress"], 37);
         assert_eq!(body["load"]["requested_model"], "tiny.gguf");
@@ -11714,7 +12192,7 @@ mod tests {
     }
 
     #[test]
-    fn inference_lifecycle_finishes_once_and_holds_admission_until_completion() {
+    fn inference_lifecycle_finishes_once_and_holds_resources_until_completion() {
         let temp = tempfile::tempdir().unwrap();
         let (runtime, runtime_lease) = test_runtime_lease(temp.path().join("lifecycle.gguf"));
         let tokens = Arc::new(std::sync::Mutex::new(HashMap::new()));
@@ -11763,7 +12241,7 @@ mod tests {
     }
 
     #[test]
-    fn dropped_client_cancels_but_drains_worker_before_releasing_admission() {
+    fn dropped_client_cancels_but_drains_worker_before_releasing_resources() {
         let temp = tempfile::tempdir().unwrap();
         let (runtime, runtime_lease) = test_runtime_lease(temp.path().join("draining.gguf"));
         let tokens = Arc::new(std::sync::Mutex::new(HashMap::new()));

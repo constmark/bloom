@@ -91,7 +91,16 @@ pub(crate) async fn handle_metrics(State(state): State<Arc<ServerState>>) -> imp
 pub(crate) async fn handle_observability(
     State(state): State<Arc<ServerState>>,
 ) -> impl IntoResponse {
-    let runtime = state.runtime_pool.read().await.default_runtime();
+    let (runtime, resident_generations, draining_generations, draining_request_leases) = {
+        let runtime_pool = state.runtime_pool.read().await;
+        let (draining_generations, draining_request_leases) = state.draining_runtime_stats();
+        (
+            runtime_pool.default_runtime(),
+            runtime_pool.len(),
+            draining_generations,
+            draining_request_leases,
+        )
+    };
     let kv_metrics = {
         if let Some(pool) = runtime
             .as_ref()
@@ -132,7 +141,7 @@ pub(crate) async fn handle_observability(
         .and_then(|runtime| runtime.cachemesh.as_ref())
         .map(|mesh| mesh.metrics());
     let loading = state.load_in_progress.load(Ordering::Relaxed);
-    let ready = state.ready.load(Ordering::Relaxed);
+    let ready = state.ready.load(Ordering::Acquire);
     let load_failed = state.load_error.read().await.is_some();
     let load_phase = if loading {
         "loading"
@@ -157,6 +166,11 @@ pub(crate) async fn handle_observability(
             },
             "model": model_id,
             "ready": ready,
+            "runtime_pool": {
+                "resident_generations": resident_generations,
+                "draining_generations": draining_generations,
+                "draining_request_leases": draining_request_leases,
+            },
             "load": {
                 "phase": load_phase,
                 "progress": state.load_progress.load(Ordering::Relaxed),
@@ -1593,7 +1607,7 @@ pub(crate) async fn remove_catalog_model(
                 ));
             }
         };
-    if state.runtime_pool.read().await.contains_source(&resolved) {
+    if state.source_is_resident_or_draining(&resolved).await {
         return Err(ModelRemovalError::Conflict {
             code: "model_is_active",
             message: "Unload or switch away from the active model before removing it.".to_string(),
@@ -1659,7 +1673,7 @@ pub(crate) async fn handle_model_integrity_start(
                 );
             }
         };
-    if state.runtime_pool.read().await.contains_source(&resolved) {
+    if state.source_is_resident_or_draining(&resolved).await {
         return error_response(
             axum::http::StatusCode::CONFLICT,
             "model_is_active",
@@ -1724,19 +1738,27 @@ fn model_integrity_error_response(error: ModelIntegrityError) -> axum::response:
 pub(crate) async fn handle_model_unload(
     State(state): State<Arc<ServerState>>,
 ) -> axum::response::Response {
-    unload_model_runtime(state, None).await
+    unload_model_runtime(state, None, false).await
 }
 
 pub(crate) async fn handle_model_unload_exact(
     state: Arc<ServerState>,
     expected: Arc<LoadedRuntime>,
 ) -> axum::response::Response {
-    unload_model_runtime(state, Some(expected)).await
+    unload_model_runtime(state, Some(expected), false).await
+}
+
+pub(crate) async fn handle_model_unload_exact_if_idle(
+    state: Arc<ServerState>,
+    expected: Arc<LoadedRuntime>,
+) -> axum::response::Response {
+    unload_model_runtime(state, Some(expected), true).await
 }
 
 async fn unload_model_runtime(
     state: Arc<ServerState>,
     expected: Option<Arc<LoadedRuntime>>,
+    only_if_idle: bool,
 ) -> axum::response::Response {
     let _lifecycle_guard = state.model_lifecycle.lock().await;
     if state.load_in_progress.swap(true, Ordering::AcqRel) {
@@ -1747,33 +1769,43 @@ async fn unload_model_runtime(
         );
     }
 
-    let was_ready = state.ready.swap(false, Ordering::AcqRel);
-    let admission_guard = state.inference_admission.write().await;
-    let in_flight = state.metrics.in_flight_requests.load(Ordering::Acquire);
-    if in_flight > 0 {
-        state.ready.store(was_ready, Ordering::Release);
+    let (removed, fallback, busy) = {
+        let mut runtime_pool = state.runtime_pool.write().await;
+        // Request leases are acquired while holding the pool read lock. This
+        // write-side check therefore makes timer-driven idle eviction atomic
+        // with new inference admission.
+        let busy = only_if_idle
+            && expected.as_ref().is_some_and(|expected| {
+                runtime_pool.contains_exact(expected)
+                    && expected.active_request_leases.load(Ordering::Acquire) > 0
+            });
+        let removed = if busy {
+            None
+        } else {
+            match expected.as_ref() {
+                Some(expected) => runtime_pool.remove_exact(expected),
+                None => runtime_pool.remove_default(),
+            }
+        };
+        if let Some(runtime) = removed.as_ref() {
+            state.track_draining_runtimes(std::slice::from_ref(runtime));
+        }
+        let fallback = runtime_pool.default_runtime();
+        if !busy {
+            state.ready.store(fallback.is_some(), Ordering::Release);
+        }
+        (removed, fallback, busy)
+    };
+    if busy {
         state.load_in_progress.store(false, Ordering::Release);
-        drop(admission_guard);
         return error_response(
             axum::http::StatusCode::CONFLICT,
             "requests_in_flight",
-            format!("Cannot unload the model while {in_flight} request(s) are in flight."),
+            "The selected runtime still has requests in flight.",
         );
     }
-
-    let (removed, fallback) = {
-        let mut runtime_pool = state.runtime_pool.write().await;
-        let removed = match expected.as_ref() {
-            Some(expected) => runtime_pool.remove_exact(expected),
-            None => runtime_pool.remove_default(),
-        };
-        let fallback = runtime_pool.default_runtime();
-        (removed, fallback)
-    };
     if expected.is_some() && removed.is_none() {
-        state.ready.store(was_ready, Ordering::Release);
         state.load_in_progress.store(false, Ordering::Release);
-        drop(admission_guard);
         return error_response(
             axum::http::StatusCode::NOT_FOUND,
             "model_not_loaded",
@@ -1791,9 +1823,7 @@ async fn unload_model_runtime(
     state
         .load_progress
         .store(if fallback.is_some() { 100 } else { 0 }, Ordering::Release);
-    state.ready.store(fallback.is_some(), Ordering::Release);
     state.load_in_progress.store(false, Ordering::Release);
-    drop(admission_guard);
 
     Json(json!({
         "object": "bloom.model_unload",
@@ -2040,8 +2070,7 @@ async fn handle_chat_completions_inner(
             message,
         );
     }
-    let admission_guard = state.inference_admission.read().await;
-    if !state.ready.load(Ordering::Relaxed) {
+    if !state.ready.load(Ordering::Acquire) {
         return model_unavailable_response(&state).await;
     }
 
@@ -2089,7 +2118,6 @@ async fn handle_chat_completions_inner(
     };
 
     state.metrics.record_request_start();
-    drop(admission_guard);
     let request_start = std::time::Instant::now();
     let params = GenerationParams {
         max_tokens,
@@ -3583,8 +3611,7 @@ pub(crate) async fn handle_completions(
             );
         }
     };
-    let admission_guard = state.inference_admission.read().await;
-    if !state.ready.load(Ordering::Relaxed) {
+    if !state.ready.load(Ordering::Acquire) {
         return model_unavailable_response(&state).await;
     }
 
@@ -3613,7 +3640,6 @@ pub(crate) async fn handle_completions(
     };
 
     state.metrics.record_request_start();
-    drop(admission_guard);
     let request_start = std::time::Instant::now();
 
     let core_response_format = match &response_format {
@@ -4634,8 +4660,7 @@ async fn run_multimodal_request_inner(
             message,
         );
     }
-    let admission_guard = state.inference_admission.read().await;
-    if !state.ready.load(Ordering::Relaxed) {
+    if !state.ready.load(Ordering::Acquire) {
         return model_unavailable_response(&state).await;
     }
 
@@ -4701,7 +4726,6 @@ async fn run_multimodal_request_inner(
     };
 
     state.metrics.record_request_start();
-    drop(admission_guard);
     let request_start = std::time::Instant::now();
     let request_id = next_request_id(&state, "mms");
     let Some(cancel_guard) = CancelTokenGuard::register(&state, request_id.clone(), None) else {
