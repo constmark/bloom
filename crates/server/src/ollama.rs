@@ -1949,9 +1949,9 @@ pub(crate) async fn handle_ollama_embed(
             Ok(activation) => activation,
             Err(error) => return ollama_error_response(error.status, error.message),
         };
-    let mut result = match execute_embedding_batch(
+    let mut result = match execute_embedding_batch_for_runtime(
         state,
-        Some(runtime.model_id.clone()),
+        runtime,
         inputs,
         payload.truncate.unwrap_or(true),
         EmbeddingProjection::L2Normalized {
@@ -2023,9 +2023,9 @@ pub(crate) async fn handle_ollama_legacy_embeddings(
             Ok(activation) => activation,
             Err(error) => return ollama_error_response(error.status, error.message),
         };
-    let result = match execute_embedding_batch(
+    let result = match execute_embedding_batch_for_runtime(
         state,
-        Some(runtime.model_id.clone()),
+        runtime,
         inputs,
         false,
         EmbeddingProjection::L2Normalized {

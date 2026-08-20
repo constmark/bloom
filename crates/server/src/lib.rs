@@ -504,11 +504,51 @@ struct LoadedRuntime {
     published_at: u64,
     source_path: PathBuf,
     catalog_id: Option<String>,
+    active_request_leases: AtomicU64,
 }
 
 impl Drop for LoadedRuntime {
     fn drop(&mut self) {
         self.scheduler_shutdown.cancel();
+    }
+}
+
+struct RuntimeRequestLeaseInner {
+    runtime: Arc<LoadedRuntime>,
+}
+
+impl Drop for RuntimeRequestLeaseInner {
+    fn drop(&mut self) {
+        self.runtime
+            .active_request_leases
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[derive(Clone)]
+struct RuntimeRequestLease {
+    inner: Arc<RuntimeRequestLeaseInner>,
+}
+
+impl RuntimeRequestLease {
+    fn try_new(runtime: Arc<LoadedRuntime>) -> Option<Self> {
+        runtime
+            .active_request_leases
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |leases| {
+                leases.checked_add(1)
+            })
+            .ok()?;
+        Some(Self {
+            inner: Arc::new(RuntimeRequestLeaseInner { runtime }),
+        })
+    }
+
+    fn runtime(&self) -> &Arc<LoadedRuntime> {
+        &self.inner.runtime
+    }
+
+    fn execution_guard(&self) -> Arc<dyn std::any::Any + Send + Sync> {
+        Arc::clone(&self.inner) as Arc<dyn std::any::Any + Send + Sync>
     }
 }
 
@@ -638,7 +678,7 @@ struct ServerState {
     enable_ifb: bool,
     max_ollama_body_bytes: usize,
     /// Per-request cancellation tokens.
-    cancel_tokens: Arc<std::sync::Mutex<HashMap<String, CancellationToken>>>,
+    cancel_tokens: Arc<std::sync::Mutex<HashMap<String, Arc<RequestCancellation>>>>,
     /// Monotonic suffix for OpenAI-compatible request IDs.
     request_counter: AtomicU64,
     /// Optional inference credential for protected OpenAI- and Ollama-compatible endpoints.
@@ -745,11 +785,25 @@ impl ServerState {
         }
     }
 
-    async fn resolve_runtime(
+    async fn lease_runtime(
         &self,
         requested: Option<&str>,
-    ) -> std::result::Result<Option<Arc<LoadedRuntime>>, RequestedModelError> {
-        self.runtime_pool.read().await.resolve(requested)
+    ) -> std::result::Result<Option<RuntimeRequestLease>, RequestedModelError> {
+        let runtime_pool = self.runtime_pool.read().await;
+        Ok(runtime_pool
+            .resolve(requested)?
+            .and_then(RuntimeRequestLease::try_new))
+    }
+
+    async fn lease_exact_runtime(
+        &self,
+        expected: &Arc<LoadedRuntime>,
+    ) -> Option<RuntimeRequestLease> {
+        let runtime_pool = self.runtime_pool.read().await;
+        runtime_pool
+            .contains_exact(expected)
+            .then(|| Arc::clone(expected))
+            .and_then(RuntimeRequestLease::try_new)
     }
 
     async fn model_unavailable(&self) -> (&'static str, String) {
@@ -839,42 +893,68 @@ impl ServerState {
     }
 }
 
-struct CancelTokenGuard {
-    tokens: Arc<std::sync::Mutex<HashMap<String, CancellationToken>>>,
-    request_id: String,
+struct RequestCancellation {
     token: CancellationToken,
+    scheduler: Option<Arc<InferenceScheduler>>,
+    cancelling: AtomicBool,
+}
+
+struct CancelTokenGuard {
+    registrations: Arc<std::sync::Mutex<HashMap<String, Arc<RequestCancellation>>>>,
+    request_id: String,
+    registration: Arc<RequestCancellation>,
 }
 
 impl CancelTokenGuard {
-    fn register(state: &Arc<ServerState>, request_id: String) -> Self {
-        Self::register_with_tokens(Arc::clone(&state.cancel_tokens), request_id)
+    fn register(
+        state: &Arc<ServerState>,
+        request_id: String,
+        scheduler: Option<Arc<InferenceScheduler>>,
+    ) -> Option<Self> {
+        Self::register_with_tokens(Arc::clone(&state.cancel_tokens), request_id, scheduler)
     }
 
     fn register_with_tokens(
-        tokens: Arc<std::sync::Mutex<HashMap<String, CancellationToken>>>,
+        registrations: Arc<std::sync::Mutex<HashMap<String, Arc<RequestCancellation>>>>,
         request_id: String,
-    ) -> Self {
-        let token = CancellationToken::new();
+        scheduler: Option<Arc<InferenceScheduler>>,
+    ) -> Option<Self> {
+        let registration = Arc::new(RequestCancellation {
+            token: CancellationToken::new(),
+            scheduler,
+            cancelling: AtomicBool::new(false),
+        });
         {
-            let mut registrations = tokens.lock().unwrap_or_else(|e| e.into_inner());
-            registrations.insert(request_id.clone(), token.clone());
+            let mut active = registrations.lock().unwrap_or_else(|e| e.into_inner());
+            match active.entry(request_id.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(Arc::clone(&registration));
+                }
+                std::collections::hash_map::Entry::Occupied(_) => return None,
+            }
         }
-        Self {
-            tokens,
+        Some(Self {
+            registrations,
             request_id,
-            token,
-        }
+            registration,
+        })
     }
 
     fn token(&self) -> CancellationToken {
-        self.token.clone()
+        self.registration.token.clone()
     }
 }
 
 impl Drop for CancelTokenGuard {
     fn drop(&mut self) {
-        let mut tokens = self.tokens.lock().unwrap_or_else(|e| e.into_inner());
-        tokens.remove(&self.request_id);
+        let mut registrations = self.registrations.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.registration.cancelling.load(Ordering::Acquire)
+            && registrations
+                .get(&self.request_id)
+                .is_some_and(|active| Arc::ptr_eq(active, &self.registration))
+        {
+            registrations.remove(&self.request_id);
+        }
     }
 }
 
@@ -890,8 +970,9 @@ struct InferenceLifecycle {
     prompt_tokens: u64,
     execution: StreamExecution,
     permit: std::sync::Mutex<Option<OwnedSemaphorePermit>>,
+    runtime_lease: std::sync::Mutex<Option<RuntimeRequestLease>>,
     worker_done: AtomicBool,
-    client_dropped: AtomicBool,
+    client_outcome: AtomicU8,
     settled: AtomicBool,
 }
 
@@ -901,6 +982,7 @@ struct InferenceLifecycleResources {
     generated_tokens: Arc<AtomicU64>,
     prompt_tokens: u64,
     permit: OwnedSemaphorePermit,
+    runtime_lease: RuntimeRequestLease,
 }
 
 enum StreamExecution {
@@ -925,8 +1007,9 @@ impl InferenceLifecycle {
             prompt_tokens: resources.prompt_tokens,
             execution,
             permit: std::sync::Mutex::new(Some(resources.permit)),
+            runtime_lease: std::sync::Mutex::new(Some(resources.runtime_lease)),
             worker_done: AtomicBool::new(worker_done),
-            client_dropped: AtomicBool::new(false),
+            client_outcome: AtomicU8::new(0),
             settled: AtomicBool::new(false),
         })
     }
@@ -945,30 +1028,44 @@ impl InferenceLifecycle {
     }
 
     fn finish(&self, success: bool) {
-        let success =
-            success && !self.token.is_cancelled() && !self.client_dropped.load(Ordering::Acquire);
-        self.settle(success);
+        let outcome = if success && !self.token.is_cancelled() {
+            1
+        } else {
+            2
+        };
+        if self
+            .client_outcome
+            .compare_exchange(0, outcome, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.maybe_settle();
+        }
     }
 
     fn client_dropped(&self) {
-        self.client_dropped.store(true, Ordering::Release);
-        self.token.cancel();
-        match &self.execution {
-            StreamExecution::Scheduled(scheduler) => {
-                scheduler.cancel_request(&self.request_id);
-                self.settle(false);
-            }
-            StreamExecution::Blocking if self.worker_done.load(Ordering::Acquire) => {
-                self.settle(false);
-            }
-            StreamExecution::Blocking => {}
+        if self
+            .client_outcome
+            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
         }
+        self.token.cancel();
+        if let StreamExecution::Scheduled(scheduler) = &self.execution {
+            scheduler.cancel_request(&self.request_id);
+        }
+        self.maybe_settle();
     }
 
     fn worker_finished(&self) {
         self.worker_done.store(true, Ordering::Release);
-        if self.client_dropped.load(Ordering::Acquire) {
-            self.settle(false);
+        self.maybe_settle();
+    }
+
+    fn maybe_settle(&self) {
+        let client_outcome = self.client_outcome.load(Ordering::Acquire);
+        if client_outcome != 0 && self.worker_done.load(Ordering::Acquire) {
+            self.settle(client_outcome == 1 && !self.token.is_cancelled());
         }
     }
 
@@ -976,10 +1073,13 @@ impl InferenceLifecycle {
         if self.settled.swap(true, Ordering::AcqRel) {
             return;
         }
-        self.registration
+        let registration = self
+            .registration
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
+        drop(registration);
+        let success = success && !self.token.is_cancelled();
         self.metrics.record_request_end(
             success,
             self.request_start.elapsed().as_secs_f64(),
@@ -987,6 +1087,10 @@ impl InferenceLifecycle {
             self.prompt_tokens,
         );
         self.permit.lock().unwrap_or_else(|e| e.into_inner()).take();
+        self.runtime_lease
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
     }
 }
 
@@ -2329,6 +2433,7 @@ async fn prepare_loaded_runtime(
         published_at: unix_seconds(),
         source_path: model_path,
         catalog_id,
+        active_request_leases: AtomicU64::new(0),
     })
 }
 
@@ -2841,6 +2946,139 @@ mod tests {
             }
             sink.on_chunk(OutputChunk::End)?;
             Ok(())
+        }
+    }
+
+    struct TestIfbExecutor {
+        execute_calls: Arc<AtomicU64>,
+    }
+
+    impl bloomai_engine::EngineExecutor for TestIfbExecutor {
+        fn execute(
+            &self,
+            _batch: bloomai_engine::ExecutionBatch,
+        ) -> Result<bloomai_engine::BatchResult> {
+            self.execute_calls.fetch_add(1, Ordering::Relaxed);
+            Err(anyhow::anyhow!(
+                "executor exploded with private backend details"
+            ))
+        }
+
+        fn max_batch_size(&self, _phase: bloomai_engine::ExecutionPhase) -> usize {
+            1
+        }
+    }
+
+    struct TestIfbAllocationGate {
+        entered: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        released: std::sync::Mutex<bool>,
+        release_signal: std::sync::Condvar,
+    }
+
+    struct TestIfbKvPool {
+        fail_allocation: bool,
+        allocation_gate: Option<TestIfbAllocationGate>,
+        allocate_paged_calls: AtomicU64,
+        free_calls: AtomicU64,
+    }
+
+    impl TestIfbKvPool {
+        fn immediate(fail_allocation: bool) -> Self {
+            Self {
+                fail_allocation,
+                allocation_gate: None,
+                allocate_paged_calls: AtomicU64::new(0),
+                free_calls: AtomicU64::new(0),
+            }
+        }
+
+        fn blocking() -> (Self, std::sync::mpsc::Receiver<()>) {
+            let (entered, entered_receiver) = std::sync::mpsc::channel();
+            (
+                Self {
+                    fail_allocation: false,
+                    allocation_gate: Some(TestIfbAllocationGate {
+                        entered: std::sync::Mutex::new(Some(entered)),
+                        released: std::sync::Mutex::new(false),
+                        release_signal: std::sync::Condvar::new(),
+                    }),
+                    allocate_paged_calls: AtomicU64::new(0),
+                    free_calls: AtomicU64::new(0),
+                },
+                entered_receiver,
+            )
+        }
+
+        fn release_allocation(&self) {
+            let Some(gate) = &self.allocation_gate else {
+                return;
+            };
+            let mut released = gate
+                .released
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            *released = true;
+            gate.release_signal.notify_all();
+        }
+    }
+
+    impl bloomai_engine::KvCachePool for TestIfbKvPool {
+        fn allocate(&self, _num_tokens: usize) -> Result<usize> {
+            if self.fail_allocation {
+                Err(anyhow::anyhow!("forced paged KV allocation failure"))
+            } else {
+                Ok(0)
+            }
+        }
+
+        fn free(&self, _handle: usize) {
+            self.free_calls.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn allocate_paged(
+            &self,
+            _request_id: &str,
+            _prompt_tokens: &[u32],
+            max_new_tokens: usize,
+            _multimodal_hash: Option<&str>,
+        ) -> Result<bloomai_engine::KvCacheAllocation> {
+            self.allocate_paged_calls.fetch_add(1, Ordering::Relaxed);
+            if let Some(gate) = &self.allocation_gate {
+                if let Some(entered) = gate
+                    .entered
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take()
+                {
+                    let _ = entered.send(());
+                }
+                let mut released = gate
+                    .released
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                while !*released {
+                    released = gate
+                        .release_signal
+                        .wait(released)
+                        .unwrap_or_else(|error| error.into_inner());
+                }
+            }
+            let handle = self.allocate(max_new_tokens)?;
+            Ok(bloomai_engine::KvCacheAllocation {
+                handle,
+                matched_tokens: 0,
+                allocated_blocks: vec![handle],
+            })
+        }
+
+        fn free_paged(&self, _request_id: &str) {}
+
+        fn get_metrics(&self) -> bloomai_engine::KvCacheMetrics {
+            bloomai_engine::KvCacheMetrics {
+                total_blocks: 1,
+                free_blocks: 1,
+                ..Default::default()
+            }
         }
     }
 
@@ -5380,6 +5618,7 @@ mod tests {
             published_at: unix_seconds(),
             source_path: model_path,
             catalog_id: None,
+            active_request_leases: AtomicU64::new(0),
         });
         let previous = state.runtime_pool.write().await.publish_default(runtime);
         assert!(previous.is_empty());
@@ -5398,6 +5637,59 @@ mod tests {
         assert!(previous.is_empty());
         state.ready.store(true, Ordering::Release);
         state
+    }
+
+    async fn test_server_state_with_ifb_runtime(
+        models_root: PathBuf,
+        executor: Arc<dyn bloomai_engine::EngineExecutor>,
+        kv_pool: Arc<dyn bloomai_engine::KvCachePool>,
+    ) -> (Arc<ServerState>, Arc<InferenceScheduler>) {
+        let (mut state, _receiver) = test_server_state(models_root.clone());
+        Arc::get_mut(&mut state).unwrap().enable_ifb = true;
+        let model_path = models_root.join("test-ifb-model.fixture");
+        std::fs::write(&model_path, b"bounded IFB fixture").unwrap();
+        let pipeline = Arc::new(
+            InferencePipeline::load_standalone_with_context(
+                &TestTextEngine {
+                    model_id: "test-ifb-model".to_string(),
+                    emitted_chunks: Arc::new(AtomicU64::new(0)),
+                },
+                DeviceKind::Cpu,
+                &model_path,
+                128,
+            )
+            .unwrap(),
+        );
+        let manifest = pipeline.metadata().manifest.clone();
+        let scheduler = Arc::new(InferenceScheduler::new(executor, kv_pool));
+        let runtime = Arc::new(LoadedRuntime {
+            model_id: pipeline.metadata().id.clone(),
+            model_family: manifest.family.clone(),
+            model_architecture: None,
+            model_chat_template: None,
+            input_modalities: vec![bloomai_core::Modality::Text],
+            memory_estimate: bloomai_engine::estimate_memory(&manifest, 128),
+            pipeline,
+            kv_cache_pool: None,
+            cachemesh: None,
+            scheduler: Some(Arc::clone(&scheduler)),
+            _memory_reservation: None,
+            scheduler_shutdown: CancellationToken::new(),
+            published_at: unix_seconds(),
+            source_path: model_path,
+            catalog_id: None,
+            active_request_leases: AtomicU64::new(0),
+        });
+        assert!(
+            state
+                .runtime_pool
+                .write()
+                .await
+                .publish_default(runtime)
+                .is_empty()
+        );
+        state.ready.store(true, Ordering::Release);
+        (state, scheduler)
     }
 
     async fn test_server_state_with_vision_runtime(
@@ -5435,6 +5727,7 @@ mod tests {
             published_at: unix_seconds(),
             source_path: model_path,
             catalog_id: None,
+            active_request_leases: AtomicU64::new(0),
         });
         assert!(
             state
@@ -5490,7 +5783,14 @@ mod tests {
             published_at: unix_seconds(),
             source_path: model_path,
             catalog_id: None,
+            active_request_leases: AtomicU64::new(0),
         })
+    }
+
+    fn test_runtime_lease(model_path: PathBuf) -> (Arc<LoadedRuntime>, RuntimeRequestLease) {
+        let runtime = test_text_runtime(model_path, Arc::new(AtomicU64::new(0)));
+        let lease = RuntimeRequestLease::try_new(Arc::clone(&runtime)).unwrap();
+        (runtime, lease)
     }
 
     fn test_multimodal_request(blocks: Vec<DataBlock>) -> InferenceRequest {
@@ -10332,6 +10632,272 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn ifb_submit_failure_cleans_all_request_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let execute_calls = Arc::new(AtomicU64::new(0));
+        let kv_pool = Arc::new(TestIfbKvPool::immediate(true));
+        let (state, scheduler) = test_server_state_with_ifb_runtime(
+            temp.path().to_path_buf(),
+            Arc::new(TestIfbExecutor {
+                execute_calls: Arc::clone(&execute_calls),
+            }),
+            kv_pool.clone(),
+        )
+        .await;
+        let app = Router::new()
+            .route("/v1/chat/completions", post(handle_chat_completions))
+            .with_state(Arc::clone(&state));
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "test-ifb-model",
+                            "messages": [{"role": "user", "content": "hello"}],
+                            "max_tokens": 1
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(kv_pool.allocate_paged_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(kv_pool.free_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(execute_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(scheduler.queue_stats(), (0, 0, 0));
+        assert!(
+            scheduler
+                .token_senders
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
+        assert!(
+            state
+                .cancel_tokens
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
+        assert_eq!(state.metrics.in_flight_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(state.metrics.requests_failed.load(Ordering::Relaxed), 1);
+        assert_eq!(state.semaphore.available_permits(), 1);
+        assert_eq!(
+            state
+                .runtime_pool
+                .read()
+                .await
+                .default_runtime()
+                .unwrap()
+                .active_request_leases
+                .load(Ordering::Acquire),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn ifb_executor_failure_stream_has_only_error_terminal_and_cleans_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let execute_calls = Arc::new(AtomicU64::new(0));
+        let kv_pool = Arc::new(TestIfbKvPool::immediate(false));
+        let (state, scheduler) = test_server_state_with_ifb_runtime(
+            temp.path().to_path_buf(),
+            Arc::new(TestIfbExecutor {
+                execute_calls: Arc::clone(&execute_calls),
+            }),
+            kv_pool.clone(),
+        )
+        .await;
+        let app = Router::new()
+            .route("/v1/chat/completions", post(handle_chat_completions))
+            .with_state(Arc::clone(&state));
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "test-ifb-model",
+                            "messages": [{"role": "user", "content": "hello"}],
+                            "stream": true,
+                            "stream_options": {"include_usage": true},
+                            "max_tokens": 1
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let execution_error = scheduler.step().unwrap_err();
+        assert!(
+            execution_error
+                .to_string()
+                .contains("executor exploded with private backend details")
+        );
+        let stream = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let error_offset = stream.find("\"error\"").unwrap();
+        let terminal = &stream[error_offset..];
+        assert!(terminal.contains("inference execution failed"));
+        assert!(!stream.contains("private backend details"));
+        assert_eq!(stream.matches("\"error\"").count(), 1);
+        assert!(!terminal.contains("finish_reason"));
+        assert!(!stream.contains("\"usage\""));
+        assert!(terminal.trim_end().ends_with("data: [DONE]"));
+
+        assert_eq!(execute_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(kv_pool.allocate_paged_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(kv_pool.free_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(scheduler.queue_stats(), (0, 0, 0));
+        assert!(
+            scheduler
+                .token_senders
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
+        assert!(
+            state
+                .cancel_tokens
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
+        assert_eq!(state.metrics.in_flight_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(state.metrics.requests_completed.load(Ordering::Relaxed), 0);
+        assert_eq!(state.metrics.requests_failed.load(Ordering::Relaxed), 1);
+        assert_eq!(state.semaphore.available_permits(), 1);
+        assert_eq!(
+            state
+                .runtime_pool
+                .read()
+                .await
+                .default_runtime()
+                .unwrap()
+                .active_request_leases
+                .load(Ordering::Acquire),
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ifb_cancel_during_submit_cleans_the_post_admission_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let execute_calls = Arc::new(AtomicU64::new(0));
+        let (blocking_pool, allocation_entered) = TestIfbKvPool::blocking();
+        let kv_pool = Arc::new(blocking_pool);
+        let (state, scheduler) = test_server_state_with_ifb_runtime(
+            temp.path().to_path_buf(),
+            Arc::new(TestIfbExecutor {
+                execute_calls: Arc::clone(&execute_calls),
+            }),
+            kv_pool.clone(),
+        )
+        .await;
+        let mut payload: ChatRequest = serde_json::from_value(json!({
+            "model": "test-ifb-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 1
+        }))
+        .unwrap();
+        payload.internal_request_id = Some("ifb-submit-cancel-race".to_string());
+        let request_state = Arc::clone(&state);
+        let request = tokio::spawn(async move {
+            handle_chat_completions(State(request_state), Json(payload)).await
+        });
+
+        let entered = allocation_entered.recv_timeout(Duration::from_secs(5));
+        if entered.is_err() {
+            kv_pool.release_allocation();
+        }
+        entered.unwrap();
+        let cancellation = tokio::time::timeout(
+            Duration::from_secs(5),
+            handle_cancel(
+                State(Arc::clone(&state)),
+                axum::extract::Path("ifb-submit-cancel-race".to_string()),
+            ),
+        )
+        .await;
+        kv_pool.release_allocation();
+        let cancellation = cancellation.unwrap();
+        assert_eq!(cancellation.status(), axum::http::StatusCode::OK);
+        let cancellation_body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(cancellation.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cancellation_body["cancelled"], true);
+
+        let response = tokio::time::timeout(Duration::from_secs(5), request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::REQUEST_TIMEOUT);
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(execute_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(kv_pool.allocate_paged_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(kv_pool.free_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(scheduler.queue_stats(), (0, 0, 0));
+        assert!(
+            scheduler
+                .token_senders
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
+        assert!(
+            state
+                .cancel_tokens
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+        );
+        assert_eq!(state.metrics.in_flight_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(state.metrics.requests_completed.load(Ordering::Relaxed), 0);
+        assert_eq!(state.metrics.requests_failed.load(Ordering::Relaxed), 1);
+        assert_eq!(state.semaphore.available_permits(), 1);
+        assert_eq!(
+            state
+                .runtime_pool
+                .read()
+                .await
+                .default_runtime()
+                .unwrap()
+                .active_request_leases
+                .load(Ordering::Acquire),
+            0
+        );
+    }
+
     #[test]
     fn chat_prompt_applies_qwen_template_to_single_user_message() {
         let messages = vec![NormalizedChatMessage {
@@ -11074,7 +11640,8 @@ mod tests {
     fn cancel_token_guard_removes_its_registration() {
         let tokens = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let guard =
-            CancelTokenGuard::register_with_tokens(Arc::clone(&tokens), "req-1".to_string());
+            CancelTokenGuard::register_with_tokens(Arc::clone(&tokens), "req-1".to_string(), None)
+                .unwrap();
         let token = guard.token();
         assert!(!token.is_cancelled());
         assert!(tokens.lock().unwrap().contains_key("req-1"));
@@ -11084,10 +11651,76 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_active_request_id_registration_is_rejected() {
+        let registrations = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let older = CancelTokenGuard::register_with_tokens(
+            Arc::clone(&registrations),
+            "req-shared".to_string(),
+            None,
+        )
+        .unwrap();
+        let newer = CancelTokenGuard::register_with_tokens(
+            Arc::clone(&registrations),
+            "req-shared".to_string(),
+            None,
+        );
+        assert!(newer.is_none());
+        assert!(registrations.lock().unwrap().contains_key("req-shared"));
+
+        drop(older);
+        assert!(!registrations.lock().unwrap().contains_key("req-shared"));
+    }
+
+    #[test]
+    fn claimed_cancellation_keeps_the_request_id_reserved_until_cleanup() {
+        let registrations = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let guard = CancelTokenGuard::register_with_tokens(
+            Arc::clone(&registrations),
+            "req-cancelling".to_string(),
+            None,
+        )
+        .unwrap();
+        let registration = Arc::clone(registrations.lock().unwrap().get("req-cancelling").unwrap());
+        registration.cancelling.store(true, Ordering::Release);
+
+        drop(guard);
+        assert!(registrations.lock().unwrap().contains_key("req-cancelling"));
+
+        registrations.lock().unwrap().remove("req-cancelling");
+        assert!(
+            CancelTokenGuard::register_with_tokens(
+                Arc::clone(&registrations),
+                "req-cancelling".to_string(),
+                None,
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn runtime_request_lease_clones_count_as_one_logical_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, lease) = test_runtime_lease(temp.path().join("lease.gguf"));
+        assert_eq!(runtime.active_request_leases.load(Ordering::Acquire), 1);
+
+        let cloned = lease.clone();
+        let execution_guard = lease.execution_guard();
+        drop(lease);
+        drop(cloned);
+        assert_eq!(runtime.active_request_leases.load(Ordering::Acquire), 1);
+
+        drop(execution_guard);
+        assert_eq!(runtime.active_request_leases.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn inference_lifecycle_finishes_once_and_holds_admission_until_completion() {
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, runtime_lease) = test_runtime_lease(temp.path().join("lifecycle.gguf"));
         let tokens = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let registration =
-            CancelTokenGuard::register_with_tokens(Arc::clone(&tokens), "req-1".to_string());
+            CancelTokenGuard::register_with_tokens(Arc::clone(&tokens), "req-1".to_string(), None)
+                .unwrap();
         let token = registration.token();
         let metrics = Arc::new(ServerMetrics::new());
         metrics.record_request_start();
@@ -11102,6 +11735,7 @@ mod tests {
                 generated_tokens: generated,
                 prompt_tokens: 7,
                 permit,
+                runtime_lease,
             },
             StreamExecution::Blocking,
         );
@@ -11109,6 +11743,7 @@ mod tests {
         let mut client = lifecycle.client_guard();
 
         assert_eq!(semaphore.available_permits(), 0);
+        assert_eq!(runtime.active_request_leases.load(Ordering::Acquire), 1);
         drop(worker);
         assert_eq!(metrics.in_flight_requests.load(Ordering::Relaxed), 1);
         assert_eq!(semaphore.available_permits(), 0);
@@ -11124,13 +11759,17 @@ mod tests {
         assert_eq!(metrics.tokens_generated_total.load(Ordering::Relaxed), 4);
         assert_eq!(metrics.prompt_tokens_total.load(Ordering::Relaxed), 7);
         assert_eq!(semaphore.available_permits(), 1);
+        assert_eq!(runtime.active_request_leases.load(Ordering::Acquire), 0);
     }
 
     #[test]
     fn dropped_client_cancels_but_drains_worker_before_releasing_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, runtime_lease) = test_runtime_lease(temp.path().join("draining.gguf"));
         let tokens = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let registration =
-            CancelTokenGuard::register_with_tokens(Arc::clone(&tokens), "req-2".to_string());
+            CancelTokenGuard::register_with_tokens(Arc::clone(&tokens), "req-2".to_string(), None)
+                .unwrap();
         let token = registration.token();
         let metrics = Arc::new(ServerMetrics::new());
         metrics.record_request_start();
@@ -11145,6 +11784,7 @@ mod tests {
                 generated_tokens: generated,
                 prompt_tokens: 5,
                 permit,
+                runtime_lease,
             },
             StreamExecution::Blocking,
         );
@@ -11156,6 +11796,7 @@ mod tests {
         assert!(tokens.lock().unwrap().contains_key("req-2"));
         assert_eq!(metrics.in_flight_requests.load(Ordering::Relaxed), 1);
         assert_eq!(semaphore.available_permits(), 0);
+        assert_eq!(runtime.active_request_leases.load(Ordering::Acquire), 1);
 
         drop(worker);
         assert!(!tokens.lock().unwrap().contains_key("req-2"));
@@ -11164,6 +11805,56 @@ mod tests {
         assert_eq!(metrics.requests_failed.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.tokens_generated_total.load(Ordering::Relaxed), 3);
         assert_eq!(metrics.prompt_tokens_total.load(Ordering::Relaxed), 5);
+        assert_eq!(semaphore.available_permits(), 1);
+        assert_eq!(runtime.active_request_leases.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn cancellation_wins_before_success_metrics_are_committed() {
+        let temp = tempfile::tempdir().unwrap();
+        let (runtime, runtime_lease) = test_runtime_lease(temp.path().join("cancel-race.gguf"));
+        let registrations = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let registration = CancelTokenGuard::register_with_tokens(
+            Arc::clone(&registrations),
+            "req-race".to_string(),
+            None,
+        )
+        .unwrap();
+        let token = registration.token();
+        let metrics = Arc::new(ServerMetrics::new());
+        metrics.record_request_start();
+        let semaphore = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&semaphore).try_acquire_owned().unwrap();
+        let lifecycle = InferenceLifecycle::new(
+            registration,
+            InferenceLifecycleResources {
+                metrics: Arc::clone(&metrics),
+                request_start: Instant::now(),
+                generated_tokens: Arc::new(AtomicU64::new(1)),
+                prompt_tokens: 2,
+                permit,
+                runtime_lease,
+            },
+            StreamExecution::Blocking,
+        );
+        drop(lifecycle.worker_guard());
+        let mut client = lifecycle.client_guard();
+
+        let registrations_lock = registrations.lock().unwrap();
+        let finish = std::thread::spawn(move || client.finish(true));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while lifecycle.client_outcome.load(Ordering::Acquire) == 0 {
+            assert!(Instant::now() < deadline, "client did not reach settlement");
+            std::thread::yield_now();
+        }
+        token.cancel();
+        drop(registrations_lock);
+        finish.join().unwrap();
+
+        assert_eq!(metrics.requests_completed.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.requests_failed.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.in_flight_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(runtime.active_request_leases.load(Ordering::Acquire), 0);
         assert_eq!(semaphore.available_permits(), 1);
     }
 

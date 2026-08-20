@@ -116,6 +116,46 @@ pub(crate) async fn execute_embedding_batch(
     truncate_inputs: bool,
     projection: EmbeddingProjection,
 ) -> std::result::Result<EmbeddingBatchResult, EmbeddingExecutionError> {
+    execute_embedding_batch_inner(
+        state,
+        requested_model,
+        None,
+        inputs,
+        truncate_inputs,
+        projection,
+    )
+    .await
+}
+
+/// Execute embeddings against the exact runtime generation selected by an
+/// internal protocol adapter. This prevents an unload/reload with the same
+/// public model id from redirecting the request after adapter activation.
+pub(crate) async fn execute_embedding_batch_for_runtime(
+    state: Arc<ServerState>,
+    runtime: Arc<LoadedRuntime>,
+    inputs: Vec<String>,
+    truncate_inputs: bool,
+    projection: EmbeddingProjection,
+) -> std::result::Result<EmbeddingBatchResult, EmbeddingExecutionError> {
+    execute_embedding_batch_inner(
+        state,
+        None,
+        Some(runtime),
+        inputs,
+        truncate_inputs,
+        projection,
+    )
+    .await
+}
+
+async fn execute_embedding_batch_inner(
+    state: Arc<ServerState>,
+    requested_model: Option<String>,
+    exact_runtime: Option<Arc<LoadedRuntime>>,
+    inputs: Vec<String>,
+    truncate_inputs: bool,
+    projection: EmbeddingProjection,
+) -> std::result::Result<EmbeddingBatchResult, EmbeddingExecutionError> {
     let admission_guard = state.inference_admission.read().await;
     if !state.ready.load(Ordering::Relaxed) {
         let (error_type, message) = state.model_unavailable().await;
@@ -126,31 +166,44 @@ pub(crate) async fn execute_embedding_batch(
         ));
     }
 
-    let runtime = match state.resolve_runtime(requested_model.as_deref()).await {
-        Ok(Some(runtime)) => runtime,
-        Ok(None) => {
-            let (error_type, message) = state.model_unavailable().await;
-            return Err(EmbeddingExecutionError::new(
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                error_type,
-                message,
-            ));
-        }
-        Err(RequestedModelError::Invalid) => {
-            return Err(EmbeddingExecutionError::new(
-                axum::http::StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "The model field must contain 1 to 256 characters without surrounding whitespace or control characters.",
-            ));
-        }
-        Err(RequestedModelError::NotLoaded) => {
-            return Err(EmbeddingExecutionError::new(
-                axum::http::StatusCode::NOT_FOUND,
-                "model_not_found",
-                "The requested model is not loaded. Query the model discovery endpoint or switch the active runtime before retrying.",
-            ));
-        }
+    let runtime_lease = match exact_runtime {
+        Some(runtime) => match state.lease_exact_runtime(&runtime).await {
+            Some(runtime_lease) => runtime_lease,
+            None => {
+                return Err(EmbeddingExecutionError::new(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "model_unavailable",
+                    "The selected model was unloaded before inference admission.",
+                ));
+            }
+        },
+        None => match state.lease_runtime(requested_model.as_deref()).await {
+            Ok(Some(runtime_lease)) => runtime_lease,
+            Ok(None) => {
+                let (error_type, message) = state.model_unavailable().await;
+                return Err(EmbeddingExecutionError::new(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    error_type,
+                    message,
+                ));
+            }
+            Err(RequestedModelError::Invalid) => {
+                return Err(EmbeddingExecutionError::new(
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "The model field must contain 1 to 256 characters without surrounding whitespace or control characters.",
+                ));
+            }
+            Err(RequestedModelError::NotLoaded) => {
+                return Err(EmbeddingExecutionError::new(
+                    axum::http::StatusCode::NOT_FOUND,
+                    "model_not_found",
+                    "The requested model is not loaded. Query the model discovery endpoint or switch the active runtime before retrying.",
+                ));
+            }
+        },
     };
+    let runtime = runtime_lease.runtime();
     let model_id = runtime.model_id.clone();
     let pipeline = Arc::clone(&runtime.pipeline);
     if !model_supports_embeddings(&pipeline) {
@@ -184,7 +237,19 @@ pub(crate) async fn execute_embedding_batch(
     drop(admission_guard);
     let request_start = Instant::now();
     let request_id = next_request_id(&state, "embed");
-    let cancel_guard = CancelTokenGuard::register(&state, request_id);
+    let Some(cancel_guard) = CancelTokenGuard::register(&state, request_id, None) else {
+        state.metrics.record_request_end(
+            false,
+            request_start.elapsed().as_secs_f64(),
+            0,
+            u64::try_from(prompt_tokens).unwrap_or(u64::MAX),
+        );
+        return Err(EmbeddingExecutionError::new(
+            axum::http::StatusCode::CONFLICT,
+            "request_id_conflict",
+            "A request with the same ID is already active.",
+        ));
+    };
     let cancel_token = cancel_guard.token();
     let lifecycle = InferenceLifecycle::new(
         cancel_guard,
@@ -194,6 +259,7 @@ pub(crate) async fn execute_embedding_batch(
             generated_tokens: Arc::new(AtomicU64::new(0)),
             prompt_tokens: u64::try_from(prompt_tokens).unwrap_or(u64::MAX),
             permit,
+            runtime_lease,
         },
         StreamExecution::Blocking,
     );

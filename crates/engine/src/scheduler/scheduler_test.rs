@@ -7,7 +7,12 @@ mod tests {
         BloomError, DeviceCapability, DeviceClass, GenerationParams, MemoryTopology, PowerState,
         ResourcePriority, ResourceTicket, ThermalState,
     };
-    use std::sync::Arc;
+    use std::sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+    use std::time::Duration;
 
     struct MockExecutor;
     impl EngineExecutor for MockExecutor {
@@ -184,6 +189,425 @@ mod tests {
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
         );
         assert!(!scheduler.cancel_request("missing"));
+    }
+
+    #[test]
+    fn chunked_cancel_removes_both_states_before_reentrant_kv_free() {
+        let pool = Arc::new(BloomKvCachePool::new(4, 8));
+        let mut config = bloomai_core::TokenSchedulingConfig::default();
+        config.chunked_prefill.enabled = true;
+        config.chunked_prefill.chunk_size = 2;
+        let scheduler = Arc::new(InferenceScheduler::with_config(
+            Arc::new(MockExecutor),
+            Arc::clone(&pool) as Arc<dyn KvCachePool>,
+            config,
+        ));
+
+        let callback_observed = Arc::new(AtomicBool::new(false));
+        let scheduler_weak = Arc::downgrade(&scheduler);
+        let callback_observed_clone = Arc::clone(&callback_observed);
+        pool.set_on_free(move |_| {
+            let scheduler = scheduler_weak.upgrade().unwrap();
+            let chunked = scheduler
+                .chunked_prefill_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let pending = scheduler
+                .pending_prefill_requests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert!(
+                !chunked
+                    .queue
+                    .iter()
+                    .any(|state| state.request_id == "chunked-cancel")
+            );
+            assert!(!pending.contains_key("chunked-cancel"));
+            callback_observed_clone.store(true, Ordering::SeqCst);
+        });
+
+        scheduler
+            .submit(Request {
+                id: "chunked-cancel".to_string(),
+                model_id: "m1".to_string(),
+                prompt_tokens: vec![1, 2, 3, 4],
+                generated_tokens: Vec::new(),
+                params: GenerationParams {
+                    max_tokens: 1,
+                    ..Default::default()
+                },
+                state: RequestState::Pending,
+                priority: 1,
+                kv_handle: None,
+                created_at: std::time::Instant::now(),
+                last_accessed: std::time::Instant::now(),
+                preemption_count: 0,
+                decode_started_at: None,
+                last_scheduled_at: None,
+                multimodal_hash: None,
+            })
+            .unwrap();
+        assert_eq!(scheduler.queue_stats(), (1, 0, 0));
+
+        let (done_tx, done_rx) = mpsc::sync_channel(0);
+        let scheduler_for_cancel = Arc::clone(&scheduler);
+        let cancel = std::thread::spawn(move || {
+            done_tx
+                .send(scheduler_for_cancel.cancel_request("chunked-cancel"))
+                .unwrap();
+        });
+        assert!(done_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        cancel.join().unwrap();
+
+        assert!(callback_observed.load(Ordering::SeqCst));
+        assert_eq!(scheduler.queue_stats(), (0, 0, 0));
+    }
+
+    struct DropProbe {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn submit_allocation_failure_removes_sender_and_releases_guard() {
+        let config = bloomai_core::TokenSchedulingConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let scheduler = InferenceScheduler::with_config(
+            Arc::new(MockExecutor),
+            Arc::new(MockKvPool::new(0)),
+            config,
+        );
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        scheduler
+            .token_senders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("allocation-failure".to_string(), sender);
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let probe = Arc::new(DropProbe {
+            dropped: Arc::clone(&dropped),
+        });
+        let weak_probe = Arc::downgrade(&probe);
+        let execution_guard: ExecutionGuard = probe.clone();
+        drop(probe);
+
+        let error = scheduler
+            .submit_with_execution_guard(
+                Request {
+                    id: "allocation-failure".to_string(),
+                    model_id: "m1".to_string(),
+                    prompt_tokens: vec![1],
+                    generated_tokens: Vec::new(),
+                    params: GenerationParams {
+                        max_tokens: 1,
+                        ..Default::default()
+                    },
+                    state: RequestState::Pending,
+                    priority: 1,
+                    kv_handle: None,
+                    created_at: std::time::Instant::now(),
+                    last_accessed: std::time::Instant::now(),
+                    preemption_count: 0,
+                    decode_started_at: None,
+                    last_scheduled_at: None,
+                    multimodal_hash: None,
+                },
+                execution_guard,
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("KV cache pool full"));
+        assert_eq!(scheduler.queue_stats(), (0, 0, 0));
+        assert!(
+            scheduler
+                .token_senders
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        );
+        assert_eq!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        );
+        assert!(weak_probe.upgrade().is_none());
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    struct BlockingExecutor {
+        entered: mpsc::SyncSender<()>,
+        resume: Mutex<mpsc::Receiver<()>>,
+        guard: Weak<DropProbe>,
+    }
+
+    impl EngineExecutor for BlockingExecutor {
+        fn execute(&self, batch: ExecutionBatch) -> Result<BatchResult> {
+            assert!(self.guard.upgrade().is_some());
+            self.entered.send(()).unwrap();
+            self.resume
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            assert!(
+                self.guard.upgrade().is_some(),
+                "execution guard dropped before the model call completed"
+            );
+            Ok(BatchResult {
+                next_tokens: vec![42; batch.request_ids.len()],
+                speculative_tokens: None,
+            })
+        }
+
+        fn max_batch_size(&self, _phase: ExecutionPhase) -> usize {
+            1
+        }
+    }
+
+    #[test]
+    fn cancellation_waits_for_executor_before_freeing_kv_and_guard() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let probe = Arc::new(DropProbe {
+            dropped: Arc::clone(&dropped),
+        });
+        let weak_probe = Arc::downgrade(&probe);
+        let execution_guard: ExecutionGuard = probe.clone();
+        drop(probe);
+
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = mpsc::sync_channel(0);
+        let executor = Arc::new(BlockingExecutor {
+            entered: entered_tx,
+            resume: Mutex::new(resume_rx),
+            guard: weak_probe.clone(),
+        });
+        let kv_pool = Arc::new(MockKvPool::new(1));
+        let scheduler = Arc::new(InferenceScheduler::new(executor, kv_pool.clone()));
+        scheduler
+            .submit_with_execution_guard(
+                Request {
+                    id: "guarded".to_string(),
+                    model_id: "m1".to_string(),
+                    prompt_tokens: vec![1],
+                    generated_tokens: Vec::new(),
+                    params: GenerationParams {
+                        max_tokens: 2,
+                        ..Default::default()
+                    },
+                    state: RequestState::Pending,
+                    priority: 1,
+                    kv_handle: None,
+                    created_at: std::time::Instant::now(),
+                    last_accessed: std::time::Instant::now(),
+                    preemption_count: 0,
+                    decode_started_at: None,
+                    last_scheduled_at: None,
+                    multimodal_hash: None,
+                },
+                execution_guard,
+            )
+            .unwrap();
+
+        let scheduler_for_step = Arc::clone(&scheduler);
+        let step = std::thread::spawn(move || scheduler_for_step.step());
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let (cancel_started_tx, cancel_started_rx) = mpsc::sync_channel(0);
+        let (cancel_done_tx, cancel_done_rx) = mpsc::sync_channel(0);
+        let scheduler_for_cancel = Arc::clone(&scheduler);
+        let cancel = std::thread::spawn(move || {
+            cancel_started_tx.send(()).unwrap();
+            let cancelled = scheduler_for_cancel.cancel_request("guarded");
+            cancel_done_tx.send(cancelled).unwrap();
+        });
+        cancel_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+
+        assert_eq!(
+            cancel_done_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+        assert_eq!(
+            kv_pool
+                .free_slots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            0,
+            "KV handle was freed while the executor was still using it"
+        );
+        assert!(weak_probe.upgrade().is_some());
+        assert!(!dropped.load(Ordering::SeqCst));
+
+        resume_tx.send(()).unwrap();
+        step.join().unwrap().unwrap();
+        assert!(cancel_done_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        cancel.join().unwrap();
+
+        assert_eq!(
+            kv_pool
+                .free_slots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            1
+        );
+        assert!(weak_probe.upgrade().is_none());
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    struct FailingExecutor {
+        guard: Weak<DropProbe>,
+    }
+
+    impl EngineExecutor for FailingExecutor {
+        fn execute(&self, _batch: ExecutionBatch) -> Result<BatchResult> {
+            assert!(self.guard.upgrade().is_some());
+            Err(anyhow::anyhow!("executor exploded with internal details"))
+        }
+
+        fn max_batch_size(&self, _phase: ExecutionPhase) -> usize {
+            1
+        }
+    }
+
+    #[test]
+    fn executor_error_notifies_cleans_chunked_state_and_releases_guard() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let probe = Arc::new(DropProbe {
+            dropped: Arc::clone(&dropped),
+        });
+        let weak_probe = Arc::downgrade(&probe);
+        let execution_guard: ExecutionGuard = probe.clone();
+        drop(probe);
+
+        let mut config = bloomai_core::TokenSchedulingConfig::default();
+        config.chunked_prefill.enabled = true;
+        config.chunked_prefill.chunk_size = 2;
+        config.max_total_tokens_per_step = 2;
+        let scheduler = InferenceScheduler::with_config(
+            Arc::new(FailingExecutor {
+                guard: weak_probe.clone(),
+            }),
+            Arc::new(MockKvPool::new(1)),
+            config,
+        );
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        scheduler
+            .token_senders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("failing".to_string(), sender);
+
+        scheduler
+            .submit_with_execution_guard(
+                Request {
+                    id: "failing".to_string(),
+                    model_id: "m1".to_string(),
+                    prompt_tokens: vec![1, 2, 3, 4],
+                    generated_tokens: Vec::new(),
+                    params: GenerationParams {
+                        max_tokens: 1,
+                        ..Default::default()
+                    },
+                    state: RequestState::Pending,
+                    priority: 1,
+                    kv_handle: None,
+                    created_at: std::time::Instant::now(),
+                    last_accessed: std::time::Instant::now(),
+                    preemption_count: 0,
+                    decode_started_at: None,
+                    last_scheduled_at: None,
+                    multimodal_hash: None,
+                },
+                execution_guard,
+            )
+            .unwrap();
+
+        let error = scheduler.step().unwrap_err();
+        assert_eq!(error.to_string(), "executor exploded with internal details");
+        assert_eq!(
+            receiver.try_recv(),
+            Ok(Err(EXECUTION_FAILED_CLIENT_MESSAGE.to_string()))
+        );
+        assert_eq!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        );
+        assert_eq!(scheduler.queue_stats(), (0, 0, 0));
+        assert!(
+            scheduler
+                .token_senders
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        );
+        assert!(weak_probe.upgrade().is_none());
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    struct MissingTokenExecutor;
+
+    impl EngineExecutor for MissingTokenExecutor {
+        fn execute(&self, _batch: ExecutionBatch) -> Result<BatchResult> {
+            Ok(BatchResult {
+                next_tokens: Vec::new(),
+                speculative_tokens: None,
+            })
+        }
+
+        fn max_batch_size(&self, _phase: ExecutionPhase) -> usize {
+            1
+        }
+    }
+
+    #[test]
+    fn malformed_batch_result_uses_failure_cleanup() {
+        let scheduler =
+            InferenceScheduler::new(Arc::new(MissingTokenExecutor), Arc::new(MockKvPool::new(1)));
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        scheduler
+            .token_senders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("malformed".to_string(), sender);
+        scheduler
+            .submit(Request {
+                id: "malformed".to_string(),
+                model_id: "m1".to_string(),
+                prompt_tokens: vec![1],
+                generated_tokens: Vec::new(),
+                params: GenerationParams {
+                    max_tokens: 1,
+                    ..Default::default()
+                },
+                state: RequestState::Pending,
+                priority: 1,
+                kv_handle: None,
+                created_at: std::time::Instant::now(),
+                last_accessed: std::time::Instant::now(),
+                preemption_count: 0,
+                decode_started_at: None,
+                last_scheduled_at: None,
+                multimodal_hash: None,
+            })
+            .unwrap();
+
+        let error = scheduler.step().unwrap_err();
+        assert!(error.to_string().contains("returned 0 next tokens"));
+        assert_eq!(
+            receiver.try_recv(),
+            Ok(Err(EXECUTION_FAILED_CLIENT_MESSAGE.to_string()))
+        );
+        assert_eq!(scheduler.queue_stats(), (0, 0, 0));
     }
 
     #[test]
@@ -1188,6 +1612,142 @@ mod tests {
         assert_eq!(metrics.cached_blocks, 0);
         assert_eq!(metrics.misses, 1);
         assert_eq!(metrics.hits, 0);
+    }
+
+    #[test]
+    fn paged_allocation_rolls_back_partial_capacity_failure() {
+        let pool = BloomKvCachePool::new(4, 2);
+        let before = pool.get_metrics();
+
+        // Three blocks are requested from a two-block pool. The allocator
+        // reserves both free blocks before discovering that no third block can
+        // be reclaimed, exercising rollback after partial progress.
+        let error = pool
+            .allocate_paged(
+                "too-large",
+                &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                0,
+                None,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("KV Cache Pool is full"));
+
+        let after = pool.get_metrics();
+        assert_eq!(after.free_blocks, before.free_blocks);
+        assert_eq!(after.active_blocks, before.active_blocks);
+        assert_eq!(after.cached_blocks, before.cached_blocks);
+        assert_eq!(after.hits, before.hits);
+        assert_eq!(after.misses, before.misses);
+        assert_eq!(after.reuses, before.reuses);
+        assert_eq!(after.evictions, before.evictions);
+        {
+            let state = pool.state.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(state.free_blocks.len(), 2);
+            assert!(state.block_ref_counts.is_empty());
+            assert!(state.block_table.is_empty());
+            assert!(state.active_requests.is_empty());
+            assert!(state.handle_to_request_id.is_empty());
+            assert_eq!(state.next_handle, 1);
+        }
+
+        let allocation = pool
+            .allocate_paged("small", &[21, 22, 23, 24], 0, None)
+            .unwrap();
+        assert_eq!(allocation.allocated_blocks.len(), 1);
+        let metrics = pool.get_metrics();
+        assert_eq!(metrics.free_blocks, 1);
+        assert_eq!(metrics.active_blocks, 1);
+        assert_eq!(metrics.cached_blocks, 0);
+    }
+
+    #[test]
+    fn legacy_allocate_uses_one_handle_mapping_and_free_removes_it() {
+        let pool = BloomKvCachePool::new(4, 2);
+
+        let handle = pool.allocate(4).unwrap();
+        {
+            let state = pool.state.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(state.handle_to_request_id.len(), 1);
+            let request_id = state.handle_to_request_id.get(&handle).unwrap();
+            assert!(request_id.starts_with("legacy-request-"));
+            assert!(state.active_requests.contains_key(request_id));
+            assert_eq!(state.next_handle, handle + 1);
+        }
+        let allocated = pool.get_metrics();
+        assert_eq!(allocated.free_blocks, 1);
+        assert_eq!(allocated.active_blocks, 1);
+        assert_eq!(allocated.cached_blocks, 0);
+
+        pool.free(handle);
+        {
+            let state = pool.state.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(state.handle_to_request_id.is_empty());
+            assert_eq!(state.active_requests.len(), 1);
+            assert!(state.active_requests.values().all(|record| !record.active));
+        }
+        assert!(pool.block_for_handle(handle, 0).is_none());
+        let freed = pool.get_metrics();
+        assert_eq!(freed.free_blocks, 1);
+        assert_eq!(freed.active_blocks, 0);
+        assert_eq!(freed.cached_blocks, 1);
+    }
+
+    #[test]
+    fn prefix_hit_is_pinned_while_its_inactive_owner_is_evicted() {
+        let pool = BloomKvCachePool::new(4, 2);
+        let cached = pool
+            .allocate_paged("cached", &[1, 2, 3, 4, 5, 6, 7, 8], 0, None)
+            .unwrap();
+        pool.free_paged("cached");
+
+        // The new request reuses the first block but needs a different second
+        // block. With no free capacity, the cached owner is the LRU victim.
+        // The prefix hit must stay pinned while the victim's other block is
+        // reclaimed, otherwise one physical block can occupy both positions.
+        let allocation = pool
+            .allocate_paged("replacement", &[1, 2, 3, 4, 9, 10, 11, 12], 0, None)
+            .unwrap();
+
+        assert_eq!(allocation.matched_tokens, 4);
+        assert_eq!(allocation.allocated_blocks.len(), 2);
+        assert_eq!(allocation.allocated_blocks[0], cached.allocated_blocks[0]);
+        assert_ne!(
+            allocation.allocated_blocks[0],
+            allocation.allocated_blocks[1]
+        );
+        let state = pool.state.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!state.active_requests.contains_key("cached"));
+        assert!(state.active_requests.contains_key("replacement"));
+        assert_eq!(state.handle_to_request_id.len(), 1);
+        assert!(
+            state
+                .handle_to_request_id
+                .values()
+                .all(|request_id| request_id == "replacement")
+        );
+        assert!(
+            allocation
+                .allocated_blocks
+                .iter()
+                .all(|block_id| state.block_ref_counts.get(block_id) == Some(&1))
+        );
+        let reused_prefix = PrefixCacheKey {
+            tokens: vec![1, 2, 3, 4],
+            multimodal_hash: None,
+        };
+        let replacement_prefix = PrefixCacheKey {
+            tokens: vec![1, 2, 3, 4, 9, 10, 11, 12],
+            multimodal_hash: None,
+        };
+        assert_eq!(state.block_table.len(), 2);
+        assert_eq!(
+            state.block_table.get(&reused_prefix),
+            Some(&allocation.allocated_blocks[0])
+        );
+        assert_eq!(
+            state.block_table.get(&replacement_prefix),
+            Some(&allocation.allocated_blocks[1])
+        );
     }
 
     #[test]

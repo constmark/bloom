@@ -13,8 +13,13 @@ use bloomai_core::{
         rate_limiter::{RateLimitDecision, TokenBucketRateLimiter},
     },
 };
+use std::any::Any;
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::ops::{Deref, DerefMut};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering as AtomicOrdering},
+};
 use std::time::Instant;
 
 use crate::io::DataBlock;
@@ -102,6 +107,16 @@ impl TokenAdmission {
 /// Unique identifier for a request
 pub type RequestId = String;
 
+const EXECUTION_FAILED_CLIENT_MESSAGE: &str = "inference execution failed";
+
+/// Opaque ownership retained while a request is executing.
+///
+/// The scheduler never inspects this value. Callers can use it to keep a
+/// runtime, model lease, or other request-scoped resource alive through the
+/// executor's synchronous model call without requiring that resource to
+/// implement `Debug` or serialization traits.
+pub type ExecutionGuard = Arc<dyn Any + Send + Sync>;
+
 /// State of a request in the lifecycle
 #[derive(Debug, Clone, PartialEq)]
 pub enum RequestState {
@@ -127,6 +142,27 @@ pub struct Request {
     pub decode_started_at: Option<Instant>,
     pub last_scheduled_at: Option<Instant>,
     pub multimodal_hash: Option<String>,
+}
+
+/// Scheduler-owned request metadata that is intentionally kept out of the
+/// public [`Request`] struct-literal API.
+struct ScheduledRequest {
+    request: Request,
+    execution_guard: Option<ExecutionGuard>,
+}
+
+impl Deref for ScheduledRequest {
+    type Target = Request;
+
+    fn deref(&self) -> &Self::Target {
+        &self.request
+    }
+}
+
+impl DerefMut for ScheduledRequest {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.request
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -227,6 +263,7 @@ impl PoolState {
 pub struct BloomKvCachePool {
     block_size: usize,
     total_blocks: usize,
+    legacy_request_sequence: AtomicU64,
     pub(crate) state: Mutex<PoolState>,
     on_free: Mutex<Option<Box<dyn Fn(usize) + Send + Sync + 'static>>>,
     on_evict: Mutex<Option<Box<dyn Fn(&[usize]) + Send + Sync + 'static>>>,
@@ -241,6 +278,7 @@ impl BloomKvCachePool {
         Self {
             block_size,
             total_blocks,
+            legacy_request_sequence: AtomicU64::new(1),
             state: Mutex::new(PoolState {
                 free_blocks,
                 block_table: HashMap::new(),
@@ -489,19 +527,17 @@ impl BloomKvCachePool {
 
 impl KvCachePool for BloomKvCachePool {
     fn allocate(&self, num_tokens: usize) -> Result<usize> {
-        let handle = {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let h = state.next_handle;
-            state.next_handle += 1;
-            h
-        };
-        let request_id = format!("legacy-handle-{}", handle);
-        {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            state
-                .handle_to_request_id
-                .insert(handle, request_id.clone());
-        }
+        let sequence = self
+            .legacy_request_sequence
+            .fetch_update(
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+                |current| current.checked_add(1),
+            )
+            .map_err(|_| {
+                BloomError::SchedulingFailed("legacy KV request sequence exhausted".into())
+            })?;
+        let request_id = format!("legacy-request-{sequence}");
         let alloc = self.allocate_paged(&request_id, &[], num_tokens, None)?;
         Ok(alloc.handle)
     }
@@ -539,6 +575,16 @@ impl KvCachePool for BloomKvCachePool {
         let mut evicted_blocks = Vec::new();
 
         if state.active_requests.contains_key(request_id) {
+            let handle = state
+                .handle_to_request_id
+                .iter()
+                .find(|(_, rid)| *rid == request_id)
+                .map(|(&h, _)| h)
+                .ok_or_else(|| {
+                    BloomError::SchedulingFailed(format!(
+                        "active KV cache handle disappeared for request {request_id}"
+                    ))
+                })?;
             if let Some(pos) = state.lru_list.iter().position(|r| r == request_id) {
                 state.lru_list.remove(pos);
             }
@@ -553,17 +599,6 @@ impl KvCachePool for BloomKvCachePool {
                 record.last_accessed = Instant::now();
                 record.blocks.clone()
             };
-
-            let handle = state
-                .handle_to_request_id
-                .iter()
-                .find(|(_, rid)| *rid == request_id)
-                .map(|(&h, _)| h)
-                .ok_or_else(|| {
-                    BloomError::SchedulingFailed(format!(
-                        "active KV cache handle disappeared for request {request_id}"
-                    ))
-                })?;
 
             return Ok(KvCacheAllocation {
                 handle,
@@ -593,17 +628,17 @@ impl KvCachePool for BloomKvCachePool {
         }
 
         let matched_tokens = reused_blocks.len() * self.block_size;
-        if !reused_blocks.is_empty() {
-            state.metrics.hits += 1;
-            state.metrics.reuses += reused_blocks.len();
-        } else {
-            state.metrics.misses += 1;
+        // Pin prefix hits before reserving additional capacity. Otherwise an
+        // inactive request that owns the matched prefix could be selected as
+        // the LRU victim below, freeing that same block and allowing it to be
+        // reserved a second time for a different sequence position.
+        for &block_id in &reused_blocks {
+            let count = state.block_ref_counts.entry(block_id).or_insert(0);
+            *count += 1;
         }
-
         let blocks_to_allocate = needed_blocks - reused_blocks.len();
         let mut newly_allocated = Vec::new();
-        let mut new_prefixes = Vec::new();
-        let mut next_prompt_block_idx = reused_blocks.len();
+        let mut allocation_error = None;
 
         for _ in 0..blocks_to_allocate {
             while state.free_blocks.is_empty() {
@@ -613,10 +648,10 @@ impl KvCachePool for BloomKvCachePool {
                     if merged > 0 && !state.free_blocks.is_empty() {
                         continue;
                     }
-                    return Err(BloomError::SchedulingFailed(
+                    allocation_error = Some(BloomError::SchedulingFailed(
                         "KV Cache Pool is full and no inactive sequences can be evicted".into(),
-                    )
-                    .into());
+                    ));
+                    break;
                 }
                 let victim_idx = {
                     let mut best_idx = 0;
@@ -636,12 +671,15 @@ impl KvCachePool for BloomKvCachePool {
                     best_idx
                 };
                 let Some(evict_id) = state.lru_list.remove(victim_idx) else {
-                    return Err(BloomError::SchedulingFailed(
+                    allocation_error = Some(BloomError::SchedulingFailed(
                         "KV cache eviction candidate disappeared".into(),
-                    )
-                    .into());
+                    ));
+                    break;
                 };
                 if let Some(record) = state.active_requests.remove(&evict_id) {
+                    state
+                        .handle_to_request_id
+                        .retain(|_, request_id| request_id != &evict_id);
                     for (block_id, prefix) in record.blocks.iter().zip(record.prefixes.iter()) {
                         let count = state.block_ref_counts.entry(*block_id).or_insert(1);
                         *count = count.saturating_sub(1);
@@ -658,13 +696,64 @@ impl KvCachePool for BloomKvCachePool {
                 }
             }
 
+            if allocation_error.is_some() {
+                break;
+            }
             let Some(block_id) = state.free_blocks.pop_front() else {
-                return Err(BloomError::SchedulingFailed(
+                allocation_error = Some(BloomError::SchedulingFailed(
                     "KV cache free list became empty during allocation".into(),
-                )
-                .into());
+                ));
+                break;
             };
             newly_allocated.push(block_id);
+        }
+
+        if let Some(error) = allocation_error {
+            // Only reservation of these blocks belongs to the failed request.
+            // Evictions/compaction performed to obtain capacity remain valid
+            // external side effects and are reported after releasing the lock.
+            for block_id in newly_allocated.into_iter().rev() {
+                state.free_blocks.push_front(block_id);
+            }
+            for (block_id, prefix) in reused_blocks.iter().zip(reused_prefixes.iter()) {
+                let release_block = state
+                    .block_ref_counts
+                    .get_mut(block_id)
+                    .is_some_and(|count| {
+                        *count = count.saturating_sub(1);
+                        *count == 0
+                    });
+                if release_block {
+                    state.block_ref_counts.remove(block_id);
+                    if state
+                        .block_table
+                        .get(prefix)
+                        .is_some_and(|mapped| mapped == block_id)
+                    {
+                        state.block_table.remove(prefix);
+                    }
+                    state.free_blocks.push_back(*block_id);
+                    evicted_blocks.push(*block_id);
+                }
+            }
+            state.update_block_counts(self.total_blocks);
+            drop(state);
+            self.notify_evicted(&evicted_blocks);
+            return Err(error.into());
+        }
+
+        if !reused_blocks.is_empty() {
+            state.metrics.hits += 1;
+            state.metrics.reuses += reused_blocks.len();
+        } else {
+            state.metrics.misses += 1;
+        }
+
+        // Capacity is fully reserved. Commit refcounts and prefix mappings in
+        // one infallible pass so no failed request can leak partial metadata.
+        let mut new_prefixes = Vec::new();
+        let mut next_prompt_block_idx = reused_blocks.len();
+        for &block_id in &newly_allocated {
             state.block_ref_counts.insert(block_id, 1);
 
             let key = if next_prompt_block_idx < num_prompt_blocks {
@@ -686,12 +775,9 @@ impl KvCachePool for BloomKvCachePool {
             new_prefixes.push(key);
         }
 
+        // The reservation pin above becomes this request's committed prefix
+        // reference on success.
         let mut final_blocks = reused_blocks;
-        for &block_id in &final_blocks {
-            let count = state.block_ref_counts.entry(block_id).or_insert(0);
-            *count += 1;
-        }
-
         final_blocks.extend(newly_allocated);
 
         let mut final_prefixes = reused_prefixes;
@@ -1369,9 +1455,12 @@ impl Scheduler for BloomScheduler {
 /// Engine-local token scheduler for continuous batching and chunked prefill.
 pub struct InferenceScheduler {
     executor: Arc<dyn EngineExecutor>,
-    prefill_queue: Mutex<VecDeque<Request>>,
-    decoding_queue: Mutex<VecDeque<Request>>,
-    active_requests: Mutex<HashMap<RequestId, Request>>,
+    /// Serializes batch construction/execution with destructive cancellation
+    /// so a KV handle cannot be freed or reused while an executor is using it.
+    execution_gate: Mutex<()>,
+    prefill_queue: Mutex<VecDeque<ScheduledRequest>>,
+    decoding_queue: Mutex<VecDeque<ScheduledRequest>>,
+    active_requests: Mutex<HashMap<RequestId, ScheduledRequest>>,
     kv_pool: Arc<dyn KvCachePool>,
     /// Maximum total tokens per scheduling step (prefill + decode).
     max_num_tokens: usize,
@@ -1384,7 +1473,7 @@ pub struct InferenceScheduler {
     chunked_prefill_queue: Mutex<ChunkedPrefillQueue>,
     preemption_manager: Mutex<PreemptionManager>,
     kv_eviction_manager: Mutex<KvEvictionManager>,
-    pending_prefill_requests: Mutex<HashMap<RequestId, Request>>,
+    pending_prefill_requests: Mutex<HashMap<RequestId, ScheduledRequest>>,
 }
 
 impl InferenceScheduler {
@@ -1417,6 +1506,7 @@ impl InferenceScheduler {
 
         Self {
             executor,
+            execution_gate: Mutex::new(()),
             prefill_queue: Mutex::new(VecDeque::new()),
             decoding_queue: Mutex::new(VecDeque::new()),
             active_requests: Mutex::new(HashMap::new()),
@@ -1434,6 +1524,15 @@ impl InferenceScheduler {
 
     /// Cancel a request by ID, freeing its KV cache allocation.
     pub fn cancel_request(&self, request_id: &str) -> bool {
+        let _execution = self
+            .execution_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.cancel_request_inner(request_id)
+    }
+
+    /// Cancel while the caller already owns `execution_gate`.
+    fn cancel_request_inner(&self, request_id: &str) -> bool {
         // A response body can disappear independently of queue ownership. Drop
         // the client sender first so cancellation never leaves an orphaned
         // channel registration, including races before or after scheduling.
@@ -1443,69 +1542,78 @@ impl InferenceScheduler {
             .unwrap_or_else(|e| e.into_inner())
             .remove(request_id)
             .is_some();
-        // Check pending prefill requests
-        {
+
+        // Submit and scheduling use the same chunked -> pending lock order.
+        // Remove both representations atomically so a concurrent submit can
+        // never expose a half-cancelled chunked request. KV release stays
+        // outside both locks because it may invoke backend callbacks.
+        let (pending_request, chunked_removed) = {
+            let mut chunked = self
+                .chunked_prefill_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let mut pending = self
                 .pending_prefill_requests
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if let Some(req) = pending.remove(request_id) {
-                if let Some(handle) = req.kv_handle {
-                    self.kv_pool.free(handle);
-                }
-                let mut cp_queue = self
-                    .chunked_prefill_queue
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                cp_queue.cancel(request_id);
-                return true;
+            let chunked_removed = chunked.cancel(request_id);
+            (pending.remove(request_id), chunked_removed)
+        };
+        if let Some(req) = pending_request {
+            if let Some(handle) = req.kv_handle {
+                self.kv_pool.free(handle);
             }
+            return true;
         }
+
         // Check prefill queue
-        {
+        let prefill_request = {
             let mut prefill = self.prefill_queue.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(req) = prefill
+            prefill
                 .iter()
                 .position(|r| r.id == request_id)
                 .and_then(|pos| prefill.remove(pos))
-            {
-                if let Some(handle) = req.kv_handle {
-                    self.kv_pool.free(handle);
-                }
-                return true;
+        };
+        if let Some(req) = prefill_request {
+            if let Some(handle) = req.kv_handle {
+                self.kv_pool.free(handle);
             }
+            return true;
         }
+
         // Check decoding queue
-        {
+        let decoding_request = {
             let mut decoding = self
                 .decoding_queue
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if let Some(req) = decoding
+            decoding
                 .iter()
                 .position(|r| r.id == request_id)
                 .and_then(|pos| decoding.remove(pos))
-            {
-                if let Some(handle) = req.kv_handle {
-                    self.kv_pool.free(handle);
-                }
-                return true;
+        };
+        if let Some(req) = decoding_request {
+            if let Some(handle) = req.kv_handle {
+                self.kv_pool.free(handle);
             }
+            return true;
         }
+
         // Check active requests
-        {
+        let active_request = {
             let mut active = self
                 .active_requests
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if let Some(req) = active.remove(request_id) {
-                if let Some(handle) = req.kv_handle {
-                    self.kv_pool.free(handle);
-                }
-                return true;
+            active.remove(request_id)
+        };
+        if let Some(req) = active_request {
+            if let Some(handle) = req.kv_handle {
+                self.kv_pool.free(handle);
             }
+            return true;
         }
-        sender_removed
+        sender_removed || chunked_removed
     }
 
     /// Return queue depths for monitoring.
@@ -1534,7 +1642,39 @@ impl InferenceScheduler {
         (prefill, decoding, active)
     }
 
-    pub fn submit(&self, mut request: Request) -> Result<()> {
+    pub fn submit(&self, request: Request) -> Result<()> {
+        self.submit_scheduled_request(ScheduledRequest {
+            request,
+            execution_guard: None,
+        })
+    }
+
+    /// Submit a request while retaining opaque ownership through every model
+    /// invocation scheduled for it.
+    pub fn submit_with_execution_guard(
+        &self,
+        request: Request,
+        execution_guard: ExecutionGuard,
+    ) -> Result<()> {
+        self.submit_scheduled_request(ScheduledRequest {
+            request,
+            execution_guard: Some(execution_guard),
+        })
+    }
+
+    fn submit_scheduled_request(&self, request: ScheduledRequest) -> Result<()> {
+        let request_id = request.id.clone();
+        let result = self.submit_inner(request);
+        if result.is_err() {
+            self.token_senders
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&request_id);
+        }
+        result
+    }
+
+    fn submit_inner(&self, mut request: ScheduledRequest) -> Result<()> {
         // HBM Admission Control & Eviction
         if self.config.enabled {
             let metrics = self.kv_pool.get_metrics();
@@ -1565,6 +1705,8 @@ impl InferenceScheduler {
                         ),
                     });
                 }
+            }
+            {
                 let decoding = self
                     .decoding_queue
                     .lock()
@@ -1651,6 +1793,11 @@ impl InferenceScheduler {
     }
 
     pub fn step(&self) -> Result<()> {
+        let _execution = self
+            .execution_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         // Check and perform preemption if high-priority requests are waiting
         let preempted_ids = self.check_and_perform_preemption()?;
 
@@ -1674,13 +1821,7 @@ impl InferenceScheduler {
                 break;
             };
             scheduled_decode = true;
-            let result = self.executor.execute(batch.batch)?;
-            self.process_result(
-                batch.request_ids,
-                result,
-                ExecutionPhase::Decode,
-                batch.is_final,
-            )?;
+            self.execute_scheduled_batch(batch, ExecutionPhase::Decode)?;
         }
 
         // Mixed chunked prefill follows SGLang's `enable_mixed_chunk` semantics:
@@ -1697,16 +1838,72 @@ impl InferenceScheduler {
                 &preempted_ids,
             )?
         {
-            let result = self.executor.execute(batch.batch)?;
-            self.process_result(
-                batch.request_ids,
-                result,
-                ExecutionPhase::Prefill,
-                batch.is_final,
-            )?;
+            self.execute_scheduled_batch(batch, ExecutionPhase::Prefill)?;
         }
 
         Ok(())
+    }
+
+    fn execute_scheduled_batch(
+        &self,
+        scheduled: ScheduledBatch,
+        phase: ExecutionPhase,
+    ) -> Result<()> {
+        let ScheduledBatch {
+            request_ids,
+            batch,
+            is_final,
+            execution_guards,
+        } = scheduled;
+
+        // Cancellation waits on `execution_gate`, while these cloned guards
+        // additionally retain opaque runtime ownership through executor
+        // completion and scheduler bookkeeping.
+        let result = match self.executor.execute(batch) {
+            Ok(result) => result,
+            Err(error) => {
+                self.fail_scheduled_requests(&request_ids);
+                drop(execution_guards);
+                return Err(error);
+            }
+        };
+
+        if result.next_tokens.len() != request_ids.len() || is_final.len() != request_ids.len() {
+            let error = BloomError::SchedulingFailed(format!(
+                "executor returned {} next tokens and {} completion flags for {} requests",
+                result.next_tokens.len(),
+                is_final.len(),
+                request_ids.len()
+            ));
+            self.fail_scheduled_requests(&request_ids);
+            drop(execution_guards);
+            return Err(error.into());
+        }
+
+        if let Err(error) = self.process_result(&request_ids, result, phase, &is_final) {
+            self.fail_scheduled_requests(&request_ids);
+            drop(execution_guards);
+            return Err(error);
+        }
+        drop(execution_guards);
+        Ok(())
+    }
+
+    fn fail_scheduled_requests(&self, request_ids: &[RequestId]) {
+        // Keep client-facing failures generic and bounded. The original
+        // executor error is returned to the caller for internal logging.
+        {
+            let senders = self.token_senders.lock().unwrap_or_else(|e| e.into_inner());
+            for request_id in request_ids {
+                if let Some(sender) = senders.get(request_id) {
+                    let _ = sender.send(Err(EXECUTION_FAILED_CLIENT_MESSAGE.to_string()));
+                }
+            }
+        }
+
+        for request_id in request_ids {
+            self.cancel_request_inner(request_id);
+        }
     }
 
     fn prefill_tokens_for(&self, req: &Request) -> Vec<u32> {
@@ -1873,6 +2070,7 @@ impl InferenceScheduler {
             let mut params = Vec::new();
             let mut is_final_vec = Vec::new();
             let mut generated_tokens = Vec::new();
+            let mut execution_guards = Vec::new();
 
             let mut i = 0;
             while i < cp_queue.queue.len() && batch_request_ids.len() < max_batch {
@@ -1896,7 +2094,7 @@ impl InferenceScheduler {
                 }
 
                 // Get request info
-                let (model_id, req_params, kv_handle) = {
+                let (model_id, req_params, kv_handle, execution_guard) = {
                     let req_opt = if pending.contains_key(&req_id) {
                         pending.get_mut(&req_id)
                     } else {
@@ -1929,7 +2127,12 @@ impl InferenceScheduler {
                             i += 1;
                             continue;
                         };
-                        (req.model_id.clone(), req.params.clone(), kv_handle)
+                        (
+                            req.model_id.clone(),
+                            req.params.clone(),
+                            kv_handle,
+                            req.execution_guard.clone(),
+                        )
                     } else {
                         i += 1;
                         continue;
@@ -1959,6 +2162,9 @@ impl InferenceScheduler {
                 cu_seqlens.push(tokens.len());
                 start_positions.push(start);
                 params.push(req_params);
+                if let Some(guard) = execution_guard {
+                    execution_guards.push(guard);
+                }
 
                 // Advance chunk state
                 state.filled_tokens += scheduled_chunk_size;
@@ -2006,6 +2212,7 @@ impl InferenceScheduler {
                     generated_tokens,
                 },
                 is_final: is_final_vec,
+                execution_guards,
             }));
         }
 
@@ -2027,6 +2234,7 @@ impl InferenceScheduler {
         let mut params = Vec::new();
         let mut is_final_vec = Vec::new();
         let mut generated_tokens = Vec::new();
+        let mut execution_guards = Vec::new();
 
         let mut rate_limiter = self.rate_limiter.lock().unwrap_or_else(|e| e.into_inner());
         let mut i = 0;
@@ -2099,6 +2307,9 @@ impl InferenceScheduler {
             params.push(req.params.clone());
             is_final_vec.push(true);
             generated_tokens.push(req.generated_tokens.clone());
+            if let Some(guard) = req.execution_guard.clone() {
+                execution_guards.push(guard);
+            }
 
             let mut active = self
                 .active_requests
@@ -2124,6 +2335,7 @@ impl InferenceScheduler {
                 generated_tokens,
             },
             is_final: is_final_vec,
+            execution_guards,
         }))
     }
 
@@ -2153,6 +2365,7 @@ impl InferenceScheduler {
         let mut params = Vec::new();
         let mut is_final_vec = Vec::new();
         let mut generated_tokens = Vec::new();
+        let mut execution_guards = Vec::new();
 
         let mut rate_limiter = self.rate_limiter.lock().unwrap_or_else(|e| e.into_inner());
         let mut i = 0;
@@ -2220,6 +2433,9 @@ impl InferenceScheduler {
             params.push(req.params.clone());
             is_final_vec.push(true);
             generated_tokens.push(req.generated_tokens.clone());
+            if let Some(guard) = req.execution_guard.clone() {
+                execution_guards.push(guard);
+            }
 
             // Update metadata in kv cache pool
             self.kv_pool.update_request_metadata(
@@ -2253,15 +2469,16 @@ impl InferenceScheduler {
                 generated_tokens,
             },
             is_final: is_final_vec,
+            execution_guards,
         }))
     }
 
     fn process_result(
         &self,
-        request_ids: Vec<RequestId>,
+        request_ids: &[RequestId],
         result: BatchResult,
         _phase: ExecutionPhase,
-        is_final: Vec<bool>,
+        is_final: &[bool],
     ) -> Result<()> {
         let mut active = self
             .active_requests
@@ -2350,6 +2567,7 @@ struct ScheduledBatch {
     request_ids: Vec<RequestId>,
     batch: ExecutionBatch,
     is_final: Vec<bool>,
+    execution_guards: Vec<ExecutionGuard>,
 }
 
 #[cfg(test)]

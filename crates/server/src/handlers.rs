@@ -2045,23 +2045,24 @@ async fn handle_chat_completions_inner(
         return model_unavailable_response(&state).await;
     }
 
-    let runtime = match exact_runtime {
-        Some(runtime) => {
-            if !state.runtime_pool.read().await.contains_exact(&runtime) {
+    let runtime_lease = match exact_runtime {
+        Some(runtime) => match state.lease_exact_runtime(&runtime).await {
+            Some(lease) => lease,
+            None => {
                 return error_response(
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,
                     "model_unavailable",
                     "The selected model was unloaded before inference admission.",
                 );
             }
-            runtime
-        }
-        None => match state.resolve_runtime(payload.model.as_deref()).await {
-            Ok(Some(runtime)) => runtime,
+        },
+        None => match state.lease_runtime(payload.model.as_deref()).await {
+            Ok(Some(lease)) => lease,
             Ok(None) => return model_unavailable_response(&state).await,
             Err(error) => return requested_model_error_response(error),
         },
     };
+    let runtime = Arc::clone(runtime_lease.runtime());
     let model_id = runtime.model_id.clone();
     if model_supports_embeddings(&runtime.pipeline) {
         return embedding_model_generation_response(&model_id);
@@ -2169,7 +2170,26 @@ async fn handle_chat_completions_inner(
         None => next_request_id(&state, "chatcmpl"),
     };
     let created = unix_seconds();
-    let cancel_guard = CancelTokenGuard::register(&state, request_id.clone());
+    let cancel_scheduler = if state.enable_ifb {
+        scheduler_opt.clone()
+    } else {
+        None
+    };
+    let Some(cancel_guard) =
+        CancelTokenGuard::register(&state, request_id.clone(), cancel_scheduler)
+    else {
+        state.metrics.record_request_end(
+            false,
+            request_start.elapsed().as_secs_f64(),
+            0,
+            prompt_tokens as u64,
+        );
+        return error_response(
+            axum::http::StatusCode::CONFLICT,
+            "request_id_conflict",
+            "A request with the same ID is already active.",
+        );
+    };
     let cancel_token = cancel_guard.token();
 
     if state.enable_ifb {
@@ -2210,7 +2230,8 @@ async fn handle_chat_completions_inner(
             multimodal_hash: None,
         };
 
-        if let Err(e) = scheduler.submit(req) {
+        if let Err(e) = scheduler.submit_with_execution_guard(req, runtime_lease.execution_guard())
+        {
             state.metrics.record_request_end(
                 false,
                 request_start.elapsed().as_secs_f64(),
@@ -2221,6 +2242,23 @@ async fn handle_chat_completions_inner(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
                 format!("Failed to submit to scheduler: {}", e),
+            );
+        }
+        // Cancellation can win after the request ID is registered but before
+        // the scheduler owns the request. Recheck after submission so a
+        // successful cancellation can never leave a newly queued orphan.
+        if cancel_token.is_cancelled() {
+            scheduler.cancel_request(&request_id);
+            state.metrics.record_request_end(
+                false,
+                request_start.elapsed().as_secs_f64(),
+                0,
+                prompt_tokens as u64,
+            );
+            return error_response(
+                axum::http::StatusCode::REQUEST_TIMEOUT,
+                "request_cancelled",
+                "The generation request was cancelled.",
             );
         }
 
@@ -2234,6 +2272,7 @@ async fn handle_chat_completions_inner(
                     generated_tokens: Arc::clone(&generated_count),
                     prompt_tokens: prompt_tokens as u64,
                     permit,
+                    runtime_lease: runtime_lease.clone(),
                 },
                 StreamExecution::Scheduled(Arc::clone(&scheduler)),
             );
@@ -2409,8 +2448,9 @@ async fn handle_chat_completions_inner(
         let start_request_id = request_id.clone();
         let start_model_id = model_id.clone();
         let generated_count_for_usage = Arc::clone(&generated_count);
+        let stream_failed_for_usage = Arc::clone(&stream_failed);
         let usage_stream = futures::stream::once(async move {
-            include_usage.then(|| {
+            (include_usage && !stream_failed_for_usage.load(Ordering::Acquire)).then(|| {
                 Ok::<Event, std::convert::Infallible>(chat_usage_chunk(
                     usage_request_id,
                     usage_model_id,
@@ -2430,9 +2470,13 @@ async fn handle_chat_completions_inner(
         });
         let stop_filter_for_flush = Arc::clone(&stop_filter);
         let accumulated_text_for_flush = Arc::clone(&accumulated_text);
+        let stream_failed_for_flush = Arc::clone(&stream_failed);
         let flush_request_id = request_id.clone();
         let flush_model_id = model_id.clone();
         let flush_stream = futures::stream::once(async move {
+            if stream_failed_for_flush.load(Ordering::Acquire) {
+                return None;
+            }
             let tail = stop_filter_for_flush
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -2466,6 +2510,7 @@ async fn handle_chat_completions_inner(
                 generated_tokens: Arc::clone(&generated_count),
                 prompt_tokens: prompt_tokens as u64,
                 permit,
+                runtime_lease: runtime_lease.clone(),
             },
             StreamExecution::Scheduled(Arc::clone(&scheduler)),
         );
@@ -2475,6 +2520,9 @@ async fn handle_chat_completions_inner(
             .chain(sse_stream)
             .chain(flush_stream)
             .chain(futures::stream::once(async move {
+                if stream_failed_for_validation.load(Ordering::Acquire) {
+                    return None;
+                }
                 let text = {
                     let acc = accumulated_text_for_final
                         .lock()
@@ -2498,17 +2546,17 @@ async fn handle_chat_completions_inner(
                                 }
                             }
                         });
-                        Ok::<Event, std::convert::Infallible>(json_event(err_chunk))
+                        Some(Ok::<Event, std::convert::Infallible>(json_event(err_chunk)))
                     }
                     Ok(output) if tool_config_for_final.is_some() => {
-                        Ok::<Event, std::convert::Infallible>(chat_tool_output_chunk(
+                        Some(Ok::<Event, std::convert::Infallible>(chat_tool_output_chunk(
                             final_request_id,
                             final_model_id,
                             created,
                             &output,
                             generated_count_for_finish.load(Ordering::Relaxed) as usize,
                             max_tokens,
-                        ))
+                        )))
                     }
                     Ok(_) => {
                         let finish_reason = if stop_sequence_hit_for_final.load(Ordering::Acquire) {
@@ -2519,15 +2567,15 @@ async fn handle_chat_completions_inner(
                                 max_tokens,
                             )
                         };
-                        Ok::<Event, std::convert::Infallible>(chat_stop_chunk(
+                        Some(Ok::<Event, std::convert::Infallible>(chat_stop_chunk(
                             final_request_id,
                             final_model_id,
                             created,
                             finish_reason,
-                        ))
+                        )))
                     }
                 }
-            }))
+            }).filter_map(futures::future::ready))
             .chain(usage_stream)
             .chain(futures::stream::once(async move {
                 lifecycle_for_final.finish(!stream_failed_for_final.load(Ordering::Relaxed));
@@ -2549,6 +2597,7 @@ async fn handle_chat_completions_inner(
                 generated_tokens: Arc::clone(&generated_count),
                 prompt_tokens: prompt_tokens as u64,
                 permit,
+                runtime_lease: runtime_lease.clone(),
             },
             StreamExecution::Blocking,
         );
@@ -2663,6 +2712,7 @@ async fn handle_chat_completions_inner(
             generated_tokens: Arc::clone(&generated_count),
             prompt_tokens: prompt_tokens as u64,
             permit,
+            runtime_lease: runtime_lease.clone(),
         },
         StreamExecution::Blocking,
     );
@@ -3538,11 +3588,12 @@ pub(crate) async fn handle_completions(
         return model_unavailable_response(&state).await;
     }
 
-    let runtime = match state.resolve_runtime(payload.model.as_deref()).await {
-        Ok(Some(runtime)) => runtime,
+    let runtime_lease = match state.lease_runtime(payload.model.as_deref()).await {
+        Ok(Some(lease)) => lease,
         Ok(None) => return model_unavailable_response(&state).await,
         Err(error) => return requested_model_error_response(error),
     };
+    let runtime = Arc::clone(runtime_lease.runtime());
     let model_id = runtime.model_id.clone();
     if model_supports_embeddings(&runtime.pipeline) {
         return embedding_model_generation_response(&model_id);
@@ -3617,7 +3668,26 @@ pub(crate) async fn handle_completions(
     }
     let input = ModelInput::Text { prompt };
     let request_id = next_request_id(&state, "cmpl");
-    let cancel_guard = CancelTokenGuard::register(&state, request_id.clone());
+    let cancel_scheduler = if state.enable_ifb {
+        scheduler_opt.clone()
+    } else {
+        None
+    };
+    let Some(cancel_guard) =
+        CancelTokenGuard::register(&state, request_id.clone(), cancel_scheduler)
+    else {
+        state.metrics.record_request_end(
+            false,
+            request_start.elapsed().as_secs_f64(),
+            0,
+            prompt_tokens as u64,
+        );
+        return error_response(
+            axum::http::StatusCode::CONFLICT,
+            "request_id_conflict",
+            "A request with the same ID is already active.",
+        );
+    };
     let cancel_token = cancel_guard.token();
 
     if state.enable_ifb {
@@ -3658,7 +3728,8 @@ pub(crate) async fn handle_completions(
             multimodal_hash: None,
         };
 
-        if let Err(e) = scheduler.submit(req) {
+        if let Err(e) = scheduler.submit_with_execution_guard(req, runtime_lease.execution_guard())
+        {
             state.metrics.record_request_end(
                 false,
                 request_start.elapsed().as_secs_f64(),
@@ -3669,6 +3740,22 @@ pub(crate) async fn handle_completions(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
                 format!("Failed to submit to scheduler: {}", e),
+            );
+        }
+        // See the chat path above: cancellation may be claimed before the
+        // scheduler has a queue entry to remove.
+        if cancel_token.is_cancelled() {
+            scheduler.cancel_request(&request_id);
+            state.metrics.record_request_end(
+                false,
+                request_start.elapsed().as_secs_f64(),
+                0,
+                prompt_tokens as u64,
+            );
+            return error_response(
+                axum::http::StatusCode::REQUEST_TIMEOUT,
+                "request_cancelled",
+                "The generation request was cancelled.",
             );
         }
 
@@ -3682,6 +3769,7 @@ pub(crate) async fn handle_completions(
                     generated_tokens: Arc::clone(&generated_count),
                     prompt_tokens: prompt_tokens as u64,
                     permit,
+                    runtime_lease: runtime_lease.clone(),
                 },
                 StreamExecution::Scheduled(Arc::clone(&scheduler)),
             );
@@ -3843,9 +3931,13 @@ pub(crate) async fn handle_completions(
         let final_model_id = model_id.clone();
         let stop_filter_for_flush = Arc::clone(&stop_filter);
         let accumulated_text_for_flush = Arc::clone(&accumulated_text);
+        let stream_failed_for_flush = Arc::clone(&stream_failed);
         let flush_request_id = request_id.clone();
         let flush_model_id = model_id.clone();
         let flush_stream = futures::stream::once(async move {
+            if stream_failed_for_flush.load(Ordering::Acquire) {
+                return None;
+            }
             let tail = stop_filter_for_flush
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -3879,6 +3971,7 @@ pub(crate) async fn handle_completions(
                 generated_tokens: Arc::clone(&generated_count),
                 prompt_tokens: prompt_tokens as u64,
                 permit,
+                runtime_lease: runtime_lease.clone(),
             },
             StreamExecution::Scheduled(Arc::clone(&scheduler)),
         );
@@ -3887,6 +3980,9 @@ pub(crate) async fn handle_completions(
         let final_stream = sse_stream
             .chain(flush_stream)
             .chain(futures::stream::once(async move {
+                if stream_failed_for_validation.load(Ordering::Acquire) {
+                    return None;
+                }
                 let text = {
                     let acc = accumulated_text_for_final
                         .lock()
@@ -3901,7 +3997,7 @@ pub(crate) async fn handle_completions(
                             "type": "invalid_response_format"
                         }
                     });
-                    Ok::<Event, std::convert::Infallible>(json_event(err_chunk))
+                    Some(Ok::<Event, std::convert::Infallible>(json_event(err_chunk)))
                 } else {
                     let finish_reason = if stop_sequence_hit_for_final.load(Ordering::Acquire) {
                         "stop"
@@ -3911,7 +4007,7 @@ pub(crate) async fn handle_completions(
                             max_tokens,
                         )
                     };
-                    Ok::<Event, std::convert::Infallible>(json_event(json!({
+                    Some(Ok::<Event, std::convert::Infallible>(json_event(json!({
                         "id": final_request_id,
                         "object": "text_completion.chunk",
                         "created": unix_seconds(),
@@ -3921,9 +4017,9 @@ pub(crate) async fn handle_completions(
                             "text": "",
                             "finish_reason": finish_reason
                         }]
-                    })))
+                    }))))
                 }
-            }))
+            }).filter_map(futures::future::ready))
             .chain(futures::stream::once(async move {
                 lifecycle_for_final.finish(!stream_failed_for_final.load(Ordering::Relaxed));
                 Ok::<Event, std::convert::Infallible>(Event::default().data("[DONE]"))
@@ -3944,6 +4040,7 @@ pub(crate) async fn handle_completions(
                 generated_tokens: Arc::clone(&generated_count),
                 prompt_tokens: prompt_tokens as u64,
                 permit,
+                runtime_lease: runtime_lease.clone(),
             },
             StreamExecution::Blocking,
         );
@@ -4049,6 +4146,7 @@ pub(crate) async fn handle_completions(
             generated_tokens: Arc::clone(&generated_count),
             prompt_tokens: prompt_tokens as u64,
             permit,
+            runtime_lease: runtime_lease.clone(),
         },
         StreamExecution::Blocking,
     );
@@ -4541,23 +4639,24 @@ async fn run_multimodal_request_inner(
         return model_unavailable_response(&state).await;
     }
 
-    let runtime = match exact_runtime {
-        Some(runtime) => {
-            if !state.runtime_pool.read().await.contains_exact(&runtime) {
+    let runtime_lease = match exact_runtime {
+        Some(runtime) => match state.lease_exact_runtime(&runtime).await {
+            Some(lease) => lease,
+            None => {
                 return error_response(
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,
                     "model_unavailable",
                     "The selected model was unloaded before inference admission.",
                 );
             }
-            runtime
-        }
-        None => match state.resolve_runtime(requested_model.as_deref()).await {
-            Ok(Some(runtime)) => runtime,
+        },
+        None => match state.lease_runtime(requested_model.as_deref()).await {
+            Ok(Some(lease)) => lease,
             Ok(None) => return model_unavailable_response(&state).await,
             Err(error) => return requested_model_error_response(error),
         },
     };
+    let runtime = Arc::clone(runtime_lease.runtime());
     let model_id = runtime.model_id.clone();
     let pipeline = Arc::clone(&runtime.pipeline);
     if let Err(message) = validate_multimodal_modalities(&runtime.input_modalities, &payload.blocks)
@@ -4605,7 +4704,19 @@ async fn run_multimodal_request_inner(
     drop(admission_guard);
     let request_start = std::time::Instant::now();
     let request_id = next_request_id(&state, "mms");
-    let cancel_guard = CancelTokenGuard::register(&state, request_id.clone());
+    let Some(cancel_guard) = CancelTokenGuard::register(&state, request_id.clone(), None) else {
+        state.metrics.record_request_end(
+            false,
+            request_start.elapsed().as_secs_f64(),
+            0,
+            u64::try_from(prompt_tokens).unwrap_or(u64::MAX),
+        );
+        return error_response(
+            axum::http::StatusCode::CONFLICT,
+            "request_id_conflict",
+            "A request with the same ID is already active.",
+        );
+    };
     let cancel_token = cancel_guard.token();
 
     let (tx, rx) = mpsc::channel::<std::result::Result<OutputChunk, String>>(100);
@@ -4620,6 +4731,7 @@ async fn run_multimodal_request_inner(
             generated_tokens: generated_count,
             prompt_tokens: u64::try_from(prompt_tokens).unwrap_or(u64::MAX),
             permit,
+            runtime_lease: runtime_lease.clone(),
         },
         StreamExecution::Blocking,
     );
@@ -5056,41 +5168,40 @@ pub(crate) async fn handle_cancel(
             message,
         );
     }
-    let mut cancelled = false;
-
-    // Try every scheduler retained by the pool before the global token map.
-    // Collect first so no pool lock is held while scheduler code runs.
-    let schedulers = state
-        .runtime_pool
-        .read()
-        .await
-        .schedulers()
-        .collect::<Vec<_>>();
-    for scheduler in schedulers {
-        if scheduler.cancel_request(&request_id) {
-            cancelled = true;
-        }
-    }
-
-    // Try cancel token
-    {
-        let tokens = state
+    let (registration, cancelled) = {
+        let registrations = state
             .cancel_tokens
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Some(token) = tokens.get(&request_id) {
-            token.cancel();
-            cancelled = true;
+        if let Some(registration) = registrations.get(&request_id).cloned() {
+            if registration
+                .cancelling
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                registration.token.cancel();
+                (Some(registration), true)
+            } else {
+                (None, true)
+            }
+        } else {
+            (None, false)
         }
-    }
-
-    // Clean up cancel token
-    {
-        let mut tokens = state
+    };
+    if let Some(registration) = registration {
+        if let Some(scheduler) = &registration.scheduler {
+            scheduler.cancel_request(&request_id);
+        }
+        let mut registrations = state
             .cancel_tokens
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        tokens.remove(&request_id);
+        if registrations
+            .get(&request_id)
+            .is_some_and(|active| Arc::ptr_eq(active, &registration))
+        {
+            registrations.remove(&request_id);
+        }
     }
 
     if cancelled {

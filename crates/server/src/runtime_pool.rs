@@ -40,14 +40,17 @@ impl RuntimeKey {
 /// Keeping the container generic makes its ownership and selection behavior
 /// independently testable without constructing a complete inference backend.
 pub(crate) trait RuntimePoolEntry {
+    #[cfg(test)]
     type Scheduler;
 
     fn model_id(&self) -> &str;
     fn source_path(&self) -> &Path;
+    #[cfg(test)]
     fn scheduler(&self) -> Option<Arc<Self::Scheduler>>;
 }
 
 impl RuntimePoolEntry for LoadedRuntime {
+    #[cfg(test)]
     type Scheduler = bloomai_engine::scheduler::InferenceScheduler;
 
     fn model_id(&self) -> &str {
@@ -58,6 +61,7 @@ impl RuntimePoolEntry for LoadedRuntime {
         &self.source_path
     }
 
+    #[cfg(test)]
     fn scheduler(&self) -> Option<Arc<Self::Scheduler>> {
         self.scheduler.clone()
     }
@@ -379,6 +383,7 @@ impl<R: RuntimePoolEntry> RuntimePool<R> {
         self.entries.iter().map(|slot| slot.key.source())
     }
 
+    #[cfg(test)]
     pub(crate) fn schedulers(&self) -> impl Iterator<Item = Arc<R::Scheduler>> + '_ {
         self.entries
             .iter()

@@ -87,9 +87,9 @@ pub use crate::scheduler::paged_cache::{
 };
 pub use crate::scheduler::{
     BatchResult, BloomKvCachePool, BloomScheduler, EngineExecutor, EnvironmentConstraints,
-    ExecutionBatch, ExecutionPhase, FairnessStrategy, InferenceScheduler, KvCacheAllocation,
-    KvCacheMetrics, KvCachePool, ModelRoute, ModelSwitchReason, Request, RequestClass,
-    RequestState, ScheduledSegment, Scheduler, SegmentResult,
+    ExecutionBatch, ExecutionGuard, ExecutionPhase, FairnessStrategy, InferenceScheduler,
+    KvCacheAllocation, KvCacheMetrics, KvCachePool, ModelRoute, ModelSwitchReason, Request,
+    RequestClass, RequestState, ScheduledSegment, Scheduler, SegmentResult,
 };
 pub use crate::world::{
     ActionSchema, MockPolicyEngine, MockWorldModel, PolicyEngine, StateCacheManager,
