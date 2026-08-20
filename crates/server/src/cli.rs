@@ -1,6 +1,8 @@
 #![allow(unused_imports, dead_code)]
 use super::*;
 
+pub(crate) const MAX_LOADED_MODELS: usize = 16;
+
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DoctorFormat {
     Text,
@@ -72,6 +74,10 @@ pub(crate) struct Args {
     /// Maximum concurrent requests; bounded by the platform runtime semaphore capacity.
     #[arg(long, default_value_t = 4)]
     pub max_concurrent: usize,
+
+    /// Maximum inference runtimes retained in memory. The default preserves single-model behavior.
+    #[arg(long, env = "BLOOM_MAX_LOADED_MODELS", default_value_t = 1)]
+    pub max_loaded_models: usize,
 
     /// Context size for memory checks.
     #[arg(long, default_value_t = 2048)]
@@ -338,6 +344,7 @@ pub(crate) fn apply_config(
     apply_config_value!(args, matches, config, device);
     apply_config_option!(args, matches, config, dtype);
     apply_config_value!(args, matches, config, max_concurrent);
+    apply_config_value!(args, matches, config, max_loaded_models);
     apply_config_value!(args, matches, config, context_size);
     apply_config_value!(args, matches, config, memory_utilization);
     apply_config_option!(args, matches, config, reserve_memory_bytes);

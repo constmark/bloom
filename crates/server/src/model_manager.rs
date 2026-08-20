@@ -1,5 +1,6 @@
 //! Safe discovery and resolution of locally installed models.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -39,6 +40,14 @@ pub(crate) struct ModelCatalog {
 
 impl ModelCatalog {
     pub(crate) fn scan(root: &Path, active_path: Option<&Path>) -> Result<Self> {
+        let active_paths = active_path
+            .into_iter()
+            .map(Path::to_path_buf)
+            .collect::<Vec<_>>();
+        Self::scan_with_active_paths(root, &active_paths)
+    }
+
+    pub(crate) fn scan_with_active_paths(root: &Path, active_paths: &[PathBuf]) -> Result<Self> {
         if !root.exists() {
             return Ok(Self {
                 root: root.display().to_string(),
@@ -56,7 +65,10 @@ impl ModelCatalog {
         let canonical_root = root.canonicalize().with_context(|| {
             format!("failed to resolve model catalog root '{}'", root.display())
         })?;
-        let canonical_active = active_path.and_then(|path| path.canonicalize().ok());
+        let canonical_active = active_paths
+            .iter()
+            .filter_map(|path| path.canonicalize().ok())
+            .collect::<BTreeSet<_>>();
         let mut models = Vec::new();
 
         let mut inspected_entries = 0_usize;
@@ -146,7 +158,7 @@ impl ModelCatalog {
                 size_bytes,
                 size_complete,
                 modified_at,
-                active: canonical_active.as_ref() == Some(&canonical_path),
+                active: canonical_active.contains(&canonical_path),
                 provenance,
                 provenance_error,
             });
@@ -421,6 +433,20 @@ mod tests {
         assert_eq!(catalog.models[1].id, "tiny.gguf");
         assert_eq!(catalog.models[1].size_bytes, 4);
         assert!(catalog.models[1].size_complete);
+    }
+
+    #[test]
+    fn marks_every_resident_source_active() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first.gguf");
+        let second = temp.path().join("second.gguf");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+
+        let catalog = ModelCatalog::scan_with_active_paths(temp.path(), &[first, second]).unwrap();
+
+        assert_eq!(catalog.models.len(), 2);
+        assert!(catalog.models.iter().all(|entry| entry.active));
     }
 
     #[test]

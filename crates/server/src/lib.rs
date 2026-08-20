@@ -10,6 +10,7 @@
 #![cfg_attr(not(test), warn(clippy::unwrap_used))]
 
 use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -510,11 +511,28 @@ struct ModelLoadRequest {
     catalog_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 enum ModelLoadOutcome {
     Loading,
-    Ready { model_id: String },
+    Ready { runtime: Arc<LoadedRuntime> },
     Failed { message: String },
+}
+
+impl std::fmt::Debug for ModelLoadOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Loading => formatter.write_str("Loading"),
+            Self::Ready { runtime } => formatter
+                .debug_struct("Ready")
+                .field("model_id", &runtime.model_id)
+                .field("source_path", &runtime.source_path)
+                .finish(),
+            Self::Failed { message } => formatter
+                .debug_struct("Failed")
+                .field("message", message)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -531,26 +549,45 @@ struct ModelLifecycle {
     active: Option<ActiveModelLoad>,
 }
 
-struct OllamaResidencyExpiry {
+struct OllamaRuntimeResidency {
     runtime: Weak<LoadedRuntime>,
-    expires_at: SystemTime,
+    revision: u64,
+    expiry: Option<SystemTime>,
+    timer_cancel: CancellationToken,
 }
 
 #[derive(Default)]
 struct OllamaResidencyState {
-    revision: u64,
-    expiry: Option<OllamaResidencyExpiry>,
-    timer_cancel: CancellationToken,
+    runtimes: Vec<OllamaRuntimeResidency>,
 }
 
-#[derive(Debug)]
 enum ModelLoadAdmission {
-    AlreadyReady,
+    AlreadyReady {
+        runtime: Arc<LoadedRuntime>,
+    },
     Loading {
         sequence: u64,
         queued: bool,
         completion: watch::Receiver<ModelLoadOutcome>,
     },
+}
+
+impl std::fmt::Debug for ModelLoadAdmission {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyReady { runtime } => formatter
+                .debug_struct("AlreadyReady")
+                .field("model_id", &runtime.model_id)
+                .finish(),
+            Self::Loading {
+                sequence, queued, ..
+            } => formatter
+                .debug_struct("Loading")
+                .field("sequence", sequence)
+                .field("queued", queued)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -561,7 +598,7 @@ enum ModelLoadAdmissionError {
 
 struct CachedModelCatalog {
     refreshed_at: Instant,
-    active_path: Option<PathBuf>,
+    active_paths: Vec<PathBuf>,
     download_revision: u64,
     import_revision: u64,
     integrity_revision: u64,
@@ -628,8 +665,18 @@ impl ServerState {
         if self.load_in_progress.load(Ordering::Acquire) {
             return Err(ModelLoadAdmissionError::Busy);
         }
-        if self.runtime_pool.read().await.contains_source(&path) {
-            return Ok(ModelLoadAdmission::AlreadyReady);
+        let resident = {
+            let mut runtime_pool = self.runtime_pool.write().await;
+            let resident = runtime_pool.find_source(&path);
+            if let Some(runtime) = resident.as_ref() {
+                runtime_pool.promote_exact(runtime);
+            }
+            resident
+        };
+        if let Some(runtime) = resident {
+            *self.requested_model.write().await = Some(selector);
+            self.ready.store(true, Ordering::Release);
+            return Ok(ModelLoadAdmission::AlreadyReady { runtime });
         }
 
         lifecycle.next_sequence = lifecycle.next_sequence.saturating_add(1).max(1);
@@ -642,7 +689,10 @@ impl ServerState {
             completion: completion.clone(),
         });
         self.load_in_progress.store(true, Ordering::Release);
-        self.ready.store(false, Ordering::Release);
+        self.ready.store(
+            !self.runtime_pool.read().await.is_empty(),
+            Ordering::Release,
+        );
         self.load_progress.store(0, Ordering::Release);
         *self.load_error.write().await = None;
         *self.requested_model.write().await = Some(selector);
@@ -681,15 +731,16 @@ impl ServerState {
             .is_some_and(|active| active.sequence == sequence)
             && let Some(active) = lifecycle.active.take()
         {
+            self.load_in_progress.store(false, Ordering::Release);
             active.completion.send_replace(outcome);
         }
     }
 
-    async fn get_runtime(&self) -> Result<Arc<LoadedRuntime>> {
-        match self.runtime_pool.read().await.default_runtime() {
-            Some(runtime) => Ok(runtime),
-            _ => Err(anyhow!(self.model_unavailable().await.1)),
-        }
+    async fn resolve_runtime(
+        &self,
+        requested: Option<&str>,
+    ) -> std::result::Result<Option<Arc<LoadedRuntime>>, RequestedModelError> {
+        self.runtime_pool.read().await.resolve(requested)
     }
 
     async fn model_unavailable(&self) -> (&'static str, String) {
@@ -731,8 +782,13 @@ impl ServerState {
     ) -> Result<(ModelCatalog, Option<Arc<LoadedRuntime>>)> {
         let runtime_pool = self.runtime_pool.read().await;
         let runtime = runtime_pool.default_runtime();
-        let active_path = runtime_pool.default_source();
+        let mut active_paths = runtime_pool
+            .active_sources()
+            .map(Path::to_path_buf)
+            .collect::<Vec<_>>();
         drop(runtime_pool);
+        active_paths.sort();
+        active_paths.dedup();
         let download_revision = self
             .model_downloads
             .as_ref()
@@ -747,7 +803,7 @@ impl ServerState {
         if !force_refresh
             && let Some(cached) = self.model_catalog_cache.read().await.as_ref()
             && cached.refreshed_at.elapsed() < MODEL_CATALOG_CACHE_TTL
-            && cached.active_path == active_path
+            && cached.active_paths == active_paths
             && cached.download_revision == download_revision
             && cached.import_revision == import_revision
             && cached.integrity_revision == integrity_revision
@@ -756,14 +812,15 @@ impl ServerState {
         }
 
         let root = self.models_root.clone();
-        let active_for_scan = active_path.clone();
-        let catalog =
-            task::spawn_blocking(move || ModelCatalog::scan(&root, active_for_scan.as_deref()))
-                .await
-                .map_err(|error| anyhow!("model catalog scan task failed: {error}"))??;
+        let active_for_scan = active_paths.clone();
+        let catalog = task::spawn_blocking(move || {
+            ModelCatalog::scan_with_active_paths(&root, &active_for_scan)
+        })
+        .await
+        .map_err(|error| anyhow!("model catalog scan task failed: {error}"))??;
         *self.model_catalog_cache.write().await = Some(CachedModelCatalog {
             refreshed_at: Instant::now(),
-            active_path,
+            active_paths,
             download_revision,
             import_revision,
             integrity_revision,
@@ -1560,6 +1617,8 @@ async fn run_server(args: Args, config_path: PathBuf) -> Result<()> {
         return Ok(());
     }
     validate_server_arguments(&args)?;
+    let runtime_pool_capacity = NonZeroUsize::new(args.max_loaded_models)
+        .ok_or_else(|| anyhow!("maximum loaded models must be at least 1"))?;
 
     let model_path = args.model.clone();
     // Validate runtime selection before any storage cleanup or directory
@@ -1692,7 +1751,7 @@ async fn run_server(args: Args, config_path: PathBuf) -> Result<()> {
 
     let (model_loader, model_load_requests) = mpsc::channel(1);
     let state = Arc::new(ServerState {
-        runtime_pool: RwLock::new(RuntimePool::new()),
+        runtime_pool: RwLock::new(RuntimePool::with_capacity(runtime_pool_capacity)),
         inference_admission: RwLock::new(()),
         semaphore: Arc::new(Semaphore::new(args.max_concurrent)),
         ready: AtomicBool::new(false),
@@ -2075,13 +2134,6 @@ async fn model_loader_loop(
         state.load_progress.store(1, Ordering::Release);
         *state.load_error.write().await = None;
 
-        // Close the admission gate, then let requests that already own the
-        // previous runtime finish before it can be replaced.
-        let admission_guard = state.inference_admission.write().await;
-        while state.metrics.in_flight_requests.load(Ordering::Acquire) > 0 {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-
         match prepare_loaded_runtime(
             Arc::clone(&state),
             &args,
@@ -2092,25 +2144,27 @@ async fn model_loader_loop(
         .await
         {
             Ok(runtime) => {
+                // Runtime preparation is isolated from publication so an
+                // existing resident remains available during a long load.
+                // Close admission only for the atomic publish/evict boundary.
+                let admission_guard = state.inference_admission.write().await;
+                while state.metrics.in_flight_requests.load(Ordering::Acquire) > 0 {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                let runtime = Arc::new(runtime);
                 let model_id = runtime.model_id.clone();
-                let previous = state
+                let retired = state
                     .runtime_pool
                     .write()
                     .await
-                    .publish_default(Arc::new(runtime));
-                drop(previous);
+                    .publish_default(Arc::clone(&runtime));
+                drop(retired);
                 state.load_progress.store(100, Ordering::Release);
                 state.ready.store(true, Ordering::Release);
-                state.load_in_progress.store(false, Ordering::Release);
-                state
-                    .finish_model_load(
-                        request.sequence,
-                        ModelLoadOutcome::Ready {
-                            model_id: model_id.clone(),
-                        },
-                    )
-                    .await;
                 drop(admission_guard);
+                state
+                    .finish_model_load(request.sequence, ModelLoadOutcome::Ready { runtime })
+                    .await;
                 tracing::info!(model = %model_id, "Model load completed");
             }
             Err(error) => {
@@ -2126,7 +2180,6 @@ async fn model_loader_loop(
                 state.load_progress.store(0, Ordering::Release);
                 let has_fallback = !state.runtime_pool.read().await.is_empty();
                 state.ready.store(has_fallback, Ordering::Release);
-                state.load_in_progress.store(false, Ordering::Release);
                 state
                     .finish_model_load(
                         request.sequence,
@@ -2135,7 +2188,6 @@ async fn model_loader_loop(
                         },
                     )
                     .await;
-                drop(admission_guard);
             }
         }
     }
@@ -2148,6 +2200,19 @@ fn model_path_label(path: &std::path::Path) -> String {
         .filter(|name| !name.is_empty())
         .unwrap_or("external model")
         .to_string()
+}
+
+fn validate_loaded_runtime_model_id(model_id: &str) -> Result<()> {
+    if model_id == "default" {
+        return Err(anyhow!(
+            "loaded model ID 'default' is reserved for the current default runtime selector"
+        ));
+    }
+    validate_model_selector(model_id).map_err(|_| {
+        anyhow!(
+            "loaded model ID must contain 1 to 256 characters without surrounding whitespace or control characters"
+        )
+    })
 }
 
 async fn prepare_loaded_runtime(
@@ -2201,6 +2266,7 @@ async fn prepare_loaded_runtime(
     .map_err(|error| anyhow!("model loader task failed: {error}"))??;
     let pipeline = Arc::new(pipeline);
     let model_id = pipeline.metadata().id.clone();
+    validate_loaded_runtime_model_id(&model_id)?;
     tracing::info!(model = %model_id, "Model pipeline is loaded; preparing runtime services");
 
     let actual_context_size = pipeline
@@ -2649,6 +2715,7 @@ mod tests {
     }
 
     struct TestTextEngine {
+        model_id: String,
         emitted_chunks: Arc<AtomicU64>,
     }
 
@@ -2671,12 +2738,12 @@ mod tests {
             _device: DeviceKind,
         ) -> Result<Box<dyn bloomai_engine::LoadedModel>> {
             let manifest = bloomai_core::ModelManifest {
-                id: "test-text-model".to_string(),
+                id: self.model_id.clone(),
                 ..bloomai_core::ModelManifest::default()
             };
             Ok(Box::new(TestTextModel {
                 metadata: bloomai_engine::ModelMetadata {
-                    id: "test-text-model".to_string(),
+                    id: self.model_id.clone(),
                     modality: bloomai_core::Modality::Text,
                     quantized: false,
                     manifest,
@@ -4973,6 +5040,132 @@ mod tests {
         assert_eq!(body["error"]["type"], "model_not_found");
     }
 
+    #[tokio::test]
+    async fn openai_routes_resolve_two_resident_models_without_changing_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, _receiver) = test_server_state(temp.path().to_path_buf());
+        let default = test_text_runtime_with_id(
+            temp.path().join("resident-a.gguf"),
+            "resident-a",
+            Arc::new(AtomicU64::new(0)),
+        );
+        let secondary = test_text_runtime_with_id(
+            temp.path().join("resident-b.gguf"),
+            "resident-b",
+            Arc::new(AtomicU64::new(0)),
+        );
+        {
+            let mut runtime_pool = state.runtime_pool.write().await;
+            *runtime_pool = RuntimePool::with_capacity(NonZeroUsize::new(2).unwrap());
+            assert!(
+                runtime_pool
+                    .publish(Arc::clone(&default), true)
+                    .into_retired()
+                    .is_empty()
+            );
+            assert!(
+                runtime_pool
+                    .publish(Arc::clone(&secondary), false)
+                    .into_retired()
+                    .is_empty()
+            );
+        }
+        state.ready.store(true, Ordering::Release);
+        let app = Router::new()
+            .route("/models", get(handle_models))
+            .route("/models/{model}", get(handle_model_retrieve))
+            .route("/chat/completions", post(handle_chat_completions))
+            .nest("/api", ollama_api_router(Arc::clone(&state)))
+            .with_state(Arc::clone(&state));
+
+        let listed = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/models")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let listed: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(listed.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(listed["data"][0]["id"], "resident-a");
+        assert_eq!(listed["data"][1]["id"], "resident-b");
+
+        let processes = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/ps")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let processes: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(processes.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(processes["models"].as_array().unwrap().len(), 2);
+        let (catalog, _) = state.fresh_model_catalog_snapshot().await.unwrap();
+        assert!(catalog.models.iter().all(|entry| entry.active));
+
+        for (requested, expected) in [
+            (None, "resident-a"),
+            (Some("default"), "resident-a"),
+            (Some("resident-b"), "resident-b"),
+        ] {
+            let mut body = json!({
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": false,
+                "max_tokens": 4
+            });
+            if let Some(requested) = requested {
+                body["model"] = json!(requested);
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/chat/completions")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(axum::body::Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["model"], expected);
+        }
+
+        assert!(Arc::ptr_eq(
+            &state.runtime_pool.read().await.default_runtime().unwrap(),
+            &default
+        ));
+    }
+
+    #[test]
+    fn loaded_runtime_model_ids_exclude_the_reserved_default_alias() {
+        assert!(validate_loaded_runtime_model_id("resident-model").is_ok());
+        assert!(validate_loaded_runtime_model_id("default").is_err());
+        assert!(validate_loaded_runtime_model_id(" invalid ").is_err());
+        assert!(validate_loaded_runtime_model_id("").is_err());
+    }
+
     #[test]
     fn generation_admission_validates_controls_prompt_shape_and_context_budget() {
         assert!(helpers::validate_generation_controls(128, 0.7, 0.9).is_ok());
@@ -5050,7 +5243,7 @@ mod tests {
             catalog_id: None,
         });
         let previous = state.runtime_pool.write().await.publish_default(runtime);
-        assert!(previous.is_none());
+        assert!(previous.is_empty());
         state.ready.store(true, Ordering::Release);
         (state, native_batch_calls)
     }
@@ -5063,7 +5256,7 @@ mod tests {
         let model_path = models_root.join("test-text-model.fixture");
         let runtime = test_text_runtime(model_path, emitted_chunks);
         let previous = state.runtime_pool.write().await.publish_default(runtime);
-        assert!(previous.is_none());
+        assert!(previous.is_empty());
         state.ready.store(true, Ordering::Release);
         state
     }
@@ -5072,10 +5265,21 @@ mod tests {
         model_path: PathBuf,
         emitted_chunks: Arc<AtomicU64>,
     ) -> Arc<LoadedRuntime> {
+        test_text_runtime_with_id(model_path, "test-text-model", emitted_chunks)
+    }
+
+    fn test_text_runtime_with_id(
+        model_path: PathBuf,
+        model_id: &str,
+        emitted_chunks: Arc<AtomicU64>,
+    ) -> Arc<LoadedRuntime> {
         std::fs::write(&model_path, b"bounded text fixture").unwrap();
         let pipeline = Arc::new(
             InferencePipeline::load_standalone_with_context(
-                &TestTextEngine { emitted_chunks },
+                &TestTextEngine {
+                    model_id: model_id.to_string(),
+                    emitted_chunks,
+                },
                 DeviceKind::Cpu,
                 &model_path,
                 128,
@@ -6185,8 +6389,7 @@ mod tests {
 
         assert_eq!(response.status(), axum::http::StatusCode::OK);
         let residency = state.ollama_residency.lock().await;
-        assert_eq!(residency.revision, 0);
-        assert!(residency.expiry.is_none());
+        assert!(residency.runtimes.is_empty());
     }
 
     #[tokio::test]
@@ -6311,6 +6514,8 @@ mod tests {
             .write()
             .await
             .publish_default(Arc::clone(&replacement))
+            .into_iter()
+            .next()
             .expect("the original runtime must be returned");
 
         tokio::time::sleep(Duration::from_millis(80)).await;
@@ -6323,7 +6528,164 @@ mod tests {
         assert!(Arc::ptr_eq(&current, &replacement));
         assert!(!Arc::ptr_eq(&current, &previous));
         assert!(state.ready.load(Ordering::Acquire));
-        assert!(state.ollama_residency.lock().await.expiry.is_none());
+        assert!(state.ollama_residency.lock().await.runtimes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ollama_expiry_unloads_only_its_exact_nondefault_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, _receiver) = test_server_state(temp.path().to_path_buf());
+        let first = test_text_runtime_with_id(
+            temp.path().join("first.gguf"),
+            "first-runtime",
+            Arc::new(AtomicU64::new(0)),
+        );
+        let second = test_text_runtime_with_id(
+            temp.path().join("second.gguf"),
+            "second-runtime",
+            Arc::new(AtomicU64::new(0)),
+        );
+        {
+            let mut runtime_pool = state.runtime_pool.write().await;
+            *runtime_pool = RuntimePool::with_capacity(NonZeroUsize::new(2).unwrap());
+            drop(
+                runtime_pool
+                    .publish(Arc::clone(&first), true)
+                    .into_retired(),
+            );
+            drop(
+                runtime_pool
+                    .publish(Arc::clone(&second), false)
+                    .into_retired(),
+            );
+        }
+        state.ready.store(true, Ordering::Release);
+        let app = Router::new()
+            .nest("/api", ollama_api_router(Arc::clone(&state)))
+            .with_state(Arc::clone(&state));
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/generate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "second-runtime",
+                            "prompt": "",
+                            "keep_alive": "20ms",
+                            "stream": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert!(state.runtime_pool.write().await.promote_exact(&first));
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while state.runtime_pool.read().await.contains_exact(&second) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let runtime_pool = state.runtime_pool.read().await;
+        assert!(!runtime_pool.contains_exact(&second));
+        assert!(runtime_pool.contains_exact(&first));
+        assert!(Arc::ptr_eq(runtime_pool.default_ref().unwrap(), &first));
+        assert!(state.ready.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn ollama_resident_keep_alive_policies_do_not_cancel_each_other() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, _receiver) = test_server_state(temp.path().to_path_buf());
+        let first = test_text_runtime_with_id(
+            temp.path().join("independent-first.gguf"),
+            "independent-first",
+            Arc::new(AtomicU64::new(0)),
+        );
+        let second = test_text_runtime_with_id(
+            temp.path().join("independent-second.gguf"),
+            "independent-second",
+            Arc::new(AtomicU64::new(0)),
+        );
+        {
+            let mut runtime_pool = state.runtime_pool.write().await;
+            *runtime_pool = RuntimePool::with_capacity(NonZeroUsize::new(2).unwrap());
+            drop(
+                runtime_pool
+                    .publish(Arc::clone(&first), true)
+                    .into_retired(),
+            );
+            drop(
+                runtime_pool
+                    .publish(Arc::clone(&second), false)
+                    .into_retired(),
+            );
+        }
+        state.ready.store(true, Ordering::Release);
+        let app = Router::new()
+            .nest("/api", ollama_api_router(Arc::clone(&state)))
+            .with_state(Arc::clone(&state));
+
+        let first_policy = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/generate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "independent-first",
+                            "prompt": "",
+                            "keep_alive": "40ms",
+                            "stream": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first_policy.status(), axum::http::StatusCode::OK);
+
+        let second_policy = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/generate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "independent-second",
+                            "prompt": "",
+                            "keep_alive": -1,
+                            "stream": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second_policy.status(), axum::http::StatusCode::OK);
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while state.runtime_pool.read().await.contains_exact(&first) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let runtime_pool = state.runtime_pool.read().await;
+        assert!(!runtime_pool.contains_exact(&first));
+        assert!(runtime_pool.contains_exact(&second));
+        assert!(Arc::ptr_eq(runtime_pool.default_ref().unwrap(), &second));
+        drop(runtime_pool);
+
+        let residency = state.ollama_residency.lock().await;
+        assert_eq!(residency.runtimes.len(), 1);
+        assert!(residency.expiry_for(&second).is_none());
     }
 
     #[tokio::test]
@@ -6554,18 +6916,18 @@ mod tests {
     async fn ollama_delete_refuses_the_active_catalog_model() {
         let temp = tempfile::tempdir().unwrap();
         let active_model = temp.path().join("active.gguf");
-        std::fs::write(&active_model, b"active").unwrap();
-        let state = test_server_state_with_text_runtime(
-            temp.path().to_path_buf(),
-            Arc::new(AtomicU64::new(0)),
-        )
-        .await;
-        {
-            let mut runtime_pool = state.runtime_pool.write().await;
-            let runtime = Arc::get_mut(runtime_pool.default_mut().unwrap()).unwrap();
-            runtime.source_path = active_model.clone();
-            runtime.catalog_id = Some("active.gguf".to_string());
-        }
+        let (state, _receiver) = test_server_state(temp.path().to_path_buf());
+        let mut runtime = test_text_runtime(active_model.clone(), Arc::new(AtomicU64::new(0)));
+        Arc::get_mut(&mut runtime).unwrap().catalog_id = Some("active.gguf".to_string());
+        assert!(
+            state
+                .runtime_pool
+                .write()
+                .await
+                .publish_default(runtime)
+                .is_empty()
+        );
+        state.ready.store(true, Ordering::Release);
         let app = Router::new()
             .nest("/api", ollama_api_router(Arc::clone(&state)))
             .with_state(state);
@@ -8451,25 +8813,32 @@ mod tests {
         assert_eq!(queued_request.path, model_path);
         assert!(receiver.try_recv().is_err());
 
-        state.load_in_progress.store(false, Ordering::Release);
+        let mut ready_runtime = test_text_runtime(
+            temp.path().join("tiny-runtime.fixture"),
+            Arc::new(AtomicU64::new(0)),
+        );
+        Arc::get_mut(&mut ready_runtime).unwrap().model_id = "tiny-runtime".to_string();
         state
             .finish_model_load(
                 sequence,
                 ModelLoadOutcome::Ready {
-                    model_id: "tiny-runtime".to_string(),
+                    runtime: Arc::clone(&ready_runtime),
                 },
             )
             .await;
         assert_eq!(
             ollama::wait_for_model_activation(first_completion)
                 .await
-                .unwrap(),
+                .unwrap()
+                .model_id,
             "tiny-runtime"
         );
+        assert!(!state.load_in_progress.load(Ordering::Acquire));
         assert_eq!(
             ollama::wait_for_model_activation(joined_completion)
                 .await
-                .unwrap(),
+                .unwrap()
+                .model_id,
             "tiny-runtime"
         );
 
@@ -8494,7 +8863,6 @@ mod tests {
         assert!(failed_sequence > sequence);
         let failed_request = receiver.recv().await.unwrap();
         assert_eq!(failed_request.sequence, failed_sequence);
-        state.load_in_progress.store(false, Ordering::Release);
         state
             .finish_model_load(
                 failed_sequence,
@@ -8505,9 +8873,11 @@ mod tests {
             .await;
         let error = ollama::wait_for_model_activation(failed_completion)
             .await
-            .unwrap_err();
+            .err()
+            .expect("failed activation must return an error");
         assert_eq!(error.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
         assert!(error.message.contains("deterministic loader failure"));
+        assert!(!state.load_in_progress.load(Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -8524,7 +8894,7 @@ mod tests {
                 .write()
                 .await
                 .publish_default(Arc::clone(&fallback))
-                .is_none()
+                .is_empty()
         );
         state.ready.store(true, Ordering::Release);
 
@@ -8575,6 +8945,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_load_admission_promotes_a_resident_source_without_reloading() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, mut receiver) = test_server_state(temp.path().to_path_buf());
+        let first = test_text_runtime_with_id(
+            temp.path().join("first.fixture"),
+            "first-runtime",
+            Arc::new(AtomicU64::new(0)),
+        );
+        let second = test_text_runtime_with_id(
+            temp.path().join("second.fixture"),
+            "second-runtime",
+            Arc::new(AtomicU64::new(0)),
+        );
+        {
+            let mut runtime_pool = state.runtime_pool.write().await;
+            *runtime_pool = RuntimePool::with_capacity(NonZeroUsize::new(2).unwrap());
+            drop(
+                runtime_pool
+                    .publish(Arc::clone(&first), true)
+                    .into_retired(),
+            );
+            drop(
+                runtime_pool
+                    .publish(Arc::clone(&second), false)
+                    .into_retired(),
+            );
+        }
+
+        let admission = state
+            .admit_model_load(
+                second.source_path.clone(),
+                Some("second-catalog".to_string()),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let ModelLoadAdmission::AlreadyReady { runtime } = admission else {
+            panic!("a resident source must not be loaded again");
+        };
+        assert!(Arc::ptr_eq(&runtime, &second));
+        assert!(Arc::ptr_eq(
+            state.runtime_pool.read().await.default_ref().unwrap(),
+            &second
+        ));
+        assert!(receiver.try_recv().is_err());
+        assert!(!state.load_in_progress.load(Ordering::Acquire));
+        assert_eq!(
+            state.requested_model.read().await.as_deref(),
+            Some("second-catalog")
+        );
+    }
+
+    #[tokio::test]
+    async fn ollama_rejects_cross_runtime_model_and_catalog_alias_collisions() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, _receiver) = test_server_state(temp.path().to_path_buf());
+        let mut first = test_text_runtime_with_id(
+            temp.path().join("collision-a.gguf"),
+            "shared-selector",
+            Arc::new(AtomicU64::new(0)),
+        );
+        Arc::get_mut(&mut first).unwrap().catalog_id = Some("collision-a.gguf".to_string());
+        let mut second = test_text_runtime_with_id(
+            temp.path().join("collision-b.gguf"),
+            "second-runtime",
+            Arc::new(AtomicU64::new(0)),
+        );
+        Arc::get_mut(&mut second).unwrap().catalog_id = Some("shared-selector".to_string());
+        {
+            let mut runtime_pool = state.runtime_pool.write().await;
+            *runtime_pool = RuntimePool::with_capacity(NonZeroUsize::new(2).unwrap());
+            drop(
+                runtime_pool
+                    .publish(Arc::clone(&first), true)
+                    .into_retired(),
+            );
+            drop(
+                runtime_pool
+                    .publish(Arc::clone(&second), false)
+                    .into_retired(),
+            );
+        }
+        state.ready.store(true, Ordering::Release);
+
+        let activation = ollama::activate_ollama_model(&state, "shared-selector")
+            .await
+            .unwrap_err();
+        assert_eq!(activation.status, axum::http::StatusCode::CONFLICT);
+
+        let app = Router::new()
+            .nest("/api", ollama_api_router(Arc::clone(&state)))
+            .with_state(Arc::clone(&state));
+        let show = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/show")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({"model": "shared-selector"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(show.status(), axum::http::StatusCode::CONFLICT);
+
+        let unload = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/generate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "shared-selector",
+                            "prompt": "",
+                            "keep_alive": 0,
+                            "stream": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unload.status(), axum::http::StatusCode::CONFLICT);
+
+        let runtime_pool = state.runtime_pool.read().await;
+        assert!(runtime_pool.contains_exact(&first));
+        assert!(runtime_pool.contains_exact(&second));
+        assert!(Arc::ptr_eq(runtime_pool.default_ref().unwrap(), &first));
+    }
+
+    #[tokio::test]
     async fn ollama_activation_queues_an_inactive_catalog_model_and_waits_for_completion() {
         let temp = tempfile::tempdir().unwrap();
         let model_path = write_test_model_manifest(temp.path(), "tiny")
@@ -8592,16 +9099,103 @@ mod tests {
         assert_eq!(queued.catalog_id.as_deref(), Some("tiny"));
         assert!(!activation.is_finished());
 
-        state.load_in_progress.store(false, Ordering::Release);
+        let mut ready_runtime = test_text_runtime(
+            temp.path().join("tiny-llama.fixture"),
+            Arc::new(AtomicU64::new(0)),
+        );
+        Arc::get_mut(&mut ready_runtime).unwrap().model_id = "tiny-llama".to_string();
         state
             .finish_model_load(
                 queued.sequence,
                 ModelLoadOutcome::Ready {
-                    model_id: "tiny-llama".to_string(),
+                    runtime: ready_runtime,
                 },
             )
             .await;
         assert_eq!(activation.await.unwrap().unwrap(), "tiny-llama");
+        assert!(!state.load_in_progress.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn ollama_long_activation_does_not_hold_the_residency_registry() {
+        let temp = tempfile::tempdir().unwrap();
+        let model_path = write_test_model_manifest(temp.path(), "slow")
+            .canonicalize()
+            .unwrap();
+        let (state, mut receiver) = test_server_state(temp.path().to_path_buf());
+        let app = Router::new()
+            .nest("/api", ollama_api_router(Arc::clone(&state)))
+            .with_state(Arc::clone(&state));
+        let activation_app = app.clone();
+        let activation = tokio::spawn(async move {
+            activation_app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/api/generate")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(axum::body::Body::from(
+                            json!({
+                                "model": "slow",
+                                "prompt": "",
+                                "keep_alive": -1,
+                                "stream": false
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+
+        let queued = receiver.recv().await.unwrap();
+        assert_eq!(queued.path, model_path);
+        assert!(state.ollama_residency.try_lock().is_ok());
+        let processes = tokio::time::timeout(
+            Duration::from_millis(200),
+            app.oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/ps")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("process discovery must not wait for another model to load")
+        .unwrap();
+        assert_eq!(processes.status(), axum::http::StatusCode::OK);
+
+        let mut ready_runtime = test_text_runtime(
+            temp.path().join("slow-runtime.fixture"),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let runtime = Arc::get_mut(&mut ready_runtime).unwrap();
+        runtime.model_id = "slow-runtime".to_string();
+        runtime.source_path = model_path;
+        runtime.catalog_id = Some("slow".to_string());
+        assert!(
+            state
+                .runtime_pool
+                .write()
+                .await
+                .publish_default(Arc::clone(&ready_runtime))
+                .is_empty()
+        );
+        state.ready.store(true, Ordering::Release);
+        state
+            .finish_model_load(
+                queued.sequence,
+                ModelLoadOutcome::Ready {
+                    runtime: ready_runtime,
+                },
+            )
+            .await;
+
+        assert_eq!(
+            activation.await.unwrap().status(),
+            axum::http::StatusCode::OK
+        );
     }
 
     #[tokio::test]

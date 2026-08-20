@@ -11,7 +11,7 @@ use bloomai_engine::{MemoryPreallocationConfig, SpeculativeMode, SupportLevel};
 use serde::Serialize;
 use tokio::sync::Semaphore;
 
-use super::cli::{Args, DoctorFormat};
+use super::cli::{Args, DoctorFormat, MAX_LOADED_MODELS};
 use super::model_index::validate_configuration as validate_model_index_configuration;
 use super::model_index_state::inspect_model_index_watermark_directory;
 use super::model_license::ModelLicensePolicy;
@@ -261,6 +261,11 @@ fn server_argument_errors(args: &Args) -> Vec<String> {
         errors.push(format!(
             "Maximum concurrency must not exceed this platform's runtime limit of {}.",
             Semaphore::MAX_PERMITS
+        ));
+    }
+    if !(1..=MAX_LOADED_MODELS).contains(&args.max_loaded_models) {
+        errors.push(format!(
+            "Maximum loaded models must be between 1 and {MAX_LOADED_MODELS}."
         ));
     }
     if args.context_size == 0 {
@@ -1301,6 +1306,41 @@ mod tests {
         let mut explicit = Args::from_arg_matches(&matches).unwrap();
         super::super::cli::apply_config(&mut explicit, &matches, &config);
         assert_eq!(explicit.max_concurrent, 2);
+        assert!(validate_server_arguments(&explicit).is_ok());
+    }
+
+    #[test]
+    fn loaded_model_capacity_is_bounded_and_honors_cli_precedence() {
+        let defaults = default_args();
+        assert_eq!(defaults.max_loaded_models, 1);
+
+        let mut zero = defaults.clone();
+        zero.max_loaded_models = 0;
+        assert!(
+            validate_server_arguments(&zero)
+                .unwrap_err()
+                .to_string()
+                .contains("Maximum loaded models")
+        );
+
+        let config = bloomai_engine::ServerConfig {
+            max_loaded_models: Some(MAX_LOADED_MODELS + 1),
+            ..Default::default()
+        };
+        let matches = Args::command()
+            .try_get_matches_from(["bloom_server"])
+            .unwrap();
+        let mut configured = Args::from_arg_matches(&matches).unwrap();
+        super::super::cli::apply_config(&mut configured, &matches, &config);
+        assert_eq!(configured.max_loaded_models, MAX_LOADED_MODELS + 1);
+        assert!(validate_server_arguments(&configured).is_err());
+
+        let matches = Args::command()
+            .try_get_matches_from(["bloom_server", "--max-loaded-models", "2"])
+            .unwrap();
+        let mut explicit = Args::from_arg_matches(&matches).unwrap();
+        super::super::cli::apply_config(&mut explicit, &matches, &config);
+        assert_eq!(explicit.max_loaded_models, 2);
         assert!(validate_server_arguments(&explicit).is_ok());
     }
 

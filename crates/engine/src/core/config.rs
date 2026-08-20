@@ -71,6 +71,7 @@ pub struct ServerConfig {
     pub device: Option<String>,
     pub dtype: Option<String>,
     pub max_concurrent: Option<usize>,
+    pub max_loaded_models: Option<usize>,
     pub context_size: Option<usize>,
     pub memory_utilization: Option<f64>,
     pub reserve_memory_bytes: Option<usize>,
@@ -214,6 +215,7 @@ fn example_config() -> BloomConfig {
             backend: Some("candle".to_string()),
             device: Some("cpu".to_string()),
             max_concurrent: Some(4),
+            max_loaded_models: Some(1),
             context_size: Some(2048),
             memory_utilization: Some(crate::core::memory::default_memory_utilization()),
             disable_memory_prealloc: Some(false),
@@ -345,6 +347,7 @@ mod tests {
         assert_eq!(config.server.context_shift_tokens, Some(1024));
         assert_eq!(config.server.compact_free_blocks, Some(128));
         assert_eq!(config.server.max_upload_bytes, Some(12 * MIB as usize));
+        assert_eq!(config.server.max_loaded_models, Some(1));
         assert_eq!(config.server.enable_model_downloads, Some(false));
         assert_eq!(config.server.max_model_download_bytes, Some(20 * GIB));
         assert_eq!(config.server.enable_model_imports, Some(false));

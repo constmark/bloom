@@ -204,34 +204,109 @@ impl Drop for OllamaResidencyLease {
     }
 }
 
+impl OllamaResidencyState {
+    fn runtime_index(&self, runtime: &Arc<LoadedRuntime>) -> Option<usize> {
+        let runtime = Arc::downgrade(runtime);
+        self.weak_runtime_index(&runtime)
+    }
+
+    fn weak_runtime_index(&self, runtime: &Weak<LoadedRuntime>) -> Option<usize> {
+        self.runtimes
+            .iter()
+            .position(|entry| Weak::ptr_eq(&entry.runtime, runtime))
+    }
+
+    fn prune_released(&mut self) {
+        self.runtimes
+            .retain(|entry| entry.runtime.strong_count() > 0);
+    }
+
+    fn commit(&mut self, runtime: &Arc<LoadedRuntime>) -> (u64, CancellationToken) {
+        self.prune_released();
+        if let Some(index) = self.runtime_index(runtime) {
+            let entry = &mut self.runtimes[index];
+            entry.timer_cancel.cancel();
+            entry.timer_cancel = CancellationToken::new();
+            entry.revision = entry.revision.wrapping_add(1).max(1);
+            entry.expiry = None;
+            return (entry.revision, entry.timer_cancel.clone());
+        }
+
+        let timer_cancel = CancellationToken::new();
+        self.runtimes.push(OllamaRuntimeResidency {
+            runtime: Arc::downgrade(runtime),
+            revision: 1,
+            expiry: None,
+            timer_cancel: timer_cancel.clone(),
+        });
+        (1, timer_cancel)
+    }
+
+    fn set_expiry(
+        &mut self,
+        runtime: &Weak<LoadedRuntime>,
+        revision: u64,
+        expires_at: SystemTime,
+    ) -> bool {
+        let Some(index) = self.weak_runtime_index(runtime) else {
+            return false;
+        };
+        let entry = &mut self.runtimes[index];
+        if entry.revision != revision {
+            return false;
+        }
+        entry.expiry = Some(expires_at);
+        true
+    }
+
+    fn matches(&self, runtime: &Weak<LoadedRuntime>, revision: u64) -> bool {
+        self.weak_runtime_index(runtime)
+            .is_some_and(|index| self.runtimes[index].revision == revision)
+    }
+
+    fn clear_if_current(&mut self, runtime: &Weak<LoadedRuntime>, revision: u64) {
+        let Some(index) = self.weak_runtime_index(runtime) else {
+            return;
+        };
+        if self.runtimes[index].revision != revision {
+            return;
+        }
+        let entry = self.runtimes.remove(index);
+        entry.timer_cancel.cancel();
+    }
+
+    fn cancel_runtime(&mut self, runtime: &Arc<LoadedRuntime>) {
+        let Some(index) = self.runtime_index(runtime) else {
+            return;
+        };
+        let entry = self.runtimes.remove(index);
+        entry.timer_cancel.cancel();
+    }
+
+    pub(super) fn expiry_for(&self, runtime: &Arc<LoadedRuntime>) -> Option<SystemTime> {
+        self.runtime_index(runtime)
+            .and_then(|index| self.runtimes[index].expiry)
+    }
+}
+
 fn commit_ollama_residency_request(
     residency: &mut OllamaResidencyState,
+    runtime: &Arc<LoadedRuntime>,
 ) -> (u64, CancellationToken) {
-    residency.timer_cancel.cancel();
-    residency.timer_cancel = CancellationToken::new();
-    residency.revision = residency.revision.wrapping_add(1).max(1);
-    residency.expiry = None;
-    (residency.revision, residency.timer_cancel.clone())
+    residency.commit(runtime)
 }
 
 async fn ollama_residency_lease(
     state: Arc<ServerState>,
+    runtime: &Arc<LoadedRuntime>,
     revision: u64,
     timer_cancel: CancellationToken,
     keep_alive: OllamaKeepAlive,
 ) -> std::result::Result<OllamaResidencyLease, String> {
-    let runtime = state
-        .runtime_pool
-        .read()
-        .await
-        .default_runtime()
-        .as_ref()
-        .map(Arc::downgrade)
-        .ok_or_else(|| "the activated model was unavailable for residency tracking".to_string())?;
     Ok(OllamaResidencyLease {
         state,
         revision,
-        runtime,
+        runtime: Arc::downgrade(runtime),
         keep_alive,
         timer_cancel,
     })
@@ -249,13 +324,9 @@ async fn arm_ollama_residency_expiry(
         .unwrap_or(SystemTime::UNIX_EPOCH + MAX_OLLAMA_KEEP_ALIVE);
     {
         let mut residency = state.ollama_residency.lock().await;
-        if residency.revision != revision {
+        if !residency.set_expiry(&runtime, revision, expires_at) {
             return;
         }
-        residency.expiry = Some(OllamaResidencyExpiry {
-            runtime: runtime.clone(),
-            expires_at,
-        });
     }
     tokio::select! {
         _ = timer_cancel.cancelled() => return,
@@ -264,33 +335,38 @@ async fn arm_ollama_residency_expiry(
 
     loop {
         let mut residency = state.ollama_residency.lock().await;
-        if residency.revision != revision {
+        if !residency.matches(&runtime, revision) {
             return;
         }
         let Some(expected_runtime) = runtime.upgrade() else {
-            residency.expiry = None;
+            residency.clear_if_current(&runtime, revision);
             return;
         };
-        let current_runtime = state.runtime_pool.read().await.default_runtime();
-        if current_runtime
-            .as_ref()
-            .is_none_or(|current| !Arc::ptr_eq(current, &expected_runtime))
+        if !state
+            .runtime_pool
+            .read()
+            .await
+            .contains_exact(&expected_runtime)
         {
-            residency.expiry = None;
+            residency.clear_if_current(&runtime, revision);
             return;
         }
 
-        let response = handle_model_unload(State(Arc::clone(&state))).await;
+        let response = handle_model_unload_exact(Arc::clone(&state), expected_runtime).await;
         if response.status().is_success() {
-            residency.expiry = None;
-            tracing::info!("Ollama keep_alive deadline unloaded the active model");
+            residency.clear_if_current(&runtime, revision);
+            tracing::info!("Ollama keep_alive deadline unloaded its resident model");
+            return;
+        }
+        if response.status() == axum::http::StatusCode::NOT_FOUND {
+            residency.clear_if_current(&runtime, revision);
             return;
         }
         if response.status() != axum::http::StatusCode::CONFLICT {
-            residency.expiry = None;
+            residency.clear_if_current(&runtime, revision);
             tracing::warn!(
                 status = %response.status(),
-                "Ollama keep_alive deadline could not unload the active model"
+                "Ollama keep_alive deadline could not unload its resident model"
             );
             return;
         }
@@ -305,12 +381,7 @@ async fn arm_ollama_residency_expiry(
 async fn ollama_runtime_expiry(state: &ServerState, runtime: &Arc<LoadedRuntime>) -> String {
     let residency = state.ollama_residency.lock().await;
     residency
-        .expiry
-        .as_ref()
-        .and_then(|expiry| {
-            let tracked = expiry.runtime.upgrade()?;
-            Arc::ptr_eq(&tracked, runtime).then_some(expiry.expires_at)
-        })
+        .expiry_for(runtime)
         .and_then(|expires_at| expires_at.duration_since(UNIX_EPOCH).ok())
         .map(|elapsed| {
             let rounded_seconds = elapsed
@@ -337,7 +408,7 @@ pub(crate) async fn handle_ollama_version() -> axum::response::Response {
 pub(crate) async fn handle_ollama_tags(
     State(state): State<Arc<ServerState>>,
 ) -> axum::response::Response {
-    let (catalog, runtime) = match state.model_catalog_snapshot().await {
+    let (catalog, _) = match state.model_catalog_snapshot().await {
         Ok(snapshot) => snapshot,
         Err(_) => {
             return ollama_error_response(
@@ -346,25 +417,29 @@ pub(crate) async fn handle_ollama_tags(
             );
         }
     };
+    let resident = state.runtime_pool.read().await.snapshot();
     let mut models = catalog
         .models
         .iter()
         .map(|entry| {
             ollama_catalog_model(
                 entry,
-                runtime
-                    .as_ref()
-                    .filter(|runtime| catalog_entry_matches_runtime(entry, runtime)),
+                resident
+                    .entries()
+                    .iter()
+                    .map(|(_, runtime)| runtime)
+                    .find(|runtime| catalog_entry_matches_runtime(&catalog, entry, runtime)),
             )
         })
         .collect::<Vec<_>>();
-    if let Some(runtime) = runtime.as_ref().filter(|runtime| {
-        catalog
+    for (_, runtime) in resident.entries() {
+        if catalog
             .models
             .iter()
-            .all(|entry| !catalog_entry_matches_runtime(entry, runtime))
-    }) {
-        models.push(ollama_runtime_model(runtime));
+            .all(|entry| !catalog_entry_matches_runtime(&catalog, entry, runtime))
+        {
+            models.push(ollama_runtime_model(runtime));
+        }
     }
     ollama_json(json!({"models": models}))
 }
@@ -372,7 +447,7 @@ pub(crate) async fn handle_ollama_tags(
 pub(crate) async fn handle_ollama_ps(
     State(state): State<Arc<ServerState>>,
 ) -> axum::response::Response {
-    let (catalog, runtime) = match state.model_catalog_snapshot().await {
+    let (catalog, _) = match state.model_catalog_snapshot().await {
         Ok(snapshot) => snapshot,
         Err(_) => {
             return ollama_error_response(
@@ -381,36 +456,49 @@ pub(crate) async fn handle_ollama_ps(
             );
         }
     };
-    let expires_at = match runtime.as_ref() {
-        Some(runtime) => ollama_runtime_expiry(&state, runtime).await,
-        None => INDEFINITE_OLLAMA_EXPIRY.to_string(),
-    };
-    let models = runtime
-        .as_ref()
-        .map(|runtime| {
-            let entry = catalog
-                .models
-                .iter()
-                .find(|entry| catalog_entry_matches_runtime(entry, runtime));
-            let selector = entry
-                .map(ollama_catalog_selector)
-                .unwrap_or(runtime.model_id.as_str());
-            vec![json!({
-                "name": selector,
-                "model": selector,
-                "size": runtime.memory_estimate.weight_bytes,
-                "digest": runtime_digest(entry),
-                "details": ollama_details(
-                    runtime_format(runtime),
-                    model_family_name(&runtime.model_family),
-                    runtime_quantization(runtime),
-                ),
-                "expires_at": expires_at,
-                "size_vram": runtime.memory_estimate.device_weight_bytes,
-                "context_length": runtime.pipeline.context_size()
-            })]
-        })
-        .unwrap_or_default();
+    let resident = state.runtime_pool.read().await.snapshot();
+    let default = resident.default_runtime();
+    let mut runtimes = Vec::with_capacity(resident.entries().len());
+    if let Some(runtime) = default.as_ref() {
+        runtimes.push(Arc::clone(runtime));
+    }
+    runtimes.extend(
+        resident
+            .entries()
+            .iter()
+            .map(|(_, runtime)| runtime)
+            .filter(|runtime| {
+                default
+                    .as_ref()
+                    .is_none_or(|default| !Arc::ptr_eq(runtime, default))
+            })
+            .cloned(),
+    );
+    let mut models = Vec::with_capacity(runtimes.len());
+    for runtime in runtimes {
+        let expires_at = ollama_runtime_expiry(&state, &runtime).await;
+        let entry = catalog
+            .models
+            .iter()
+            .find(|entry| catalog_entry_matches_runtime(&catalog, entry, &runtime));
+        let selector = entry
+            .map(ollama_catalog_selector)
+            .unwrap_or(runtime.model_id.as_str());
+        models.push(json!({
+            "name": selector,
+            "model": selector,
+            "size": runtime.memory_estimate.weight_bytes,
+            "digest": runtime_digest(entry),
+            "details": ollama_details(
+                runtime_format(&runtime),
+                model_family_name(&runtime.model_family),
+                runtime_quantization(&runtime),
+            ),
+            "expires_at": expires_at,
+            "size_vram": runtime.memory_estimate.device_weight_bytes,
+            "context_length": runtime.pipeline.context_size()
+        }));
+    }
     ollama_json(json!({"models": models}))
 }
 
@@ -440,7 +528,7 @@ pub(crate) async fn handle_ollama_show(
     if validate_ollama_model_selector(requested).is_err() {
         return ollama_bad_request("model selector is invalid");
     }
-    let (catalog, runtime) = match state.model_catalog_snapshot().await {
+    let (catalog, _) = match state.model_catalog_snapshot().await {
         Ok(snapshot) => snapshot,
         Err(_) => {
             return ollama_error_response(
@@ -449,40 +537,44 @@ pub(crate) async fn handle_ollama_show(
             );
         }
     };
-    let requested = if requested == "default" {
-        match runtime.as_ref() {
-            Some(runtime) => catalog
-                .models
-                .iter()
-                .find(|entry| catalog_entry_matches_runtime(entry, runtime))
-                .map(ollama_catalog_selector)
-                .unwrap_or(runtime.model_id.as_str()),
-            None => {
+    let resident = state.runtime_pool.read().await.snapshot();
+    let (entry, matching_runtime) = if requested == "default" {
+        let Some(runtime) = resident.default_runtime() else {
+            return ollama_error_response(
+                axum::http::StatusCode::NOT_FOUND,
+                "model 'default' not found",
+            );
+        };
+        let entry = catalog
+            .models
+            .iter()
+            .find(|entry| catalog_entry_matches_runtime(&catalog, entry, &runtime));
+        (entry, Some(runtime))
+    } else {
+        let matching_entries = catalog
+            .models
+            .iter()
+            .filter(|entry| ollama_catalog_entry_matches_selector(entry, requested))
+            .collect::<Vec<_>>();
+        if matching_entries.len() > 1 {
+            return ollama_error_response(
+                axum::http::StatusCode::CONFLICT,
+                format!("model selector {requested:?} resolves to multiple local catalog entries"),
+            );
+        }
+        let entry = matching_entries.first().copied();
+        let matching_runtime = match resolve_resident_runtime(&catalog, &resident, requested, entry)
+        {
+            Ok(runtime) => runtime,
+            Err(()) => {
                 return ollama_error_response(
-                    axum::http::StatusCode::NOT_FOUND,
-                    "model 'default' not found",
+                    axum::http::StatusCode::CONFLICT,
+                    format!("model selector {requested:?} resolves to multiple loaded runtimes"),
                 );
             }
-        }
-    } else {
-        requested
+        };
+        (entry, matching_runtime)
     };
-    let matching_entries = catalog
-        .models
-        .iter()
-        .filter(|entry| ollama_catalog_entry_matches_selector(entry, requested))
-        .collect::<Vec<_>>();
-    if matching_entries.len() > 1 {
-        return ollama_error_response(
-            axum::http::StatusCode::CONFLICT,
-            format!("model selector {requested:?} resolves to multiple local catalog entries"),
-        );
-    }
-    let entry = matching_entries.first().copied();
-    let matching_runtime = runtime.as_ref().filter(|runtime| {
-        runtime.model_id == requested
-            || entry.is_some_and(|entry| catalog_entry_matches_runtime(entry, runtime))
-    });
     if entry.is_none() && matching_runtime.is_none() {
         return ollama_error_response(
             axum::http::StatusCode::NOT_FOUND,
@@ -492,17 +584,27 @@ pub(crate) async fn handle_ollama_show(
 
     let format = entry
         .map(|entry| entry.format.as_str())
-        .or_else(|| matching_runtime.map(|runtime| runtime_format(runtime)))
+        .or_else(|| {
+            matching_runtime
+                .as_ref()
+                .map(|runtime| runtime_format(runtime))
+        })
         .unwrap_or("unknown");
     let family = matching_runtime
+        .as_ref()
         .map(|runtime| model_family_name(&runtime.model_family))
         .unwrap_or("unknown");
     let quantization = matching_runtime
+        .as_ref()
         .and_then(|runtime| runtime_quantization(runtime))
         .or_else(|| entry.and_then(|entry| quantization_from_name(&entry.id)));
     let modified_at = entry
         .and_then(|entry| entry.modified_at)
-        .or_else(|| matching_runtime.and_then(|runtime| runtime_modified_at(runtime)))
+        .or_else(|| {
+            matching_runtime
+                .as_ref()
+                .and_then(|runtime| runtime_modified_at(runtime))
+        })
         .unwrap_or_default();
     let license = entry
         .and_then(|entry| entry.provenance.as_ref())
@@ -510,18 +612,20 @@ pub(crate) async fn handle_ollama_show(
         .unwrap_or_default();
     let mut model_info = serde_json::Map::new();
     model_info.insert("general.architecture".to_string(), json!(family));
-    if let Some(runtime) = matching_runtime {
+    if let Some(runtime) = matching_runtime.as_ref() {
         model_info.insert(
             format!("{family}.context_length"),
             json!(runtime.pipeline.context_size()),
         );
     }
-    let capabilities =
-        if matching_runtime.is_some_and(|runtime| model_supports_embeddings(&runtime.pipeline)) {
-            vec!["embedding"]
-        } else {
-            vec!["completion", "tools"]
-        };
+    let capabilities = if matching_runtime
+        .as_ref()
+        .is_some_and(|runtime| model_supports_embeddings(&runtime.pipeline))
+    {
+        vec!["embedding"]
+    } else {
+        vec!["completion", "tools"]
+    };
     ollama_json(json!({
         "parameters": "temperature 0.7\ntop_p 0.9\nnum_predict 128",
         "license": license,
@@ -1113,18 +1217,21 @@ impl OllamaActivationError {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn activate_ollama_model(
     state: &Arc<ServerState>,
     requested: &str,
 ) -> std::result::Result<String, OllamaActivationError> {
-    activate_ollama_model_with_permission(state, requested, true).await
+    activate_ollama_model_with_permission(state, requested, true)
+        .await
+        .map(|runtime| runtime.model_id.clone())
 }
 
 async fn activate_ollama_model_with_permission(
     state: &Arc<ServerState>,
     requested: &str,
     allow_lifecycle_change: bool,
-) -> std::result::Result<String, OllamaActivationError> {
+) -> std::result::Result<Arc<LoadedRuntime>, OllamaActivationError> {
     if validate_ollama_model_selector(requested).is_err() {
         return Err(OllamaActivationError::new(
             axum::http::StatusCode::BAD_REQUEST,
@@ -1133,33 +1240,21 @@ async fn activate_ollama_model_with_permission(
     }
 
     let _storage_guard = state.model_storage.serial().await;
-    let (catalog, runtime) = state.fresh_model_catalog_snapshot().await.map_err(|_| {
+    let (catalog, _) = state.fresh_model_catalog_snapshot().await.map_err(|_| {
         OllamaActivationError::new(
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             "the local model catalog could not be inspected",
         )
     })?;
+    let resident = state.runtime_pool.read().await.snapshot();
 
     if requested == "default" {
-        return runtime
-            .map(|runtime| runtime.model_id.clone())
-            .ok_or_else(|| {
-                OllamaActivationError::new(
-                    axum::http::StatusCode::NOT_FOUND,
-                    "model \"default\" is not loaded",
-                )
-            });
-    }
-    if let Some(runtime) = runtime.as_ref().filter(|runtime| {
-        runtime.model_id == requested || runtime.catalog_id.as_deref() == Some(requested)
-    }) {
-        return Ok(runtime.model_id.clone());
-    }
-    if !allow_lifecycle_change {
-        return Err(OllamaActivationError::new(
-            axum::http::StatusCode::FORBIDDEN,
-            "the inference API key cannot load or switch the active model",
-        ));
+        return resident.default_runtime().ok_or_else(|| {
+            OllamaActivationError::new(
+                axum::http::StatusCode::NOT_FOUND,
+                "model \"default\" is not loaded",
+            )
+        });
     }
 
     let mut candidates = catalog
@@ -1167,6 +1262,35 @@ async fn activate_ollama_model_with_permission(
         .iter()
         .filter(|entry| ollama_catalog_entry_matches_selector(entry, requested))
         .collect::<Vec<_>>();
+    if candidates.len() > 1 {
+        return Err(OllamaActivationError::new(
+            axum::http::StatusCode::CONFLICT,
+            format!("model selector {requested:?} resolves to multiple local catalog entries"),
+        ));
+    }
+    let resident_match =
+        resolve_resident_runtime(&catalog, &resident, requested, candidates.first().copied())
+            .map_err(|()| {
+                OllamaActivationError::new(
+                    axum::http::StatusCode::CONFLICT,
+                    format!("model selector {requested:?} resolves to multiple loaded runtimes"),
+                )
+            })?;
+    if let Some(runtime) = resident_match {
+        if allow_lifecycle_change && !state.runtime_pool.write().await.promote_exact(&runtime) {
+            return Err(OllamaActivationError::new(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "the selected model was unloaded before inference admission",
+            ));
+        }
+        return Ok(runtime);
+    }
+    if !allow_lifecycle_change {
+        return Err(OllamaActivationError::new(
+            axum::http::StatusCode::FORBIDDEN,
+            "the inference API key cannot load or switch the active model",
+        ));
+    }
 
     if candidates.is_empty()
         && validate_index_id(requested).is_ok()
@@ -1201,11 +1325,21 @@ async fn activate_ollama_model_with_permission(
             format!("model {requested:?} not found"),
         ));
     };
-    if let Some(runtime) = runtime
-        .as_ref()
-        .filter(|runtime| catalog_entry_matches_runtime(entry, runtime))
-    {
-        return Ok(runtime.model_id.clone());
+    let resident_match = resolve_resident_runtime(&catalog, &resident, requested, Some(entry))
+        .map_err(|()| {
+            OllamaActivationError::new(
+                axum::http::StatusCode::CONFLICT,
+                format!("model selector {requested:?} resolves to multiple loaded runtimes"),
+            )
+        })?;
+    if let Some(runtime) = resident_match {
+        if !state.runtime_pool.write().await.promote_exact(&runtime) {
+            return Err(OllamaActivationError::new(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "the selected model was unloaded before inference admission",
+            ));
+        }
+        return Ok(runtime);
     }
 
     let catalog_id = entry.id.clone();
@@ -1227,18 +1361,7 @@ async fn activate_ollama_model_with_permission(
     drop(_storage_guard);
 
     match admission {
-        ModelLoadAdmission::AlreadyReady => state
-            .runtime_pool
-            .read()
-            .await
-            .default_ref()
-            .map(|runtime| runtime.model_id.clone())
-            .ok_or_else(|| {
-                OllamaActivationError::new(
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                    "the selected model was unloaded before inference admission",
-                )
-            }),
+        ModelLoadAdmission::AlreadyReady { runtime } => Ok(runtime),
         ModelLoadAdmission::Loading {
             sequence,
             queued,
@@ -1269,11 +1392,11 @@ fn validate_ollama_model_selector(selector: &str) -> std::result::Result<(), ()>
 
 pub(crate) async fn wait_for_model_activation(
     mut completion: watch::Receiver<ModelLoadOutcome>,
-) -> std::result::Result<String, OllamaActivationError> {
+) -> std::result::Result<Arc<LoadedRuntime>, OllamaActivationError> {
     loop {
         match completion.borrow().clone() {
             ModelLoadOutcome::Loading => {}
-            ModelLoadOutcome::Ready { model_id } => return Ok(model_id),
+            ModelLoadOutcome::Ready { runtime } => return Ok(runtime),
             ModelLoadOutcome::Failed { message } => {
                 return Err(OllamaActivationError::new(
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -1408,21 +1531,29 @@ async fn handle_ollama_lifecycle(
         return ollama_bad_request("model selector is invalid");
     }
 
-    // Serialize the lifecycle operation with expiry. The old deadline remains
-    // authoritative until the requested load or unload succeeds, so a failed
-    // request cannot accidentally make the current runtime resident forever.
-    let mut residency = state.ollama_residency.lock().await;
+    // Resolve or load without holding the residency registry. Only policy
+    // commit and exact unload are serialized with expiry, so work for one
+    // runtime cannot stall every other resident timer or `/api/ps` query.
     let mut residency_lease = None;
     let done_reason = match action {
         OllamaLifecycleAction::Load(keep_alive) => {
-            if let Err(error) = activate_ollama_model(state, &model).await {
-                return ollama_error_response(error.status, error.message);
+            let runtime = match activate_ollama_model_with_permission(state, &model, true).await {
+                Ok(runtime) => runtime,
+                Err(error) => return ollama_error_response(error.status, error.message),
+            };
+            let mut residency = state.ollama_residency.lock().await;
+            if !state.runtime_pool.read().await.contains_exact(&runtime) {
+                return ollama_error_response(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "the selected model was unloaded before its residency policy could be committed",
+                );
             }
             let (residency_revision, residency_timer_cancel) =
-                commit_ollama_residency_request(&mut residency);
+                commit_ollama_residency_request(&mut residency, &runtime);
             drop(residency);
             let lease = match ollama_residency_lease(
                 Arc::clone(state),
+                &runtime,
                 residency_revision,
                 residency_timer_cancel,
                 keep_alive,
@@ -1447,7 +1578,7 @@ async fn handle_ollama_lifecycle(
                     "another model lifecycle operation is already in progress",
                 );
             }
-            let (catalog, runtime) = match state.fresh_model_catalog_snapshot().await {
+            let (catalog, _) = match state.fresh_model_catalog_snapshot().await {
                 Ok(snapshot) => snapshot,
                 Err(_) => {
                     return ollama_error_response(
@@ -1456,31 +1587,52 @@ async fn handle_ollama_lifecycle(
                     );
                 }
             };
+            let resident = state.runtime_pool.read().await.snapshot();
+            let runtime = if model == "default" {
+                resident.default_runtime()
+            } else {
+                let matching_entries = catalog
+                    .models
+                    .iter()
+                    .filter(|entry| ollama_catalog_entry_matches_selector(entry, &model))
+                    .collect::<Vec<_>>();
+                if matching_entries.len() > 1 {
+                    return ollama_error_response(
+                        axum::http::StatusCode::CONFLICT,
+                        format!(
+                            "model selector {model:?} resolves to multiple local catalog entries"
+                        ),
+                    );
+                }
+                match resolve_resident_runtime(
+                    &catalog,
+                    &resident,
+                    &model,
+                    matching_entries.first().copied(),
+                ) {
+                    Ok(runtime) => runtime,
+                    Err(()) => {
+                        return ollama_error_response(
+                            axum::http::StatusCode::CONFLICT,
+                            format!(
+                                "model selector {model:?} resolves to multiple loaded runtimes"
+                            ),
+                        );
+                    }
+                }
+            };
             let Some(runtime) = runtime else {
                 return ollama_error_response(
                     axum::http::StatusCode::NOT_FOUND,
                     format!("model {model:?} is not loaded"),
                 );
             };
-            let entry = catalog
-                .models
-                .iter()
-                .find(|entry| catalog_entry_matches_runtime(entry, &runtime));
-            if model != "default"
-                && model != runtime.model_id
-                && runtime.catalog_id.as_deref() != Some(model.as_str())
-                && entry.is_none_or(|entry| !ollama_catalog_entry_matches_selector(entry, &model))
-            {
-                return ollama_error_response(
-                    axum::http::StatusCode::NOT_FOUND,
-                    format!("model {model:?} is not loaded"),
-                );
-            }
-            let response = handle_model_unload(State(Arc::clone(state))).await;
+            let mut residency = state.ollama_residency.lock().await;
+            let response = handle_model_unload_exact(Arc::clone(state), Arc::clone(&runtime)).await;
             if !response.status().is_success() {
                 return adapt_ollama_error_response(response).await;
             }
-            commit_ollama_residency_request(&mut residency);
+            residency.cancel_runtime(&runtime);
             drop(residency);
             "unload"
         }
@@ -1518,18 +1670,26 @@ async fn activate_ollama_model_for_request(
     operator_scope: bool,
     keep_alive: OllamaKeepAlive,
 ) -> std::result::Result<(String, Option<OllamaResidencyLease>), OllamaActivationError> {
-    let mut residency = state.ollama_residency.lock().await;
-    let active_model =
+    let runtime =
         activate_ollama_model_with_permission(state, requested_model, operator_scope).await?;
+    let active_model = runtime.model_id.clone();
     if !operator_scope {
         return Ok((active_model, None));
     }
 
+    let mut residency = state.ollama_residency.lock().await;
+    if !state.runtime_pool.read().await.contains_exact(&runtime) {
+        return Err(OllamaActivationError::new(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "the selected model was unloaded before its residency policy could be committed",
+        ));
+    }
     let (residency_revision, residency_timer_cancel) =
-        commit_ollama_residency_request(&mut residency);
+        commit_ollama_residency_request(&mut residency, &runtime);
     drop(residency);
     let lease = ollama_residency_lease(
         Arc::clone(state),
+        &runtime,
         residency_revision,
         residency_timer_cancel,
         keep_alive,
@@ -3272,11 +3432,49 @@ fn runtime_digest(entry: Option<&model_manager::ModelCatalogEntry>) -> String {
         .unwrap_or_default()
 }
 
+fn resolve_resident_runtime(
+    catalog: &model_manager::ModelCatalog,
+    resident: &crate::runtime_pool::RuntimePoolSnapshot<LoadedRuntime>,
+    selector: &str,
+    catalog_entry: Option<&model_manager::ModelCatalogEntry>,
+) -> std::result::Result<Option<Arc<LoadedRuntime>>, ()> {
+    let mut matched = None;
+    for (_, runtime) in resident.entries() {
+        let matches = runtime.model_id == selector
+            || runtime.catalog_id.as_deref() == Some(selector)
+            || catalog_entry
+                .is_some_and(|entry| catalog_entry_matches_runtime(catalog, entry, runtime));
+        if !matches {
+            continue;
+        }
+        if matched
+            .as_ref()
+            .is_some_and(|previous| !Arc::ptr_eq(previous, runtime))
+        {
+            return Err(());
+        }
+        matched = Some(Arc::clone(runtime));
+    }
+    Ok(matched)
+}
+
 fn catalog_entry_matches_runtime(
+    catalog: &model_manager::ModelCatalog,
     entry: &model_manager::ModelCatalogEntry,
     runtime: &LoadedRuntime,
 ) -> bool {
-    entry.active || runtime.catalog_id.as_deref() == Some(entry.id.as_str())
+    if runtime.catalog_id.as_deref() == Some(entry.id.as_str()) {
+        return true;
+    }
+    if !entry.active {
+        return false;
+    }
+    let catalog_path = Path::new(&catalog.root).join(&entry.id);
+    runtime.source_path == catalog_path
+        || runtime
+            .source_path
+            .canonicalize()
+            .is_ok_and(|source| source == catalog_path)
 }
 
 fn ollama_catalog_selector(entry: &model_manager::ModelCatalogEntry) -> &str {

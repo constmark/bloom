@@ -255,11 +255,24 @@ fn openai_model_resource(runtime: &LoadedRuntime) -> serde_json::Value {
 }
 
 pub(crate) async fn handle_models(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
-    let runtime = state.runtime_pool.read().await.default_runtime();
-    let models = runtime
-        .as_ref()
-        .map(|runtime| vec![openai_model_resource(runtime)])
-        .unwrap_or_default();
+    let snapshot = state.runtime_pool.read().await.snapshot();
+    let default = snapshot.default_runtime();
+    let mut models = Vec::with_capacity(snapshot.entries().len());
+    if let Some(runtime) = default.as_ref() {
+        models.push(openai_model_resource(runtime));
+    }
+    models.extend(
+        snapshot
+            .entries()
+            .iter()
+            .map(|(_, runtime)| runtime)
+            .filter(|runtime| {
+                default
+                    .as_ref()
+                    .is_none_or(|default| !Arc::ptr_eq(runtime, default))
+            })
+            .map(|runtime| openai_model_resource(runtime)),
+    );
     Json(json!({
         "object": "list",
         "data": models
@@ -1432,7 +1445,7 @@ pub(crate) async fn handle_model_switch(
         .admit_model_load(path, Some(model_id.clone()), false)
         .await
     {
-        Ok(ModelLoadAdmission::AlreadyReady) => Json(json!({
+        Ok(ModelLoadAdmission::AlreadyReady { .. }) => Json(json!({
             "object": "bloom.model_load",
             "accepted": false,
             "unchanged": true,
@@ -1537,7 +1550,7 @@ pub(crate) async fn remove_catalog_model(
         });
     }
 
-    let (catalog, runtime) = state
+    let (catalog, _) = state
         .fresh_model_catalog_snapshot()
         .await
         .map_err(|error| {
@@ -1580,10 +1593,7 @@ pub(crate) async fn remove_catalog_model(
                 ));
             }
         };
-    if runtime
-        .as_ref()
-        .is_some_and(|runtime| runtime.source_path == resolved)
-    {
+    if state.runtime_pool.read().await.contains_source(&resolved) {
         return Err(ModelRemovalError::Conflict {
             code: "model_is_active",
             message: "Unload or switch away from the active model before removing it.".to_string(),
@@ -1714,6 +1724,20 @@ fn model_integrity_error_response(error: ModelIntegrityError) -> axum::response:
 pub(crate) async fn handle_model_unload(
     State(state): State<Arc<ServerState>>,
 ) -> axum::response::Response {
+    unload_model_runtime(state, None).await
+}
+
+pub(crate) async fn handle_model_unload_exact(
+    state: Arc<ServerState>,
+    expected: Arc<LoadedRuntime>,
+) -> axum::response::Response {
+    unload_model_runtime(state, Some(expected)).await
+}
+
+async fn unload_model_runtime(
+    state: Arc<ServerState>,
+    expected: Option<Arc<LoadedRuntime>>,
+) -> axum::response::Response {
     let _lifecycle_guard = state.model_lifecycle.lock().await;
     if state.load_in_progress.swap(true, Ordering::AcqRel) {
         return error_response(
@@ -1737,11 +1761,37 @@ pub(crate) async fn handle_model_unload(
         );
     }
 
-    let previous = state.runtime_pool.write().await.remove_default();
-    drop(previous);
-    *state.requested_model.write().await = None;
+    let (removed, fallback) = {
+        let mut runtime_pool = state.runtime_pool.write().await;
+        let removed = match expected.as_ref() {
+            Some(expected) => runtime_pool.remove_exact(expected),
+            None => runtime_pool.remove_default(),
+        };
+        let fallback = runtime_pool.default_runtime();
+        (removed, fallback)
+    };
+    if expected.is_some() && removed.is_none() {
+        state.ready.store(was_ready, Ordering::Release);
+        state.load_in_progress.store(false, Ordering::Release);
+        drop(admission_guard);
+        return error_response(
+            axum::http::StatusCode::NOT_FOUND,
+            "model_not_loaded",
+            "The selected runtime generation is no longer loaded.",
+        );
+    }
+    drop(removed);
+    *state.requested_model.write().await = fallback.as_ref().map(|runtime| {
+        runtime
+            .catalog_id
+            .clone()
+            .unwrap_or_else(|| runtime.model_id.clone())
+    });
     *state.load_error.write().await = None;
-    state.load_progress.store(0, Ordering::Release);
+    state
+        .load_progress
+        .store(if fallback.is_some() { 100 } else { 0 }, Ordering::Release);
+    state.ready.store(fallback.is_some(), Ordering::Release);
     state.load_in_progress.store(false, Ordering::Release);
     drop(admission_guard);
 
@@ -1976,20 +2026,12 @@ pub(crate) async fn handle_chat_completions(
         return model_unavailable_response(&state).await;
     }
 
-    let runtime = match state.get_runtime().await {
-        Ok(runtime) => runtime,
-        Err(e) => {
-            return error_response(
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                "model_loading",
-                e.to_string(),
-            );
-        }
+    let runtime = match state.resolve_runtime(payload.model.as_deref()).await {
+        Ok(Some(runtime)) => runtime,
+        Ok(None) => return model_unavailable_response(&state).await,
+        Err(error) => return requested_model_error_response(error),
     };
     let model_id = runtime.model_id.clone();
-    if let Err(error) = validate_requested_model(payload.model.as_deref(), &model_id) {
-        return requested_model_error_response(error);
-    }
     if model_supports_embeddings(&runtime.pipeline) {
         return embedding_model_generation_response(&model_id);
     }
@@ -3465,20 +3507,12 @@ pub(crate) async fn handle_completions(
         return model_unavailable_response(&state).await;
     }
 
-    let runtime = match state.get_runtime().await {
-        Ok(runtime) => runtime,
-        Err(e) => {
-            return error_response(
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                "model_loading",
-                e.to_string(),
-            );
-        }
+    let runtime = match state.resolve_runtime(payload.model.as_deref()).await {
+        Ok(Some(runtime)) => runtime,
+        Ok(None) => return model_unavailable_response(&state).await,
+        Err(error) => return requested_model_error_response(error),
     };
     let model_id = runtime.model_id.clone();
-    if let Err(error) = validate_requested_model(payload.model.as_deref(), &model_id) {
-        return requested_model_error_response(error);
-    }
     if model_supports_embeddings(&runtime.pipeline) {
         return embedding_model_generation_response(&model_id);
     }
@@ -4455,20 +4489,12 @@ async fn run_multimodal_request(
         return model_unavailable_response(&state).await;
     }
 
-    let runtime = match state.get_runtime().await {
-        Ok(runtime) => runtime,
-        Err(e) => {
-            return error_response(
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                "model_loading",
-                e.to_string(),
-            );
-        }
+    let runtime = match state.resolve_runtime(requested_model.as_deref()).await {
+        Ok(Some(runtime)) => runtime,
+        Ok(None) => return model_unavailable_response(&state).await,
+        Err(error) => return requested_model_error_response(error),
     };
     let model_id = runtime.model_id.clone();
-    if let Err(error) = validate_requested_model(requested_model.as_deref(), &model_id) {
-        return requested_model_error_response(error);
-    }
     let pipeline = Arc::clone(&runtime.pipeline);
     if let Err(message) = validate_multimodal_modalities(&runtime.input_modalities, &payload.blocks)
     {

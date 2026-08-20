@@ -126,26 +126,32 @@ pub(crate) async fn execute_embedding_batch(
         ));
     }
 
-    let runtime = state.get_runtime().await.map_err(|error| {
-        EmbeddingExecutionError::new(
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "model_loading",
-            error.to_string(),
-        )
-    })?;
+    let runtime = match state.resolve_runtime(requested_model.as_deref()).await {
+        Ok(Some(runtime)) => runtime,
+        Ok(None) => {
+            let (error_type, message) = state.model_unavailable().await;
+            return Err(EmbeddingExecutionError::new(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                error_type,
+                message,
+            ));
+        }
+        Err(RequestedModelError::Invalid) => {
+            return Err(EmbeddingExecutionError::new(
+                axum::http::StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "The model field must contain 1 to 256 characters without surrounding whitespace or control characters.",
+            ));
+        }
+        Err(RequestedModelError::NotLoaded) => {
+            return Err(EmbeddingExecutionError::new(
+                axum::http::StatusCode::NOT_FOUND,
+                "model_not_found",
+                "The requested model is not loaded. Query the model discovery endpoint or switch the active runtime before retrying.",
+            ));
+        }
+    };
     let model_id = runtime.model_id.clone();
-    validate_requested_model(requested_model.as_deref(), &model_id).map_err(|error| match error {
-        RequestedModelError::Invalid => EmbeddingExecutionError::new(
-            axum::http::StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "The model field must contain 1 to 256 characters without surrounding whitespace or control characters.",
-        ),
-        RequestedModelError::NotLoaded => EmbeddingExecutionError::new(
-            axum::http::StatusCode::NOT_FOUND,
-            "model_not_found",
-            "The requested model is not loaded. Query the model discovery endpoint or switch the active runtime before retrying.",
-        ),
-    })?;
     let pipeline = Arc::clone(&runtime.pipeline);
     if !model_supports_embeddings(&pipeline) {
         return Err(EmbeddingExecutionError::new(
