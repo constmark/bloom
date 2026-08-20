@@ -22,6 +22,7 @@ from validate_release_artifact import (  # noqa: E402
     validate_release,
 )
 from create_release_archive import create_archive  # noqa: E402
+from sbom_contract import build_sbom  # noqa: E402
 
 REPOSITORY_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -34,12 +35,16 @@ class ReleaseArtifactValidatorTests(unittest.TestCase):
         *,
         embedded_ui: bool = True,
         native_self_check: bool = True,
-        schema_version: object = 1,
+        schema_version: object = 2,
     ) -> pathlib.Path:
         root = parent / f"bloom-{target}"
         root.mkdir()
         for relative_name in REQUIRED_FILES:
-            if relative_name == "BLOOM-RELEASE.json":
+            if relative_name in {
+                "BLOOM-DEPENDENCY-POLICY.json",
+                "BLOOM-RELEASE.json",
+                "BLOOM-SBOM.cdx.json",
+            }:
                 continue
             path = root / relative_name
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -67,6 +72,64 @@ class ReleaseArtifactValidatorTests(unittest.TestCase):
                     "sha256": hashlib.sha256(payload).hexdigest(),
                 }
             )
+
+        dependency_policy = json.loads(
+            (REPOSITORY_ROOT / "config/dependency-policy.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        package_id = (
+            "path+file:///workspace/crates/engine#"
+            "bloomai-engine@0.1.0-test"
+        )
+        metadata_documents = [
+            {
+                "workspace_members": [package_id],
+                "packages": [
+                    {
+                        "id": package_id,
+                        "name": "bloomai-engine",
+                        "version": "0.1.0-test",
+                        "license": "Apache-2.0",
+                        "source": None,
+                    }
+                ],
+                "resolve": {"nodes": [{"id": package_id, "deps": []}]},
+            }
+        ]
+        if embedded_ui:
+            ui_package_id = (
+                "path+file:///workspace/ui#bloom-ui@0.1.0-test"
+            )
+            metadata_documents.append(
+                {
+                    "workspace_members": [ui_package_id],
+                    "packages": [
+                        {
+                            "id": ui_package_id,
+                            "name": "bloom-ui",
+                            "version": "0.1.0-test",
+                            "license": "Apache-2.0",
+                            "source": None,
+                        }
+                    ],
+                    "resolve": {
+                        "nodes": [{"id": ui_package_id, "deps": []}]
+                    },
+                }
+            )
+        sbom = build_sbom(
+            metadata_documents,
+            dependency_policy,
+            target,
+            embedded_ui,
+        )
+        (root / "BLOOM-DEPENDENCY-POLICY.json").write_text(
+            json.dumps(dependency_policy, indent=2) + "\n", encoding="utf-8"
+        )
+        (root / "BLOOM-SBOM.cdx.json").write_text(
+            json.dumps(sbom, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
 
         manifest = {
             "schema_version": schema_version,
@@ -152,6 +215,23 @@ class ReleaseArtifactValidatorTests(unittest.TestCase):
                 [item["name"] for item in windows_manifest["binaries"]],
                 [f"{name}.exe" for name in EXPECTED_BINARIES],
             )
+
+    def test_accepts_a_legacy_v1_archive_without_sbom_files(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_temp:
+            temp = pathlib.Path(raw_temp)
+            root = self.make_package(
+                temp,
+                "x86_64-unknown-linux-gnu",
+                embedded_ui=False,
+                schema_version=1,
+            )
+            (root / "BLOOM-DEPENDENCY-POLICY.json").unlink()
+            (root / "BLOOM-SBOM.cdx.json").unlink()
+            archive_path = temp / "legacy-v1.tar.gz"
+            self.make_tar(root, archive_path)
+
+            manifest = validate_release(archive_path, None, False, False)
+            self.assertEqual(manifest["schema_version"], 1)
 
     def test_rejects_unsafe_zip_members(self) -> None:
         with tempfile.TemporaryDirectory() as raw_temp:
@@ -271,6 +351,40 @@ class ReleaseArtifactValidatorTests(unittest.TestCase):
             archive_path = temp / "stale-readiness-schema.tar.gz"
             self.make_tar(root, archive_path)
             with self.assertRaisesRegex(ValidationError, "schema version identity"):
+                validate_release(archive_path, None, False, False)
+
+    def test_rejects_an_sbom_that_violates_the_packaged_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_temp:
+            temp = pathlib.Path(raw_temp)
+            root = self.make_package(temp, "x86_64-unknown-linux-gnu")
+            sbom_path = root / "BLOOM-SBOM.cdx.json"
+            sbom = json.loads(sbom_path.read_text(encoding="utf-8"))
+            sbom["components"][0]["properties"][1]["value"] = (
+                "git+https://example.com/unreviewed"
+            )
+            sbom_path.write_text(
+                json.dumps(sbom, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            archive_path = temp / "invalid-sbom.tar.gz"
+            self.make_tar(root, archive_path)
+
+            with self.assertRaisesRegex(ValidationError, "packaged SBOM.*source"):
+                validate_release(archive_path, None, False, False)
+
+    def test_rejects_an_sbom_for_a_different_release_target(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_temp:
+            temp = pathlib.Path(raw_temp)
+            root = self.make_package(temp, "x86_64-unknown-linux-gnu")
+            sbom_path = root / "BLOOM-SBOM.cdx.json"
+            sbom = json.loads(sbom_path.read_text(encoding="utf-8"))
+            sbom["metadata"]["properties"][1]["value"] = "aarch64-apple-darwin"
+            sbom_path.write_text(
+                json.dumps(sbom, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            archive_path = temp / "wrong-target-sbom.tar.gz"
+            self.make_tar(root, archive_path)
+
+            with self.assertRaisesRegex(ValidationError, "packaged SBOM.*target"):
                 validate_release(archive_path, None, False, False)
 
     def test_accepts_deterministic_tar_and_zip_metadata(self) -> None:

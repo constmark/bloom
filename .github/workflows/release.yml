@@ -48,6 +48,8 @@ jobs:
         run: python scripts/test_create_release_archive.py
       - name: Check Rust toolchain consistency
         run: python scripts/check_toolchain_consistency.py
+      - name: Test dependency policy and SBOM contract
+        run: python scripts/test_generate_sbom.py
       - name: Test readiness contract validator
         run: python scripts/check_readiness_contract.py
       - name: Install Dioxus build dependencies

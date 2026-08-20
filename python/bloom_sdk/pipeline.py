@@ -75,11 +75,41 @@ class BloomPipelineOpaque(ctypes.Structure):
 
 BloomPipelinePtr = ctypes.POINTER(BloomPipelineOpaque)
 
+
+class BloomSlice(ctypes.Structure):
+    _fields_ = [
+        ("data", ctypes.POINTER(ctypes.c_uint8)),
+        ("len", ctypes.c_size_t),
+    ]
+
+
+class BloomOwnedBuffer(ctypes.Structure):
+    _fields_ = [
+        ("data", ctypes.POINTER(ctypes.c_uint8)),
+        ("len", ctypes.c_size_t),
+    ]
+
 BloomStreamCallback = ctypes.CFUNCTYPE(
     None,
     ctypes.c_void_p,
     ctypes.c_char_p
 )
+
+BloomStreamCallbackV2 = ctypes.CFUNCTYPE(
+    None,
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_uint8),
+    ctypes.c_size_t,
+)
+
+BLOOM_STATUS_CANCELLED = -8
+
+
+def _bytes_slice(value: bytes):
+    """Return a length-delimited ABI slice and an owner that keeps it alive."""
+    owner = ctypes.create_string_buffer(value, max(1, len(value)))
+    data = ctypes.cast(owner, ctypes.POINTER(ctypes.c_uint8))
+    return BloomSlice(data, len(value)), owner
 
 
 def _configure_lib(native_lib):
@@ -118,6 +148,74 @@ def _configure_lib(native_lib):
 
     native_lib.bloom_string_free.argtypes = [ctypes.c_void_p]
     native_lib.bloom_string_free.restype = None
+
+    v2_symbols = (
+        "bloom_pipeline_load_v2",
+        "bloom_pipeline_run_v2",
+        "bloom_pipeline_run_stream_v2",
+        "bloom_buffer_free",
+        "bloom_cancellation_token_new",
+        "bloom_cancellation_token_cancel",
+        "bloom_cancellation_token_free",
+    )
+    has_version_symbol = hasattr(native_lib, "bloom_abi_version")
+    has_v2 = False
+    if has_version_symbol:
+        native_lib.bloom_abi_version.argtypes = []
+        native_lib.bloom_abi_version.restype = ctypes.c_uint32
+        abi_version = native_lib.bloom_abi_version()
+        if abi_version >= 2:
+            missing = [
+                symbol for symbol in v2_symbols if not hasattr(native_lib, symbol)
+            ]
+            if missing:
+                raise RuntimeError(
+                    "Bloom native library declares ABI revision "
+                    f"{abi_version} but is missing required symbols: "
+                    + ", ".join(missing)
+                )
+            has_v2 = True
+    if has_v2:
+        native_lib.bloom_pipeline_load_v2.argtypes = [
+            BloomSlice,
+            BloomSlice,
+            BloomSlice,
+            ctypes.c_size_t,
+            ctypes.c_char_p,
+            ctypes.c_size_t,
+        ]
+        native_lib.bloom_pipeline_load_v2.restype = BloomPipelinePtr
+        native_lib.bloom_pipeline_run_v2.argtypes = [
+            BloomPipelinePtr,
+            BloomSlice,
+            BloomSlice,
+            ctypes.POINTER(BloomOwnedBuffer),
+            ctypes.c_char_p,
+            ctypes.c_size_t,
+        ]
+        native_lib.bloom_pipeline_run_v2.restype = ctypes.c_int32
+        native_lib.bloom_pipeline_run_stream_v2.argtypes = [
+            BloomPipelinePtr,
+            BloomSlice,
+            BloomSlice,
+            BloomStreamCallbackV2,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_char_p,
+            ctypes.c_size_t,
+        ]
+        native_lib.bloom_pipeline_run_stream_v2.restype = ctypes.c_int32
+        native_lib.bloom_buffer_free.argtypes = [
+            ctypes.POINTER(BloomOwnedBuffer)
+        ]
+        native_lib.bloom_buffer_free.restype = None
+        native_lib.bloom_cancellation_token_new.argtypes = []
+        native_lib.bloom_cancellation_token_new.restype = ctypes.c_void_p
+        native_lib.bloom_cancellation_token_cancel.argtypes = [ctypes.c_void_p]
+        native_lib.bloom_cancellation_token_cancel.restype = ctypes.c_int32
+        native_lib.bloom_cancellation_token_free.argtypes = [ctypes.c_void_p]
+        native_lib.bloom_cancellation_token_free.restype = None
+    native_lib._bloom_uses_v2 = has_v2
     return native_lib
 
 
@@ -179,16 +277,32 @@ class BloomPipeline:
             self._lib = _get_lib()
         except (OSError, RuntimeError) as error:
             raise BloomLoadError(f"Could not load the Bloom native library: {error}") from error
+        self._uses_v2 = bool(getattr(self._lib, "_bloom_uses_v2", False))
         err_buf = ctypes.create_string_buffer(512)
         try:
-            self._pipeline = self._lib.bloom_pipeline_load(
-                model_path.encode("utf-8"),
-                engine.encode("utf-8"),
-                device.encode("utf-8"),
-                context_size,
-                err_buf,
-                len(err_buf)
-            )
+            if self._uses_v2:
+                model_slice, model_owner = _bytes_slice(model_path.encode("utf-8"))
+                engine_slice, engine_owner = _bytes_slice(engine.encode("utf-8"))
+                device_slice, device_owner = _bytes_slice(device.encode("utf-8"))
+                self._pipeline = self._lib.bloom_pipeline_load_v2(
+                    model_slice,
+                    engine_slice,
+                    device_slice,
+                    context_size,
+                    err_buf,
+                    len(err_buf),
+                )
+                # Keep the borrowed buffers alive through the native call.
+                _ = (model_owner, engine_owner, device_owner)
+            else:
+                self._pipeline = self._lib.bloom_pipeline_load(
+                    model_path.encode("utf-8"),
+                    engine.encode("utf-8"),
+                    device.encode("utf-8"),
+                    context_size,
+                    err_buf,
+                    len(err_buf)
+                )
         except Exception as error:
             raise BloomLoadError(f"Native pipeline loading failed: {error}") from error
         if not self._pipeline:
@@ -293,33 +407,69 @@ class BloomPipeline:
         with self._call_lock:
             if not self._pipeline:
                 raise BloomError("Pipeline is closed")
-            try:
-                res_ptr = self._lib.bloom_pipeline_run(
-                    self._pipeline,
-                    input_bytes,
-                    params_bytes,
-                    err_buf,
-                    len(err_buf)
-                )
-            except Exception as error:
-                raise BloomInferenceError(
-                    f"Native inference call failed: {error}"
-                ) from error
-            if not res_ptr:
-                raise BloomInferenceError(
-                    f"Inference failed: {_decode_error(err_buf)}"
-                )
-            try:
-                result_bytes = ctypes.cast(res_ptr, ctypes.c_char_p).value
-                if result_bytes is None:
-                    raise BloomInferenceError("Inference returned a NULL string")
-                result_text = result_bytes.decode("utf-8")
-            except UnicodeDecodeError as error:
-                raise BloomInferenceError(
-                    "Inference returned non-UTF-8 output"
-                ) from error
-            finally:
-                self._lib.bloom_string_free(res_ptr)
+            if self._uses_v2:
+                input_slice, input_owner = _bytes_slice(input_bytes)
+                params_slice, params_owner = _bytes_slice(params_bytes)
+                output = BloomOwnedBuffer()
+                try:
+                    status = self._lib.bloom_pipeline_run_v2(
+                        self._pipeline,
+                        input_slice,
+                        params_slice,
+                        ctypes.byref(output),
+                        err_buf,
+                        len(err_buf),
+                    )
+                    _ = (input_owner, params_owner)
+                except Exception as error:
+                    raise BloomInferenceError(
+                        f"Native inference call failed: {error}"
+                    ) from error
+                if status != 0:
+                    raise BloomInferenceError(
+                        f"Inference failed (code {status}): {_decode_error(err_buf)}"
+                    )
+                try:
+                    if not output.data and output.len:
+                        raise BloomInferenceError(
+                            "Inference returned an invalid output buffer"
+                        )
+                    result_bytes = ctypes.string_at(output.data, output.len)
+                    result_text = result_bytes.decode("utf-8")
+                except UnicodeDecodeError as error:
+                    raise BloomInferenceError(
+                        "Inference returned non-UTF-8 output"
+                    ) from error
+                finally:
+                    self._lib.bloom_buffer_free(ctypes.byref(output))
+            else:
+                try:
+                    res_ptr = self._lib.bloom_pipeline_run(
+                        self._pipeline,
+                        input_bytes,
+                        params_bytes,
+                        err_buf,
+                        len(err_buf)
+                    )
+                except Exception as error:
+                    raise BloomInferenceError(
+                        f"Native inference call failed: {error}"
+                    ) from error
+                if not res_ptr:
+                    raise BloomInferenceError(
+                        f"Inference failed: {_decode_error(err_buf)}"
+                    )
+                try:
+                    result_bytes = ctypes.cast(res_ptr, ctypes.c_char_p).value
+                    if result_bytes is None:
+                        raise BloomInferenceError("Inference returned a NULL string")
+                    result_text = result_bytes.decode("utf-8")
+                except UnicodeDecodeError as error:
+                    raise BloomInferenceError(
+                        "Inference returned non-UTF-8 output"
+                    ) from error
+                finally:
+                    self._lib.bloom_string_free(res_ptr)
 
         try:
             return json.loads(result_text)
@@ -341,19 +491,57 @@ class BloomPipeline:
         """
         input_bytes, params_bytes = self._prepare_input_params(prompt_or_input, max_tokens, temperature, top_p, seed)
         q = queue.Queue()
+        err_buf = ctypes.create_string_buffer(512)
+        token_lock = threading.Lock()
+        token_holder = {"value": None}
 
-        # Define local callback
+        if self._uses_v2:
+            token_holder["value"] = self._lib.bloom_cancellation_token_new()
+            if not token_holder["value"]:
+                raise BloomInferenceError("Could not allocate a native cancellation token")
+
+        def cancel_v2_stream():
+            if not self._uses_v2:
+                return
+            with token_lock:
+                token = token_holder["value"]
+                if token:
+                    self._lib.bloom_cancellation_token_cancel(token)
+
+        def free_v2_token():
+            if not self._uses_v2:
+                return
+            with token_lock:
+                token = token_holder["value"]
+                token_holder["value"] = None
+                if token:
+                    self._lib.bloom_cancellation_token_free(token)
+
         @BloomStreamCallback
-        def py_callback(user_data, chunk_json):
+        def py_callback(_user_data, chunk_json):
             try:
                 if chunk_json is None:
                     raise BloomInferenceError("Streaming callback returned NULL data")
                 chunk_str = chunk_json.decode("utf-8")
                 q.put(("chunk", json.loads(chunk_str)))
-            except Exception as e:
-                q.put(("error", BloomInferenceError(f"Invalid streaming chunk: {e}")))
+            except Exception as error:
+                q.put(("error", BloomInferenceError(
+                    f"Invalid streaming chunk: {error}"
+                )))
 
-        err_buf = ctypes.create_string_buffer(512)
+        @BloomStreamCallbackV2
+        def py_callback_v2(_user_data, chunk_json, chunk_json_len):
+            try:
+                if not chunk_json and chunk_json_len:
+                    raise BloomInferenceError("Streaming callback returned NULL data")
+                chunk_bytes = ctypes.string_at(chunk_json, chunk_json_len)
+                chunk_str = chunk_bytes.decode("utf-8")
+                q.put(("chunk", json.loads(chunk_str)))
+            except Exception as error:
+                q.put(("error", BloomInferenceError(
+                    f"Invalid streaming chunk: {error}"
+                )))
+                cancel_v2_stream()
         
         # Execute streaming FFI in a background thread to allow yielding on main thread
         def run_thread():
@@ -364,16 +552,35 @@ class BloomPipeline:
                     if not self._pipeline:
                         q.put(("error", BloomError("Pipeline is closed")))
                         return
-                    res = self._lib.bloom_pipeline_run_stream(
-                        self._pipeline,
-                        input_bytes,
-                        params_bytes,
-                        py_callback,
-                        None,
-                        err_buf,
-                        len(err_buf)
-                    )
-                if res != 0:
+                    if self._uses_v2:
+                        input_slice, input_owner = _bytes_slice(input_bytes)
+                        params_slice, params_owner = _bytes_slice(params_bytes)
+                        with token_lock:
+                            token = token_holder["value"]
+                        res = self._lib.bloom_pipeline_run_stream_v2(
+                            self._pipeline,
+                            input_slice,
+                            params_slice,
+                            py_callback_v2,
+                            None,
+                            token,
+                            err_buf,
+                            len(err_buf),
+                        )
+                        _ = (input_owner, params_owner)
+                    else:
+                        res = self._lib.bloom_pipeline_run_stream(
+                            self._pipeline,
+                            input_bytes,
+                            params_bytes,
+                            py_callback,
+                            None,
+                            err_buf,
+                            len(err_buf)
+                        )
+                if res == BLOOM_STATUS_CANCELLED:
+                    q.put(("cancelled", None))
+                elif res != 0:
                     q.put(("error", BloomInferenceError(
                         f"Streaming failed (code {res}): {_decode_error(err_buf)}"
                     )))
@@ -383,6 +590,8 @@ class BloomPipeline:
                 q.put(("error", BloomInferenceError(
                     f"Streaming native call failed: {error}"
                 )))
+            finally:
+                free_v2_token()
 
         thread = threading.Thread(target=run_thread)
         thread.start()
@@ -394,12 +603,16 @@ class BloomPipeline:
                     yield value
                 elif status == "error":
                     raise value
-                elif status == "done":
+                elif status in ("done", "cancelled"):
                     thread.join()
                     break
         finally:
-            # The worker retains self and the callback until the native call
-            # ends. Avoid blocking generator finalization when a consumer
-            # intentionally stops reading an uncancellable stream.
-            if not thread.is_alive():
+            if self._uses_v2:
+                # Closing or abandoning the generator now stops native decode
+                # cooperatively instead of leaving an orphaned worker.
+                cancel_v2_stream()
+                thread.join(timeout=1)
+            elif not thread.is_alive():
+                # A revision 1 library cannot be cancelled. The worker retains
+                # self and the callback until the native call ends.
                 thread.join()

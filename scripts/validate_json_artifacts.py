@@ -788,7 +788,7 @@ def basic_validate() -> list[tuple[Path, str]]:
             "binaries",
         ],
     )
-    if release["schema_version"] != 1 or release["object"] != "bloom.release":
+    if release["schema_version"] != 2 or release["object"] != "bloom.release":
         raise AssertionError(f"{release_path}: unsupported release manifest identity")
     binary_names = [binary["name"] for binary in release["binaries"]]
     expected_binaries = ["bloom_bench", "bloom_infer", "bloom_server", "inspect_gguf"]

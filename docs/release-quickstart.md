@@ -39,7 +39,10 @@ if ($actual -ne $expected) { throw "Bloom archive checksum mismatch" }
 
 After extracting the archive, inspect `BLOOM-RELEASE.json` for the target,
 Bloom version, embedded-UI status, package self-check, and per-binary SHA-256
-hashes.
+hashes. `BLOOM-SBOM.cdx.json` contains the release-target CycloneDX dependency
+inventory, including the independent wasm UI graph when embedded;
+`BLOOM-DEPENDENCY-POLICY.json` records the reviewed registry sources
+and declared license expressions that admitted it.
 
 ## 2. Run the deployment check
 

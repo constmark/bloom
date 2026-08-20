@@ -22,16 +22,20 @@ from readiness_contract import (
     validate_readiness_document,
     validate_readiness_schema_document,
 )
+from sbom_contract import SbomError, validate_sbom_document
 
 MAX_ENTRY_COUNT = 10_000
 MAX_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024
 MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_READINESS_ARTIFACT_BYTES = 64 * 1024
+MAX_SBOM_BYTES = 8 * 1024 * 1024
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 TARGET_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 EXPECTED_BINARIES = ("bloom_bench", "bloom_infer", "bloom_server", "inspect_gguf")
 REQUIRED_FILES = (
+    "BLOOM-DEPENDENCY-POLICY.json",
     "BLOOM-RELEASE.json",
+    "BLOOM-SBOM.cdx.json",
     "LICENSE",
     "QUICKSTART.md",
     "README.md",
@@ -45,6 +49,10 @@ REQUIRED_FILES = (
     "examples/readiness.schema.json",
     "examples/release-manifest.schema.json",
 )
+SBOM_REQUIRED_FILES = {
+    "BLOOM-DEPENDENCY-POLICY.json",
+    "BLOOM-SBOM.cdx.json",
+}
 
 
 class ValidationError(Exception):
@@ -309,7 +317,7 @@ def validate_release(
         manifest = read_manifest(archive, f"{root}/BLOOM-RELEASE.json")
 
         schema_version = require_integer(manifest["schema_version"], "schema_version", 1)
-        if schema_version != 1 or manifest["object"] != "bloom.release":
+        if schema_version not in {1, 2} or manifest["object"] != "bloom.release":
             raise ValidationError("unsupported release manifest identity")
         version = manifest["bloom_version"]
         if not isinstance(version, str) or not version or len(version) > 128:
@@ -379,10 +387,35 @@ def validate_release(
 
         if actual_names != sorted(expected_names):
             raise ValidationError("release binaries are incomplete, duplicated, or not sorted")
-        for relative_name in REQUIRED_FILES:
+        required_files = tuple(
+            relative_name
+            for relative_name in REQUIRED_FILES
+            if schema_version >= 2 or relative_name not in SBOM_REQUIRED_FILES
+        )
+        for relative_name in required_files:
             entry = archive.entries.get(f"{root}/{relative_name}")
             if entry is None or entry.is_dir or entry.size == 0:
                 raise ValidationError(f"required release file is missing or empty: {relative_name}")
+
+        if schema_version >= 2:
+            dependency_policy = read_json_artifact(
+                archive,
+                f"{root}/BLOOM-DEPENDENCY-POLICY.json",
+                MAX_MANIFEST_BYTES,
+                "packaged dependency policy",
+            )
+            sbom = read_json_artifact(
+                archive,
+                f"{root}/BLOOM-SBOM.cdx.json",
+                MAX_SBOM_BYTES,
+                "packaged CycloneDX SBOM",
+            )
+            try:
+                validate_sbom_document(
+                    sbom, dependency_policy, version, target, embedded_ui
+                )
+            except SbomError as error:
+                raise ValidationError(f"packaged SBOM is invalid: {error}") from error
 
         readiness_name = f"{root}/examples/readiness.json"
         readiness = read_json_artifact(

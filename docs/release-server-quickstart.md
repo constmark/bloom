@@ -7,6 +7,9 @@ integrated GUI is required.
 
 Verify the separately published archive checksum before trusting the extracted
 files. `BLOOM-RELEASE.json` must report `embedded_ui: false` for this package.
+The bundled `BLOOM-SBOM.cdx.json` must report the same target and UI state, and
+`BLOOM-DEPENDENCY-POLICY.json` records the source/license policy used to admit
+its locked Cargo graph.
 Official GitHub release archives also carry signed build provenance. Before
 extraction, an online GitHub CLI can bind the downloaded archive to Bloom's
 release workflow and source revision:

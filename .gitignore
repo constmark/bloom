@@ -93,6 +93,7 @@ test_*.rs
 !scripts/test_create_release_archive.py
 !scripts/test_community_metadata.py
 !scripts/test_release_workflow_security.py
+!scripts/test_generate_sbom.py
 !scripts/test_validate_release_artifact.py
 !python/tests/test_*.py
 mock_wan.py

@@ -336,3 +336,72 @@ process-lifecycle boundary.
 | P1 | Metal/CUDA benchmark evidence is not a required cross-platform release artifact | Publish reproducible hardware profiles using the benchmark schema |
 | P2 | `paste` 1.0.15 is an unmaintained transitive dependency through Candle/gemm/tokenizers | Track upstream replacement and remove it when the model stack supports a compatible release |
 | P2 | ONNX, TensorRT, CoreML, MLX, and Vulkan remain truthful diagnostic skeletons | Keep them non-routable until an executable adapter has pinned runtime evidence |
+
+## 9. Versioned Native-Integration Iteration (2026-08-20)
+
+The C/Python P1 from Sections 7 and 8 is now implemented without removing the
+revision 1 entry points:
+
+- `bloom_abi_version()` reports ABI revision 2, while the original symbols
+  remain available for existing binaries.
+- New `_v2` load, buffered-run, and streaming entry points use bounded
+  length-delimited UTF-8 inputs. Buffered output is length-delimited and has an
+  explicit clearing free function.
+- Stable status codes distinguish invalid arguments, UTF-8, each JSON input,
+  inference, output serialization, caught panics, and cooperative cancellation.
+- A thread-safe cancellation token stops streaming at the next output-sink
+  boundary without freeing a token that is still owned by a native worker.
+- The Python SDK negotiates revision 2 automatically, retains a tested revision
+  1 fallback, and cancels native work when a partially consumed generator is
+  closed.
+
+The remaining ABI work is release engineering rather than the original unsafe
+shape: publish binary wheels, declare a compatibility window, and test packaged
+old/new shared-library combinations on supported targets. The highest-priority
+code-structure gap remains the oversized server/UI modules. At that checkpoint,
+the highest production-evidence gaps were one stable deployment cell, real
+browser and accessibility coverage, hardware benchmarks, and artifact
+SBOM/license policy; Section 10 records the native archive remediation.
+
+## 10. Release Supply-Chain Iteration (2026-08-20)
+
+The native artifact SBOM/license-policy gap is now closed for application
+archives:
+
+- A versioned repository policy admits only the reviewed crates.io registry,
+  workspace-local path packages, and the exact declared license expressions in
+  the locked dependency graph. Git, external path, alternate registry, missing
+  license, and expression drift fail closed.
+- Packaging resolves and validates the native target graph plus the independent
+  wasm UI graph, when embedded, before either build starts. It emits a
+  deterministic CycloneDX 1.5 SBOM without timestamps or local paths.
+- Each schema-version-2 archive carries the SBOM and the policy that admitted
+  it. The offline validator binds the SBOM to the Bloom version, target,
+  embedded-UI setting, component inventory, dependency edges, sources, and
+  licenses while retaining validation for legacy version-1 archives.
+- CI runs policy drift and negative contract tests independently of full
+  packaging.
+
+This does not close the separate official-container gap: a future published
+image still needs final-layer inventory, SBOM/provenance attachment, scanning,
+and orchestrator evidence. For the native application, the next code-level P1
+is real-browser/accessibility coverage or behavior-preserving decomposition of
+the largest server and UI modules.
+
+## 11. Browser Semantics Iteration (2026-08-20)
+
+A manual real-browser pass against the embedded empty-model application now
+verifies the baseline navigation and modal lifecycle instead of relying only on
+host-side state tests:
+
+- The document has one descriptive title, a favicon, one level-one Bloom
+  heading, and a named conversations landmark.
+- Runtime connection changes use a polite atomic status region.
+- The Models dialog receives initial focus, contains forward and reverse Tab
+  navigation, closes with Escape, and restores focus to its opener. Settings
+  controls expose accessible names in the browser accessibility tree.
+
+This is evidence for the audited empty state, not an automated release gate.
+Cross-browser keyboard flows, browser downloads/clipboard, screen-reader
+behavior, and an automated accessibility scanner remain in the high-priority
+register.

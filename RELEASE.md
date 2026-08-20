@@ -223,6 +223,10 @@ TTFT, TBT, tokens/s, peak memory, OS, and hardware in
   `SOURCE_DATE_EPOCH`, with atomic publication of each completed archive.
 - Bundled `QUICKSTART.md` and schema-versioned `BLOOM-RELEASE.json` containing
   the target, embedded-UI state, self-check result, and per-binary SHA-256.
+- A deterministic CycloneDX 1.5 `BLOOM-SBOM.cdx.json` and its reviewed
+  `BLOOM-DEPENDENCY-POLICY.json`; packaging checks the native target and
+  independent wasm UI graphs before building, while offline validation rejects
+  unreviewed dependency sources or declared license expressions.
 - Release notes listing support matrix changes and known limitations.
 
 The native staged `bloom_server` must pass `--doctor=json` without failures,

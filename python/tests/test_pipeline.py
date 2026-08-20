@@ -32,15 +32,27 @@ class FakeLibrary:
         self.output_buffer = ctypes.create_string_buffer(b'{"text":"ok"}')
         self.freed_pipelines = 0
         self.freed_strings = 0
+        self.freed_buffers = 0
+        self.freed_tokens = 0
+        self.cancel_calls = 0
         self.stream_started = threading.Event()
         self.stream_release = threading.Event()
+        self.stream_cancelled = threading.Event()
         self.block_stream = False
 
+        self.bloom_abi_version = FakeFunction(lambda: 2)
         self.bloom_pipeline_load = FakeFunction(self._load)
+        self.bloom_pipeline_load_v2 = FakeFunction(self._load)
         self.bloom_pipeline_free = FakeFunction(self._free_pipeline)
         self.bloom_pipeline_run = FakeFunction(self._run)
+        self.bloom_pipeline_run_v2 = FakeFunction(self._run_v2)
         self.bloom_pipeline_run_stream = FakeFunction(self._run_stream)
+        self.bloom_pipeline_run_stream_v2 = FakeFunction(self._run_stream_v2)
         self.bloom_string_free = FakeFunction(self._free_string)
+        self.bloom_buffer_free = FakeFunction(self._free_buffer)
+        self.bloom_cancellation_token_new = FakeFunction(self._new_token)
+        self.bloom_cancellation_token_cancel = FakeFunction(self._cancel_token)
+        self.bloom_cancellation_token_free = FakeFunction(self._free_token)
 
     def _load(self, *_args):
         return self.pipeline_pointer
@@ -50,6 +62,24 @@ class FakeLibrary:
 
     def _run(self, *_args):
         return ctypes.cast(self.output_buffer, ctypes.c_void_p).value
+
+    def _run_v2(
+        self,
+        _pipeline,
+        _input_json,
+        _params_json,
+        output,
+        _error_buffer,
+        _error_buffer_len,
+    ):
+        output = ctypes.cast(
+            output, ctypes.POINTER(pipeline_module.BloomOwnedBuffer)
+        ).contents
+        output.data = ctypes.cast(
+            self.output_buffer, ctypes.POINTER(ctypes.c_uint8)
+        )
+        output.len = len(self.output_buffer.value)
+        return 0
 
     def _run_stream(
         self,
@@ -67,8 +97,52 @@ class FakeLibrary:
             self.stream_release.wait(timeout=5)
         return 0
 
+    def _run_stream_v2(
+        self,
+        _pipeline,
+        _input_json,
+        _params_json,
+        callback,
+        _user_data,
+        _token,
+        _error_buffer,
+        _error_buffer_len,
+    ):
+        chunk = ctypes.create_string_buffer(b'{"TextDelta":"hello"}')
+        callback(
+            None,
+            ctypes.cast(chunk, ctypes.POINTER(ctypes.c_uint8)),
+            len(chunk.value),
+        )
+        self.stream_started.set()
+        if self.block_stream:
+            while not self.stream_release.wait(timeout=0.01):
+                if self.stream_cancelled.is_set():
+                    return pipeline_module.BLOOM_STATUS_CANCELLED
+        return 0
+
     def _free_string(self, _pointer):
         self.freed_strings += 1
+
+    def _free_buffer(self, output):
+        output = ctypes.cast(
+            output, ctypes.POINTER(pipeline_module.BloomOwnedBuffer)
+        ).contents
+        output.data = ctypes.POINTER(ctypes.c_uint8)()
+        output.len = 0
+        self.freed_buffers += 1
+
+    def _new_token(self):
+        self.stream_cancelled.clear()
+        return ctypes.c_void_p(0x1234)
+
+    def _cancel_token(self, _token):
+        self.cancel_calls += 1
+        self.stream_cancelled.set()
+        return 0
+
+    def _free_token(self, _token):
+        self.freed_tokens += 1
 
 
 class BloomPipelineTests(unittest.TestCase):
@@ -102,7 +176,8 @@ class BloomPipelineTests(unittest.TestCase):
         pipeline = pipeline_module.BloomPipeline(".", engine="mock")
 
         self.assertEqual(pipeline.generate("hello"), {"text": "ok"})
-        self.assertEqual(self.fake_lib.freed_strings, 1)
+        self.assertEqual(self.fake_lib.freed_buffers, 1)
+        self.assertEqual(self.fake_lib.freed_strings, 0)
 
         pipeline.close()
         pipeline.close()
@@ -116,7 +191,7 @@ class BloomPipelineTests(unittest.TestCase):
             pipeline_module.BloomInferenceError, "invalid JSON"
         ):
             pipeline.generate("hello")
-        self.assertEqual(self.fake_lib.freed_strings, 1)
+        self.assertEqual(self.fake_lib.freed_buffers, 1)
         pipeline.close()
 
     def test_generation_parameters_are_validated_before_native_calls(self):
@@ -151,6 +226,36 @@ class BloomPipelineTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "NUL"):
                     pipeline_module.BloomPipeline(**arguments)
 
+    def test_revision_one_library_remains_supported(self):
+        legacy_lib = FakeLibrary()
+        for symbol in (
+            "bloom_abi_version",
+            "bloom_pipeline_load_v2",
+            "bloom_pipeline_run_v2",
+            "bloom_pipeline_run_stream_v2",
+            "bloom_buffer_free",
+            "bloom_cancellation_token_new",
+            "bloom_cancellation_token_cancel",
+            "bloom_cancellation_token_free",
+        ):
+            delattr(legacy_lib, symbol)
+        pipeline_module._lib = pipeline_module._configure_lib(legacy_lib)
+
+        pipeline = pipeline_module.BloomPipeline(".", engine="mock")
+        self.assertFalse(pipeline._uses_v2)
+        self.assertEqual(pipeline.generate("hello"), {"text": "ok"})
+        self.assertEqual(legacy_lib.freed_strings, 1)
+        pipeline.close()
+
+    def test_declared_revision_two_requires_the_complete_symbol_set(self):
+        partial_lib = FakeLibrary()
+        delattr(partial_lib, "bloom_buffer_free")
+
+        with self.assertRaisesRegex(
+            RuntimeError, "declares ABI revision 2.*bloom_buffer_free"
+        ):
+            pipeline_module._configure_lib(partial_lib)
+
     def test_close_waits_for_active_stream_before_freeing_pipeline(self):
         self.fake_lib.block_stream = True
         pipeline = pipeline_module.BloomPipeline(".", engine="mock")
@@ -177,6 +282,23 @@ class BloomPipelineTests(unittest.TestCase):
         close_thread.join(timeout=2)
         self.assertTrue(close_finished.is_set())
         self.assertEqual(self.fake_lib.freed_pipelines, 1)
+
+    def test_closing_a_stream_cancels_the_v2_native_worker(self):
+        self.fake_lib.block_stream = True
+        pipeline = pipeline_module.BloomPipeline(".", engine="mock")
+        stream = pipeline.generate_stream("hello")
+
+        self.assertEqual(next(stream), {"TextDelta": "hello"})
+        self.assertTrue(self.fake_lib.stream_started.is_set())
+        stream.close()
+
+        self.assertTrue(self.fake_lib.stream_cancelled.wait(timeout=1))
+        deadline = time.monotonic() + 1
+        while self.fake_lib.freed_tokens == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertGreaterEqual(self.fake_lib.cancel_calls, 1)
+        self.assertEqual(self.fake_lib.freed_tokens, 1)
+        pipeline.close()
 
 
 @unittest.skipUnless(

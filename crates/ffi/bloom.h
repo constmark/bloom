@@ -12,6 +12,33 @@ extern "C" {
  * Opaque handle representing a loaded Bloom inference pipeline.
  */
 typedef struct BloomPipeline BloomPipeline;
+typedef struct BloomCancellationToken BloomCancellationToken;
+
+#define BLOOM_ABI_VERSION 2u
+
+typedef enum BloomStatus {
+    BLOOM_STATUS_OK = 0,
+    BLOOM_STATUS_INVALID_ARGUMENT = -1,
+    BLOOM_STATUS_INVALID_UTF8 = -2,
+    BLOOM_STATUS_INVALID_INPUT_JSON = -3,
+    BLOOM_STATUS_INVALID_PARAMS_JSON = -4,
+    BLOOM_STATUS_INFERENCE_ERROR = -5,
+    BLOOM_STATUS_OUTPUT_ERROR = -6,
+    BLOOM_STATUS_PANIC = -7,
+    BLOOM_STATUS_CANCELLED = -8
+} BloomStatus;
+
+/** Borrowed bytes. The caller retains ownership for the complete call. */
+typedef struct BloomSlice {
+    const uint8_t* data;
+    size_t len;
+} BloomSlice;
+
+/** Owned bytes returned by Bloom. Initialize to {NULL, 0}. */
+typedef struct BloomOwnedBuffer {
+    uint8_t* data;
+    size_t len;
+} BloomOwnedBuffer;
 
 /**
  * Callback function type invoked for each chunk during streaming inference.
@@ -20,6 +47,77 @@ typedef struct BloomPipeline BloomPipeline;
  * @param chunk_json JSON-serialized representation of the OutputChunk event.
  */
 typedef void (*BloomStreamCallback)(void* user_data, const char* chunk_json);
+
+/**
+ * Length-aware callback used by ABI revision 2.
+ * The chunk is borrowed only for the duration of the callback.
+ */
+typedef void (*BloomStreamCallbackV2)(
+    void* user_data,
+    const uint8_t* chunk_json,
+    size_t chunk_json_len
+);
+
+/** Return the newest ABI revision implemented by the loaded library. */
+uint32_t bloom_abi_version(void);
+
+/**
+ * Load a model pipeline using bounded, length-delimited UTF-8 inputs.
+ * Returns NULL on failure and writes a bounded diagnostic to error_buffer.
+ */
+BloomPipeline* bloom_pipeline_load_v2(
+    BloomSlice model_path,
+    BloomSlice engine_name,
+    BloomSlice device_name,
+    size_t context_size,
+    char* error_buffer,
+    size_t error_buffer_len
+);
+
+/**
+ * Run full inference using length-delimited input and output buffers.
+ * On success, release output with bloom_buffer_free.
+ */
+int32_t bloom_pipeline_run_v2(
+    BloomPipeline* pipeline,
+    BloomSlice input_json,
+    BloomSlice params_json,
+    BloomOwnedBuffer* output,
+    char* error_buffer,
+    size_t error_buffer_len
+);
+
+/** Allocate a thread-safe cooperative cancellation token. */
+BloomCancellationToken* bloom_cancellation_token_new(void);
+
+/** Mark a token as cancelled. Safe to call while a stream uses the token. */
+int32_t bloom_cancellation_token_cancel(BloomCancellationToken* token);
+
+/**
+ * Free a token after the associated stream has returned. NULL is accepted.
+ */
+void bloom_cancellation_token_free(BloomCancellationToken* token);
+
+/**
+ * Run streaming inference using length-delimited JSON and callback chunks.
+ * cancellation may be NULL. Cancellation is observed at output boundaries and
+ * returns BLOOM_STATUS_CANCELLED.
+ */
+int32_t bloom_pipeline_run_stream_v2(
+    BloomPipeline* pipeline,
+    BloomSlice input_json,
+    BloomSlice params_json,
+    BloomStreamCallbackV2 callback,
+    void* user_data,
+    const BloomCancellationToken* cancellation,
+    char* error_buffer,
+    size_t error_buffer_len
+);
+
+/** Free and clear a buffer returned by bloom_pipeline_run_v2. */
+void bloom_buffer_free(BloomOwnedBuffer* buffer);
+
+/* ABI revision 1 compatibility symbols follow. New consumers should use v2. */
 
 /**
  * Load a model pipeline.

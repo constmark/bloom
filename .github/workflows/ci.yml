@@ -52,6 +52,29 @@ jobs:
         run: python3 scripts/test_create_release_archive.py
       - name: Check Rust toolchain consistency
         run: python3 scripts/check_toolchain_consistency.py
+      - name: Check dependency policy and SBOM contract
+        run: |
+          host_target=$(rustc -vV | awk '/^host:/ {print $2}')
+          cargo metadata --locked --format-version 1 \
+            --filter-platform "$host_target" > "$RUNNER_TEMP/bloom-cargo-metadata.json"
+          python3 scripts/generate_sbom.py \
+            --metadata "$RUNNER_TEMP/bloom-cargo-metadata.json" \
+            --policy config/dependency-policy.json \
+            --target "$host_target" \
+            --embedded-ui false \
+            --output "$RUNNER_TEMP/BLOOM-SBOM.cdx.json"
+          cargo metadata --locked --format-version 1 --features serve-ui \
+            --filter-platform "$host_target" > "$RUNNER_TEMP/bloom-ui-native-metadata.json"
+          cargo metadata --manifest-path ui/Cargo.toml --locked --format-version 1 \
+            --filter-platform wasm32-unknown-unknown > "$RUNNER_TEMP/bloom-ui-wasm-metadata.json"
+          python3 scripts/generate_sbom.py \
+            --metadata "$RUNNER_TEMP/bloom-ui-native-metadata.json" \
+            --metadata "$RUNNER_TEMP/bloom-ui-wasm-metadata.json" \
+            --policy config/dependency-policy.json \
+            --target "$host_target" \
+            --embedded-ui true \
+            --output "$RUNNER_TEMP/BLOOM-UI-SBOM.cdx.json"
+          python3 scripts/test_generate_sbom.py
       - name: Check
         run: cargo check --workspace --all-targets --locked
       - name: Clippy
@@ -64,6 +87,10 @@ jobs:
         run: |
           cargo build -p bloomai-ffi --locked
           BLOOM_TEST_NATIVE_FFI=1 python3 -m unittest discover -s python/tests -v
+      - name: Check C and C++ header compatibility
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -fsyntax-only crates/ffi/tests/header_smoke.c
+          c++ -std=c++17 -Wall -Wextra -Werror -fsyntax-only crates/ffi/tests/header_smoke.cpp
       - name: Test server shutdown lifecycle
         run: python3 scripts/test_server_shutdown.py
       - name: Test server HTTP boundary

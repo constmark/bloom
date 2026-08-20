@@ -5,6 +5,29 @@ three as executable supply-chain inputs.
 
 For vulnerability reporting, see [SECURITY.md](../SECURITY.md).
 
+## Build dependencies and release inventory
+
+`config/dependency-policy.json` is a fail-closed review boundary for the locked
+Cargo graph. CI and release packaging reject missing or newly introduced
+license expressions, registries other than the reviewed crates.io index, Git
+dependencies, and path dependencies outside this workspace. A policy update is
+therefore a security and licensing review, not a mechanical dependency bump.
+
+Application archives carry the exact policy plus a deterministic CycloneDX 1.5
+`BLOOM-SBOM.cdx.json`. Packaging validates the locked native target graph and,
+for application archives, the independent wasm UI graph before executing their
+builds. The offline artifact
+validator binds its Bloom version, target, and embedded-UI feature to the
+release manifest and validates every component, declared license, source, and
+dependency edge. The SBOM intentionally omits timestamps and local paths. Cargo
+resolution can include packages that do not contribute linked code to every
+binary, so treat it as a conservative dependency inventory rather than proof of
+binary reachability. Legacy slash-separated license declarations are retained
+and normalized only through explicit policy mappings. Declared upstream
+metadata and an allowlist are not legal
+advice or proof of license compliance; release owners still review notices and
+distribution obligations.
+
 ## Model files
 
 - Load models only from controlled directories.

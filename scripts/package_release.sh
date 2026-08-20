@@ -71,6 +71,34 @@ case "$PACKAGE_UI" in
         ;;
 esac
 
+# Resolve and policy-check every dependency graph before any project build
+# script or compiler plugin can execute. The browser UI is an independent wasm
+# workspace and therefore requires its own locked metadata document.
+STAGE_DIR=$(mktemp -d)
+trap 'rm -rf "$STAGE_DIR"' EXIT
+CARGO_METADATA="${STAGE_DIR}/cargo-metadata.json"
+METADATA_ARGS=("--locked" "--format-version" "1" "--filter-platform" "$EFFECTIVE_TARGET")
+if [ "$PACKAGE_UI" = true ]; then
+    METADATA_ARGS+=("--features" "serve-ui")
+fi
+cargo metadata "${METADATA_ARGS[@]}" > "$CARGO_METADATA"
+SBOM_METADATA_ARGS=("--metadata" "$CARGO_METADATA")
+if [ "$PACKAGE_UI" = true ]; then
+    UI_CARGO_METADATA="${STAGE_DIR}/ui-cargo-metadata.json"
+    cargo metadata \
+        --manifest-path "${WORKSPACE_DIR}/ui/Cargo.toml" \
+        --locked \
+        --format-version 1 \
+        --filter-platform wasm32-unknown-unknown > "$UI_CARGO_METADATA"
+    SBOM_METADATA_ARGS+=("--metadata" "$UI_CARGO_METADATA")
+fi
+"$PYTHON_BIN" "${WORKSPACE_DIR}/scripts/generate_sbom.py" \
+    "${SBOM_METADATA_ARGS[@]}" \
+    --policy "${WORKSPACE_DIR}/config/dependency-policy.json" \
+    --target "$EFFECTIVE_TARGET" \
+    --embedded-ui "$PACKAGE_UI" \
+    --output "${STAGE_DIR}/BLOOM-SBOM.cdx.json"
+
 if [ "$PACKAGE_UI" = true ]; then
     if ! command -v dx >/dev/null 2>&1; then
         echo "Error: dx is required for the default embedded-UI release package." >&2
@@ -108,10 +136,6 @@ IS_WINDOWS=false
 if [[ "$EFFECTIVE_TARGET" == *windows* ]]; then
     IS_WINDOWS=true
 fi
-
-# Create a temporary staging directory
-STAGE_DIR=$(mktemp -d)
-trap 'rm -rf "$STAGE_DIR"' EXIT
 
 STAGING_NAME="bloom"
 if [ -n "$TARGET" ]; then
@@ -216,8 +240,9 @@ fi
 # metadata inside the archive. The outer archive checksum remains authoritative
 # for transport integrity; these hashes make extracted binaries auditable.
 echo "Writing release manifest..."
-CARGO_METADATA="${STAGE_DIR}/cargo-metadata.json"
-cargo metadata --locked --no-deps --format-version 1 > "$CARGO_METADATA"
+cp "${WORKSPACE_DIR}/config/dependency-policy.json" \
+    "$PKG_DIR/BLOOM-DEPENDENCY-POLICY.json"
+cp "${STAGE_DIR}/BLOOM-SBOM.cdx.json" "$PKG_DIR/BLOOM-SBOM.cdx.json"
 "$PYTHON_BIN" - "$PKG_DIR" "$CARGO_METADATA" "$EFFECTIVE_TARGET" "$PACKAGE_UI" "$SELF_CHECK_STATUS" "$DOCTOR_REPORT" <<'PY'
 import hashlib
 import json
@@ -275,7 +300,7 @@ for name in binary_names:
     )
 
 manifest = {
-    "schema_version": 1,
+    "schema_version": 2,
     "object": "bloom.release",
     "bloom_version": version,
     "target": target,

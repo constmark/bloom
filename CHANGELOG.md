@@ -260,6 +260,17 @@ called out in release notes.
   that could otherwise observe the directory before a follow-up permission
   change.
 
+### C ABI / Python SDK
+
+- Add C ABI revision 2 with runtime version negotiation, bounded
+  length-delimited UTF-8 inputs, length-delimited owned output buffers, stable
+  status codes, length-aware stream callbacks, and thread-safe cooperative
+  cancellation tokens. The revision 1 symbols remain exported for migration.
+- Prefer ABI revision 2 automatically in the Python SDK while retaining a
+  tested revision 1 fallback. Closing a partially consumed Python stream now
+  cancels native decode at the next output boundary and the worker owns its
+  token until the native call returns.
+
 ### UI
 
 - Add explicit, non-destructive recent-context continuations. `Continue` on any
@@ -791,6 +802,19 @@ called out in release notes.
 
 ### CI / open-source readiness
 
+- Give the embedded UI a single descriptive document title and favicon, promote
+  the product name to the page's level-one heading, name the conversations
+  landmark, and announce connection/runtime state through a polite live status.
+  A real-browser empty-state audit now records dialog focus entry, forward and
+  reverse focus containment, Escape dismissal, and opener-focus restoration;
+  automated cross-browser and assistive-technology gates remain future work.
+- Add a fail-closed locked-dependency policy for reviewed Cargo registry
+  sources and exact declared license expressions. CI and release packaging now
+  validate before building and generate a deterministic CycloneDX 1.5 SBOM
+  covering the native target plus the independent wasm UI workspace when
+  embedded. Schema-version-2 archives bundle it with the reviewed policy; the
+  offline validator retains legacy version-1 support and binds current SBOM
+  identity, components, sources, licenses, and graph to the release contract.
 - Replace loose Markdown issue templates with required, English-only GitHub
   forms for bugs, features, and model/backend support. Route vulnerabilities to
   private advisories, disable public blank issues, use only existing repository

@@ -59,18 +59,22 @@ non-container macOS and Windows archive builders.
 ## High-priority gaps
 
 - Add real-browser end-to-end and accessibility gates for the embedded UI;
-  current interaction, clipboard, download, focus, and assistive-technology
-  behavior still requires manual validation.
+  the empty state and Models/Settings focus lifecycle have a manual browser
+  audit, while clipboard, download, cross-browser, scanner, and target
+  assistive-technology behavior still require repeatable validation.
 - Add dedicated target-hardware runners and published performance budgets for
   each claimed Metal or CUDA deployment. Feature compilation alone is not
   execution evidence.
-- Stabilize and package the C ABI and Python SDK, including version negotiation,
-  binary wheels for supported targets, ownership/error contracts, and ABI
-  compatibility tests, before treating them as production integration APIs.
+- Continue stabilizing and package the C ABI and Python SDK. Revision 2 now
+  provides version negotiation, bounded length-delimited buffers, explicit
+  ownership/status contracts, cooperative stream cancellation, and revision 1
+  fallback tests; binary wheels, a declared compatibility window, and packaged
+  cross-version ABI tests remain before production support.
 - Define a signed-index revocation and incident-recovery mechanism; expiry and
   rollback watermarks do not provide urgent remote revocation.
-- Add dependency license/source policy enforcement and an artifact-level SBOM
-  gate alongside the existing vulnerability audit.
+- Extend the native archive's dependency policy and target-filtered CycloneDX
+  SBOM gate to any future official container image, including final-layer
+  package inventory and signed image provenance.
 - Split the largest server, CLI, scheduler, executor, and browser modules so
   security and lifecycle boundaries remain reviewable as features grow.
 

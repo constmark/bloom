@@ -17,12 +17,15 @@ python3 -m pip install -r requirements/schema-validation.txt
 
 The Python SDK boundary tests do not require a model or compiled native
 library. A contract fake verifies lazy native-library loading, parameter
-admission, native string ownership, idempotent close, and serialization between
-active streaming calls and handle destruction. The Rust FFI tests separately
-cross the real C ABI with the mock engine and require a NULL stream callback to
-fail closed rather than invoke undefined behavior. CI also builds the shared
-library and sets `BLOOM_TEST_NATIVE_FFI=1`, which makes the Python suite run a
-real buffered and streaming `ctypes` round trip through the Rust mock engine.
+admission, revision 2 negotiation, revision 1 fallback, native buffer
+ownership, cooperative stream cancellation, idempotent close, and
+serialization between active streaming calls and handle destruction. The Rust
+FFI tests separately cross both ABI shapes with the mock engine, including
+length boundaries, cancellation status, and NULL callbacks. CI compiles the
+public header as strict C11 and C++17, then builds the shared library and sets
+`BLOOM_TEST_NATIVE_FFI=1`, which makes
+the Python suite run a real buffered and streaming `ctypes` round trip through
+the Rust mock engine.
 
 The process-lifecycle test builds and launches the real server. It exercises a
 clean `SIGTERM`, bounded deadline expiry, and repeated-signal escalation on

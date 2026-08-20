@@ -2,12 +2,19 @@
 
 Every Bloom application archive contains `BLOOM-RELEASE.json`. It identifies
 the build and lets users or automation verify extracted executables without
-depending on archive filenames.
+depending on archive filenames. The same archive contains the deterministic
+CycloneDX 1.5 `BLOOM-SBOM.cdx.json` and the exact reviewed
+`BLOOM-DEPENDENCY-POLICY.json` used to admit its Cargo dependency graph.
 
-Consumers must require both:
+Current archives use:
 
-- `schema_version: 1`; and
+- `schema_version: 2`; and
 - `object: "bloom.release"`.
+
+The offline validator continues to accept legacy schema-version-1 archives,
+which predate the required packaged dependency policy and SBOM. Version 2
+requires both inventory files and validates them as part of the archive
+contract.
 
 Unknown schema versions must be rejected. Within version `1`, consumers should
 require the complete target-specific executable set and validate every declared
@@ -59,6 +66,20 @@ succeeds. This makes the archive container reproducible for an identical staged
 tree; it does not claim bit-for-bit reproducibility across separate native
 compiler or linker executions.
 
+The SBOM merges target-filtered locked Cargo metadata for the native workspace
+with the independent `wasm32-unknown-unknown` UI workspace when the browser is
+embedded. Policy validation runs before either workspace is built. It lists workspace and registry packages,
+their declared license expressions, reviewed source, and resolved dependency
+edges without local paths or timestamps. The policy rejects undeclared or new
+license expressions, non-crates.io registries, Git dependencies, and external
+path dependencies until a maintainer explicitly reviews and updates the policy.
+Known legacy slash-separated Cargo declarations are preserved in a component
+property and explicitly normalized to an SPDX `OR` expression for CycloneDX
+consumers; every such normalization is itself part of the reviewed policy.
+This is a reproducible inventory and drift gate, not a legal conclusion about
+license compatibility or proof that every resolved package contributed machine
+code to every binary.
+
 From a Bloom source checkout, validate either supported archive format without
 extracting it:
 
@@ -73,7 +94,10 @@ extracting it:
 The validator also accepts Windows `.zip` archives. It rejects unsafe paths,
 links, duplicate members, oversized archives, incomplete documentation,
 incorrect executable modes, inconsistent self-check metadata, and binary hash
-or size mismatches. The release-only metadata flag additionally requires one
+or size mismatches. It also parses the bounded SBOM and packaged policy,
+requires their target, version, and embedded-UI identity to match the release,
+and rejects incomplete dependency graphs or unreviewed sources and license
+expressions. The release-only metadata flag additionally requires one
 normalized archive timestamp, canonical ownership and modes, and restricted
 extended metadata. The validator also parses the packaged readiness example and
 schema within a 64 KiB budget, requires the current Bloom identity and server
