@@ -221,9 +221,10 @@ async fn ollama_residency_lease(
     keep_alive: OllamaKeepAlive,
 ) -> std::result::Result<OllamaResidencyLease, String> {
     let runtime = state
-        .runtime
+        .runtime_pool
         .read()
         .await
+        .default_runtime()
         .as_ref()
         .map(Arc::downgrade)
         .ok_or_else(|| "the activated model was unavailable for residency tracking".to_string())?;
@@ -270,7 +271,7 @@ async fn arm_ollama_residency_expiry(
             residency.expiry = None;
             return;
         };
-        let current_runtime = state.runtime.read().await.clone();
+        let current_runtime = state.runtime_pool.read().await.default_runtime();
         if current_runtime
             .as_ref()
             .is_none_or(|current| !Arc::ptr_eq(current, &expected_runtime))
@@ -1227,10 +1228,10 @@ async fn activate_ollama_model_with_permission(
 
     match admission {
         ModelLoadAdmission::AlreadyReady => state
-            .runtime
+            .runtime_pool
             .read()
             .await
-            .as_ref()
+            .default_ref()
             .map(|runtime| runtime.model_id.clone())
             .ok_or_else(|| {
                 OllamaActivationError::new(

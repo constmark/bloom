@@ -98,6 +98,7 @@ mod model_upgrade;
 mod ollama;
 mod readiness;
 mod response_store;
+mod runtime_pool;
 mod shutdown;
 mod tool_calling;
 mod ui;
@@ -125,6 +126,7 @@ use model_storage::ModelStorageManager;
 use ollama::*;
 use readiness::*;
 use response_store::ResponseStore;
+use runtime_pool::RuntimePool;
 #[cfg(test)]
 use shutdown::ShutdownSignal;
 use shutdown::{
@@ -567,7 +569,7 @@ struct CachedModelCatalog {
 }
 
 struct ServerState {
-    runtime: RwLock<Option<Arc<LoadedRuntime>>>,
+    runtime_pool: RwLock<RuntimePool>,
     inference_admission: RwLock<()>,
     semaphore: Arc<Semaphore>,
     ready: AtomicBool,
@@ -626,13 +628,7 @@ impl ServerState {
         if self.load_in_progress.load(Ordering::Acquire) {
             return Err(ModelLoadAdmissionError::Busy);
         }
-        if self
-            .runtime
-            .read()
-            .await
-            .as_ref()
-            .is_some_and(|runtime| runtime.source_path == path)
-        {
+        if self.runtime_pool.read().await.contains_source(&path) {
             return Ok(ModelLoadAdmission::AlreadyReady);
         }
 
@@ -659,8 +655,10 @@ impl ServerState {
             let message = format!("model loader is unavailable: {error}");
             lifecycle.active = None;
             self.load_in_progress.store(false, Ordering::Release);
-            self.ready
-                .store(self.runtime.read().await.is_some(), Ordering::Release);
+            self.ready.store(
+                !self.runtime_pool.read().await.is_empty(),
+                Ordering::Release,
+            );
             *self.load_error.write().await = Some(message.clone());
             completion.send_replace(ModelLoadOutcome::Failed {
                 message: message.clone(),
@@ -688,7 +686,7 @@ impl ServerState {
     }
 
     async fn get_runtime(&self) -> Result<Arc<LoadedRuntime>> {
-        match self.runtime.read().await.clone() {
+        match self.runtime_pool.read().await.default_runtime() {
             Some(runtime) => Ok(runtime),
             _ => Err(anyhow!(self.model_unavailable().await.1)),
         }
@@ -731,8 +729,10 @@ impl ServerState {
         &self,
         force_refresh: bool,
     ) -> Result<(ModelCatalog, Option<Arc<LoadedRuntime>>)> {
-        let runtime = self.runtime.read().await.clone();
-        let active_path = runtime.as_ref().map(|runtime| runtime.source_path.clone());
+        let runtime_pool = self.runtime_pool.read().await;
+        let runtime = runtime_pool.default_runtime();
+        let active_path = runtime_pool.default_source();
+        drop(runtime_pool);
         let download_revision = self
             .model_downloads
             .as_ref()
@@ -1692,7 +1692,7 @@ async fn run_server(args: Args, config_path: PathBuf) -> Result<()> {
 
     let (model_loader, model_load_requests) = mpsc::channel(1);
     let state = Arc::new(ServerState {
-        runtime: RwLock::new(None),
+        runtime_pool: RwLock::new(RuntimePool::new()),
         inference_admission: RwLock::new(()),
         semaphore: Arc::new(Semaphore::new(args.max_concurrent)),
         ready: AtomicBool::new(false),
@@ -2093,7 +2093,11 @@ async fn model_loader_loop(
         {
             Ok(runtime) => {
                 let model_id = runtime.model_id.clone();
-                let previous = state.runtime.write().await.replace(Arc::new(runtime));
+                let previous = state
+                    .runtime_pool
+                    .write()
+                    .await
+                    .publish_default(Arc::new(runtime));
                 drop(previous);
                 state.load_progress.store(100, Ordering::Release);
                 state.ready.store(true, Ordering::Release);
@@ -2120,7 +2124,7 @@ async fn model_loader_loop(
                 tracing::error!(path = %requested_model, error = %message, "Model load failed");
                 *state.load_error.write().await = Some(message.clone());
                 state.load_progress.store(0, Ordering::Release);
-                let has_fallback = state.runtime.read().await.is_some();
+                let has_fallback = !state.runtime_pool.read().await.is_empty();
                 state.ready.store(has_fallback, Ordering::Release);
                 state.load_in_progress.store(false, Ordering::Release);
                 state
@@ -4860,8 +4864,8 @@ mod tests {
         )
         .await;
         let (model_id, published_at) = {
-            let runtime = state.runtime.read().await;
-            let runtime = runtime.as_ref().unwrap();
+            let runtime_pool = state.runtime_pool.read().await;
+            let runtime = runtime_pool.default_ref().unwrap();
             (runtime.model_id.clone(), runtime.published_at)
         };
         let app = Router::new()
@@ -5045,7 +5049,8 @@ mod tests {
             source_path: model_path,
             catalog_id: None,
         });
-        *state.runtime.write().await = Some(runtime);
+        let previous = state.runtime_pool.write().await.publish_default(runtime);
+        assert!(previous.is_none());
         state.ready.store(true, Ordering::Release);
         (state, native_batch_calls)
     }
@@ -5056,6 +5061,17 @@ mod tests {
     ) -> Arc<ServerState> {
         let (state, _receiver) = test_server_state(models_root.clone());
         let model_path = models_root.join("test-text-model.fixture");
+        let runtime = test_text_runtime(model_path, emitted_chunks);
+        let previous = state.runtime_pool.write().await.publish_default(runtime);
+        assert!(previous.is_none());
+        state.ready.store(true, Ordering::Release);
+        state
+    }
+
+    fn test_text_runtime(
+        model_path: PathBuf,
+        emitted_chunks: Arc<AtomicU64>,
+    ) -> Arc<LoadedRuntime> {
         std::fs::write(&model_path, b"bounded text fixture").unwrap();
         let pipeline = Arc::new(
             InferencePipeline::load_standalone_with_context(
@@ -5067,7 +5083,7 @@ mod tests {
             .unwrap(),
         );
         let manifest = pipeline.metadata().manifest.clone();
-        let runtime = Arc::new(LoadedRuntime {
+        Arc::new(LoadedRuntime {
             model_id: pipeline.metadata().id.clone(),
             model_family: manifest.family.clone(),
             model_architecture: None,
@@ -5083,10 +5099,7 @@ mod tests {
             published_at: unix_seconds(),
             source_path: model_path,
             catalog_id: None,
-        });
-        *state.runtime.write().await = Some(runtime);
-        state.ready.store(true, Ordering::Release);
-        state
+        })
     }
 
     fn test_multimodal_request(blocks: Vec<DataBlock>) -> InferenceRequest {
@@ -5138,7 +5151,7 @@ mod tests {
         );
         (
             Arc::new(ServerState {
-                runtime: RwLock::new(None),
+                runtime_pool: RwLock::new(RuntimePool::new()),
                 inference_admission: RwLock::new(()),
                 semaphore: Arc::new(Semaphore::new(1)),
                 ready: AtomicBool::new(false),
@@ -6177,6 +6190,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_unload_removes_the_default_runtime_and_clears_lifecycle_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_server_state_with_text_runtime(
+            temp.path().to_path_buf(),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await;
+        *state.requested_model.write().await = Some("test-text-model".to_string());
+        *state.load_error.write().await = Some("stale failure".to_string());
+        state.load_progress.store(100, Ordering::Release);
+
+        let response = handle_model_unload(State(Arc::clone(&state))).await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["unloaded"], true);
+        assert!(state.runtime_pool.read().await.is_empty());
+        assert!(!state.ready.load(Ordering::Acquire));
+        assert!(!state.load_in_progress.load(Ordering::Acquire));
+        assert_eq!(state.load_progress.load(Ordering::Acquire), 0);
+        assert!(state.requested_model.read().await.is_none());
+        assert!(state.load_error.read().await.is_none());
+    }
+
+    #[tokio::test]
     async fn ollama_empty_prompt_keep_alive_zero_unloads_the_active_runtime() {
         let temp = tempfile::tempdir().unwrap();
         let state = test_server_state_with_text_runtime(
@@ -6219,8 +6262,68 @@ mod tests {
         assert_eq!(body["response"], "");
         assert_eq!(body["done"], true);
         assert_eq!(body["done_reason"], "unload");
-        assert!(state.runtime.read().await.is_none());
+        assert!(state.runtime_pool.read().await.is_empty());
         assert!(!state.ready.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn ollama_expiry_for_replaced_runtime_does_not_unload_the_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_server_state_with_text_runtime(
+            temp.path().to_path_buf(),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await;
+        let app = Router::new()
+            .nest("/api", ollama_api_router(Arc::clone(&state)))
+            .with_state(Arc::clone(&state));
+
+        let timed = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/generate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "default",
+                            "prompt": "",
+                            "keep_alive": "30ms",
+                            "stream": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(timed.status(), axum::http::StatusCode::OK);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        // The replacement deliberately has the same model ID. The expiry
+        // guard must use Arc identity instead of a selector vulnerable to ABA.
+        let replacement = test_text_runtime(
+            temp.path().join("replacement-text-model.fixture"),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let previous = state
+            .runtime_pool
+            .write()
+            .await
+            .publish_default(Arc::clone(&replacement))
+            .expect("the original runtime must be returned");
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let current = state
+            .runtime_pool
+            .read()
+            .await
+            .default_runtime()
+            .expect("the replacement runtime must remain published");
+        assert!(Arc::ptr_eq(&current, &replacement));
+        assert!(!Arc::ptr_eq(&current, &previous));
+        assert!(state.ready.load(Ordering::Acquire));
+        assert!(state.ollama_residency.lock().await.expiry.is_none());
     }
 
     #[tokio::test]
@@ -6276,15 +6379,15 @@ mod tests {
         let indefinite = app.clone().oneshot(preload(json!(-1))).await.unwrap();
         assert_eq!(indefinite.status(), axum::http::StatusCode::OK);
         tokio::time::sleep(Duration::from_millis(80)).await;
-        assert!(state.runtime.read().await.is_some());
+        assert!(!state.runtime_pool.read().await.is_empty());
 
         let expiring = app.oneshot(preload(json!("20ms"))).await.unwrap();
         assert_eq!(expiring.status(), axum::http::StatusCode::OK);
         let deadline = Instant::now() + Duration::from_secs(1);
-        while state.runtime.read().await.is_some() && Instant::now() < deadline {
+        while !state.runtime_pool.read().await.is_empty() && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(state.runtime.read().await.is_none());
+        assert!(state.runtime_pool.read().await.is_empty());
         assert!(!state.ready.load(Ordering::Acquire));
     }
 
@@ -6331,10 +6434,10 @@ mod tests {
         assert_eq!(failed.status(), axum::http::StatusCode::NOT_FOUND);
 
         let deadline = Instant::now() + Duration::from_secs(1);
-        while state.runtime.read().await.is_some() && Instant::now() < deadline {
+        while !state.runtime_pool.read().await.is_empty() && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(state.runtime.read().await.is_none());
+        assert!(state.runtime_pool.read().await.is_empty());
         assert!(!state.ready.load(Ordering::Acquire));
     }
 
@@ -6458,8 +6561,8 @@ mod tests {
         )
         .await;
         {
-            let mut runtime = state.runtime.write().await;
-            let runtime = Arc::get_mut(runtime.as_mut().unwrap()).unwrap();
+            let mut runtime_pool = state.runtime_pool.write().await;
+            let runtime = Arc::get_mut(runtime_pool.default_mut().unwrap()).unwrap();
             runtime.source_path = active_model.clone();
             runtime.catalog_id = Some("active.gguf".to_string());
         }
@@ -8405,6 +8508,70 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
         assert!(error.message.contains("deterministic loader failure"));
+    }
+
+    #[tokio::test]
+    async fn failed_runtime_preparation_preserves_the_published_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, receiver) = test_server_state(temp.path().to_path_buf());
+        let fallback = test_text_runtime(
+            temp.path().join("fallback-text-model.fixture"),
+            Arc::new(AtomicU64::new(0)),
+        );
+        assert!(
+            state
+                .runtime_pool
+                .write()
+                .await
+                .publish_default(Arc::clone(&fallback))
+                .is_none()
+        );
+        state.ready.store(true, Ordering::Release);
+
+        let args = Args::try_parse_from(["bloom_server", "--disable-memory-prealloc"]).unwrap();
+        let loader = tokio::spawn(model_loader_loop(
+            Arc::clone(&state),
+            args,
+            DeviceKind::Cpu,
+            receiver,
+        ));
+        let admission = state
+            .admit_model_load(
+                temp.path().join("missing-model"),
+                Some("missing-model".to_string()),
+                true,
+            )
+            .await
+            .unwrap();
+        let ModelLoadAdmission::Loading { mut completion, .. } = admission else {
+            panic!("a different source must queue runtime preparation");
+        };
+        let outcome = tokio::time::timeout(Duration::from_secs(1), async move {
+            loop {
+                let outcome = completion.borrow().clone();
+                if !matches!(outcome, ModelLoadOutcome::Loading) {
+                    break outcome;
+                }
+                completion.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("runtime preparation must finish");
+
+        assert!(matches!(outcome, ModelLoadOutcome::Failed { .. }));
+        let published = state
+            .runtime_pool
+            .read()
+            .await
+            .default_runtime()
+            .expect("fallback runtime must remain published");
+        assert!(Arc::ptr_eq(&published, &fallback));
+        assert!(state.ready.load(Ordering::Acquire));
+        assert!(!state.load_in_progress.load(Ordering::Acquire));
+        assert!(state.load_error.read().await.is_some());
+
+        loader.abort();
+        let _ = loader.await;
     }
 
     #[tokio::test]

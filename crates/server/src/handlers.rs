@@ -29,7 +29,7 @@ pub(crate) async fn handle_health(State(state): State<Arc<ServerState>>) -> impl
         .metrics
         .requests_total
         .load(std::sync::atomic::Ordering::Relaxed);
-    let runtime = state.runtime.read().await.clone();
+    let runtime = state.runtime_pool.read().await.default_runtime();
     let model_id = runtime
         .as_ref()
         .map(|runtime| runtime.model_id.as_str())
@@ -46,7 +46,7 @@ pub(crate) async fn handle_health(State(state): State<Arc<ServerState>>) -> impl
 // ─── /metrics ──────────────────────────────────────────────────────────────
 
 pub(crate) async fn handle_metrics(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
-    let runtime = state.runtime.read().await.clone();
+    let runtime = state.runtime_pool.read().await.default_runtime();
     let kv_metrics = {
         if let Some(pool) = runtime
             .as_ref()
@@ -91,7 +91,7 @@ pub(crate) async fn handle_metrics(State(state): State<Arc<ServerState>>) -> imp
 pub(crate) async fn handle_observability(
     State(state): State<Arc<ServerState>>,
 ) -> impl IntoResponse {
-    let runtime = state.runtime.read().await.clone();
+    let runtime = state.runtime_pool.read().await.default_runtime();
     let kv_metrics = {
         if let Some(pool) = runtime
             .as_ref()
@@ -203,7 +203,7 @@ pub(crate) async fn handle_observability(
 pub(crate) async fn handle_kv_cache_stats(
     State(state): State<Arc<ServerState>>,
 ) -> impl IntoResponse {
-    let runtime = state.runtime.read().await.clone();
+    let runtime = state.runtime_pool.read().await.default_runtime();
     let kv_metrics = {
         if let Some(pool) = runtime
             .as_ref()
@@ -255,7 +255,7 @@ fn openai_model_resource(runtime: &LoadedRuntime) -> serde_json::Value {
 }
 
 pub(crate) async fn handle_models(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
-    let runtime = state.runtime.read().await.clone();
+    let runtime = state.runtime_pool.read().await.default_runtime();
     let models = runtime
         .as_ref()
         .map(|runtime| vec![openai_model_resource(runtime)])
@@ -295,13 +295,11 @@ pub(crate) async fn handle_model_retrieve(
         return requested_model_error_response(error);
     }
 
-    let runtime = state.runtime.read().await.clone();
-    let Some(runtime) = runtime else {
-        return requested_model_error_response(RequestedModelError::NotLoaded);
+    let runtime = match state.runtime_pool.read().await.resolve(Some(&model)) {
+        Ok(Some(runtime)) => runtime,
+        Ok(None) => return requested_model_error_response(RequestedModelError::NotLoaded),
+        Err(error) => return requested_model_error_response(error),
     };
-    if let Err(error) = validate_requested_model(Some(&model), &runtime.model_id) {
-        return requested_model_error_response(error);
-    }
     Json(openai_model_resource(&runtime)).into_response()
 }
 
@@ -1651,13 +1649,7 @@ pub(crate) async fn handle_model_integrity_start(
                 );
             }
         };
-    if state
-        .runtime
-        .read()
-        .await
-        .as_ref()
-        .is_some_and(|runtime| runtime.source_path == resolved)
-    {
+    if state.runtime_pool.read().await.contains_source(&resolved) {
         return error_response(
             axum::http::StatusCode::CONFLICT,
             "model_is_active",
@@ -1745,7 +1737,7 @@ pub(crate) async fn handle_model_unload(
         );
     }
 
-    let previous = state.runtime.write().await.take();
+    let previous = state.runtime_pool.write().await.remove_default();
     drop(previous);
     *state.requested_model.write().await = None;
     *state.load_error.write().await = None;
@@ -4867,14 +4859,18 @@ pub(crate) async fn handle_cancel(
     }
     let mut cancelled = false;
 
-    // Try IFB scheduler cancel first
-    let runtime = state.runtime.read().await.clone();
-    if let Some(scheduler) = runtime
-        .as_ref()
-        .and_then(|runtime| runtime.scheduler.as_ref())
-        && scheduler.cancel_request(&request_id)
-    {
-        cancelled = true;
+    // Try every scheduler retained by the pool before the global token map.
+    // Collect first so no pool lock is held while scheduler code runs.
+    let schedulers = state
+        .runtime_pool
+        .read()
+        .await
+        .schedulers()
+        .collect::<Vec<_>>();
+    for scheduler in schedulers {
+        if scheduler.cancel_request(&request_id) {
+            cancelled = true;
+        }
     }
 
     // Try cancel token
@@ -4919,7 +4915,7 @@ pub(crate) async fn handle_cancel(
 // ─── /v1/backends ───────────────────────────────────────────────────────────
 
 pub(crate) async fn handle_backends(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
-    let runtime = state.runtime.read().await.clone();
+    let runtime = state.runtime_pool.read().await.default_runtime();
     let model_id = runtime
         .as_ref()
         .map(|runtime| runtime.model_id.clone())
