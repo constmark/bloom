@@ -6,12 +6,13 @@ use super::model_index::{
     model_index_installation_state, validate_index_id,
 };
 use super::*;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::collections::VecDeque;
 use std::convert::Infallible;
 
-const MAX_OLLAMA_ADAPTER_BODY_BYTES: usize = 16 * MIB as usize;
 const MAX_OLLAMA_STREAM_BYTES: usize = 16 * MIB as usize;
 const MAX_OLLAMA_STREAM_EVENTS: usize = 131_072;
+const MAX_OLLAMA_IMAGE_BASE64_BYTES: usize = MAX_MULTIMODAL_IMAGE_BYTES.div_ceil(3) * 4;
 const OLLAMA_CONTENT_TYPE: &str = "application/x-ndjson";
 const OLLAMA_PULL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DEFAULT_OLLAMA_KEEP_ALIVE: Duration = Duration::from_secs(5 * 60);
@@ -61,6 +62,18 @@ struct OllamaMessage {
     tool_name: Option<String>,
     #[serde(default, flatten)]
     extensions: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug)]
+struct OllamaImageInput {
+    bytes: Vec<u8>,
+    mime: String,
+}
+
+struct OllamaPreparedImageRequest {
+    prompt: Option<String>,
+    image: OllamaImageInput,
+    params: InferenceParams,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1669,12 +1682,12 @@ async fn activate_ollama_model_for_request(
     requested_model: &str,
     operator_scope: bool,
     keep_alive: OllamaKeepAlive,
-) -> std::result::Result<(String, Option<OllamaResidencyLease>), OllamaActivationError> {
+) -> std::result::Result<(Arc<LoadedRuntime>, Option<OllamaResidencyLease>), OllamaActivationError>
+{
     let runtime =
         activate_ollama_model_with_permission(state, requested_model, operator_scope).await?;
-    let active_model = runtime.model_id.clone();
     if !operator_scope {
-        return Ok((active_model, None));
+        return Ok((runtime, None));
     }
 
     let mut residency = state.ollama_residency.lock().await;
@@ -1698,7 +1711,7 @@ async fn activate_ollama_model_for_request(
     .map_err(|message| {
         OllamaActivationError::new(axum::http::StatusCode::SERVICE_UNAVAILABLE, message)
     })?;
-    Ok((active_model, Some(lease)))
+    Ok((runtime, Some(lease)))
 }
 
 pub(crate) async fn handle_ollama_chat(
@@ -1742,12 +1755,19 @@ pub(crate) async fn handle_ollama_chat(
         Ok(keep_alive) => keep_alive,
         Err(message) => return ollama_bad_request(message),
     };
-    let chat_request = match ollama_chat_request(payload, stream) {
+    let (chat_request, image) = match ollama_chat_request(payload, stream) {
+        Ok(request) => request,
+        Err(message) => return ollama_bad_request(message),
+    };
+    let image_request = match image
+        .map(|image| prepare_ollama_image_request(&chat_request, image))
+        .transpose()
+    {
         Ok(request) => request,
         Err(message) => return ollama_bad_request(message),
     };
     let requested_model = chat_request.model.clone().unwrap_or_default();
-    let (active_model, residency_lease) = match activate_ollama_model_for_request(
+    let (runtime, residency_lease) = match activate_ollama_model_for_request(
         &state,
         &requested_model,
         operator_scope,
@@ -1758,11 +1778,20 @@ pub(crate) async fn handle_ollama_chat(
         Ok(activation) => activation,
         Err(error) => return ollama_error_response(error.status, error.message),
     };
-    let mut chat_request = chat_request;
-    chat_request.model = Some(active_model);
-    let response = handle_chat_completions(State(state), Json(chat_request))
-        .await
-        .into_response();
+    if let Some(image_request) = image_request {
+        let request = image_request.into_inference_request();
+        let response = run_multimodal_request_for_runtime(state, request, runtime).await;
+        return ollama_from_multimodal_response(
+            response,
+            OllamaOutputKind::Chat,
+            stream,
+            started,
+            requested_model,
+            residency_lease,
+        )
+        .await;
+    }
+    let response = handle_chat_completions_for_runtime(state, chat_request, runtime).await;
     ollama_from_chat_response(
         response,
         OllamaOutputKind::Chat,
@@ -1818,12 +1847,19 @@ pub(crate) async fn handle_ollama_generate(
         Ok(keep_alive) => keep_alive,
         Err(message) => return ollama_bad_request(message),
     };
-    let chat_request = match ollama_generate_request(payload, stream) {
+    let (chat_request, image) = match ollama_generate_request(payload, stream) {
+        Ok(request) => request,
+        Err(message) => return ollama_bad_request(message),
+    };
+    let image_request = match image
+        .map(|image| prepare_ollama_image_request(&chat_request, image))
+        .transpose()
+    {
         Ok(request) => request,
         Err(message) => return ollama_bad_request(message),
     };
     let requested_model = chat_request.model.clone().unwrap_or_default();
-    let (active_model, residency_lease) = match activate_ollama_model_for_request(
+    let (runtime, residency_lease) = match activate_ollama_model_for_request(
         &state,
         &requested_model,
         operator_scope,
@@ -1834,11 +1870,20 @@ pub(crate) async fn handle_ollama_generate(
         Ok(activation) => activation,
         Err(error) => return ollama_error_response(error.status, error.message),
     };
-    let mut chat_request = chat_request;
-    chat_request.model = Some(active_model);
-    let response = handle_chat_completions(State(state), Json(chat_request))
-        .await
-        .into_response();
+    if let Some(image_request) = image_request {
+        let request = image_request.into_inference_request();
+        let response = run_multimodal_request_for_runtime(state, request, runtime).await;
+        return ollama_from_multimodal_response(
+            response,
+            OllamaOutputKind::Generate,
+            stream,
+            started,
+            requested_model,
+            residency_lease,
+        )
+        .await;
+    }
+    let response = handle_chat_completions_for_runtime(state, chat_request, runtime).await;
     ollama_from_chat_response(
         response,
         OllamaOutputKind::Generate,
@@ -1899,14 +1944,14 @@ pub(crate) async fn handle_ollama_embed(
         Ok(inputs) => inputs,
         Err(message) => return ollama_bad_request(message),
     };
-    let (active_model, _residency_lease) =
+    let (runtime, _residency_lease) =
         match activate_ollama_model_for_request(&state, &model, operator_scope, keep_alive).await {
             Ok(activation) => activation,
             Err(error) => return ollama_error_response(error.status, error.message),
         };
     let mut result = match execute_embedding_batch(
         state,
-        Some(active_model),
+        Some(runtime.model_id.clone()),
         inputs,
         payload.truncate.unwrap_or(true),
         EmbeddingProjection::L2Normalized {
@@ -1973,14 +2018,14 @@ pub(crate) async fn handle_ollama_legacy_embeddings(
         Ok(inputs) => inputs,
         Err(message) => return ollama_bad_request(message),
     };
-    let (active_model, _residency_lease) =
+    let (runtime, _residency_lease) =
         match activate_ollama_model_for_request(&state, &model, operator_scope, keep_alive).await {
             Ok(activation) => activation,
             Err(error) => return ollama_error_response(error.status, error.message),
         };
     let result = match execute_embedding_batch(
         state,
-        Some(active_model),
+        Some(runtime.model_id.clone()),
         inputs,
         false,
         EmbeddingProjection::L2Normalized {
@@ -2027,7 +2072,7 @@ fn ollama_embed_payload(
 fn ollama_chat_request(
     payload: OllamaChatRequest,
     stream: bool,
-) -> std::result::Result<ChatRequest, String> {
+) -> std::result::Result<(ChatRequest, Option<OllamaImageInput>), String> {
     reject_ollama_extensions("chat request", &payload.extensions)?;
     validate_ollama_neutral_controls(
         payload.think.as_ref(),
@@ -2039,35 +2084,38 @@ fn ollama_chat_request(
         return Err("messages must contain at least one entry".to_string());
     }
     let options = parse_ollama_options(payload.options.as_ref())?;
-    let messages = ollama_chat_messages(payload.messages)?;
+    let (messages, image) = ollama_chat_messages(payload.messages)?;
     let response_format = ollama_response_format(payload.format.as_ref())?;
-    Ok(ChatRequest {
-        model: required_ollama_model(payload.model)?,
-        messages,
-        stream,
-        stream_options: stream.then_some(StreamOptions {
-            include_usage: true,
+    Ok((
+        ChatRequest {
+            model: required_ollama_model(payload.model)?,
+            messages,
+            stream,
+            stream_options: stream.then_some(StreamOptions {
+                include_usage: true,
+                extensions: BTreeMap::new(),
+            }),
+            max_tokens: None,
+            max_completion_tokens: Some(options.max_tokens.unwrap_or(128)),
+            temperature: Some(options.temperature.unwrap_or(0.7)),
+            top_p: Some(options.top_p.unwrap_or(0.9)),
+            seed: options.seed,
+            stop: (!options.stop.is_empty()).then(|| json!(options.stop)),
+            response_format,
+            tools: payload.tools,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            internal_request_id: None,
             extensions: BTreeMap::new(),
-        }),
-        max_tokens: None,
-        max_completion_tokens: Some(options.max_tokens.unwrap_or(128)),
-        temperature: Some(options.temperature.unwrap_or(0.7)),
-        top_p: Some(options.top_p.unwrap_or(0.9)),
-        seed: options.seed,
-        stop: (!options.stop.is_empty()).then(|| json!(options.stop)),
-        response_format,
-        tools: payload.tools,
-        tool_choice: None,
-        parallel_tool_calls: None,
-        internal_request_id: None,
-        extensions: BTreeMap::new(),
-    })
+        },
+        image,
+    ))
 }
 
 fn ollama_generate_request(
     payload: OllamaGenerateRequest,
     stream: bool,
-) -> std::result::Result<ChatRequest, String> {
+) -> std::result::Result<(ChatRequest, Option<OllamaImageInput>), String> {
     reject_ollama_extensions("generate request", &payload.extensions)?;
     validate_ollama_neutral_controls(
         payload.think.as_ref(),
@@ -2085,20 +2133,12 @@ fn ollama_generate_request(
     {
         return Err("fill-in-the-middle suffix generation is not supported".to_string());
     }
-    if payload
-        .images
-        .as_ref()
-        .is_some_and(|images| !images.is_null() && images.as_array().is_none_or(|v| !v.is_empty()))
-    {
-        return Err(
-            "inline Ollama image input is not supported; use Bloom's multimodal endpoint"
-                .to_string(),
-        );
-    }
-    let prompt = payload
-        .prompt
-        .filter(|prompt| !prompt.trim().is_empty())
-        .ok_or_else(|| "prompt is required and must not be blank".to_string())?;
+    let image = parse_ollama_images(payload.images.as_ref(), "generate request")?;
+    let prompt = match payload.prompt {
+        Some(prompt) if !prompt.trim().is_empty() => Some(prompt),
+        _ if image.is_some() => None,
+        _ => return Err("prompt is required and must not be blank".to_string()),
+    };
     let options = parse_ollama_options(payload.options.as_ref())?;
     let mut messages = Vec::with_capacity(2);
     if let Some(system) = payload.system.filter(|system| !system.is_empty()) {
@@ -2110,30 +2150,144 @@ fn ollama_generate_request(
     }
     messages.push(ChatCompletionMessage {
         role: "user".to_string(),
-        content: json!(prompt),
+        content: json!(prompt.unwrap_or_default()),
         extensions: BTreeMap::new(),
     });
-    Ok(ChatRequest {
-        model: required_ollama_model(payload.model)?,
-        messages,
-        stream,
-        stream_options: stream.then_some(StreamOptions {
-            include_usage: true,
+    Ok((
+        ChatRequest {
+            model: required_ollama_model(payload.model)?,
+            messages,
+            stream,
+            stream_options: stream.then_some(StreamOptions {
+                include_usage: true,
+                extensions: BTreeMap::new(),
+            }),
+            max_tokens: None,
+            max_completion_tokens: Some(options.max_tokens.unwrap_or(128)),
+            temperature: Some(options.temperature.unwrap_or(0.7)),
+            top_p: Some(options.top_p.unwrap_or(0.9)),
+            seed: options.seed,
+            stop: (!options.stop.is_empty()).then(|| json!(options.stop)),
+            response_format: ollama_response_format(payload.format.as_ref())?,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            internal_request_id: None,
             extensions: BTreeMap::new(),
-        }),
-        max_tokens: None,
-        max_completion_tokens: Some(options.max_tokens.unwrap_or(128)),
-        temperature: Some(options.temperature.unwrap_or(0.7)),
-        top_p: Some(options.top_p.unwrap_or(0.9)),
-        seed: options.seed,
-        stop: (!options.stop.is_empty()).then(|| json!(options.stop)),
-        response_format: ollama_response_format(payload.format.as_ref())?,
-        tools: None,
-        tool_choice: None,
-        parallel_tool_calls: None,
-        internal_request_id: None,
-        extensions: BTreeMap::new(),
+        },
+        image,
+    ))
+}
+
+fn parse_ollama_images(
+    value: Option<&serde_json::Value>,
+    context: &str,
+) -> std::result::Result<Option<OllamaImageInput>, String> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let images = value
+        .as_array()
+        .ok_or_else(|| format!("{context} images must be an array of base64 strings"))?;
+    if images.is_empty() {
+        return Ok(None);
+    }
+    if images.len() != 1 {
+        return Err("Ollama requests can contain at most one image".to_string());
+    }
+    let encoded = images[0]
+        .as_str()
+        .ok_or_else(|| format!("{context} image must be a base64 string"))?;
+    if encoded.is_empty() {
+        return Err(format!("{context} image must not be empty"));
+    }
+    if encoded.len() > MAX_OLLAMA_IMAGE_BASE64_BYTES {
+        return Err(format!(
+            "{context} image exceeds the {MAX_MULTIMODAL_IMAGE_BYTES}-byte decoded limit"
+        ));
+    }
+    if encoded.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return Err(format!(
+            "{context} image must use canonical base64 without whitespace"
+        ));
+    }
+    let bytes = STANDARD
+        .decode(encoded)
+        .map_err(|_| format!("{context} image contains invalid base64"))?;
+    if STANDARD.encode(&bytes) != encoded {
+        return Err(format!("{context} image must use canonical padded base64"));
+    }
+    if bytes.is_empty() || bytes.len() > MAX_MULTIMODAL_IMAGE_BYTES {
+        return Err(format!(
+            "{context} image must decode to between 1 and {MAX_MULTIMODAL_IMAGE_BYTES} bytes"
+        ));
+    }
+    let mime = match image::guess_format(&bytes) {
+        Ok(image::ImageFormat::Jpeg) => "image/jpeg",
+        Ok(image::ImageFormat::Png) => "image/png",
+        Ok(_) => return Err(format!("{context} image must be JPEG or PNG")),
+        Err(_) => return Err(format!("{context} image has an invalid file signature")),
+    };
+    validate_uploaded_image(&bytes, mime)
+        .map_err(|message| format!("{context} image is invalid: {message}"))?;
+    Ok(Some(OllamaImageInput {
+        bytes,
+        mime: mime.to_string(),
+    }))
+}
+
+fn prepare_ollama_image_request(
+    request: &ChatRequest,
+    image: OllamaImageInput,
+) -> std::result::Result<OllamaPreparedImageRequest, String> {
+    if !ollama_neutral_value(request.tools.as_ref()) {
+        return Err("tools cannot be combined with image input".to_string());
+    }
+    if request.response_format.is_some() {
+        return Err("format cannot be combined with image input".to_string());
+    }
+    if request.stop.is_some() {
+        return Err("stop sequences cannot be combined with image input".to_string());
+    }
+    let messages = normalize_chat_messages(&request.messages)?;
+    validate_chat_messages(&messages)?;
+    if messages.len() != 1 || messages[0].role != "user" {
+        return Err(
+            "image requests currently support exactly one user message and no system or history messages"
+                .to_string(),
+        );
+    }
+    let max_tokens = resolve_chat_max_tokens(request.max_tokens, request.max_completion_tokens)?;
+    let params = InferenceParams {
+        max_tokens,
+        temperature: request.temperature.unwrap_or(0.7),
+        top_p: request.top_p.unwrap_or(0.9),
+        seed: request.seed,
+        response_format: None,
+    };
+    validate_generation_controls(params.max_tokens, params.temperature, params.top_p)?;
+    Ok(OllamaPreparedImageRequest {
+        prompt: (!messages[0].content.trim().is_empty()).then(|| messages[0].content.clone()),
+        image,
+        params,
     })
+}
+
+impl OllamaPreparedImageRequest {
+    fn into_inference_request(self) -> InferenceRequest {
+        let mut blocks = Vec::with_capacity(2);
+        if let Some(prompt) = self.prompt {
+            blocks.push(DataBlock::Text(prompt));
+        }
+        blocks.push(DataBlock::Image {
+            bytes: self.image.bytes,
+            mime: self.image.mime,
+        });
+        InferenceRequest {
+            blocks,
+            params: self.params,
+        }
+    }
 }
 
 fn required_ollama_model(model: Option<String>) -> std::result::Result<Option<String>, String> {
@@ -2145,7 +2299,7 @@ fn required_ollama_model(model: Option<String>) -> std::result::Result<Option<St
 
 fn ollama_chat_messages(
     messages: Vec<OllamaMessage>,
-) -> std::result::Result<Vec<ChatCompletionMessage>, String> {
+) -> std::result::Result<(Vec<ChatCompletionMessage>, Option<OllamaImageInput>), String> {
     if messages.len() > MAX_CHAT_REQUEST_MESSAGES {
         return Err(format!(
             "messages cannot contain more than {MAX_CHAT_REQUEST_MESSAGES} entries"
@@ -2153,17 +2307,26 @@ fn ollama_chat_messages(
     }
     let mut converted = Vec::with_capacity(messages.len());
     let mut outstanding = VecDeque::<(String, String)>::new();
+    let mut request_image = None;
     for (message_index, message) in messages.into_iter().enumerate() {
         reject_ollama_extensions(
             &format!("message at index {message_index}"),
             &message.extensions,
         )?;
-        if message.images.as_ref().is_some_and(|images| {
-            !images.is_null() && images.as_array().is_none_or(|images| !images.is_empty())
-        }) {
+        let image = parse_ollama_images(
+            message.images.as_ref(),
+            &format!("message at index {message_index}"),
+        )?;
+        let has_image = image.is_some();
+        if has_image && message.role != "user" {
             return Err(format!(
-                "message at index {message_index} contains unsupported image input"
+                "message at index {message_index} may attach images only to the user role"
             ));
+        }
+        if let Some(image) = image
+            && request_image.replace(image).is_some()
+        {
+            return Err("Ollama requests can contain at most one image".to_string());
         }
         if message
             .thinking
@@ -2193,9 +2356,15 @@ fn ollama_chat_messages(
                         message.role
                     ));
                 }
-                let content = message.content.ok_or_else(|| {
-                    format!("message at index {message_index} requires string content")
-                })?;
+                let content = match message.content {
+                    Some(content) => content,
+                    None if message.role == "user" && has_image => String::new(),
+                    _ => {
+                        return Err(format!(
+                            "message at index {message_index} requires string content"
+                        ));
+                    }
+                };
                 converted.push(ChatCompletionMessage {
                     role: message.role,
                     content: json!(content),
@@ -2303,7 +2472,7 @@ fn ollama_chat_messages(
             "every assistant tool call must be followed by a matching tool result".to_string(),
         );
     }
-    Ok(converted)
+    Ok((converted, request_image))
 }
 
 fn ollama_historical_tool_calls(
@@ -2673,6 +2842,432 @@ async fn ollama_from_chat_response(
         Err(message) => {
             ollama_error_response(axum::http::StatusCode::INTERNAL_SERVER_ERROR, message)
         }
+    }
+}
+
+async fn ollama_from_multimodal_response(
+    response: axum::response::Response,
+    kind: OllamaOutputKind,
+    stream: bool,
+    started: Instant,
+    requested_model: String,
+    residency_lease: Option<OllamaResidencyLease>,
+) -> axum::response::Response {
+    if !response.status().is_success() {
+        return adapt_ollama_error_response(response).await;
+    }
+    if !ollama_internal_response_is_sse(&response) {
+        return ollama_error_response(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "the internal multimodal response did not use SSE",
+        );
+    }
+    if stream {
+        return ollama_stream_from_multimodal(
+            response,
+            kind,
+            started,
+            requested_model,
+            residency_lease,
+        );
+    }
+
+    let _residency_lease = residency_lease;
+    let mut body = response.into_body().into_data_stream();
+    let mut decoder = ChatSseDecoder::default();
+    let mut state = OllamaMultimodalStreamState::new(kind, started, requested_model);
+    let mut transport_bytes = 0_usize;
+    while let Some(chunk) = body.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(_) => {
+                return ollama_error_response(
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "the internal multimodal stream body failed",
+                );
+            }
+        };
+        transport_bytes = match transport_bytes.checked_add(chunk.len()) {
+            Some(bytes) if bytes <= MAX_OLLAMA_STREAM_BYTES => bytes,
+            _ => {
+                return ollama_error_response(
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "the internal multimodal stream exceeded its byte limit",
+                );
+            }
+        };
+        let frames = match decoder.push(&chunk) {
+            Ok(frames) => frames,
+            Err(message) => {
+                return ollama_error_response(
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    message,
+                );
+            }
+        };
+        let frame_count = frames.len();
+        for (index, frame) in frames.into_iter().enumerate() {
+            if frame == "[DONE]" {
+                if index + 1 != frame_count || decoder.finish().is_err() {
+                    return ollama_error_response(
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        "the internal multimodal stream ended with invalid framing",
+                    );
+                }
+                return match state.finish(true) {
+                    Ok(payload) => ollama_json(payload),
+                    Err(message) => ollama_error_response(
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        message,
+                    ),
+                };
+            }
+            let payload = match serde_json::from_str::<serde_json::Value>(&frame) {
+                Ok(payload) => payload,
+                Err(_) => {
+                    return ollama_error_response(
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        "the internal multimodal stream emitted invalid JSON",
+                    );
+                }
+            };
+            if let Err(message) = state.ingest(payload, true) {
+                return ollama_error_response(
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    message,
+                );
+            }
+        }
+    }
+    ollama_error_response(
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        "the internal multimodal stream ended before its terminal marker",
+    )
+}
+
+fn ollama_internal_response_is_sse(response: &axum::response::Response) -> bool {
+    response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
+}
+
+fn ollama_stream_from_multimodal(
+    response: axum::response::Response,
+    kind: OllamaOutputKind,
+    started: Instant,
+    requested_model: String,
+    residency_lease: Option<OllamaResidencyLease>,
+) -> axum::response::Response {
+    let mut body = response.into_body().into_data_stream();
+    let (tx, rx) = mpsc::channel::<std::result::Result<axum::body::Bytes, Infallible>>(32);
+    task::spawn(async move {
+        let _residency_lease = residency_lease;
+        let mut decoder = ChatSseDecoder::default();
+        let mut state = OllamaMultimodalStreamState::new(kind, started, requested_model);
+        let mut transport_bytes = 0_usize;
+        loop {
+            let chunk = tokio::select! {
+                _ = tx.closed() => return,
+                chunk = body.next() => chunk,
+            };
+            let Some(chunk) = chunk else {
+                send_ollama_stream_error(
+                    &tx,
+                    "the internal multimodal stream ended before its terminal marker",
+                )
+                .await;
+                return;
+            };
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(_) => {
+                    send_ollama_stream_error(&tx, "the internal multimodal stream body failed")
+                        .await;
+                    return;
+                }
+            };
+            transport_bytes = match transport_bytes.checked_add(chunk.len()) {
+                Some(bytes) if bytes <= MAX_OLLAMA_STREAM_BYTES => bytes,
+                _ => {
+                    send_ollama_stream_error(
+                        &tx,
+                        "the internal multimodal stream exceeded its byte limit",
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let frames = match decoder.push(&chunk) {
+                Ok(frames) => frames,
+                Err(message) => {
+                    send_ollama_stream_error(&tx, &message).await;
+                    return;
+                }
+            };
+            let frame_count = frames.len();
+            for (index, frame) in frames.into_iter().enumerate() {
+                if frame == "[DONE]" {
+                    if index + 1 != frame_count || decoder.finish().is_err() {
+                        send_ollama_stream_error(
+                            &tx,
+                            "the internal multimodal stream ended with invalid framing",
+                        )
+                        .await;
+                        return;
+                    }
+                    match state.finish(false) {
+                        Ok(payload) => {
+                            let _ = send_ollama_line(&tx, payload).await;
+                        }
+                        Err(message) => send_ollama_stream_error(&tx, &message).await,
+                    }
+                    return;
+                }
+                let payload = match serde_json::from_str::<serde_json::Value>(&frame) {
+                    Ok(payload) => payload,
+                    Err(_) => {
+                        send_ollama_stream_error(
+                            &tx,
+                            "the internal multimodal stream emitted invalid JSON",
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                match state.ingest(payload, false) {
+                    Ok(Some(payload)) => {
+                        if !send_ollama_line(&tx, payload).await {
+                            return;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(message) => {
+                        send_ollama_stream_error(&tx, &message).await;
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static(OLLAMA_CONTENT_TYPE),
+            ),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        axum::body::Body::from_stream(ReceiverStream::new(rx)),
+    )
+        .into_response()
+}
+
+struct OllamaMultimodalStreamState {
+    kind: OllamaOutputKind,
+    started: Instant,
+    requested_model: String,
+    id: Option<String>,
+    internal_model: Option<String>,
+    created: Option<u64>,
+    saw_start: bool,
+    saw_end: bool,
+    events: usize,
+    output_bytes: usize,
+    buffered: String,
+}
+
+impl OllamaMultimodalStreamState {
+    fn new(kind: OllamaOutputKind, started: Instant, requested_model: String) -> Self {
+        Self {
+            kind,
+            started,
+            requested_model,
+            id: None,
+            internal_model: None,
+            created: None,
+            saw_start: false,
+            saw_end: false,
+            events: 0,
+            output_bytes: 0,
+            buffered: String::new(),
+        }
+    }
+
+    fn ingest(
+        &mut self,
+        payload: serde_json::Value,
+        collect: bool,
+    ) -> std::result::Result<Option<serde_json::Value>, String> {
+        self.events = self.events.saturating_add(1);
+        if self.events > MAX_OLLAMA_STREAM_EVENTS {
+            return Err("the internal multimodal stream emitted too many events".to_string());
+        }
+        if let Some(error) = payload.get("error") {
+            return Err(error
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("the local multimodal generation stream failed")
+                .to_string());
+        }
+        let object = payload
+            .as_object()
+            .ok_or_else(|| "the internal multimodal stream emitted a non-object".to_string())?;
+        reject_ollama_object_fields(
+            object,
+            &["id", "object", "created", "model", "chunk"],
+            "internal multimodal stream event",
+        )?;
+        if payload.get("object").and_then(serde_json::Value::as_str) != Some("multimodal.chunk") {
+            return Err(
+                "the internal multimodal stream used an unexpected object type".to_string(),
+            );
+        }
+        self.validate_identity(&payload)?;
+        let chunk = payload
+            .get("chunk")
+            .ok_or_else(|| "the internal multimodal stream omitted its chunk".to_string())?;
+        if chunk.is_null() {
+            if self.saw_start || self.saw_end || self.output_bytes != 0 {
+                return Err(
+                    "the internal multimodal stream emitted an invalid start event".to_string(),
+                );
+            }
+            self.saw_start = true;
+            return Ok(None);
+        }
+        if !self.saw_start {
+            return Err(
+                "the internal multimodal stream emitted output before its start event".to_string(),
+            );
+        }
+        if self.saw_end {
+            return Err(
+                "the internal multimodal stream emitted output after its end event".to_string(),
+            );
+        }
+        if chunk.as_str() == Some("End") {
+            self.saw_end = true;
+            return Ok(None);
+        }
+        let chunk = chunk
+            .as_object()
+            .filter(|chunk| chunk.len() == 1)
+            .ok_or_else(|| "the internal multimodal stream emitted an invalid chunk".to_string())?;
+        if chunk.contains_key("Metrics") {
+            if !chunk["Metrics"].is_object() {
+                return Err("the internal multimodal stream emitted invalid metrics".to_string());
+            }
+            return Ok(None);
+        }
+        let text = if let Some(text) = chunk.get("TextDelta") {
+            text.as_str().ok_or_else(|| {
+                "the internal multimodal stream emitted a non-text delta".to_string()
+            })?
+        } else if let Some(token) = chunk.get("VlmToken") {
+            let token = token.as_object().ok_or_else(|| {
+                "the internal multimodal stream emitted an invalid VLM token".to_string()
+            })?;
+            reject_ollama_object_fields(
+                token,
+                &["text", "bounding_box"],
+                "internal multimodal VLM token",
+            )?;
+            token
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    "the internal multimodal stream omitted VLM token text".to_string()
+                })?
+        } else {
+            return Err(
+                "the internal multimodal stream emitted an unsupported output chunk".to_string(),
+            );
+        };
+        self.output_bytes = self
+            .output_bytes
+            .checked_add(text.len())
+            .filter(|bytes| *bytes <= MAX_OLLAMA_STREAM_BYTES)
+            .ok_or_else(|| "the internal multimodal output exceeded its byte limit".to_string())?;
+        if collect {
+            self.buffered.push_str(text);
+            return Ok(None);
+        }
+        let mut output = self.base_payload()?;
+        match self.kind {
+            OllamaOutputKind::Chat => {
+                output["message"] = json!({"role": "assistant", "content": text});
+            }
+            OllamaOutputKind::Generate => output["response"] = json!(text),
+        }
+        Ok(Some(output))
+    }
+
+    fn validate_identity(
+        &mut self,
+        payload: &serde_json::Value,
+    ) -> std::result::Result<(), String> {
+        let id = payload
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| "the internal multimodal stream omitted its id".to_string())?;
+        let model = payload
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .filter(|model| !model.is_empty())
+            .ok_or_else(|| "the internal multimodal stream omitted its model".to_string())?;
+        let created = payload
+            .get("created")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                "the internal multimodal stream omitted its creation time".to_string()
+            })?;
+        if self.id.as_deref().is_some_and(|expected| expected != id)
+            || self
+                .internal_model
+                .as_deref()
+                .is_some_and(|expected| expected != model)
+            || self.created.is_some_and(|expected| expected != created)
+        {
+            return Err("the internal multimodal stream changed identity".to_string());
+        }
+        self.id.get_or_insert_with(|| id.to_string());
+        self.internal_model.get_or_insert_with(|| model.to_string());
+        self.created.get_or_insert(created);
+        Ok(())
+    }
+
+    fn base_payload(&self) -> std::result::Result<serde_json::Value, String> {
+        let created = self.created.ok_or_else(|| {
+            "the internal multimodal stream omitted its creation time".to_string()
+        })?;
+        Ok(ollama_base_payload(
+            &self.requested_model,
+            created,
+            self.kind,
+        ))
+    }
+
+    fn finish(&self, buffered: bool) -> std::result::Result<serde_json::Value, String> {
+        if !self.saw_start || !self.saw_end {
+            return Err(
+                "the internal multimodal stream omitted its start or end event".to_string(),
+            );
+        }
+        let mut payload = self.base_payload()?;
+        if buffered {
+            match self.kind {
+                OllamaOutputKind::Chat => {
+                    payload["message"] = json!({"role": "assistant", "content": self.buffered});
+                }
+                OllamaOutputKind::Generate => payload["response"] = json!(self.buffered),
+            }
+        }
+        add_ollama_terminal_without_usage(&mut payload, self.started.elapsed())?;
+        Ok(payload)
     }
 }
 
@@ -3247,6 +3842,20 @@ fn add_ollama_terminal_fields(
     Ok(())
 }
 
+fn add_ollama_terminal_without_usage(
+    payload: &mut serde_json::Value,
+    elapsed: Duration,
+) -> std::result::Result<(), String> {
+    let duration = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+    let object = payload
+        .as_object_mut()
+        .ok_or_else(|| "the Ollama adapter constructed an invalid payload".to_string())?;
+    object.insert("done".to_string(), json!(true));
+    object.insert("done_reason".to_string(), json!("stop"));
+    object.insert("total_duration".to_string(), json!(duration));
+    Ok(())
+}
+
 async fn adapt_ollama_error_response(
     response: axum::response::Response,
 ) -> axum::response::Response {
@@ -3580,6 +4189,23 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::ImageEncoder as _;
+
+    fn test_png_bytes() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut bytes)
+            .write_image(&[0, 0, 0, 255], 1, 1, image::ColorType::Rgba8)
+            .unwrap();
+        bytes
+    }
+
+    fn test_jpeg_bytes() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut bytes)
+            .encode(&[0, 0, 0], 1, 1, image::ColorType::Rgb8)
+            .unwrap();
+        bytes
+    }
 
     #[test]
     fn signed_acquisition_alias_is_the_stable_ollama_catalog_identity() {
@@ -3642,6 +4268,200 @@ mod tests {
         ] {
             assert!(parse_ollama_options(Some(&invalid)).is_err());
         }
+    }
+
+    #[test]
+    fn ollama_images_accept_only_one_bounded_canonical_png_or_jpeg() {
+        for (bytes, expected_mime) in [
+            (test_png_bytes(), "image/png"),
+            (test_jpeg_bytes(), "image/jpeg"),
+        ] {
+            let encoded = STANDARD.encode(&bytes);
+            let image = parse_ollama_images(Some(&json!([encoded])), "test")
+                .unwrap()
+                .unwrap();
+            assert_eq!(image.bytes, bytes);
+            assert_eq!(image.mime, expected_mime);
+        }
+        assert!(parse_ollama_images(None, "test").unwrap().is_none());
+        assert!(
+            parse_ollama_images(Some(&serde_json::Value::Null), "test")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            parse_ollama_images(Some(&json!([])), "test")
+                .unwrap()
+                .is_none()
+        );
+        for invalid in [
+            json!({}),
+            json!("not-an-array"),
+            json!([1]),
+            json!(["", "extra"]),
+            json!(["aGVs bG8="]),
+            json!(["data:image/png;base64,aGVsbG8="]),
+            json!([STANDARD.encode(b"not an image")]),
+        ] {
+            assert!(parse_ollama_images(Some(&invalid), "test").is_err());
+        }
+        let padded = STANDARD.encode(test_png_bytes());
+        let unpadded = padded.trim_end_matches('=');
+        assert_ne!(unpadded, padded);
+        assert!(parse_ollama_images(Some(&json!([unpadded])), "test").is_err());
+
+        let mut at_limit = test_png_bytes();
+        at_limit.resize(MAX_MULTIMODAL_IMAGE_BYTES, 0);
+        let encoded = STANDARD.encode(&at_limit);
+        let parsed = parse_ollama_images(Some(&json!([encoded])), "test")
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.bytes.len(), MAX_MULTIMODAL_IMAGE_BYTES);
+
+        at_limit.push(0);
+        let encoded = STANDARD.encode(at_limit);
+        assert!(parse_ollama_images(Some(&json!([encoded])), "test").is_err());
+    }
+
+    #[test]
+    fn ollama_image_requests_are_single_turn_and_preserve_image_only_input() {
+        let encoded = STANDARD.encode(test_png_bytes());
+        for content in [None, Some(""), Some("   ")] {
+            let mut message = json!({"role": "user", "images": [encoded.clone()]});
+            if let Some(content) = content {
+                message["content"] = json!(content);
+            }
+            let payload = serde_json::from_value::<OllamaChatRequest>(json!({
+                "model": "vision",
+                "messages": [message],
+                "stream": false
+            }))
+            .unwrap();
+            let (request, image) = ollama_chat_request(payload, false).unwrap();
+            let prepared = prepare_ollama_image_request(&request, image.unwrap()).unwrap();
+            let inference = prepared.into_inference_request();
+            assert_eq!(inference.blocks.len(), 1);
+            assert!(matches!(inference.blocks[0], DataBlock::Image { .. }));
+        }
+
+        let payload = serde_json::from_value::<OllamaGenerateRequest>(json!({
+            "model": "vision",
+            "images": [encoded.clone()],
+            "stream": false
+        }))
+        .unwrap();
+        let (request, image) = ollama_generate_request(payload, false).unwrap();
+        let inference = prepare_ollama_image_request(&request, image.unwrap())
+            .unwrap()
+            .into_inference_request();
+        assert_eq!(inference.blocks.len(), 1);
+        assert!(matches!(inference.blocks[0], DataBlock::Image { .. }));
+
+        let payload = serde_json::from_value::<OllamaChatRequest>(json!({
+            "model": "vision",
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "user", "content": "second", "images": [encoded]}
+            ]
+        }))
+        .unwrap();
+        let (request, image) = ollama_chat_request(payload, true).unwrap();
+        assert!(prepare_ollama_image_request(&request, image.unwrap()).is_err());
+    }
+
+    #[test]
+    fn ollama_image_requests_reject_incompatible_controls_before_activation() {
+        let encoded = STANDARD.encode(test_png_bytes());
+        for extra in [
+            json!({"tools": [{"type": "function"}]}),
+            json!({"format": "json"}),
+            json!({"options": {"stop": ["END"]}}),
+        ] {
+            let mut payload = json!({
+                "model": "vision",
+                "messages": [{
+                    "role": "user",
+                    "content": "describe",
+                    "images": [encoded.clone()]
+                }]
+            });
+            payload
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let payload = serde_json::from_value::<OllamaChatRequest>(payload).unwrap();
+            let (request, image) = ollama_chat_request(payload, true).unwrap();
+            assert!(prepare_ollama_image_request(&request, image.unwrap()).is_err());
+        }
+    }
+
+    #[test]
+    fn multimodal_stream_state_is_ordered_bounded_and_uses_the_requested_alias() {
+        let event = |chunk: serde_json::Value| {
+            json!({
+                "id": "mms-1",
+                "object": "multimodal.chunk",
+                "created": 1_700_000_000_u64,
+                "model": "internal-vision",
+                "chunk": chunk
+            })
+        };
+        let mut state = OllamaMultimodalStreamState::new(
+            OllamaOutputKind::Chat,
+            Instant::now(),
+            "vision-alias".to_string(),
+        );
+        assert!(
+            state
+                .ingest(event(serde_json::Value::Null), true)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            state
+                .ingest(event(json!({"TextDelta": "a"})), true)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            state
+                .ingest(
+                    event(json!({"VlmToken": {"text": "b", "bounding_box": null}})),
+                    true
+                )
+                .unwrap()
+                .is_none()
+        );
+        state
+            .ingest(event(json!({"Metrics": {"compute_ms": 1}})), true)
+            .unwrap();
+        state.ingest(event(json!("End")), true).unwrap();
+        let terminal = state.finish(true).unwrap();
+        assert_eq!(terminal["model"], "vision-alias");
+        assert_eq!(terminal["message"]["content"], "ab");
+        assert_eq!(terminal["done"], true);
+        assert!(terminal.get("eval_count").is_none());
+        assert!(terminal.get("prompt_eval_count").is_none());
+
+        let mut missing_start = OllamaMultimodalStreamState::new(
+            OllamaOutputKind::Generate,
+            Instant::now(),
+            "vision".to_string(),
+        );
+        assert!(
+            missing_start
+                .ingest(event(json!({"TextDelta": "early"})), false)
+                .is_err()
+        );
+        let mut missing_end = OllamaMultimodalStreamState::new(
+            OllamaOutputKind::Generate,
+            Instant::now(),
+            "vision".to_string(),
+        );
+        missing_end
+            .ingest(event(serde_json::Value::Null), false)
+            .unwrap();
+        assert!(missing_end.finish(false).is_err());
     }
 
     #[test]
@@ -3747,7 +4567,8 @@ mod tests {
             {"role": "tool", "tool_name": "lookup", "content": "18 C"}
         ]))
         .unwrap();
-        let messages = ollama_chat_messages(messages).unwrap();
+        let (messages, image) = ollama_chat_messages(messages).unwrap();
+        assert!(image.is_none());
         assert_eq!(messages.len(), 4);
         assert_eq!(
             messages[1].extensions["tool_calls"]

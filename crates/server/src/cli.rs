@@ -133,9 +133,17 @@ pub(crate) struct Args {
     #[arg(long, env = "BLOOM_CORS_ALLOW_ORIGIN", default_value = "same-origin")]
     pub cors_allow_origin: String,
 
-    /// Maximum JSON request body size in bytes.
+    /// Maximum request body size for standard JSON API routes.
     #[arg(long, env = "BLOOM_MAX_BODY_BYTES", default_value_t = 1024 * 1024)]
     pub max_body_bytes: usize,
+
+    /// Maximum JSON body size for Ollama chat/generate requests with inline base64 images.
+    #[arg(
+        long,
+        env = "BLOOM_MAX_OLLAMA_BODY_BYTES",
+        default_value_t = MAX_OLLAMA_ADAPTER_BODY_BYTES
+    )]
+    pub max_ollama_body_bytes: usize,
 
     /// Maximum multipart image upload size in bytes.
     #[arg(long, env = "BLOOM_MAX_UPLOAD_BYTES", default_value_t = 12 * MIB as usize)]

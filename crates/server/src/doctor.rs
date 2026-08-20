@@ -16,8 +16,8 @@ use super::model_index::validate_configuration as validate_model_index_configura
 use super::model_index_state::inspect_model_index_watermark_directory;
 use super::model_license::ModelLicensePolicy;
 use super::{
-    BrowserOriginPolicy, MAX_SHUTDOWN_TIMEOUT_SECONDS, ModelCatalog, engine_registry,
-    parse_browser_origin_policy, select_backend_name,
+    BrowserOriginPolicy, MAX_OLLAMA_ADAPTER_BODY_BYTES, MAX_SHUTDOWN_TIMEOUT_SECONDS, ModelCatalog,
+    engine_registry, parse_browser_origin_policy, select_backend_name,
 };
 
 const DOCTOR_SCHEMA_VERSION: u32 = 1;
@@ -284,7 +284,11 @@ fn server_argument_errors(args: &Args) -> Vec<String> {
     }
     for (name, value) in [
         ("Maximum tokens per scheduling step", args.max_num_tokens),
-        ("Maximum JSON body size", args.max_body_bytes),
+        ("Maximum standard JSON body size", args.max_body_bytes),
+        (
+            "Maximum Ollama image JSON body size",
+            args.max_ollama_body_bytes,
+        ),
         ("Maximum upload size", args.max_upload_bytes),
         (
             "Maximum model import chunk size",
@@ -294,6 +298,11 @@ fn server_argument_errors(args: &Args) -> Vec<String> {
         if value == 0 {
             errors.push(format!("{name} must be greater than zero."));
         }
+    }
+    if args.max_ollama_body_bytes > MAX_OLLAMA_ADAPTER_BODY_BYTES {
+        errors.push(format!(
+            "Maximum Ollama image JSON body size must not exceed {MAX_OLLAMA_ADAPTER_BODY_BYTES} bytes."
+        ));
     }
     if args.enable_model_downloads && args.max_model_download_bytes == 0 {
         errors.push(
@@ -975,6 +984,23 @@ mod tests {
         assert_eq!(text.doctor, Some(DoctorFormat::Text));
         assert_eq!(json.doctor, Some(DoctorFormat::Json));
         assert_eq!(text.cors_allow_origin, "same-origin");
+    }
+
+    #[test]
+    fn ollama_image_json_body_limit_is_explicit_and_bounded() {
+        let default = default_args();
+        assert_eq!(default.max_ollama_body_bytes, MAX_OLLAMA_ADAPTER_BODY_BYTES);
+        let configured =
+            Args::try_parse_from(["bloom_server", "--max-ollama-body-bytes", "2097152"]).unwrap();
+        assert_eq!(configured.max_ollama_body_bytes, 2 * 1024 * 1024);
+        assert!(validate_server_arguments(&configured).is_ok());
+
+        let mut zero = default.clone();
+        zero.max_ollama_body_bytes = 0;
+        assert!(validate_server_arguments(&zero).is_err());
+        let mut oversized = default;
+        oversized.max_ollama_body_bytes = MAX_OLLAMA_ADAPTER_BODY_BYTES + 1;
+        assert!(validate_server_arguments(&oversized).is_err());
     }
 
     #[test]

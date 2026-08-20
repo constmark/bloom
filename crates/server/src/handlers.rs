@@ -1931,7 +1931,26 @@ fn run_cancellable_text_inference(
 pub(crate) async fn handle_chat_completions(
     State(state): State<Arc<ServerState>>,
     Json(payload): Json<ChatRequest>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    handle_chat_completions_inner(state, payload, None).await
+}
+
+/// Execute a chat request against the exact runtime generation selected by an
+/// internal protocol adapter. This prevents an unload/reload with the same
+/// public model id from redirecting the request after adapter activation.
+pub(crate) async fn handle_chat_completions_for_runtime(
+    state: Arc<ServerState>,
+    payload: ChatRequest,
+    runtime: Arc<LoadedRuntime>,
+) -> axum::response::Response {
+    handle_chat_completions_inner(state, payload, Some(runtime)).await
+}
+
+async fn handle_chat_completions_inner(
+    state: Arc<ServerState>,
+    payload: ChatRequest,
+    exact_runtime: Option<Arc<LoadedRuntime>>,
+) -> axum::response::Response {
     if let Err(message) = validate_chat_request_compatibility(&payload) {
         return error_response(
             axum::http::StatusCode::BAD_REQUEST,
@@ -2026,10 +2045,22 @@ pub(crate) async fn handle_chat_completions(
         return model_unavailable_response(&state).await;
     }
 
-    let runtime = match state.resolve_runtime(payload.model.as_deref()).await {
-        Ok(Some(runtime)) => runtime,
-        Ok(None) => return model_unavailable_response(&state).await,
-        Err(error) => return requested_model_error_response(error),
+    let runtime = match exact_runtime {
+        Some(runtime) => {
+            if !state.runtime_pool.read().await.contains_exact(&runtime) {
+                return error_response(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "model_unavailable",
+                    "The selected model was unloaded before inference admission.",
+                );
+            }
+            runtime
+        }
+        None => match state.resolve_runtime(payload.model.as_deref()).await {
+            Ok(Some(runtime)) => runtime,
+            Ok(None) => return model_unavailable_response(&state).await,
+            Err(error) => return requested_model_error_response(error),
+        },
     };
     let model_id = runtime.model_id.clone();
     if model_supports_embeddings(&runtime.pipeline) {
@@ -4477,6 +4508,27 @@ async fn run_multimodal_request(
     payload: InferenceRequest,
     requested_model: Option<String>,
 ) -> axum::response::Response {
+    run_multimodal_request_inner(state, payload, requested_model, None).await
+}
+
+/// Run a multimodal request against the exact runtime selected by a protocol
+/// adapter. The runtime identity is rechecked while inference admission is
+/// held so a concurrent unload cannot silently redirect the request to a
+/// newer runtime with the same public model id.
+pub(crate) async fn run_multimodal_request_for_runtime(
+    state: Arc<ServerState>,
+    payload: InferenceRequest,
+    runtime: Arc<LoadedRuntime>,
+) -> axum::response::Response {
+    run_multimodal_request_inner(state, payload, None, Some(runtime)).await
+}
+
+async fn run_multimodal_request_inner(
+    state: Arc<ServerState>,
+    payload: InferenceRequest,
+    requested_model: Option<String>,
+    exact_runtime: Option<Arc<LoadedRuntime>>,
+) -> axum::response::Response {
     if let Err(message) = validate_multimodal_request(&payload) {
         return error_response(
             axum::http::StatusCode::BAD_REQUEST,
@@ -4489,10 +4541,22 @@ async fn run_multimodal_request(
         return model_unavailable_response(&state).await;
     }
 
-    let runtime = match state.resolve_runtime(requested_model.as_deref()).await {
-        Ok(Some(runtime)) => runtime,
-        Ok(None) => return model_unavailable_response(&state).await,
-        Err(error) => return requested_model_error_response(error),
+    let runtime = match exact_runtime {
+        Some(runtime) => {
+            if !state.runtime_pool.read().await.contains_exact(&runtime) {
+                return error_response(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "model_unavailable",
+                    "The selected model was unloaded before inference admission.",
+                );
+            }
+            runtime
+        }
+        None => match state.resolve_runtime(requested_model.as_deref()).await {
+            Ok(Some(runtime)) => runtime,
+            Ok(None) => return model_unavailable_response(&state).await,
+            Err(error) => return requested_model_error_response(error),
+        },
     };
     let model_id = runtime.model_id.clone();
     let pipeline = Arc::clone(&runtime.pipeline);
@@ -4501,6 +4565,27 @@ async fn run_multimodal_request(
         return error_response(
             axum::http::StatusCode::UNPROCESSABLE_ENTITY,
             "unsupported_modality",
+            message,
+        );
+    }
+    let prompt_tokens = match estimate_multimodal_context_tokens(&pipeline, &payload.blocks) {
+        Ok(tokens) => tokens,
+        Err(message) => {
+            return error_response(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "tokenization_error",
+                message,
+            );
+        }
+    };
+    if let Err(message) = validate_context_budget(
+        prompt_tokens,
+        payload.params.max_tokens,
+        pipeline.context_size(),
+    ) {
+        return error_response(
+            axum::http::StatusCode::BAD_REQUEST,
+            "context_length_exceeded",
             message,
         );
     }
@@ -4533,14 +4618,16 @@ async fn run_multimodal_request(
             metrics: Arc::clone(&state.metrics),
             request_start,
             generated_tokens: generated_count,
-            prompt_tokens: 0,
+            prompt_tokens: u64::try_from(prompt_tokens).unwrap_or(u64::MAX),
             permit,
         },
         StreamExecution::Blocking,
     );
     let worker_lifecycle = lifecycle.worker_guard();
+    let runtime_for_worker = Arc::clone(&runtime);
 
     task::spawn_blocking(move || {
+        let _runtime_guard = runtime_for_worker;
         let _worker_lifecycle = worker_lifecycle;
         let tx_clone = tx.clone();
         let run_res = pipeline_clone.run_request(payload, &mut |chunk: OutputChunk| {
@@ -4561,6 +4648,7 @@ async fn run_multimodal_request(
     let stream_failed_for_stream = Arc::clone(&stream_failed);
     let req_id_for_stream = request_id.clone();
     let model_id_clone = model_id.clone();
+    let created = unix_seconds();
 
     let sse_stream = ReceiverStream::new(rx).map(move |item| {
         let chunk = match item {
@@ -4568,7 +4656,7 @@ async fn run_multimodal_request(
                 json!({
                     "id": req_id_for_stream.clone(),
                     "object": "multimodal.chunk",
-                    "created": unix_seconds(),
+                    "created": created,
                     "model": model_id_clone.clone(),
                     "chunk": out_chunk,
                 })
@@ -4590,7 +4678,7 @@ async fn run_multimodal_request(
     let start_event = json_event(json!({
         "id": request_id,
         "object": "multimodal.chunk",
-        "created": unix_seconds(),
+        "created": created,
         "model": model_id,
         "chunk": null
     }));
@@ -4759,6 +4847,62 @@ pub(crate) fn validate_multimodal_modalities(
     Ok(())
 }
 
+fn estimate_multimodal_context_tokens(
+    pipeline: &InferencePipeline,
+    blocks: &[DataBlock],
+) -> std::result::Result<usize, String> {
+    let mut tokens = 0_usize;
+    for block in blocks {
+        match block {
+            DataBlock::Text(text) => {
+                let text_tokens = pipeline
+                    .tokenize(text)
+                    .map_err(|error| format!("Prompt tokenization failed: {error}"))?
+                    .len();
+                tokens = tokens
+                    .checked_add(text_tokens)
+                    .ok_or_else(|| "Multimodal context token count overflowed.".to_string())?;
+            }
+            DataBlock::Image { bytes, mime } => {
+                let (width, height) = uploaded_image_dimensions(bytes, mime)
+                    .map_err(|message| message.to_string())?;
+                let vision_tokens = estimate_multimodal_visual_tokens(width, height)?;
+                tokens = tokens
+                    .checked_add(vision_tokens)
+                    .ok_or_else(|| "Multimodal context token count overflowed.".to_string())?;
+            }
+            _ => {}
+        }
+    }
+    Ok(tokens)
+}
+
+pub(crate) fn estimate_multimodal_visual_tokens(
+    width: u32,
+    height: u32,
+) -> std::result::Result<usize, String> {
+    const VISION_RESIZE_ALIGNMENT: usize = 32;
+    if width == 0 || height == 0 {
+        return Err("Image dimensions must be non-zero.".to_string());
+    }
+    let align = |dimension: u32| {
+        usize::try_from(dimension)
+            .map_err(|_| "Image dimension exceeded this platform.".to_string())?
+            .checked_add(VISION_RESIZE_ALIGNMENT - 1)
+            .map(|value| value / VISION_RESIZE_ALIGNMENT * VISION_RESIZE_ALIGNMENT)
+            .ok_or_else(|| "Aligned image dimension overflowed this platform.".to_string())
+    };
+    let aligned_pixels = align(width)?
+        .checked_mul(align(height)?)
+        .ok_or_else(|| "Aligned image pixel count overflowed this platform.".to_string())?;
+    let resized_pixels =
+        aligned_pixels.clamp(MIN_MULTIMODAL_VISION_PIXELS, MAX_MULTIMODAL_VISION_PIXELS);
+    resized_pixels
+        .div_ceil(MULTIMODAL_VISION_PIXELS_PER_TOKEN)
+        .checked_add(MULTIMODAL_VISION_TOKEN_OVERHEAD)
+        .ok_or_else(|| "Multimodal visual token estimate overflowed.".to_string())
+}
+
 pub(crate) fn validate_uploaded_image(bytes: &[u8], mime: &str) -> Result<(), &'static str> {
     let expected = match mime {
         "image/jpeg" => image::ImageFormat::Jpeg,
@@ -4769,7 +4913,36 @@ pub(crate) fn validate_uploaded_image(bytes: &[u8], mime: &str) -> Result<(), &'
         Ok(actual) if actual == expected => Ok(()),
         Ok(_) => Err("Image content does not match its declared media type."),
         Err(_) => Err("Image attachment has an invalid or unsupported file signature."),
+    }?;
+    let (width, height) = uploaded_image_dimensions(bytes, mime)?;
+    let pixels = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or("Image dimensions overflow the supported pixel count.")?;
+    if width == 0 || height == 0 || pixels > MAX_MULTIMODAL_IMAGE_PIXELS {
+        return Err("Image dimensions exceed the supported pixel count.");
     }
+    if width > MAX_MULTIMODAL_IMAGE_DIMENSION || height > MAX_MULTIMODAL_IMAGE_DIMENSION {
+        return Err("Image dimensions exceed the supported width or height.");
+    }
+    let shorter = width.min(height);
+    let longer = width.max(height);
+    if u64::from(longer)
+        > u64::from(shorter).saturating_mul(u64::from(MAX_MULTIMODAL_IMAGE_ASPECT_RATIO))
+    {
+        return Err("Image aspect ratio exceeds the supported limit.");
+    }
+    Ok(())
+}
+
+fn uploaded_image_dimensions(bytes: &[u8], mime: &str) -> Result<(u32, u32), &'static str> {
+    let format = match mime {
+        "image/jpeg" => image::ImageFormat::Jpeg,
+        "image/png" => image::ImageFormat::Png,
+        _ => return Err("Image attachment must be a JPEG or PNG file."),
+    };
+    image::io::Reader::with_format(std::io::Cursor::new(bytes), format)
+        .into_dimensions()
+        .map_err(|_| "Image attachment has an invalid or incomplete header.")
 }
 
 #[derive(Debug, Clone, Deserialize)]

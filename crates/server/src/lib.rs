@@ -149,6 +149,7 @@ const MAX_CHAT_CONTENT_PARTS: usize = 256;
 const MAX_CHAT_CONTENT_BYTES: usize = 768 * 1024;
 const MAX_CHAT_USER_MESSAGE_CHARS: usize = 262_144;
 const MAX_CHAT_SYSTEM_MESSAGE_CHARS: usize = 65_536;
+const MAX_OLLAMA_ADAPTER_BODY_BYTES: usize = 16 * MIB as usize;
 const MAX_RESPONSES_ADAPTER_BODY_BYTES: usize = 16 * MIB as usize;
 const MAX_RESPONSES_STREAM_FRAME_BYTES: usize = MIB as usize;
 const MAX_RESPONSES_STREAM_OUTPUT_BYTES: usize = 16 * MIB as usize;
@@ -171,6 +172,13 @@ const MAX_MULTIMODAL_BLOCKS: usize = 3;
 const MAX_MULTIMODAL_TEXT_CHARS: usize = 262_144;
 const MAX_MULTIMODAL_TEXT_BYTES: usize = 768 * 1024;
 const MAX_MULTIMODAL_IMAGE_BYTES: usize = 10 * MIB as usize;
+const MAX_MULTIMODAL_IMAGE_PIXELS: u64 = 16_777_216;
+const MAX_MULTIMODAL_IMAGE_DIMENSION: u32 = 16_384;
+const MAX_MULTIMODAL_IMAGE_ASPECT_RATIO: u32 = 200;
+const MIN_MULTIMODAL_VISION_PIXELS: usize = 65_536;
+const MAX_MULTIMODAL_VISION_PIXELS: usize = 16_777_216;
+const MULTIMODAL_VISION_PIXELS_PER_TOKEN: usize = 1_024;
+const MULTIMODAL_VISION_TOKEN_OVERHEAD: usize = 256;
 const MIN_MULTIMODAL_AUDIO_SAMPLE_RATE: u32 = 8_000;
 const MAX_MULTIMODAL_AUDIO_SAMPLE_RATE: u32 = 48_000;
 const MAX_MULTIMODAL_AUDIO_SECONDS: usize = 600;
@@ -628,6 +636,7 @@ struct ServerState {
     metrics: Arc<ServerMetrics>,
     speculative_mode: String,
     enable_ifb: bool,
+    max_ollama_body_bytes: usize,
     /// Per-request cancellation tokens.
     cancel_tokens: Arc<std::sync::Mutex<HashMap<String, CancellationToken>>>,
     /// Monotonic suffix for OpenAI-compatible request IDs.
@@ -1503,8 +1512,14 @@ fn ollama_api_router(state: Arc<ServerState>) -> Router<Arc<ServerState>> {
         .route("/tags", get(handle_ollama_tags))
         .route("/ps", get(handle_ollama_ps))
         .route("/show", post(handle_ollama_show))
-        .route("/chat", post(handle_ollama_chat))
-        .route("/generate", post(handle_ollama_generate))
+        .route(
+            "/chat",
+            post(handle_ollama_chat).layer(DefaultBodyLimit::max(state.max_ollama_body_bytes)),
+        )
+        .route(
+            "/generate",
+            post(handle_ollama_generate).layer(DefaultBodyLimit::max(state.max_ollama_body_bytes)),
+        )
         .route("/embed", post(handle_ollama_embed))
         .route("/embeddings", post(handle_ollama_legacy_embeddings))
         .route_layer(middleware::from_fn_with_state(
@@ -1773,6 +1788,7 @@ async fn run_server(args: Args, config_path: PathBuf) -> Result<()> {
         metrics: Arc::new(ServerMetrics::new()),
         speculative_mode: args.speculative.clone(),
         enable_ifb: args.enable_ifb,
+        max_ollama_body_bytes: args.max_ollama_body_bytes,
         cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
         request_counter: AtomicU64::new(0),
         api_key: args.api_key.clone().filter(|value| !value.is_empty()),
@@ -2601,8 +2617,44 @@ mod tests {
     use super::*;
     use crate::model_download::ModelDownloadPhase;
     use bloomai_engine::scheduler::kv_hook::KvHook;
+    use image::ImageEncoder as _;
     use sha2::{Digest as _, Sha256};
     use tower::ServiceExt as _;
+
+    fn tiny_png_bytes() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut bytes)
+            .write_image(&[0, 0, 0, 255], 1, 1, image::ColorType::Rgba8)
+            .unwrap();
+        bytes
+    }
+
+    fn tiny_jpeg_bytes() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut bytes)
+            .encode(&[0, 0, 0], 1, 1, image::ColorType::Rgb8)
+            .unwrap();
+        bytes
+    }
+
+    fn png_with_dimensions(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = tiny_png_bytes();
+        bytes[16..20].copy_from_slice(&width.to_be_bytes());
+        bytes[20..24].copy_from_slice(&height.to_be_bytes());
+        let mut crc = u32::MAX;
+        for byte in &bytes[12..29] {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 {
+                    (crc >> 1) ^ 0xedb8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        bytes[29..33].copy_from_slice(&(!crc).to_be_bytes());
+        bytes
+    }
 
     struct StreamDropFlag(Arc<AtomicBool>);
 
@@ -2787,6 +2839,93 @@ mod tests {
                 self.emitted_chunks.fetch_add(1, Ordering::Relaxed);
                 sink.on_chunk(OutputChunk::TextDelta(text.to_string()))?;
             }
+            sink.on_chunk(OutputChunk::End)?;
+            Ok(())
+        }
+    }
+
+    struct TestVisionEngine {
+        requests: Arc<AtomicU64>,
+    }
+
+    impl bloomai_engine::Engine for TestVisionEngine {
+        fn name(&self) -> &'static str {
+            "test-vision"
+        }
+
+        fn supported_modalities(&self) -> Vec<bloomai_core::Modality> {
+            vec![bloomai_core::Modality::Multi]
+        }
+
+        fn supported_devices(&self) -> Vec<DeviceKind> {
+            vec![DeviceKind::Cpu]
+        }
+
+        fn load(
+            &self,
+            _model_path: &Path,
+            _device: DeviceKind,
+        ) -> Result<Box<dyn bloomai_engine::LoadedModel>> {
+            let manifest = bloomai_core::ModelManifest {
+                id: "test-vision-model".to_string(),
+                ..bloomai_core::ModelManifest::default()
+            };
+            Ok(Box::new(TestVisionModel {
+                metadata: bloomai_engine::ModelMetadata {
+                    id: "test-vision-model".to_string(),
+                    modality: bloomai_core::Modality::Multi,
+                    quantized: false,
+                    manifest,
+                },
+                requests: Arc::clone(&self.requests),
+            }))
+        }
+    }
+
+    struct TestVisionModel {
+        metadata: bloomai_engine::ModelMetadata,
+        requests: Arc<AtomicU64>,
+    }
+
+    impl bloomai_engine::LoadedModel for TestVisionModel {
+        fn metadata(&self) -> &bloomai_engine::ModelMetadata {
+            &self.metadata
+        }
+
+        fn infer(
+            &self,
+            _input: ModelInput,
+            _params: &GenerationParams,
+        ) -> Result<bloomai_engine::ModelOutput> {
+            Ok(bloomai_engine::ModelOutput {
+                text: Some("vision ok".to_string()),
+                logits: None,
+                image: None,
+                audio: None,
+                video: None,
+            })
+        }
+
+        fn infer_stream(
+            &self,
+            input: ModelInput,
+            _params: &GenerationParams,
+            sink: &mut dyn bloomai_engine::model::OutputSink,
+        ) -> Result<()> {
+            let has_image = match input {
+                ModelInput::Vision { bytes, .. } => !bytes.is_empty(),
+                ModelInput::Multi { image, .. } => image.is_some_and(|bytes| !bytes.is_empty()),
+                _ => false,
+            };
+            if !has_image {
+                return Err(anyhow!("test vision model requires an image"));
+            }
+            self.requests.fetch_add(1, Ordering::Relaxed);
+            sink.on_chunk(OutputChunk::TextDelta("vision ".to_string()))?;
+            sink.on_chunk(OutputChunk::VlmToken {
+                text: "ok".to_string(),
+                bounding_box: None,
+            })?;
             sink.on_chunk(OutputChunk::End)?;
             Ok(())
         }
@@ -5261,6 +5400,54 @@ mod tests {
         state
     }
 
+    async fn test_server_state_with_vision_runtime(
+        models_root: PathBuf,
+    ) -> (Arc<ServerState>, Arc<AtomicU64>) {
+        let (state, _receiver) = test_server_state(models_root.clone());
+        let model_path = models_root.join("test-vision-model.fixture");
+        std::fs::write(&model_path, b"bounded vision fixture").unwrap();
+        let requests = Arc::new(AtomicU64::new(0));
+        let pipeline = Arc::new(
+            InferencePipeline::load_standalone_with_context(
+                &TestVisionEngine {
+                    requests: Arc::clone(&requests),
+                },
+                DeviceKind::Cpu,
+                &model_path,
+                2_048,
+            )
+            .unwrap(),
+        );
+        let manifest = pipeline.metadata().manifest.clone();
+        let runtime = Arc::new(LoadedRuntime {
+            model_id: pipeline.metadata().id.clone(),
+            model_family: manifest.family.clone(),
+            model_architecture: Some("qwen3_vl".to_string()),
+            model_chat_template: None,
+            input_modalities: vec![bloomai_core::Modality::Multi],
+            memory_estimate: bloomai_engine::estimate_memory(&manifest, 2_048),
+            pipeline,
+            kv_cache_pool: None,
+            cachemesh: None,
+            scheduler: None,
+            _memory_reservation: None,
+            scheduler_shutdown: CancellationToken::new(),
+            published_at: unix_seconds(),
+            source_path: model_path,
+            catalog_id: None,
+        });
+        assert!(
+            state
+                .runtime_pool
+                .write()
+                .await
+                .publish_default(runtime)
+                .is_empty()
+        );
+        state.ready.store(true, Ordering::Release);
+        (state, requests)
+    }
+
     fn test_text_runtime(
         model_path: PathBuf,
         emitted_chunks: Arc<AtomicU64>,
@@ -5377,6 +5564,7 @@ mod tests {
                 metrics: Arc::new(ServerMetrics::new()),
                 speculative_mode: "none".to_string(),
                 enable_ifb: false,
+                max_ollama_body_bytes: MAX_OLLAMA_ADAPTER_BODY_BYTES,
                 cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
                 request_counter: AtomicU64::new(0),
                 api_key: None,
@@ -5817,7 +6005,7 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .method("POST")
-                    .uri("/api/chat")
+                    .uri("/api/embed")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(axum::body::Body::from(
                         "{\"model\":\"default\",\"padding\":\"0123456789\"}",
@@ -6015,6 +6203,298 @@ mod tests {
             assert!(admitted["error"].is_string());
             assert!(admitted.get("type").is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn ollama_chat_and_generate_accept_bounded_vision_images() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, requests) =
+            test_server_state_with_vision_runtime(temp.path().to_path_buf()).await;
+        let app = Router::new()
+            .nest("/api", ollama_api_router(Arc::clone(&state)))
+            .with_state(state)
+            .layer(DefaultBodyLimit::max(MIB as usize));
+
+        let mut larger_than_default_body = tiny_png_bytes();
+        larger_than_default_body.resize(MIB as usize + 1, 0);
+        let encoded = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            larger_than_default_body,
+        );
+        let chat = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/chat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "test-vision-model",
+                            "messages": [{"role": "user", "images": [encoded]}],
+                            "stream": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(chat.status(), axum::http::StatusCode::OK);
+        let chat: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(chat.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(chat["model"], "test-vision-model");
+        assert_eq!(chat["message"]["content"], "vision ok");
+        assert_eq!(chat["done"], true);
+        assert!(chat.get("eval_count").is_none());
+
+        let encoded =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, tiny_png_bytes());
+        let generate = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/generate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "test-vision-model",
+                            "prompt": "describe",
+                            "images": [encoded],
+                            "stream": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(generate.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            generate.headers()[header::CONTENT_TYPE],
+            "application/x-ndjson"
+        );
+        let body = axum::body::to_bytes(generate.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let lines = std::str::from_utf8(&body)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0]["response"], "vision ");
+        assert_eq!(lines[1]["response"], "ok");
+        assert_eq!(lines[2]["response"], "");
+        assert_eq!(lines[2]["done"], true);
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
+
+        let encoded =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, tiny_png_bytes());
+        let over_context = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/generate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "test-vision-model",
+                            "prompt": "word ".repeat(2_048),
+                            "images": [encoded],
+                            "stream": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(over_context.status(), axum::http::StatusCode::BAD_REQUEST);
+        let over_context: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(over_context.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(over_context["error"].as_str().unwrap().contains("context"));
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
+
+        let oversized = format!(
+            "{{\"padding\":\"{}\"}}",
+            "x".repeat(MAX_OLLAMA_ADAPTER_BODY_BYTES)
+        );
+        let rejected = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/chat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(oversized))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn ollama_image_json_body_limit_can_be_tightened_independently() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut state, _receiver) = test_server_state(temp.path().to_path_buf());
+        Arc::get_mut(&mut state).unwrap().max_ollama_body_bytes = 1_024;
+        let app = Router::new()
+            .nest("/api", ollama_api_router(Arc::clone(&state)))
+            .with_state(state)
+            .layer(DefaultBodyLimit::max(MAX_OLLAMA_ADAPTER_BODY_BYTES));
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/chat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({"padding": "x".repeat(1_024)}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn ollama_images_fail_closed_before_or_at_modality_admission() {
+        let encoded =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, tiny_png_bytes());
+        let temp = tempfile::tempdir().unwrap();
+        let (empty_state, _receiver) = test_server_state(temp.path().to_path_buf());
+        let empty_app = Router::new()
+            .nest("/api", ollama_api_router(Arc::clone(&empty_state)))
+            .with_state(empty_state);
+        let invalid_controls = empty_app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/chat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "missing",
+                            "messages": [{
+                                "role": "user",
+                                "content": "describe",
+                                "images": [encoded.clone()]
+                            }],
+                            "tools": [{"type": "function"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            invalid_controls.status(),
+            axum::http::StatusCode::BAD_REQUEST
+        );
+
+        let text_root = temp.path().join("text");
+        std::fs::create_dir_all(&text_root).unwrap();
+        let text_state =
+            test_server_state_with_text_runtime(text_root, Arc::new(AtomicU64::new(0))).await;
+        let text_app = Router::new()
+            .nest("/api", ollama_api_router(Arc::clone(&text_state)))
+            .with_state(text_state);
+        let unsupported = text_app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/generate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "test-text-model",
+                            "prompt": "describe",
+                            "images": [encoded],
+                            "stream": false
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            unsupported.status(),
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(unsupported.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(body["error"].as_str().unwrap().contains("Vision"));
+    }
+
+    #[tokio::test]
+    async fn exact_chat_runtime_rejects_a_same_model_id_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, _receiver) = test_server_state(temp.path().to_path_buf());
+        let old_chunks = Arc::new(AtomicU64::new(0));
+        let new_chunks = Arc::new(AtomicU64::new(0));
+        let old_runtime = test_text_runtime_with_id(
+            temp.path().join("old.fixture"),
+            "shared-model",
+            Arc::clone(&old_chunks),
+        );
+        let new_runtime = test_text_runtime_with_id(
+            temp.path().join("new.fixture"),
+            "shared-model",
+            Arc::clone(&new_chunks),
+        );
+        assert!(
+            state
+                .runtime_pool
+                .write()
+                .await
+                .publish_default(Arc::clone(&old_runtime))
+                .is_empty()
+        );
+        state.ready.store(true, Ordering::Release);
+        let retired = state
+            .runtime_pool
+            .write()
+            .await
+            .publish_default(new_runtime);
+        assert_eq!(retired.len(), 1);
+        assert!(Arc::ptr_eq(&retired[0], &old_runtime));
+
+        let request = serde_json::from_value::<ChatRequest>(json!({
+            "model": "shared-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": false
+        }))
+        .unwrap();
+        let response = handle_chat_completions_for_runtime(
+            Arc::clone(&state),
+            request,
+            Arc::clone(&old_runtime),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(old_chunks.load(Ordering::Relaxed), 0);
+        assert_eq!(new_chunks.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -9277,7 +9757,7 @@ mod tests {
             "--{boundary}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nWhat is shown?\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"tiny.png\"\r\nContent-Type: image/png\r\n\r\n"
         )
         .into_bytes();
-        body.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        body.extend_from_slice(&tiny_png_bytes());
         body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
         let request = axum::http::Request::builder()
             .method("POST")
@@ -10840,7 +11320,7 @@ mod tests {
         let valid = test_multimodal_request(vec![
             DataBlock::Text("Describe this image.".to_string()),
             DataBlock::Image {
-                bytes: b"\x89PNG\r\n\x1a\n".to_vec(),
+                bytes: tiny_png_bytes(),
                 mime: "image/png".to_string(),
             },
         ]);
@@ -10923,9 +11403,23 @@ mod tests {
 
     #[test]
     fn image_upload_signature_must_match_declared_mime() {
-        assert!(validate_uploaded_image(b"\x89PNG\r\n\x1a\n", "image/png").is_ok());
-        assert!(validate_uploaded_image(b"\x89PNG\r\n\x1a\n", "image/jpeg").is_err());
+        let png = tiny_png_bytes();
+        let jpeg = tiny_jpeg_bytes();
+        assert!(validate_uploaded_image(&png, "image/png").is_ok());
+        assert!(validate_uploaded_image(&jpeg, "image/jpeg").is_ok());
+        assert!(validate_uploaded_image(&png, "image/jpeg").is_err());
         assert!(validate_uploaded_image(b"not an image", "image/png").is_err());
+        assert!(validate_uploaded_image(&png_with_dimensions(4_097, 4_097), "image/png").is_err());
+        assert!(validate_uploaded_image(&png_with_dimensions(16_385, 100), "image/png").is_err());
+        assert!(validate_uploaded_image(&png_with_dimensions(1_000, 1), "image/png").is_err());
+    }
+
+    #[test]
+    fn multimodal_context_estimate_accounts_for_vision_resize_alignment() {
+        assert_eq!(estimate_multimodal_visual_tokens(1, 1).unwrap(), 320);
+        let aligned = estimate_multimodal_visual_tokens(16_368, 1_008).unwrap();
+        assert_eq!(aligned, 16_640);
+        assert!(validate_context_budget(aligned, 128, 16_767).is_err());
     }
 
     #[test]
