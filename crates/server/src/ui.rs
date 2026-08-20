@@ -17,13 +17,12 @@ use std::time::{Duration, Instant};
 
 #[cfg(any(feature = "serve-ui", test))]
 use axum::http::{HeaderName, HeaderValue};
+use axum::{Router, routing::get};
 #[cfg(feature = "serve-ui")]
 use axum::{
-    Router,
     body::Body,
     http::{HeaderMap, Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
-    routing::get,
 };
 #[cfg(feature = "serve-ui")]
 use rust_embed::Embed;
@@ -151,11 +150,12 @@ pub fn launch_browser(url: &str) -> io::Result<()> {
     try_browser_commands(url, run_browser_command)
 }
 
-#[cfg(not(feature = "serve-ui"))]
-use axum::Router;
-
-/// Build the router that serves the embedded UI, or `None` when the
-/// `serve-ui` feature is disabled.
+/// Build the root router.
+///
+/// UI-enabled builds serve the embedded application at `/`. API-only builds
+/// keep the same root path available as an Ollama-compatible liveness
+/// heartbeat so official clients can discover the server before using
+/// `/api/*` routes.
 #[cfg(feature = "serve-ui")]
 pub fn ui_router() -> Option<Router> {
     Some(
@@ -167,7 +167,12 @@ pub fn ui_router() -> Option<Router> {
 
 #[cfg(not(feature = "serve-ui"))]
 pub fn ui_router() -> Option<Router> {
-    None
+    Some(Router::new().route("/", get(serve_ollama_heartbeat)))
+}
+
+#[cfg(not(feature = "serve-ui"))]
+async fn serve_ollama_heartbeat() -> &'static str {
+    "Ollama is running\n"
 }
 
 #[cfg(feature = "serve-ui")]
@@ -272,6 +277,78 @@ fn apply_ui_security_headers(mut response: Response) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn root_route_supports_the_ollama_heartbeat_contract() {
+        use tower::ServiceExt as _;
+
+        let app = ui_router().expect("the root router is always available");
+        let head = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::HEAD)
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(head.status(), axum::http::StatusCode::OK);
+        assert!(
+            axum::body::to_bytes(head.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let get = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get.status(), axum::http::StatusCode::OK);
+
+        #[cfg(not(feature = "serve-ui"))]
+        {
+            assert_eq!(
+                get.headers()[axum::http::header::CONTENT_TYPE],
+                "text/plain; charset=utf-8"
+            );
+            assert_eq!(
+                axum::body::to_bytes(get.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+                "Ollama is running\n"
+            );
+        }
+
+        #[cfg(feature = "serve-ui")]
+        {
+            assert_eq!(get.headers()[header::CONTENT_TYPE], "text/html");
+            let body = axum::body::to_bytes(get.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(String::from_utf8_lossy(&body).contains("<title>Bloom"));
+        }
+
+        let post = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(!post.status().is_success());
+    }
 
     #[test]
     fn spa_fallback_requires_html_navigation_outside_protocol_namespaces() {
