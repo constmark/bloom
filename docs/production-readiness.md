@@ -76,7 +76,10 @@ non-container macOS and Windows archive builders.
   SBOM gate to any future official container image, including final-layer
   package inventory and signed image provenance.
 - Split the largest server, CLI, scheduler, executor, and browser modules so
-  security and lifecycle boundaries remain reviewable as features grow.
+  security and lifecycle boundaries remain reviewable as features grow. Loaded
+  runtime ownership now has a focused bounded pool, exact draining leases, and
+  aggregate host/device memory admission, but the surrounding composition and
+  handler modules remain oversized.
 
 ## Operational boundaries
 

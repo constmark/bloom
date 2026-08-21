@@ -91,6 +91,21 @@ called out in release notes.
 
 ### Runtime
 
+- Introduce a bounded runtime pool with exact model/source resolution,
+  configurable `max_loaded_models`, deterministic retirement, and generation
+  leases that let admitted requests finish after logical unload or replacement.
+  OpenAI and Ollama routing, readiness, discovery, cancellation, residency
+  timers, catalog protection, and draining now operate on the selected runtime
+  rather than a global single-model slot.
+- Enforce aggregate host/device memory admission across resident, loading, and
+  draining runtime generations. Strict manifest/artifact accounting, cgroup and
+  CUDA probes, transactional RAII permits, IFB worker ownership, and preflight
+  schema v2 prevent model-count capacity from oversubscribing physical memory;
+  disabling page-touch preallocation no longer disables the hard ledger.
+- Fail the production UI build before touching generated assets when the
+  installed Dioxus CLI is missing, malformed, or differs from the locked
+  `0.7.10` UI dependencies. Regression tests cover exact, stale, malformed,
+  failed, and missing version probes.
 - Freeze legacy environment-backed engine settings before constructing the
   multi-threaded server runtime. The server bootstrap and standalone inference
   CLI no longer mutate the process environment after worker threads may exist.

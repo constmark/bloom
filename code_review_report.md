@@ -332,7 +332,7 @@ process-lifecycle boundary.
 | Priority | Remaining gap | Exit condition |
 | --- | --- | --- |
 | P1 | UI `main.rs`/`api.rs`, server handlers and model-management modules, and Candle executors remain too large | Continue behavior-preserving splits by protocol and runtime ownership, with focused tests per extracted module |
-| P1 | C ABI streaming still lacks cancellation and length-delimited string inputs | Ship a versioned ABI revision and migration path before declaring stability |
+| P1 | Native integration still lacks binary wheels and packaged old/new shared-library compatibility evidence | Publish supported wheels, declare the compatibility window, and test packaged ABI combinations on every supported target |
 | P1 | Metal/CUDA benchmark evidence is not a required cross-platform release artifact | Publish reproducible hardware profiles using the benchmark schema |
 | P2 | `paste` 1.0.15 is an unmaintained transitive dependency through Candle/gemm/tokenizers | Track upstream replacement and remove it when the model stack supports a compatible release |
 | P2 | ONNX, TensorRT, CoreML, MLX, and Vulkan remain truthful diagnostic skeletons | Keep them non-routable until an executable adapter has pinned runtime evidence |
@@ -405,3 +405,24 @@ This is evidence for the audited empty state, not an automated release gate.
 Cross-browser keyboard flows, browser downloads/clipboard, screen-reader
 behavior, and an automated accessibility scanner remain in the high-priority
 register.
+
+## 12. Runtime Residency and Memory Iteration (2026-08-21)
+
+Loaded-model ownership now crosses a focused bounded `RuntimePool` instead of
+exposing `RwLock<Option<Arc<LoadedRuntime>>>` throughout server modules. The
+pool centralizes default and exact selection, source matching,
+publication/removal, capacity retirement, and snapshots. Request leases retain
+the exact runtime generation through synchronous, streaming, and IFB execution;
+logical unload removes new admission immediately while physical resources drain
+outside pool locks. Ollama residency timers use exact identities and idle-only
+expiry so stale policies cannot unload replacements or active requests.
+
+Multi-runtime publication is guarded by two independent hard limits: the
+discoverable `max_loaded_models` capacity plus one physical-generation
+headroom, and a transactional host/device byte ledger spanning resident,
+candidate, draining, and scheduler-worker lifetimes. Preflight schema v2 and
+runtime observability expose domain-separated required, committed, available,
+and limit values. Strict cgroup/CUDA probes and manifest artifact accounting
+fail closed when the physical placement cannot be verified. The remaining
+code-structure priority is behavior-preserving decomposition of the oversized
+handler, composition, UI, and Candle executor modules.

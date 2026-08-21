@@ -49,6 +49,7 @@ static site or embed it in the server binary.
   validated HTTP request IDs for log correlation
 - Versioned browser persistence with legacy migration and corruption recovery
 - Labelled, keyboard-contained drawers and dialogs with Escape dismissal, focus restoration, and reduced-motion support
+- Semantic document/landmark hierarchy and polite live runtime-status announcements
 - Responsive layout for desktop and mobile browsers
 
 ## Development
@@ -490,10 +491,12 @@ just ui-clippy
 Pure conversation-state, archive-merge, submission-preflight, history-window,
 streaming-protocol, and modal keyboard-boundary tests run on the host. The UI
 type check targets `wasm32-unknown-unknown`, matching production builds. Before
-a release, validate initial focus, Tab and Shift+Tab
-cycling, Escape dismissal, opener-focus restoration, accessible names and
-descriptions, and reduced-motion behavior in every supported browser with the
-target assistive technology.
+a release, validate initial focus, Tab and Shift+Tab cycling, Escape dismissal,
+opener-focus restoration, accessible names and descriptions, status
+announcements, and reduced-motion behavior in every supported browser with the
+target assistive technology. The embedded empty state and Models/Settings
+controls have a manual Chromium accessibility-tree and keyboard audit; this
+does not replace the target-browser release check.
 
 ### Embedded in bloom_server
 

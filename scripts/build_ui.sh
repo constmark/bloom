@@ -9,11 +9,7 @@ PUBLIC_DIR="${UI_DIR}/target/dx/bloom-ui/release/web/public"
 BUILD_LOG="$(mktemp)"
 trap 'rm -f "$BUILD_LOG"' EXIT
 
-if ! command -v dx >/dev/null 2>&1; then
-    echo "Error: dx is required to build the Bloom UI." >&2
-    echo "Install it with: cargo install dioxus-cli --version 0.7.10 --locked" >&2
-    exit 1
-fi
+bash "${WORKSPACE_DIR}/scripts/check_ui_tool_version.sh"
 
 # Dioxus fingerprints assets but does not remove previous fingerprints. Clean
 # only its generated public directory so a release cannot retain stale bundles.

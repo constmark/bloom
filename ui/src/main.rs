@@ -1243,7 +1243,9 @@ fn App() -> Element {
         document::Stylesheet { href: STYLE }
         div { class: "shell",
             if !show_specialized_workspace {
-                aside { class: if show_sidebar() { "sidebar open" } else { "sidebar" },
+                aside {
+                class: if show_sidebar() { "sidebar open" } else { "sidebar" },
+                aria_label: "Conversations",
                 div { class: "sidebar-header",
                     div { class: "sidebar-title", "Conversations" }
                     button {
@@ -1476,7 +1478,7 @@ fn App() -> Element {
                         }
                         div { class: "brand-logo", "B" }
                         div {
-                            div { class: "brand-title", "Bloom" }
+                            h1 { class: "brand-title", "Bloom" }
                             div { class: "brand-sub",
                                 if show_speech_workspace {
                                     "Live speech to text"
@@ -1489,7 +1491,11 @@ fn App() -> Element {
                         }
                     }
                     div { class: "header-actions",
-                        span { class: "status-pill {status_view.0}",
+                        span {
+                            class: "status-pill {status_view.0}",
+                            role: "status",
+                            aria_live: "polite",
+                            aria_atomic: "true",
                             span { class: "status-dot" }
                             "{status_view.1}"
                         }

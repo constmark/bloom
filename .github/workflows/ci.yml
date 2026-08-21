@@ -52,6 +52,8 @@ jobs:
         run: python3 scripts/test_create_release_archive.py
       - name: Check Rust toolchain consistency
         run: python3 scripts/check_toolchain_consistency.py
+      - name: Test Dioxus CLI version gate
+        run: python3 scripts/test_ui_tool_version.py
       - name: Check dependency policy and SBOM contract
         run: |
           host_target=$(rustc -vV | awk '/^host:/ {print $2}')
