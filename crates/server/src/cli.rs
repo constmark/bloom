@@ -83,7 +83,7 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = 2048)]
     pub context_size: usize,
 
-    /// Fraction of currently available memory Bloom may plan to use at startup.
+    /// Hard fraction of detected host/device memory available to all live runtime generations.
     #[arg(long, env = "BLOOM_MEMORY_UTILIZATION", default_value_t = 0.75)]
     pub memory_utilization: f64,
 
@@ -91,7 +91,7 @@ pub(crate) struct Args {
     #[arg(long, env = "BLOOM_RESERVE_MEMORY_BYTES")]
     pub reserve_memory_bytes: Option<usize>,
 
-    /// Disable startup memory preallocation and only log memory estimates.
+    /// Disable startup page-touch preallocation; hard runtime memory admission remains enabled.
     #[arg(
         long,
         env = "BLOOM_DISABLE_MEMORY_PREALLOC",
@@ -219,11 +219,11 @@ pub(crate) struct Args {
     )]
     pub staged_model_retention_seconds: u64,
 
-    /// Speculative decoding mode: none, ngram, draft, mtp.
+    /// Speculative decoding mode: none, ngram, or mtp (draft is not memory-safe yet).
     #[arg(long, default_value = "none")]
     pub speculative: String,
 
-    /// Path to draft model (for speculative=draft).
+    /// Reserved draft-model path; draft serving is rejected until it has aggregate accounting.
     #[arg(long)]
     pub draft_model: Option<PathBuf>,
 
@@ -255,11 +255,11 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = 2 * GIB as usize)]
     pub cachemesh_l2_capacity_bytes: usize,
 
-    /// Enable CacheMesh L3 remote cache backend.
+    /// Enable the persistent CacheMesh L3 backend; requires --cachemesh-l3-path.
     #[arg(long, default_value_t = false)]
     pub enable_cachemesh_l3: bool,
 
-    /// Directory-backed CacheMesh L3 path. Use a shared mount for multi-host cache.
+    /// Persistent directory-backed CacheMesh L3 path. Use a shared mount for multi-host cache.
     #[arg(long, env = "BLOOM_CACHEMESH_L3_PATH")]
     pub cachemesh_l3_path: Option<PathBuf>,
 

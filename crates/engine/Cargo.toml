@@ -13,8 +13,8 @@ documentation.workspace = true
 [features]
 default = ["candle-engine"]
 candle-engine = ["candle-core", "candle-nn", "candle-transformers", "tokenizers"]
-cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
-metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal", "dep:metal", "dep:objc2-metal", "dep:candle-metal-kernels"]
+cuda = ["bloomai-backend/cuda", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+metal = ["bloomai-backend/metal", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal", "dep:metal", "dep:objc2-metal", "dep:candle-metal-kernels"]
 flash-attn = ["candle-flash-attn"]
 # Opt-in tests that need real hardware or external toolchains (GPU/NPU/Metal,
 # the TileLang Python JIT, etc.). Excluded from default CI; enable with

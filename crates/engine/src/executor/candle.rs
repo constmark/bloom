@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use anyhow::{Result, anyhow};
 use bloomai_core::{
@@ -8,7 +9,6 @@ use bloomai_core::{
 };
 use candle_core::{DType, Device, Tensor};
 
-use crate::core::memory::error_text_indicates_oom;
 use crate::core::parallelism::ParallelStrategy;
 use crate::core::quantization::{QuantMethod, QuantizationConfig};
 use crate::engine::BackendMaturity;
@@ -77,6 +77,101 @@ fn prepare_runtime_tokenizer(
         .with_truncation(None)
         .map_err(|error| anyhow!("failed to disable tokenizer truncation: {error}"))?;
     Ok(tokenizer)
+}
+
+/// Require startup verification to succeed. The verified wrapper remains the
+/// resident non-IFB model generation; the server explicitly releases it only
+/// when a continuous-batching scheduler will own separately accounted
+/// execution wrappers.
+fn finalize_loading_verification<T>(
+    _holder: &Mutex<Option<T>>,
+    verification: Result<()>,
+) -> Result<()> {
+    verification.map_err(|error| anyhow!("model loading verification failed: {error}"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArtifactStamp {
+    path: PathBuf,
+    len: u64,
+    modified: Option<SystemTime>,
+    is_directory: bool,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl ArtifactStamp {
+    fn capture(path: &Path, is_directory: bool) -> Result<Self> {
+        let metadata = std::fs::metadata(path).map_err(|error| {
+            anyhow!(
+                "failed to inspect model artifact {}: {error}",
+                path.display()
+            )
+        })?;
+        if metadata.is_dir() != is_directory || metadata.is_file() == is_directory {
+            return Err(anyhow!(
+                "model artifact changed type while loading: {}",
+                path.display()
+            ));
+        }
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Ok(Self {
+            path: path.to_path_buf(),
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            is_directory,
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WeightArtifactSnapshot {
+    directory: ArtifactStamp,
+    files: Vec<ArtifactStamp>,
+}
+
+impl WeightArtifactSnapshot {
+    fn capture(model_path: &Path, paths: &[PathBuf]) -> Result<Self> {
+        if paths.is_empty() {
+            return Err(anyhow!(
+                "the Candle runtime did not resolve any model weight artifacts"
+            ));
+        }
+        Ok(Self {
+            directory: ArtifactStamp::capture(model_path, true)?,
+            files: paths
+                .iter()
+                .map(|path| ArtifactStamp::capture(path, false))
+                .collect::<Result<Vec<_>>>()?,
+        })
+    }
+
+    fn verify(&self) -> Result<()> {
+        let directory = ArtifactStamp::capture(&self.directory.path, true)?;
+        if directory != self.directory {
+            return Err(anyhow!(
+                "model directory changed after strict memory admission: {}",
+                self.directory.path.display()
+            ));
+        }
+        for expected in &self.files {
+            let current = ArtifactStamp::capture(&expected.path, false)?;
+            if current != *expected {
+                return Err(anyhow!(
+                    "model weight artifact changed after strict memory admission: {}",
+                    expected.path.display()
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 const MAX_BERT_EMBEDDING_BATCH_ITEMS: usize = 64;
@@ -326,7 +421,7 @@ impl Engine for CandleEngine {
                             e
                         ))?
                 }
-                #[cfg(feature = "metal")]
+                #[cfg(all(not(feature = "cuda"), feature = "metal"))]
                 {
                     Device::new_metal(0)
                         .map_err(|e| anyhow!(
@@ -442,13 +537,21 @@ impl Engine for CandleEngine {
         let _quant_config = QuantizationConfig::from_model_config(&config);
 
         let mut manifest = crate::manifest_adapter::load_manifest(model_path)?;
-        let has_safetensors =
-            !crate::core::manifest::resolve_hf_safetensors_files(model_path)?.is_empty();
+        let safetensors_files = crate::core::manifest::resolve_hf_safetensors_files(model_path)?;
+        let has_safetensors = !safetensors_files.is_empty();
         if has_safetensors {
             // Validate precision before constructing a model that can only fail
             // later during its first CPU matmul.
             safetensors_dtype_for_device(&device)?;
+        } else if gguf_file_path.is_none() {
+            gguf_file_path = find_gguf_file(model_path);
         }
+        let weight_artifact_paths = if has_safetensors {
+            safetensors_files
+        } else {
+            gguf_file_path.iter().cloned().collect()
+        };
+        let weight_artifacts = WeightArtifactSnapshot::capture(model_path, &weight_artifact_paths)?;
         let model_id = model_path
             .file_name()
             .and_then(|n| n.to_str())
@@ -478,24 +581,7 @@ impl Engine for CandleEngine {
             quantized: is_quantized,
             manifest,
         };
-        let is_uma = cfg!(target_os = "macos");
-
         let model_holder = Arc::new(Mutex::new(None));
-        let model_ptr = Arc::clone(&model_holder);
-        let offload_cb = Arc::new(move || {
-            let mut guard = model_ptr.lock().unwrap_or_else(|e| e.into_inner());
-            *guard = None;
-            tracing::info!(
-                "Model weights released from runtime memory by the residency coordinator."
-            );
-            Ok(())
-        });
-
-        // Register memory footprint with the global VRAM coordinator
-        let coordinator = bloomai_core::global_vram_coordinator();
-        if let Err(e) = coordinator.request_load(&metadata.id, model_size, is_uma, offload_cb) {
-            tracing::error!("VRAM registration failed: {}", e);
-        }
 
         let mut eos_token_ids = Vec::new();
         if let Some(eos_id) = config.get("eos_token_id") {
@@ -550,19 +636,18 @@ impl Engine for CandleEngine {
             metadata,
             eos_token_ids,
             model_size,
+            weight_artifacts,
+            residency_strategy: ResidencyStrategy::Resident,
             processors,
             current_prefix,
             kv_cache_pool,
         };
 
-        // --- Verify loading: execute a small dummy forward pass ---
-        match model.verify_loading() {
-            Ok(()) => tracing::info!("Model loading verification passed (dummy forward pass OK)"),
-            Err(e) => tracing::warn!(
-                "Model loading verification failed: {}. Model may still work but results could be incorrect.",
-                e
-            ),
-        }
+        // Verify before publishing. Failed models must not masquerade as the
+        // requested device after an implicit CPU fallback.
+        let verification = model.verify_loading();
+        finalize_loading_verification(&model.model, verification)?;
+        tracing::info!("Model loading verification passed (dummy forward pass OK)");
 
         Ok(Box::new(model))
     }
@@ -1239,6 +1324,8 @@ struct CandleTextModel {
     metadata: ModelMetadata,
     eos_token_ids: Vec<u32>,
     model_size: usize,
+    weight_artifacts: WeightArtifactSnapshot,
+    residency_strategy: ResidencyStrategy,
     processors: crate::processor::ProcessorRegistry,
     current_prefix: Mutex<Vec<u32>>,
     kv_cache_pool: Arc<crate::scheduler::BloomKvCachePool>,
@@ -1347,32 +1434,14 @@ impl CandleTextModel {
     }
 
     fn reload_for_generation(&self) -> Result<QwenModelWrapper> {
-        match self.reload() {
-            Ok(m) => Ok(m),
-            Err(e) => {
-                let err_str = e.to_string().to_lowercase();
-                if error_text_indicates_oom(&err_str)
-                    || err_str.contains("metal")
-                    || err_str.contains("cuda")
-                {
-                    tracing::warn!(
-                        "GPU allocation failed (possibly OOM): {}. Falling back to CPU...",
-                        e
-                    );
-                    self.reload_cpu()
-                } else {
-                    Err(e)
-                }
-            }
-        }
+        self.reload()
     }
 
     fn reload(&self) -> Result<QwenModelWrapper> {
-        self.reload_on_device(&self.device)
-    }
-
-    fn reload_cpu(&self) -> Result<QwenModelWrapper> {
-        self.reload_on_device(&Device::Cpu)
+        self.weight_artifacts.verify()?;
+        let wrapper = self.reload_on_device(&self.device)?;
+        self.weight_artifacts.verify()?;
+        Ok(wrapper)
     }
 
     /// Whether `reload_on_device` would pick the `QwenModelWrapper::Streaming`
@@ -1733,19 +1802,10 @@ impl CandleTextModel {
     fn verify_loading(&self) -> Result<()> {
         let mut model_guard = self.model.lock().unwrap_or_else(|e| e.into_inner());
         if model_guard.is_none() {
-            let reloaded = match self.reload() {
-                Ok(m) => m,
-                Err(e) => {
-                    let err_str = e.to_string().to_lowercase();
-                    if error_text_indicates_oom(&err_str) {
-                        tracing::warn!("verify_loading: GPU load failed with OOM, trying CPU...");
-                        self.reload_cpu()?
-                    } else {
-                        return Err(e);
-                    }
-                }
-            };
-            *model_guard = Some(reloaded);
+            // Device identity is part of the loaded-runtime contract. In
+            // particular, a GPU OOM must fail this load instead of silently
+            // publishing a CPU wrapper behind a GPU estimate and device tag.
+            *model_guard = Some(self.reload()?);
         }
         let model = model_guard
             .as_mut()
@@ -1846,6 +1906,18 @@ impl CandleTextModel {
 }
 
 impl LoadedModel for CandleTextModel {
+    fn actual_device(&self) -> Option<DeviceKind> {
+        Some(if self.device.is_cpu() {
+            DeviceKind::Cpu
+        } else {
+            DeviceKind::Gpu
+        })
+    }
+
+    fn candle_device(&self) -> Option<Device> {
+        Some(self.device.clone())
+    }
+
     fn forward(
         &self,
         input_ids: &candle_core::Tensor,
@@ -1865,6 +1937,19 @@ impl LoadedModel for CandleTextModel {
     fn create_wrapper(&self) -> Result<Box<dyn std::any::Any + Send + Sync>> {
         let wrapper = self.reload()?;
         Ok(Box::new(wrapper))
+    }
+
+    fn release_idle_weights(&self) {
+        let released = self
+            .model
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        drop(released);
+        self.current_prefix
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
     }
 
     fn clear_kv_cache(&self) {
@@ -2087,26 +2172,7 @@ impl CandleTextModel {
                 // place; retaining the old wrapper here briefly doubles resident
                 // weight memory and can turn a valid CPU load into an OOM failure.
                 *model_guard = None;
-                let reloaded = match self.reload() {
-                    Ok(m) => m,
-                    Err(e) => {
-                        let err_str = e.to_string().to_lowercase();
-                        if error_text_indicates_oom(&err_str)
-                            || err_str.contains("metal")
-                            || err_str.contains("cuda")
-                        {
-                            let _span =
-                                tracing::info_span!("model.fallback", reason = %e).entered();
-                            tracing::warn!(
-                                "GPU allocation failed (possibly OOM): {}. Falling back to CPU...",
-                                e
-                            );
-                            self.reload_cpu()?
-                        } else {
-                            return Err(e);
-                        }
-                    }
-                };
+                let reloaded = self.reload()?;
                 *model_guard = Some(reloaded);
             } else if let Some(wrapper) = model_guard.as_mut() {
                 tracing::info!("Resetting KV cache in-place...");
@@ -2114,25 +2180,7 @@ impl CandleTextModel {
             }
         } else if model_guard.is_none() {
             tracing::info!("Reloading model weights onto GPU/CPU via fast UMA/mmap path...");
-            let reloaded = match self.reload() {
-                Ok(m) => m,
-                Err(e) => {
-                    let err_str = e.to_string().to_lowercase();
-                    if error_text_indicates_oom(&err_str)
-                        || err_str.contains("metal")
-                        || err_str.contains("cuda")
-                    {
-                        let _span = tracing::info_span!("model.fallback", reason = %e).entered();
-                        tracing::warn!(
-                            "GPU allocation failed (possibly OOM): {}. Falling back to CPU...",
-                            e
-                        );
-                        self.reload_cpu()?
-                    } else {
-                        return Err(e);
-                    }
-                }
-            };
+            let reloaded = self.reload()?;
             *model_guard = Some(reloaded);
         }
         if is_embedding {
@@ -2516,12 +2564,7 @@ impl CandleTextModel {
 
         sink.on_chunk(crate::io::OutputChunk::End)?;
 
-        let coordinator = bloomai_core::global_vram_coordinator();
-        let strategy = coordinator
-            .residency_strategy_for_model(&self.metadata.id)
-            .unwrap_or(ResidencyStrategy::OnDemand);
-
-        if strategy == ResidencyStrategy::OnDemand {
+        if self.residency_strategy == ResidencyStrategy::OnDemand {
             *model_guard = None;
             // The physical KV cache is owned by the dropped wrapper. Retaining
             // its logical prefix would report a hit against a newly reloaded,
@@ -2529,7 +2572,10 @@ impl CandleTextModel {
             current_prefix_guard.clear();
             tracing::info!("Model weights released from runtime memory (OnDemand).");
         } else {
-            tracing::debug!("Keeping model weights resident (strategy: {:?}).", strategy);
+            tracing::debug!(
+                "Keeping model weights resident (strategy: {:?}).",
+                self.residency_strategy
+            );
         }
         Ok(())
     }
@@ -3527,6 +3573,52 @@ mod tests {
         let tokenizer = prepare_runtime_tokenizer(tokenizer).unwrap();
         assert!(tokenizer.get_padding().is_none());
         assert!(tokenizer.get_truncation().is_none());
+    }
+
+    #[test]
+    fn loading_verification_is_fatal_and_keeps_the_verified_wrapper_resident() {
+        let holder = Mutex::new(Some("verification weights"));
+        let error = finalize_loading_verification(
+            &holder,
+            Err(anyhow!("dummy forward exposed corrupt weights")),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("model loading verification failed")
+        );
+        assert_eq!(
+            holder
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_deref(),
+            Some("verification weights")
+        );
+
+        finalize_loading_verification(&holder, Ok(())).unwrap();
+        assert!(
+            holder
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn lazy_reload_rejects_weight_artifact_generation_changes() {
+        let directory = create_temp_dir();
+        let weight = directory.join("model.safetensors");
+        fs::write(&weight, b"first-generation").unwrap();
+        let snapshot =
+            WeightArtifactSnapshot::capture(&directory, std::slice::from_ref(&weight)).unwrap();
+        snapshot.verify().unwrap();
+
+        fs::write(&weight, b"replacement-generation-with-a-new-size").unwrap();
+        let error = snapshot.verify().unwrap_err().to_string();
+        assert!(error.contains("changed after strict memory admission"));
+
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

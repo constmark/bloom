@@ -115,12 +115,29 @@ impl ServerMetrics {
         observations.push(value);
     }
 
-    /// Render metrics in Prometheus text format.
-    pub fn render_prometheus(
+    /// Render metrics in Prometheus text format with the authoritative runtime
+    /// memory ledger attached.
+    pub(crate) fn render_prometheus_with_runtime_memory(
         &self,
         kv_cache_metrics: &bloomai_engine::KvCacheMetrics,
         cachemesh_metrics: Option<&bloomai_engine::CacheMeshMetrics>,
         queue_stats: (usize, usize, usize),
+        runtime_memory: crate::runtime_memory::RuntimeMemoryBudgetSnapshot,
+    ) -> String {
+        self.render_prometheus_inner(
+            kv_cache_metrics,
+            cachemesh_metrics,
+            queue_stats,
+            Some(runtime_memory),
+        )
+    }
+
+    fn render_prometheus_inner(
+        &self,
+        kv_cache_metrics: &bloomai_engine::KvCacheMetrics,
+        cachemesh_metrics: Option<&bloomai_engine::CacheMeshMetrics>,
+        queue_stats: (usize, usize, usize),
+        runtime_memory: Option<crate::runtime_memory::RuntimeMemoryBudgetSnapshot>,
     ) -> String {
         let mut out = String::new();
         let uptime = self.start_time.elapsed().as_secs_f64();
@@ -371,17 +388,50 @@ impl ServerMetrics {
             memory_pressure
         ));
 
+        if let Some(runtime_memory) = runtime_memory {
+            out.push_str("# HELP bloom_runtime_memory_host_limit_bytes Host-memory limit enforced by runtime admission.\n");
+            out.push_str("# TYPE bloom_runtime_memory_host_limit_bytes gauge\n");
+            out.push_str(&format!(
+                "bloom_runtime_memory_host_limit_bytes {}\n",
+                runtime_memory.host_limit_bytes
+            ));
+            out.push_str("# HELP bloom_runtime_memory_host_committed_bytes Host memory committed across loading, resident, and draining runtimes.\n");
+            out.push_str("# TYPE bloom_runtime_memory_host_committed_bytes gauge\n");
+            out.push_str(&format!(
+                "bloom_runtime_memory_host_committed_bytes {}\n",
+                runtime_memory.host_used_bytes
+            ));
+            out.push_str("# HELP bloom_runtime_memory_device_limit_bytes Device-memory limit enforced by runtime admission; zero for unified memory.\n");
+            out.push_str("# TYPE bloom_runtime_memory_device_limit_bytes gauge\n");
+            out.push_str(&format!(
+                "bloom_runtime_memory_device_limit_bytes {}\n",
+                runtime_memory.device_limit_bytes
+            ));
+            out.push_str("# HELP bloom_runtime_memory_device_committed_bytes Device memory committed across loading, resident, and draining runtimes.\n");
+            out.push_str("# TYPE bloom_runtime_memory_device_committed_bytes gauge\n");
+            out.push_str(&format!(
+                "bloom_runtime_memory_device_committed_bytes {}\n",
+                runtime_memory.device_used_bytes
+            ));
+            out.push_str("# HELP bloom_runtime_memory_physical_generations Physical runtime generations holding a memory permit.\n");
+            out.push_str("# TYPE bloom_runtime_memory_physical_generations gauge\n");
+            out.push_str(&format!(
+                "bloom_runtime_memory_physical_generations {}\n",
+                runtime_memory.generations
+            ));
+        }
+
         // Resource Coordinator metrics
         let res_snapshot = bloomai_core::global_resource_coordinator().snapshot();
 
-        out.push_str("# HELP bloom_resource_ram_budget_bytes RAM budget allocated in resource coordinator.\n");
+        out.push_str("# HELP bloom_resource_ram_budget_bytes Legacy advisory RAM budget from the resource coordinator; use bloom_runtime_memory_host_limit_bytes for enforced admission.\n");
         out.push_str("# TYPE bloom_resource_ram_budget_bytes gauge\n");
         out.push_str(&format!(
             "bloom_resource_ram_budget_bytes {}\n",
             res_snapshot.ram_budget
         ));
 
-        out.push_str("# HELP bloom_resource_vram_budget_bytes VRAM budget allocated in resource coordinator.\n");
+        out.push_str("# HELP bloom_resource_vram_budget_bytes Legacy advisory VRAM budget from the resource coordinator; use bloom_runtime_memory_device_limit_bytes for enforced admission.\n");
         out.push_str("# TYPE bloom_resource_vram_budget_bytes gauge\n");
         out.push_str(&format!(
             "bloom_resource_vram_budget_bytes {}\n",
@@ -507,7 +557,7 @@ mod tests {
             reuses: 10,
         };
 
-        let output = m.render_prometheus(&kv, None, (0, 1, 2));
+        let output = m.render_prometheus_inner(&kv, None, (0, 1, 2), None);
         assert!(output.contains("bloom_requests_total 1"));
         assert!(output.contains("bloom_kv_cache_total_blocks 100"));
         assert!(output.contains("bloom_kv_cache_utilization 0.2000"));
@@ -515,6 +565,29 @@ mod tests {
         assert!(output.contains("bloom_request_duration_seconds_avg"));
         assert!(output.contains("bloom_system_memory_used_bytes"));
         assert!(output.contains("bloom_resource_ram_budget_bytes"));
+    }
+
+    #[test]
+    fn runtime_memory_budget_metrics_are_explicitly_reported() {
+        let metrics = ServerMetrics::new();
+        let output = metrics.render_prometheus_with_runtime_memory(
+            &KvCacheMetrics::default(),
+            None,
+            (0, 0, 0),
+            crate::runtime_memory::RuntimeMemoryBudgetSnapshot {
+                host_limit_bytes: 100,
+                host_used_bytes: 40,
+                device_limit_bytes: 80,
+                device_used_bytes: 30,
+                generations: 2,
+            },
+        );
+
+        assert!(output.contains("bloom_runtime_memory_host_limit_bytes 100"));
+        assert!(output.contains("bloom_runtime_memory_host_committed_bytes 40"));
+        assert!(output.contains("bloom_runtime_memory_device_limit_bytes 80"));
+        assert!(output.contains("bloom_runtime_memory_device_committed_bytes 30"));
+        assert!(output.contains("bloom_runtime_memory_physical_generations 2"));
     }
 
     #[test]

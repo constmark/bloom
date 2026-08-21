@@ -1,5 +1,7 @@
 use anyhow::Result;
-use bloomai_core::{BloomError, CacheHandle, GenerationParams, Modality, ModelManifest};
+use bloomai_core::{
+    BloomError, CacheHandle, DeviceKind, GenerationParams, Modality, ModelManifest,
+};
 
 use crate::io::{DataBlock, InferenceRequest, ModelInput, ModelOutput, OutputChunk};
 
@@ -40,6 +42,21 @@ where
 }
 
 pub trait LoadedModel: Send + Sync {
+    /// Physical device selected by the loaded backend, when the adapter can
+    /// report it. Strict serving paths use this to reject silent cross-domain
+    /// fallback after memory admission.
+    fn actual_device(&self) -> Option<DeviceKind> {
+        None
+    }
+
+    /// Exact Candle device identity used by model weights. Continuous batching
+    /// must clone this handle rather than constructing another device for the
+    /// same ordinal, because Candle device identity is instance-specific.
+    #[cfg(feature = "candle-engine")]
+    fn candle_device(&self) -> Option<candle_core::Device> {
+        None
+    }
+
     #[cfg(feature = "candle-engine")]
     fn forward(
         &self,
@@ -53,6 +70,11 @@ pub trait LoadedModel: Send + Sync {
     fn create_wrapper(&self) -> Result<Box<dyn std::any::Any + Send + Sync>> {
         Err(BloomError::Engine("create_wrapper not supported for this model".into()).into())
     }
+
+    /// Release the verified idle wrapper when another runtime component owns
+    /// separately accounted execution wrappers. Backends that keep a single
+    /// shared model resident may leave the default no-op implementation.
+    fn release_idle_weights(&self) {}
 
     fn clear_kv_cache(&self) {}
 

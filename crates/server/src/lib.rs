@@ -70,9 +70,9 @@ use bloomai_engine::executor::wan::WanEngine;
 use bloomai_engine::scheduler::paged_cache::{PagedAttentionCache, PagedCacheConfig};
 use bloomai_engine::scheduler::{BloomKvCachePool, InferenceScheduler, Request, RequestState};
 use bloomai_engine::{
-    CacheMesh, CacheMeshConfig, DataBlock, EngineRegistry, FileSystemRemoteCache,
-    InMemoryRemoteCache, InferenceParams, InferencePipeline, InferenceRequest, KvCachePool,
-    ModelInput, OutputChunk, speculative_mode_is_mtp,
+    CacheMesh, CacheMeshConfig, DataBlock, EngineRegistry, FileSystemRemoteCache, InferenceParams,
+    InferencePipeline, InferenceRequest, KvCachePool, ModelInput, OutputChunk,
+    speculative_mode_is_mtp,
 };
 
 mod catalog_lock;
@@ -99,6 +99,7 @@ mod model_upgrade;
 mod ollama;
 mod readiness;
 mod response_store;
+mod runtime_memory;
 mod runtime_pool;
 mod shutdown;
 mod tool_calling;
@@ -127,6 +128,7 @@ use model_storage::ModelStorageManager;
 use ollama::*;
 use readiness::*;
 use response_store::ResponseStore;
+use runtime_memory::{RuntimeMemoryPermit, RuntimeMemoryPlanner};
 use runtime_pool::RuntimePool;
 #[cfg(test)]
 use shutdown::ShutdownSignal;
@@ -504,6 +506,7 @@ struct LoadedRuntime {
     published_at: u64,
     source_path: PathBuf,
     catalog_id: Option<String>,
+    _runtime_memory_permit: Option<RuntimeMemoryPermit>,
     /// Declared last so its final strong reference is released only after all
     /// heavyweight runtime fields have finished teardown.
     active_request_leases: Arc<AtomicU64>,
@@ -559,6 +562,7 @@ struct ModelLoadRequest {
     sequence: u64,
     path: PathBuf,
     catalog_id: Option<String>,
+    memory_permit: Option<RuntimeMemoryPermit>,
 }
 
 #[derive(Clone)]
@@ -674,6 +678,7 @@ struct DrainingRuntime {
 
 struct ServerState {
     runtime_pool: RwLock<RuntimePool>,
+    runtime_memory: RuntimeMemoryPlanner,
     /// Runtime generations removed from discovery but still retained by an
     /// admitted request. Weak references preserve storage safety without
     /// extending their physical lifetime.
@@ -734,6 +739,15 @@ impl ServerState {
                 });
             }
         }
+    }
+
+    fn discard_unpublished_runtime(&self, runtime: Arc<LoadedRuntime>) {
+        // Runtime preparation may already have spawned an IFB worker. Register
+        // the candidate before dropping its owning Arc so that the worker's
+        // source marker and memory permit remain visible to delete/reload and
+        // physical-generation admission until the task has fully exited.
+        self.track_draining_runtimes(std::slice::from_ref(&runtime));
+        drop(runtime);
     }
 
     fn append_draining_sources(&self, sources: &mut Vec<PathBuf>) {
@@ -807,10 +821,33 @@ impl ServerState {
         // checks the same source representation without doing I/O under a
         // lifecycle or pool lock. A missing path is left for the loader to
         // report through the existing asynchronous failure contract.
-        let path = tokio::fs::canonicalize(&path).await.unwrap_or(path);
+        let resolved_path = tokio::fs::canonicalize(&path).await;
+        let source_exists = resolved_path.is_ok();
+        let path = resolved_path.unwrap_or(path);
         let selector = catalog_id
             .clone()
             .unwrap_or_else(|| model_path_label(&path));
+
+        // Manifest parsing and hardware probes may touch storage or invoke a
+        // backend-specific capability probe, so perform them before entering
+        // the lifecycle/pool linearization boundary. An unreadable manifest
+        // deliberately remains an asynchronous loader failure for backwards
+        // compatibility; once a manifest is readable, memory admission is a
+        // fail-closed prerequisite that cannot be disabled with page-touch
+        // preallocation controls.
+        let planned_reservation = source_exists
+            .then(|| bloomai_engine::load_manifest(&path).ok())
+            .flatten()
+            .map(|manifest| {
+                let estimate = self.runtime_memory.planned_estimate(&manifest)?;
+                self.runtime_memory
+                    .footprint(&manifest, &estimate)
+                    .and_then(|footprint| {
+                        self.runtime_memory
+                            .available()
+                            .map(|available| (footprint, available))
+                    })
+            });
         let mut lifecycle = self.model_lifecycle.lock().await;
 
         if let Some(active) = lifecycle.active.as_ref() {
@@ -826,11 +863,11 @@ impl ServerState {
         if self.load_in_progress.load(Ordering::Acquire) {
             return Err(ModelLoadAdmissionError::Busy);
         }
-        let (resident, source_is_draining, has_physical_capacity) = {
+        let (resident, memory_permit) = {
             let mut runtime_pool = self.runtime_pool.write().await;
             if let Some(runtime) = runtime_pool.find_source(&path) {
                 runtime_pool.promote_exact(&runtime);
-                (Some(runtime), false, true)
+                (Some(runtime), None)
             } else {
                 let (draining_generations, _, source_is_draining) =
                     self.inspect_draining_runtimes(Some(&path));
@@ -839,7 +876,29 @@ impl ServerState {
                     .saturating_add(RUNTIME_DRAINING_HEADROOM);
                 let has_physical_capacity =
                     runtime_pool.len().saturating_add(draining_generations) < physical_limit;
-                (None, source_is_draining, has_physical_capacity)
+                if source_is_draining {
+                    return Err(ModelLoadAdmissionError::Unavailable(
+                        RUNTIME_SOURCE_DRAINING_ERROR.to_string(),
+                    ));
+                }
+                if !has_physical_capacity {
+                    return Err(ModelLoadAdmissionError::Unavailable(
+                        RUNTIME_DRAINING_CAPACITY_ERROR.to_string(),
+                    ));
+                }
+
+                let memory_permit = match planned_reservation {
+                    Some(Ok((footprint, available))) => {
+                        Some(self.runtime_memory.reserve(footprint, available).map_err(
+                            |error| ModelLoadAdmissionError::Unavailable(error.to_string()),
+                        )?)
+                    }
+                    Some(Err(error)) => {
+                        return Err(ModelLoadAdmissionError::Unavailable(error.to_string()));
+                    }
+                    None => None,
+                };
+                (None, memory_permit)
             }
         };
         if let Some(runtime) = resident {
@@ -847,17 +906,6 @@ impl ServerState {
             self.ready.store(true, Ordering::Release);
             return Ok(ModelLoadAdmission::AlreadyReady { runtime });
         }
-        if source_is_draining {
-            return Err(ModelLoadAdmissionError::Unavailable(
-                RUNTIME_SOURCE_DRAINING_ERROR.to_string(),
-            ));
-        }
-        if !has_physical_capacity {
-            return Err(ModelLoadAdmissionError::Unavailable(
-                RUNTIME_DRAINING_CAPACITY_ERROR.to_string(),
-            ));
-        }
-
         lifecycle.next_sequence = lifecycle.next_sequence.saturating_add(1).max(1);
         let sequence = lifecycle.next_sequence;
         let (completion, receiver) = watch::channel(ModelLoadOutcome::Loading);
@@ -880,6 +928,7 @@ impl ServerState {
             sequence,
             path,
             catalog_id,
+            memory_permit,
         }) {
             let message = format!("model loader is unavailable: {error}");
             lifecycle.active = None;
@@ -1904,6 +1953,7 @@ async fn run_server(args: Args, config_path: PathBuf) -> Result<()> {
         "npu" | "intel-npu" => DeviceKind::Npu,
         other => return Err(anyhow!("unsupported device: {}", other)),
     };
+    let runtime_memory = RuntimeMemoryPlanner::new(&args, device_kind)?;
 
     let model_license_policy = Arc::new(ModelLicensePolicy::new(
         args.allowed_model_licenses.clone(),
@@ -2014,12 +2064,15 @@ async fn run_server(args: Args, config_path: PathBuf) -> Result<()> {
             memory_utilization: args.memory_utilization,
             reserve_memory_bytes: args.reserve_memory_bytes,
             disable_memory_prealloc: args.disable_memory_prealloc,
+            enable_ifb: args.enable_ifb,
         },
+        runtime_memory.clone(),
     );
 
     let (model_loader, model_load_requests) = mpsc::channel(1);
     let state = Arc::new(ServerState {
         runtime_pool: RwLock::new(RuntimePool::with_capacity(runtime_pool_capacity)),
+        runtime_memory,
         draining_runtimes: std::sync::Mutex::new(Vec::new()),
         semaphore: Arc::new(Semaphore::new(args.max_concurrent)),
         ready: AtomicBool::new(false),
@@ -2403,12 +2456,19 @@ async fn model_loader_loop(
         state.load_progress.store(1, Ordering::Release);
         *state.load_error.write().await = None;
 
+        // Keep the managed model source immutable from the final manifest
+        // read through publication. Pull/delete/upgrade use the same storage
+        // fence, so the engine cannot load one artifact generation while the
+        // memory permit and catalog identity describe another.
+        let _storage_guard = state.model_storage.serial().await;
+
         match prepare_loaded_runtime(
             Arc::clone(&state),
             &args,
             device_kind,
             request.path,
             request.catalog_id,
+            request.memory_permit,
         )
         .await
         {
@@ -2434,10 +2494,7 @@ async fn model_loader_loop(
                     }
                     Err(message) => {
                         tracing::error!(model = %model_id, error = %message, "Model publication failed");
-                        // The candidate was never registered as resident or
-                        // draining. Tear it down before reopening lifecycle
-                        // operations that may remove or replace its source.
-                        drop(runtime);
+                        state.discard_unpublished_runtime(runtime);
                         *state.load_error.write().await = Some(message.clone());
                         state.load_progress.store(0, Ordering::Release);
                         let has_fallback = !state.runtime_pool.read().await.is_empty();
@@ -2505,6 +2562,7 @@ async fn prepare_loaded_runtime(
     device_kind: DeviceKind,
     model_path: PathBuf,
     catalog_id: Option<String>,
+    mut memory_permit: Option<RuntimeMemoryPermit>,
 ) -> Result<LoadedRuntime> {
     let model_path = tokio::fs::canonicalize(&model_path)
         .await
@@ -2512,6 +2570,8 @@ async fn prepare_loaded_runtime(
     state.load_progress.store(5, Ordering::Release);
     let manifest = bloomai_engine::load_manifest(&model_path)?;
     let backend_name = select_backend_name(&args.backend, &args.speculative, &manifest);
+    validate_ifb_backend(args.enable_ifb, &backend_name)?;
+    validate_strict_runtime_backend(&backend_name)?;
     engine_registry().get(&backend_name).map_err(|error| {
         anyhow!(
             "{}. Supported engines are: candle, openvino, funasr, qwen3_vl, longcat, intel-npu, npu-tts, onnxruntime, coreml, mlx, vulkan, llamacpp, wan.",
@@ -2519,20 +2579,72 @@ async fn prepare_loaded_runtime(
         )
     })?;
 
-    let planned_context_size = args.context_size.saturating_mul(args.max_concurrent.max(1));
-    let planned_memory =
-        bloomai_engine::estimate_memory_for_device(&manifest, planned_context_size, device_kind);
+    // Re-read and re-account at the loader boundary so a source changed after
+    // admission cannot bypass the aggregate budget. Missing/corrupt sources
+    // still arrive here through the historical asynchronous error path.
+    let planned_memory = state
+        .runtime_memory
+        .planned_estimate(&manifest)
+        .map_err(|error| anyhow!("runtime memory estimation failed before model load: {error}"))?;
+    let planned_footprint = state
+        .runtime_memory
+        .footprint(&manifest, &planned_memory)
+        .map_err(|error| anyhow!("runtime memory planning failed before model load: {error}"))?;
+    let planned_available = state
+        .runtime_memory
+        .available()
+        .map_err(|error| anyhow!("runtime memory probe failed before model load: {error}"))?;
+    match memory_permit.as_mut() {
+        Some(permit) => permit
+            .resize(planned_footprint, planned_available)
+            .map_err(|error| {
+                anyhow!("runtime memory admission failed before model load: {error}")
+            })?,
+        None => {
+            memory_permit = Some(
+                state
+                    .runtime_memory
+                    .reserve(planned_footprint, planned_available)
+                    .map_err(|error| {
+                        anyhow!("runtime memory admission failed before model load: {error}")
+                    })?,
+            );
+        }
+    }
     state.load_progress.store(15, Ordering::Release);
-    let memory_plan = bloomai_engine::plan_memory_preallocation(
-        planned_memory,
-        bloomai_engine::MemoryPreallocationConfig {
-            enabled: !args.disable_memory_prealloc,
-            memory_utilization: args.memory_utilization,
-            reserve_memory_bytes: args.reserve_memory_bytes,
-        },
-    )?;
+    // This short-lived allocation is only a physical page-touch probe. The
+    // aggregate runtime ledger above remains authoritative regardless of the
+    // `disable_memory_prealloc` optimization switch.
+    let page_touch_bytes = if args.disable_memory_prealloc {
+        0
+    } else if let Some(bytes) = args.reserve_memory_bytes {
+        bytes
+    } else {
+        planned_memory
+            .kv_cache_bytes
+            .checked_add(planned_memory.temp_tensor_bytes)
+            .ok_or_else(|| anyhow!("startup page-touch memory estimate overflow"))?
+    };
+    if page_touch_bytes > isize::MAX as usize {
+        return Err(anyhow!(
+            "startup page-touch reservation exceeds the platform allocation limit"
+        ));
+    }
     state.load_progress.store(25, Ordering::Release);
-    drop(bloomai_engine::reserve_memory_for_plan(&memory_plan)?);
+    drop(
+        bloomai_engine::MemoryReservation::reserve(page_touch_bytes)
+            .map_err(|error| anyhow!("startup page-touch reservation failed: {error}"))?,
+    );
+
+    let load_available = state
+        .runtime_memory
+        .available()
+        .map_err(|error| anyhow!("runtime memory probe failed immediately before load: {error}"))?;
+    memory_permit
+        .as_ref()
+        .ok_or_else(|| anyhow!("runtime memory permit is missing after admission"))?
+        .revalidate_available(load_available)
+        .map_err(|error| anyhow!("runtime memory headroom changed before model load: {error}"))?;
 
     state.load_progress.store(35, Ordering::Release);
     let context_size = args.context_size;
@@ -2542,7 +2654,7 @@ async fn prepare_loaded_runtime(
         let engine = registry
             .get(&backend_name)
             .map_err(|error| anyhow!(error.to_string()))?;
-        InferencePipeline::load_standalone_with_context(
+        InferencePipeline::load_standalone_with_context_strict(
             engine,
             device_kind,
             &pipeline_path,
@@ -2553,33 +2665,66 @@ async fn prepare_loaded_runtime(
     .map_err(|error| anyhow!("model loader task failed: {error}"))??;
     let pipeline = Arc::new(pipeline);
     let model_id = pipeline.metadata().id.clone();
+    let loaded_manifest = pipeline.metadata().manifest.clone();
     validate_loaded_runtime_model_id(&model_id)?;
+    let actual_device = pipeline.device();
+    if actual_device != device_kind {
+        return Err(anyhow!(
+            "loaded pipeline changed device from {device_kind:?} to {actual_device:?}; refusing to publish a runtime whose memory topology cannot be accounted safely"
+        ));
+    }
+    if args.enable_ifb {
+        // IFB creates independently accounted execution wrappers. Do not keep
+        // the startup verification wrapper as an untracked extra weight copy.
+        pipeline.release_idle_weights();
+    }
     tracing::info!(model = %model_id, "Model pipeline is loaded; preparing runtime services");
 
     let actual_context_size = pipeline
         .context_size()
-        .saturating_mul(args.max_concurrent.max(1));
-    let memory_estimate =
-        bloomai_engine::estimate_memory_for_device(&manifest, actual_context_size, device_kind);
+        .checked_mul(args.max_concurrent.max(1))
+        .ok_or_else(|| anyhow!("loaded runtime context memory estimate overflow"))?;
+    let memory_estimate = state
+        .runtime_memory
+        .estimate_for_context(&loaded_manifest, actual_context_size, actual_device)
+        .map_err(|error| anyhow!("loaded runtime memory estimation failed: {error}"))?;
+    let actual_footprint = state
+        .runtime_memory
+        .footprint(&loaded_manifest, &memory_estimate)
+        .map_err(|error| anyhow!("loaded runtime memory planning failed: {error}"))?;
+    let actual_available = state
+        .runtime_memory
+        .available()
+        .map_err(|error| anyhow!("loaded runtime memory probe failed: {error}"))?;
+    memory_permit
+        .as_mut()
+        .ok_or_else(|| anyhow!("runtime memory permit is missing after admission"))?
+        .resize(actual_footprint, actual_available)
+        .map_err(|error| anyhow!("loaded runtime exceeds its memory admission: {error}"))?;
     state.load_progress.store(65, Ordering::Release);
+    let active_request_leases = Arc::new(AtomicU64::new(0));
     let scheduling = build_scheduling_runtime(
         &state,
         args,
-        &manifest,
+        &loaded_manifest,
         Arc::clone(&pipeline),
         &model_id,
-        actual_context_size,
-        &memory_estimate,
+        SchedulingRuntimeBuildContext {
+            memory_context_size: actual_context_size,
+            memory_estimate: &memory_estimate,
+            runtime_lifetime_marker: Arc::clone(&active_request_leases),
+            runtime_memory_permit: memory_permit.clone(),
+        },
     )?;
 
     state.load_progress.store(95, Ordering::Release);
-    let model_architecture = manifest
+    let model_architecture = loaded_manifest
         .parameters
         .get("gguf_architecture")
-        .or_else(|| manifest.parameters.get("model_type"))
+        .or_else(|| loaded_manifest.parameters.get("model_type"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
-    let model_chat_template = manifest
+    let model_chat_template = loaded_manifest
         .parameters
         .get("chat_template_kind")
         .and_then(serde_json::Value::as_str)
@@ -2587,7 +2732,7 @@ async fn prepare_loaded_runtime(
     Ok(LoadedRuntime {
         pipeline,
         model_id,
-        model_family: manifest.family,
+        model_family: loaded_manifest.family,
         model_architecture,
         model_chat_template,
         input_modalities: manifest.io_schema.inputs,
@@ -2600,8 +2745,27 @@ async fn prepare_loaded_runtime(
         published_at: unix_seconds(),
         source_path: model_path,
         catalog_id,
-        active_request_leases: Arc::new(AtomicU64::new(0)),
+        _runtime_memory_permit: memory_permit,
+        active_request_leases,
     })
+}
+
+pub(crate) fn validate_ifb_backend(enable_ifb: bool, backend_name: &str) -> Result<()> {
+    if enable_ifb && backend_name != "candle" {
+        return Err(anyhow!(
+            "in-flight batching requires the verified Candle batch backend; selected backend '{backend_name}' cannot be published with IFB enabled"
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_strict_runtime_backend(backend_name: &str) -> Result<()> {
+    if !matches!(backend_name, "candle" | "qwen3_vl") {
+        return Err(anyhow!(
+            "strict aggregate memory admission requires a backend that reports its verified physical device; selected backend '{backend_name}' does not yet provide that contract"
+        ));
+    }
+    Ok(())
 }
 
 struct SchedulingRuntime {
@@ -2612,15 +2776,37 @@ struct SchedulingRuntime {
     shutdown: CancellationToken,
 }
 
+/// Owns every resource whose physical lifetime may extend past logical
+/// runtime unload. Declaration order is intentional: scheduler-owned model
+/// wrappers are destroyed before the accounting permit, and the source marker
+/// is released last even when the worker future unwinds or is aborted.
+struct SchedulingWorkerLifetime {
+    scheduler: Arc<InferenceScheduler>,
+    _runtime_memory_permit: Option<RuntimeMemoryPermit>,
+    _runtime_lifetime_marker: Arc<AtomicU64>,
+}
+
+struct SchedulingRuntimeBuildContext<'a> {
+    memory_context_size: usize,
+    memory_estimate: &'a bloomai_engine::MemoryEstimate,
+    runtime_lifetime_marker: Arc<AtomicU64>,
+    runtime_memory_permit: Option<RuntimeMemoryPermit>,
+}
+
 fn build_scheduling_runtime(
     state: &ServerState,
     args: &Args,
     manifest: &bloomai_core::ModelManifest,
     pipeline: Arc<InferencePipeline>,
     model_id: &str,
-    memory_context_size: usize,
-    memory_estimate: &bloomai_engine::MemoryEstimate,
+    build: SchedulingRuntimeBuildContext<'_>,
 ) -> Result<SchedulingRuntime> {
+    let SchedulingRuntimeBuildContext {
+        memory_context_size,
+        memory_estimate,
+        runtime_lifetime_marker,
+        runtime_memory_permit,
+    } = build;
     let shutdown = CancellationToken::new();
     if !args.enable_ifb {
         return Ok(SchedulingRuntime {
@@ -2661,22 +2847,7 @@ fn build_scheduling_runtime(
     };
     let kv_pool = Arc::new(BloomKvCachePool::new(block_size, total_blocks));
 
-    let device = if pipeline.device() == DeviceKind::Cpu {
-        candle_core::Device::Cpu
-    } else {
-        #[cfg(feature = "cuda")]
-        {
-            candle_core::Device::new_cuda(0).unwrap_or(candle_core::Device::Cpu)
-        }
-        #[cfg(feature = "metal")]
-        {
-            candle_core::Device::new_metal(0).unwrap_or(candle_core::Device::Cpu)
-        }
-        #[cfg(not(any(feature = "cuda", feature = "metal")))]
-        {
-            candle_core::Device::Cpu
-        }
-    };
+    let device = build_ifb_scheduler_device(&pipeline)?;
 
     let request_models = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
         usize,
@@ -2794,12 +2965,17 @@ fn build_scheduling_runtime(
             write_through_l3: args.cachemesh_write_through_l3,
         };
         let mesh = if args.enable_cachemesh_l3 {
+            let path = args
+                .cachemesh_l3_path
+                .as_ref()
+                .filter(|path| !path.as_os_str().is_empty())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "CacheMesh L3 requires a persistent directory configured with --cachemesh-l3-path"
+                    )
+                })?;
             let remote: Arc<dyn bloomai_engine::RemoteCacheBackend> =
-                if let Some(path) = &args.cachemesh_l3_path {
-                    Arc::new(FileSystemRemoteCache::new(path)?)
-                } else {
-                    Arc::new(InMemoryRemoteCache::new())
-                };
+                Arc::new(FileSystemRemoteCache::new(path)?);
             CacheMesh::with_remote(config, remote)
         } else {
             CacheMesh::new(config)
@@ -2856,7 +3032,11 @@ fn build_scheduling_runtime(
         scheduling_config,
     ));
 
-    let scheduler_for_worker = Arc::clone(&scheduler);
+    let worker_lifetime = SchedulingWorkerLifetime {
+        scheduler: Arc::clone(&scheduler),
+        _runtime_memory_permit: runtime_memory_permit,
+        _runtime_lifetime_marker: runtime_lifetime_marker,
+    };
     let worker_shutdown = shutdown.clone();
     tokio::spawn(async move {
         tracing::info!("Starting continuous-batching scheduler worker");
@@ -2864,7 +3044,7 @@ fn build_scheduling_runtime(
             tokio::select! {
                 _ = worker_shutdown.cancelled() => break,
                 _ = tokio::time::sleep(Duration::from_millis(5)) => {
-                    if let Err(error) = scheduler_for_worker.step() {
+                    if let Err(error) = worker_lifetime.scheduler.step() {
                         tracing::error!(%error, "Scheduler step failed");
                     }
                 }
@@ -2882,12 +3062,42 @@ fn build_scheduling_runtime(
     })
 }
 
+fn build_ifb_scheduler_device(pipeline: &InferencePipeline) -> Result<candle_core::Device> {
+    #[cfg(feature = "candle-engine")]
+    {
+        let device = pipeline.model().candle_device().ok_or_else(|| {
+            anyhow!(
+                "in-flight batching requires the exact Candle device identity owned by the loaded model"
+            )
+        })?;
+        let actual_kind = if device.is_cpu() {
+            DeviceKind::Cpu
+        } else {
+            DeviceKind::Gpu
+        };
+        if actual_kind != pipeline.device() {
+            return Err(anyhow!(
+                "the IFB scheduler device does not match the admitted pipeline device"
+            ));
+        }
+        Ok(device)
+    }
+    #[cfg(not(feature = "candle-engine"))]
+    {
+        let _ = pipeline;
+        Err(anyhow!(
+            "in-flight batching requires a server built with Candle support"
+        ))
+    }
+}
+
 // ─── Health / readiness ─────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model_download::ModelDownloadPhase;
+    use crate::runtime_memory::RuntimeMemoryFootprint;
     use bloomai_engine::scheduler::kv_hook::KvHook;
     use image::ImageEncoder as _;
     use sha2::{Digest as _, Sha256};
@@ -5785,6 +5995,7 @@ mod tests {
             published_at: unix_seconds(),
             source_path: model_path,
             catalog_id: None,
+            _runtime_memory_permit: None,
             active_request_leases: Arc::new(AtomicU64::new(0)),
         });
         let previous = state.runtime_pool.write().await.publish_default(runtime);
@@ -5845,6 +6056,7 @@ mod tests {
             published_at: unix_seconds(),
             source_path: model_path,
             catalog_id: None,
+            _runtime_memory_permit: None,
             active_request_leases: Arc::new(AtomicU64::new(0)),
         });
         assert!(
@@ -5894,6 +6106,7 @@ mod tests {
             published_at: unix_seconds(),
             source_path: model_path,
             catalog_id: None,
+            _runtime_memory_permit: None,
             active_request_leases: Arc::new(AtomicU64::new(0)),
         });
         assert!(
@@ -5951,6 +6164,7 @@ mod tests {
             published_at: unix_seconds(),
             source_path: model_path,
             catalog_id: None,
+            _runtime_memory_permit: None,
             active_request_leases: Arc::new(AtomicU64::new(0)),
         })
     }
@@ -5995,6 +6209,11 @@ mod tests {
         let (model_loader, receiver) = mpsc::channel(1);
         let model_storage = ModelStorageManager::new(models_root.clone(), 0, 0);
         let model_integrity = ModelIntegrityManager::new(models_root.clone());
+        let runtime_memory = RuntimeMemoryPlanner::for_test(
+            usize::MAX,
+            usize::MAX,
+            bloomai_core::MemoryTopology::Unified,
+        );
         let model_preflight = ModelPreflightManager::new(
             models_root.clone(),
             ModelPreflightConfig {
@@ -6006,11 +6225,14 @@ mod tests {
                 memory_utilization: 0.75,
                 reserve_memory_bytes: None,
                 disable_memory_prealloc: false,
+                enable_ifb: false,
             },
+            runtime_memory.clone(),
         );
         (
             Arc::new(ServerState {
                 runtime_pool: RwLock::new(RuntimePool::new()),
+                runtime_memory,
                 draining_runtimes: std::sync::Mutex::new(Vec::new()),
                 semaphore: Arc::new(Semaphore::new(1)),
                 ready: AtomicBool::new(false),
@@ -6072,6 +6294,26 @@ mod tests {
             select_backend_name("candle", "draft-mtp", &manifest),
             "llamacpp"
         );
+    }
+
+    #[test]
+    fn ifb_rejects_non_candle_backends_before_runtime_publication() {
+        let error = validate_ifb_backend(true, "onnxruntime")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("verified Candle batch backend"));
+        assert!(validate_ifb_backend(true, "candle").is_ok());
+        assert!(validate_ifb_backend(false, "onnxruntime").is_ok());
+    }
+
+    #[test]
+    fn strict_admission_rejects_backends_without_verified_device_reporting() {
+        assert!(validate_strict_runtime_backend("candle").is_ok());
+        assert!(validate_strict_runtime_backend("qwen3_vl").is_ok());
+        let error = validate_strict_runtime_backend("wan")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("verified physical device"));
     }
 
     #[tokio::test]
@@ -7433,6 +7675,158 @@ mod tests {
                 .iter()
                 .any(|entry| entry.id == "draining.gguf" && !entry.active)
         );
+    }
+
+    #[tokio::test]
+    async fn logical_unload_keeps_runtime_memory_charged_until_request_drain() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, _receiver) = test_server_state(temp.path().to_path_buf());
+        let footprint = RuntimeMemoryFootprint {
+            host_bytes: 4_096,
+            device_bytes: 0,
+        };
+        let permit = state
+            .runtime_memory
+            .reserve(
+                footprint,
+                RuntimeMemoryFootprint {
+                    host_bytes: usize::MAX,
+                    device_bytes: usize::MAX,
+                },
+            )
+            .unwrap();
+        let mut runtime = test_text_runtime(
+            temp.path().join("memory-draining.gguf"),
+            Arc::new(AtomicU64::new(0)),
+        );
+        Arc::get_mut(&mut runtime).unwrap()._runtime_memory_permit = Some(permit);
+        assert!(
+            state
+                .runtime_pool
+                .write()
+                .await
+                .publish_default(Arc::clone(&runtime))
+                .is_empty()
+        );
+        let lease = state.lease_exact_runtime(&runtime).await.unwrap();
+
+        let response = handle_model_unload_exact(Arc::clone(&state), runtime).await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let draining = state.runtime_memory.snapshot();
+        assert_eq!(draining.host_used_bytes, footprint.host_bytes);
+        assert_eq!(draining.generations, 1);
+
+        drop(lease);
+
+        let released = state.runtime_memory.snapshot();
+        assert_eq!(released.host_used_bytes, 0);
+        assert_eq!(released.device_used_bytes, 0);
+        assert_eq!(released.generations, 0);
+    }
+
+    #[tokio::test]
+    async fn worker_guards_keep_memory_and_source_alive_after_logical_unload() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, _receiver) = test_server_state(temp.path().to_path_buf());
+        let footprint = RuntimeMemoryFootprint {
+            host_bytes: 8_192,
+            device_bytes: 0,
+        };
+        let permit = state
+            .runtime_memory
+            .reserve(
+                footprint,
+                RuntimeMemoryFootprint {
+                    host_bytes: usize::MAX,
+                    device_bytes: usize::MAX,
+                },
+            )
+            .unwrap();
+        let mut runtime = test_text_runtime(
+            temp.path().join("worker-draining.gguf"),
+            Arc::new(AtomicU64::new(0)),
+        );
+        Arc::get_mut(&mut runtime).unwrap()._runtime_memory_permit = Some(permit);
+        let source = runtime.source_path.clone();
+        let worker_memory = runtime
+            ._runtime_memory_permit
+            .as_ref()
+            .expect("test runtime must own a memory permit")
+            .clone();
+        let worker_source_marker = Arc::clone(&runtime.active_request_leases);
+        let (release_worker, worker_blocked) = tokio::sync::oneshot::channel::<()>();
+        let worker = tokio::spawn(async move {
+            let _ = worker_blocked.await;
+            drop(worker_memory);
+            drop(worker_source_marker);
+        });
+        assert!(
+            state
+                .runtime_pool
+                .write()
+                .await
+                .publish_default(Arc::clone(&runtime))
+                .is_empty()
+        );
+
+        let response = handle_model_unload_exact(Arc::clone(&state), runtime).await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(state.runtime_memory.snapshot().generations, 1);
+        assert_eq!(state.draining_runtime_stats(), (1, 0));
+        assert!(state.source_is_resident_or_draining(&source).await);
+
+        release_worker.send(()).unwrap();
+        worker.await.unwrap();
+
+        assert_eq!(state.runtime_memory.snapshot().generations, 0);
+        assert_eq!(state.draining_runtime_stats(), (0, 0));
+        assert!(!state.source_is_resident_or_draining(&source).await);
+    }
+
+    #[tokio::test]
+    async fn unpublished_candidate_worker_remains_tracked_until_physical_exit() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, _receiver) = test_server_state(temp.path().to_path_buf());
+        let footprint = RuntimeMemoryFootprint {
+            host_bytes: 16_384,
+            device_bytes: 0,
+        };
+        let permit = state
+            .runtime_memory
+            .reserve(
+                footprint,
+                RuntimeMemoryFootprint {
+                    host_bytes: usize::MAX,
+                    device_bytes: usize::MAX,
+                },
+            )
+            .unwrap();
+        let mut runtime = test_text_runtime(
+            temp.path().join("unpublished-worker.gguf"),
+            Arc::new(AtomicU64::new(0)),
+        );
+        Arc::get_mut(&mut runtime).unwrap()._runtime_memory_permit = Some(permit);
+        let source = runtime.source_path.clone();
+        let worker_memory = runtime
+            ._runtime_memory_permit
+            .as_ref()
+            .expect("candidate must own a memory permit")
+            .clone();
+        let worker_source_marker = Arc::clone(&runtime.active_request_leases);
+
+        state.discard_unpublished_runtime(runtime);
+
+        assert_eq!(state.runtime_memory.snapshot().generations, 1);
+        assert!(state.source_is_resident_or_draining(&source).await);
+
+        drop(worker_memory);
+        assert_eq!(state.runtime_memory.snapshot().generations, 0);
+        assert!(state.source_is_resident_or_draining(&source).await);
+
+        drop(worker_source_marker);
+        assert!(!state.source_is_resident_or_draining(&source).await);
     }
 
     #[tokio::test]
@@ -9332,6 +9726,11 @@ mod tests {
         assert_eq!(body["runtime_pool"]["resident_generations"], 0);
         assert_eq!(body["runtime_pool"]["draining_generations"], 0);
         assert_eq!(body["runtime_pool"]["draining_request_leases"], 0);
+        assert!(body["runtime_memory_budget"]["host_limit_bytes"].is_u64());
+        assert_eq!(body["runtime_memory_budget"]["host_committed_bytes"], 0);
+        assert!(body["runtime_memory_budget"]["device_limit_bytes"].is_u64());
+        assert_eq!(body["runtime_memory_budget"]["device_committed_bytes"], 0);
+        assert_eq!(body["runtime_memory_budget"]["physical_generations"], 0);
         assert_eq!(body["load"]["phase"], "loading");
         assert_eq!(body["load"]["progress"], 37);
         assert_eq!(body["load"]["requested_model"], "tiny.gguf");
@@ -10021,6 +10420,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn closed_loader_channel_rolls_back_runtime_memory_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let model_path = write_test_model_manifest(temp.path(), "closed-loader");
+        let (state, receiver) = test_server_state(temp.path().to_path_buf());
+        drop(receiver);
+
+        let error = state
+            .admit_model_load(model_path, Some("closed-loader".to_string()), false)
+            .await
+            .expect_err("a closed loader channel must reject admission");
+
+        let ModelLoadAdmissionError::Unavailable(message) = error else {
+            panic!("closed loader admission must report an unavailable loader");
+        };
+        assert!(message.contains("model loader is unavailable"));
+        let snapshot = state.runtime_memory.snapshot();
+        assert_eq!(snapshot.host_used_bytes, 0);
+        assert_eq!(snapshot.device_used_bytes, 0);
+        assert_eq!(snapshot.generations, 0);
+        assert!(!state.load_in_progress.load(Ordering::Acquire));
+        assert!(state.model_lifecycle.lock().await.active.is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_memory_budget_rejects_before_loader_queue() {
+        let temp = tempfile::tempdir().unwrap();
+        let model_path = write_test_model_manifest(temp.path(), "over-budget");
+        let (mut state, mut receiver) = test_server_state(temp.path().to_path_buf());
+        Arc::get_mut(&mut state).unwrap().runtime_memory =
+            RuntimeMemoryPlanner::for_test(1, 0, bloomai_core::MemoryTopology::Unified);
+
+        let error = state
+            .admit_model_load(model_path, Some("over-budget".to_string()), false)
+            .await
+            .expect_err("the aggregate budget must reject the candidate before loading");
+
+        let ModelLoadAdmissionError::Unavailable(message) = error else {
+            panic!("memory budget exhaustion must be reported as unavailable");
+        };
+        assert!(message.contains("runtime host memory budget is exhausted"));
+        assert!(receiver.try_recv().is_err());
+        assert!(!state.load_in_progress.load(Ordering::Acquire));
+        assert!(state.model_lifecycle.lock().await.active.is_none());
+    }
+
+    #[tokio::test]
     async fn model_load_admission_joins_only_the_exact_active_sequence() {
         let temp = tempfile::tempdir().unwrap();
         let model_path = write_test_model_manifest(temp.path(), "tiny")
@@ -10475,7 +10920,7 @@ mod tests {
             .await
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["schema_version"], 1);
+        assert_eq!(body["schema_version"], 2);
         assert_eq!(body["object"], "bloom.model_preflight");
         assert_eq!(body["data"]["model_id"], "tiny");
         assert_eq!(body["data"]["manifest"]["family"], "llama");
@@ -10485,6 +10930,10 @@ mod tests {
         );
         assert_eq!(body["data"]["runtime"]["selected_engine"], "candle");
         assert_eq!(body["data"]["loadable"], true);
+        assert_eq!(body["data"]["memory"]["scope"], "aggregate_unified");
+        assert!(body["data"]["memory"]["host_required_bytes"].is_u64());
+        assert!(body["data"]["memory"]["host_limit_bytes"].is_u64());
+        assert_eq!(body["data"]["memory"]["device_required_bytes"], 0);
         assert!(body["data"].get("path").is_none());
     }
 

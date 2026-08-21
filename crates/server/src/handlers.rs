@@ -73,10 +73,13 @@ pub(crate) async fn handle_metrics(State(state): State<Arc<ServerState>>) -> imp
             .and_then(|runtime| runtime.cachemesh.as_ref())
             .map(|mesh| mesh.metrics())
     };
-    let body =
-        state
-            .metrics
-            .render_prometheus(&kv_metrics, cachemesh_metrics.as_ref(), queue_stats);
+    let runtime_memory = state.runtime_memory.snapshot();
+    let body = state.metrics.render_prometheus_with_runtime_memory(
+        &kv_metrics,
+        cachemesh_metrics.as_ref(),
+        queue_stats,
+        runtime_memory,
+    );
     (
         [(
             axum::http::header::CONTENT_TYPE,
@@ -153,6 +156,7 @@ pub(crate) async fn handle_observability(
         "idle"
     };
     let requested_model = state.requested_model.read().await.clone();
+    let runtime_memory = state.runtime_memory.snapshot();
 
     (
         [(axum::http::header::CACHE_CONTROL, "no-store")],
@@ -170,6 +174,13 @@ pub(crate) async fn handle_observability(
                 "resident_generations": resident_generations,
                 "draining_generations": draining_generations,
                 "draining_request_leases": draining_request_leases,
+            },
+            "runtime_memory_budget": {
+                "host_limit_bytes": runtime_memory.host_limit_bytes,
+                "host_committed_bytes": runtime_memory.host_used_bytes,
+                "device_limit_bytes": runtime_memory.device_limit_bytes,
+                "device_committed_bytes": runtime_memory.device_used_bytes,
+                "physical_generations": runtime_memory.generations,
             },
             "load": {
                 "phase": load_phase,
@@ -1415,7 +1426,16 @@ pub(crate) async fn prepare_catalog_model_load(
         ));
     }
 
-    let preflight = match state.model_preflight.inspect(model_id).await {
+    let already_resident = {
+        let runtime_pool = state.runtime_pool.read().await;
+        runtime_pool.contains_source(&path)
+    };
+    let preflight_result = if already_resident {
+        state.model_preflight.inspect_resident(model_id).await
+    } else {
+        state.model_preflight.inspect(model_id).await
+    };
+    let preflight = match preflight_result {
         Ok(report) => report,
         Err(model_preflight::ModelPreflightError::Invalid(message)) => {
             return Err(ModelActivationError::new(

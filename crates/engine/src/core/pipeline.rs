@@ -60,6 +60,32 @@ impl InferencePipeline {
         model_path: &Path,
         context_size: usize,
     ) -> Result<Self> {
+        Self::load_standalone_with_context_policy(engine, device, model_path, context_size, true)
+    }
+
+    /// Load on one exact device without implicit context reduction or CPU
+    /// fallback.
+    ///
+    /// Long-lived serving runtimes perform aggregate, domain-aware admission
+    /// before entering the engine. Re-running the legacy best-effort host-RAM
+    /// heuristic here would compare accelerator demand to the wrong memory
+    /// domain and could silently change the device after a permit was issued.
+    pub fn load_standalone_with_context_strict(
+        engine: &dyn Engine,
+        device: DeviceKind,
+        model_path: &Path,
+        context_size: usize,
+    ) -> Result<Self> {
+        Self::load_standalone_with_context_policy(engine, device, model_path, context_size, false)
+    }
+
+    fn load_standalone_with_context_policy(
+        engine: &dyn Engine,
+        device: DeviceKind,
+        model_path: &Path,
+        context_size: usize,
+        allow_oom_recovery: bool,
+    ) -> Result<Self> {
         let _span = tracing::info_span!(
             "pipeline.load_standalone",
             engine = engine.name(),
@@ -106,7 +132,7 @@ impl InferencePipeline {
 
         let model = loop {
             attempts += 1;
-            if attempts > 5 {
+            if attempts > if allow_oom_recovery { 5 } else { 1 } {
                 return Err(last_err
                     .unwrap_or_else(|| {
                         BloomError::Runtime("OOM recovery failed: too many attempts".into())
@@ -123,7 +149,7 @@ impl InferencePipeline {
                 )
             });
 
-            if let Some(ref est) = temp_estimate {
+            if allow_oom_recovery && let Some(ref est) = temp_estimate {
                 if let Some(avail) = available_system_memory() {
                     if est.total_bytes > avail {
                         let message = memory_budget_exceeded_message(est, avail);
@@ -201,7 +227,7 @@ impl InferencePipeline {
                         || err_str.contains("metal")
                         || err_str.contains("cuda");
 
-                    if is_oom && !strict_memory_budget() {
+                    if allow_oom_recovery && is_oom && !strict_memory_budget() {
                         tracing::warn!(
                             "Model load failed with OOM: {}. Attempting OOM degradation step...",
                             e
@@ -231,6 +257,25 @@ impl InferencePipeline {
                 }
             }
         };
+
+        let actual_device = match model.actual_device() {
+            Some(actual_device) => actual_device,
+            None if !allow_oom_recovery => {
+                return Err(BloomError::Runtime(format!(
+                    "engine '{}' did not report the physical device selected after strict admission for {current_device:?}",
+                    engine.name()
+                ))
+                .into());
+            }
+            None => current_device,
+        };
+        if !allow_oom_recovery && actual_device != current_device {
+            return Err(BloomError::Runtime(format!(
+                "engine loaded the model on {actual_device:?} after strict admission for {current_device:?}"
+            ))
+            .into());
+        }
+        current_device = actual_device;
 
         // Post-load estimate (manifest is now populated from actual model).
         let post_estimate = {
@@ -367,6 +412,12 @@ impl InferencePipeline {
         self.model.as_ref()
     }
 
+    /// Drop a verified idle wrapper before handing execution ownership to a
+    /// scheduler that creates separately accounted per-request wrappers.
+    pub fn release_idle_weights(&self) {
+        self.model.release_idle_weights();
+    }
+
     pub fn context_size(&self) -> usize {
         self.context_size
     }
@@ -487,6 +538,7 @@ mod tests {
 
     struct DummyEngine {
         loaded: Arc<AtomicBool>,
+        actual_device: Option<DeviceKind>,
     }
 
     impl Engine for DummyEngine {
@@ -526,15 +578,21 @@ mod tests {
                     quantized: false,
                     manifest,
                 },
+                actual_device: self.actual_device,
             }))
         }
     }
 
     struct DummyModel {
         metadata: ModelMetadata,
+        actual_device: Option<DeviceKind>,
     }
 
     impl crate::LoadedModel for DummyModel {
+        fn actual_device(&self) -> Option<DeviceKind> {
+            self.actual_device
+        }
+
         fn metadata(&self) -> &ModelMetadata {
             &self.metadata
         }
@@ -584,6 +642,7 @@ mod tests {
         let loaded = Arc::new(AtomicBool::new(false));
         let engine = DummyEngine {
             loaded: Arc::clone(&loaded),
+            actual_device: Some(DeviceKind::Cpu),
         };
 
         let err = match InferencePipeline::load_standalone_with_context(
@@ -641,6 +700,7 @@ mod tests {
                     quantized: false,
                     manifest,
                 },
+                actual_device: Some(DeviceKind::Cpu),
             }))
         }
     }
@@ -680,5 +740,107 @@ mod tests {
         assert_eq!(pipeline.model.metadata().id, "dummy");
         assert_eq!(pipeline.device(), DeviceKind::Cpu);
         assert_eq!(pipeline.context_size(), 2048);
+    }
+
+    #[test]
+    fn strict_standalone_load_never_changes_the_admitted_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = ModelManifest {
+            id: "strict-device".to_string(),
+            family: ModelFamily::Custom("dummy".to_string()),
+            primary_dtype: DType::F32,
+            ..ModelManifest::default()
+        };
+        std::fs::write(
+            dir.path().join("bloom.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = FailOnGpuEngine {
+            attempts: Arc::clone(&attempts),
+        };
+
+        let error = InferencePipeline::load_standalone_with_context_strict(
+            &engine,
+            DeviceKind::Gpu,
+            dir.path(),
+            2_048,
+        )
+        .err()
+        .expect("strict loading must surface the GPU failure");
+
+        assert!(error.to_string().to_ascii_lowercase().contains("vram"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn strict_standalone_rejects_an_engine_that_reports_a_different_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = ModelManifest {
+            id: "lying-device".to_string(),
+            family: ModelFamily::Custom("dummy".to_string()),
+            primary_dtype: DType::F32,
+            ..ModelManifest::default()
+        };
+        std::fs::write(
+            dir.path().join("bloom.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let loaded = Arc::new(AtomicBool::new(false));
+        let engine = DummyEngine {
+            loaded: Arc::clone(&loaded),
+            actual_device: Some(DeviceKind::Cpu),
+        };
+
+        let error = InferencePipeline::load_standalone_with_context_strict(
+            &engine,
+            DeviceKind::Gpu,
+            dir.path(),
+            128,
+        )
+        .err()
+        .expect("strict loading must reject a CPU model returned for GPU admission");
+
+        assert!(error.to_string().contains("strict admission for Gpu"));
+        assert!(loaded.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn strict_standalone_rejects_an_engine_that_cannot_report_its_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = ModelManifest {
+            id: "unknown-device".to_string(),
+            family: ModelFamily::Custom("dummy".to_string()),
+            primary_dtype: DType::F32,
+            ..ModelManifest::default()
+        };
+        std::fs::write(
+            dir.path().join("bloom.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let loaded = Arc::new(AtomicBool::new(false));
+        let engine = DummyEngine {
+            loaded: Arc::clone(&loaded),
+            actual_device: None,
+        };
+
+        let error = InferencePipeline::load_standalone_with_context_strict(
+            &engine,
+            DeviceKind::Cpu,
+            dir.path(),
+            128,
+        )
+        .err()
+        .expect("strict loading must reject an unreported physical device");
+
+        assert!(
+            error
+                .to_string()
+                .contains("did not report the physical device")
+        );
+        assert!(loaded.load(Ordering::SeqCst));
     }
 }

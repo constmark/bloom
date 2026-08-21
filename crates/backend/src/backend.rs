@@ -72,67 +72,84 @@ pub(crate) fn available_free_memory() -> usize {
     }
 }
 
-#[cfg(feature = "cuda")]
-fn cuda_memory_bytes() -> Option<usize> {
-    let output = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let first = String::from_utf8(output.stdout)
-        .ok()?
-        .lines()
-        .next()?
-        .trim()
-        .parse::<usize>()
-        .ok()?;
-    Some(first * 1024 * 1024)
+#[cfg(any(feature = "cuda", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CudaDeviceSnapshot {
+    name: Option<String>,
+    total_memory: usize,
+    free_memory: usize,
 }
 
 #[cfg(feature = "cuda")]
-fn cuda_free_memory_bytes() -> Option<usize> {
-    let output = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+fn cuda_device_zero() -> std::result::Result<CudaDeviceSnapshot, String> {
+    use cudarc::driver::CudaContext;
+
+    // cudarc's dynamic loader panics when the CUDA driver shared library is absent.
+    // Convert that boundary into a normal unavailable result so probing is safe on
+    // CUDA-enabled binaries running on hosts without an NVIDIA driver.
+    let context = std::panic::catch_unwind(|| CudaContext::new(0))
+        .map_err(|_| "CUDA driver library could not be loaded".to_string())?
+        .map_err(|error| format!("could not open CUDA logical device 0: {error}"))?;
+    let (free_memory, total_memory) = context
+        .mem_get_info()
+        .map_err(|error| format!("could not query CUDA logical device 0 memory: {error}"))?;
+
+    Ok(CudaDeviceSnapshot {
+        name: context.name().ok(),
+        total_memory,
+        free_memory,
+    })
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn cuda_availability_from_probe(
+    probe: std::result::Result<CudaDeviceSnapshot, String>,
+    nvidia_smi_driver_version: Option<String>,
+) -> BackendAvailability {
+    let mut details = vec!["CUDA backend compiled".to_string()];
+    if let Some(driver) = nvidia_smi_driver_version {
+        details.push(format!(
+            "nvidia-smi driver version (descriptive metadata only): {driver}"
+        ));
     }
-    let first = String::from_utf8(output.stdout)
-        .ok()?
-        .lines()
-        .next()?
-        .trim()
-        .parse::<usize>()
-        .ok()?;
-    Some(first * 1024 * 1024)
+
+    match probe {
+        Ok(snapshot) => {
+            details.push("CUDA driver logical device 0 is available".to_string());
+            if let Some(name) = snapshot.name {
+                details.push(format!("logical device 0: {name}"));
+            }
+            details.push(format!(
+                "CUDA driver total memory: {} MB",
+                snapshot.total_memory / 1024 / 1024
+            ));
+            details.push(format!(
+                "CUDA driver free memory: {} MB",
+                snapshot.free_memory / 1024 / 1024
+            ));
+            BackendAvailability::available(details)
+        }
+        Err(error) => BackendAvailability::unavailable(
+            format!("CUDA driver logical device 0 is unavailable: {error}"),
+            details,
+        ),
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn cuda_memory_from_probe(
+    probe: std::result::Result<CudaDeviceSnapshot, String>,
+) -> (usize, usize) {
+    match probe {
+        Ok(snapshot) => (snapshot.total_memory, snapshot.free_memory),
+        Err(_) => (0, 0),
+    }
 }
 
 #[cfg(feature = "cuda")]
 fn cuda_driver_version() -> Option<String> {
     let output = std::process::Command::new("nvidia-smi")
         .args(["--query-gpu=driver_version", "--format=csv,noheader"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(
-        String::from_utf8(output.stdout)
-            .ok()?
-            .lines()
-            .next()?
-            .trim()
-            .to_string(),
-    )
-}
-
-#[cfg(feature = "cuda")]
-fn cuda_device_name() -> Option<String> {
-    let output = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=name", "--format=csv,noheader"])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -411,28 +428,7 @@ impl Backend for CudaBackend {
     fn availability(&self) -> BackendAvailability {
         #[cfg(feature = "cuda")]
         {
-            let mut details = vec!["CUDA backend compiled".to_string()];
-            if let Some(driver) = cuda_driver_version() {
-                details.push(format!("driver version: {}", driver));
-            }
-            if let Some(name) = cuda_device_name() {
-                details.push(format!("device: {}", name));
-            }
-            if let Some(bytes) = cuda_memory_bytes() {
-                details.push(format!(
-                    "nvidia-smi total memory: {} MB",
-                    bytes / 1024 / 1024
-                ));
-                if let Some(free) = cuda_free_memory_bytes() {
-                    details.push(format!("nvidia-smi free memory: {} MB", free / 1024 / 1024));
-                }
-                BackendAvailability::available(details)
-            } else {
-                BackendAvailability::unavailable(
-                    "cuda feature is enabled but nvidia-smi did not report a GPU",
-                    details,
-                )
-            }
+            cuda_availability_from_probe(cuda_device_zero(), cuda_driver_version())
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -445,14 +441,9 @@ impl Backend for CudaBackend {
 
     fn capability(&self) -> DeviceCapability {
         #[cfg(feature = "cuda")]
-        let total_memory = cuda_memory_bytes().unwrap_or(8 * GIB as usize);
+        let (total_memory, avail_memory) = cuda_memory_from_probe(cuda_device_zero());
         #[cfg(not(feature = "cuda"))]
-        let total_memory = 0;
-        #[cfg(feature = "cuda")]
-        let avail_memory =
-            cuda_free_memory_bytes().unwrap_or(conservative_available_memory(total_memory));
-        #[cfg(not(feature = "cuda"))]
-        let avail_memory = 0;
+        let (total_memory, avail_memory) = (0, 0);
         DeviceCapability {
             backend_name: "cuda".to_string(),
             vendor: Some("NVIDIA".to_string()),
@@ -645,17 +636,19 @@ mod tests {
     }
 
     #[test]
-    fn cuda_availability_reports_driver_and_device() {
+    fn cuda_availability_reports_logical_device_zero() {
         let backend = CudaBackend;
         let avail = backend.availability();
         #[cfg(feature = "cuda")]
         {
             if avail.available {
                 assert!(
-                    avail.details.iter().any(|d| d.contains("driver version")),
-                    "CUDA availability should report driver: {:?}",
+                    avail.details.iter().any(|d| d.contains("logical device 0")),
+                    "CUDA availability should report logical device 0: {:?}",
                     avail.details
                 );
+                assert!(avail.details.iter().any(|d| d.contains("total memory")));
+                assert!(avail.details.iter().any(|d| d.contains("free memory")));
             }
         }
         #[cfg(not(feature = "cuda"))]
@@ -667,6 +660,57 @@ mod tests {
                 avail.reason
             );
         }
+    }
+
+    #[test]
+    fn cuda_driver_probe_is_the_only_availability_gate() {
+        let snapshot = CudaDeviceSnapshot {
+            name: Some("test gpu".to_string()),
+            total_memory: 24 * GIB as usize,
+            free_memory: 20 * GIB as usize,
+        };
+        let available = cuda_availability_from_probe(Ok(snapshot), None);
+        assert!(available.available);
+        assert!(
+            available
+                .details
+                .iter()
+                .any(|detail| detail.contains("logical device 0"))
+        );
+
+        let unavailable = cuda_availability_from_probe(
+            Err("driver probe failed".to_string()),
+            Some("999.0".to_string()),
+        );
+        assert!(!unavailable.available);
+        assert!(
+            unavailable
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("driver probe failed"))
+        );
+        assert!(
+            unavailable
+                .details
+                .iter()
+                .any(|detail| detail.contains("descriptive metadata only")),
+            "nvidia-smi metadata must not make the backend available"
+        );
+    }
+
+    #[test]
+    fn cuda_capability_memory_uses_driver_probe_without_fallback() {
+        let expected = (24 * GIB as usize, 20 * GIB as usize);
+        let snapshot = CudaDeviceSnapshot {
+            name: None,
+            total_memory: expected.0,
+            free_memory: expected.1,
+        };
+        assert_eq!(cuda_memory_from_probe(Ok(snapshot)), expected);
+        assert_eq!(
+            cuda_memory_from_probe(Err("driver probe failed".to_string())),
+            (0, 0)
+        );
     }
 
     #[test]

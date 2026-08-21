@@ -491,7 +491,13 @@ mod tests {
         let dir = dir_holder.path();
         fs::write(dir.join("config.json"), "{}").unwrap();
         fs::write(dir.join("preprocessor_config.json"), "{}").unwrap();
-        fs::write(dir.join("model.safetensors"), "").unwrap();
+        let mut header = br#"{"weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#.to_vec();
+        let padding = (8 - header.len() % 8) % 8;
+        header.extend(std::iter::repeat_n(b' ', padding));
+        let mut safetensors = u64::try_from(header.len()).unwrap().to_le_bytes().to_vec();
+        safetensors.extend(header);
+        safetensors.extend([0_u8; 4]);
+        fs::write(dir.join("model.safetensors"), safetensors).unwrap();
 
         assert!(has_qwen_asr_layout(dir));
         assert!(!has_funasr_layout(dir));

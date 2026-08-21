@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::Read;
 use std::num::NonZero;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
 use bloomai_core::{
@@ -17,6 +17,8 @@ const MAX_SAFETENSORS_SHARDS: usize = 1_024;
 const MAX_SAFETENSORS_INDEX_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SAFETENSORS_HEADER_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SAFETENSORS_TENSOR_NAME_BYTES: usize = 4_096;
+const MAX_MODEL_ARTIFACT_DEPTH: usize = 16;
+const VALIDATED_SAFETENSORS_ELEMENT_COUNT: &str = "_bloom_validated_safetensors_element_count";
 
 /// Return the inference tasks advertised by Bloom for a trusted model manifest.
 ///
@@ -116,15 +118,20 @@ pub fn format_bytes(bytes: usize) -> String {
 /// is read from `manifest.parameters["kv_cache_bytes_per_token"]`
 /// or defaults to a conservative 512 KB.
 pub fn estimate_memory(manifest: &ModelManifest, context_size: usize) -> MemoryEstimate {
-    estimate_memory_with_weight_dtype(manifest, context_size, manifest.primary_dtype)
+    estimate_memory_with_weight_dtype(manifest, context_size, manifest.primary_dtype, None)
 }
 
 /// Estimate memory using Bloom's effective weight dtype for a target device.
 ///
 /// Native unquantized Safetensors weights are converted to F32 by the current
 /// Candle CPU kernels and to F16 on GPU unless `BLOOM_DTYPE` explicitly selects
-/// another supported precision. The on-disk dtype remains available through
-/// `ModelManifest::primary_dtype`.
+/// another supported precision. Device-aware estimates charge CPU/NPU KV
+/// storage as F32 and GPU KV storage at the verified model tensor width because
+/// the current execution wrappers do not implement the narrower
+/// `BLOOM_KV_CACHE_DTYPE` formats. The on-disk dtype remains available through
+/// `ModelManifest::primary_dtype`. GPU and NPU estimates assume full-layer
+/// accelerator placement unless `BLOOM_GPU_LAYERS` explicitly overrides it;
+/// the device-agnostic [`estimate_memory`] retains its legacy env-only policy.
 pub fn estimate_memory_for_device(
     manifest: &ModelManifest,
     context_size: usize,
@@ -134,6 +141,7 @@ pub fn estimate_memory_for_device(
         manifest,
         context_size,
         effective_weight_dtype(manifest, device),
+        Some(device),
     )
 }
 
@@ -141,6 +149,7 @@ fn estimate_memory_with_weight_dtype(
     manifest: &ModelManifest,
     context_size: usize,
     weight_dtype: DType,
+    target_device: Option<DeviceKind>,
 ) -> MemoryEstimate {
     // 1. Weight estimation
     let stored_weight_bytes = if !manifest.files.is_empty() {
@@ -227,7 +236,16 @@ fn estimate_memory_with_weight_dtype(
                 .and_then(|q| q.kv_cache_dtype)
         });
 
-    let kv_cache_dtype = kv_cache_dtype.unwrap_or(DType::F16);
+    let kv_cache_dtype = match target_device {
+        // CPU wrappers retain F32 KV tensors. NPU execution is not yet a
+        // verified strict-serving target, so keep its admission conservative.
+        Some(DeviceKind::Cpu | DeviceKind::Npu) => DType::F32,
+        // GPU K/V tensors inherit the loaded model tensor width. Compressed KV
+        // env requests are deliberately ignored until kernels implement them.
+        Some(DeviceKind::Gpu) if weight_dtype == DType::F32 => DType::F32,
+        Some(DeviceKind::Gpu) => DType::F16,
+        None => kv_cache_dtype.unwrap_or(DType::F16),
+    };
     let bytes_per_element = kv_cache_element_bytes(kv_cache_dtype);
 
     // KV Cache: 2 (key & value) * num_layers * num_kv_heads * head_dim * bytes_per_element
@@ -257,10 +275,18 @@ fn estimate_memory_with_weight_dtype(
         .unwrap_or(4096) as usize;
     let temp_tensor_bytes = (weight_bytes / 10).max(context_size * hidden_size * 2);
 
-    // Calculate VRAM offload if --gpu-layers is set
-    let gpu_layers = std::env::var("BLOOM_GPU_LAYERS")
+    // Resolve explicit or device-default accelerator layer placement.
+    let explicitly_offloaded_layers = std::env::var("BLOOM_GPU_LAYERS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok());
+    // The legacy device-agnostic estimator only applies explicit layer
+    // offload configuration. A device-aware estimate, however, must describe
+    // the placement selected by that device even when no override is present:
+    // GPU and NPU runtimes default to placing every transformer layer on the
+    // accelerator. An explicit BLOOM_GPU_LAYERS value remains authoritative.
+    let device_layers = explicitly_offloaded_layers.or_else(|| {
+        matches!(target_device, Some(DeviceKind::Gpu | DeviceKind::Npu)).then_some(num_layers)
+    });
 
     let mmap_residency_applied = manifest.runtime_hints.supports_mmap && !manifest.files.is_empty();
     let resident_weight_bytes = if mmap_residency_applied {
@@ -271,7 +297,7 @@ fn estimate_memory_with_weight_dtype(
     };
 
     let (host_weight_bytes, device_weight_bytes, offloaded_layers, total_bytes, memory_scope) =
-        if let Some(layers) = gpu_layers {
+        if let Some(layers) = device_layers {
             let offloaded_layers = layers.min(num_layers);
             if let Some(nl) = NonZero::new(num_layers) {
                 let device_weight = weight_bytes.saturating_mul(offloaded_layers) / nl.get();
@@ -337,6 +363,16 @@ fn estimate_memory_with_weight_dtype(
 }
 
 fn effective_weight_dtype(manifest: &ModelManifest, device: DeviceKind) -> DType {
+    let has_safetensors = manifest
+        .files
+        .iter()
+        .any(|file| file.format == ModelFormat::Safetensors);
+    // Candle's CPU Safetensors path materializes F32 weights and rejects
+    // F16/BF16 requests. Keep admission accounting aligned with that strict
+    // runtime contract even when BLOOM_DTYPE asks for a narrower dtype.
+    if has_safetensors && device == DeviceKind::Cpu {
+        return DType::F32;
+    }
     let requested = std::env::var("BLOOM_DTYPE").ok().and_then(|value| {
         match value.to_ascii_lowercase().as_str() {
             "f32" | "float32" => Some(DType::F32),
@@ -348,11 +384,10 @@ fn effective_weight_dtype(manifest: &ModelManifest, device: DeviceKind) -> DType
     if let Some(dtype) = requested {
         return dtype;
     }
-    let native_safetensors = manifest.quantization.is_none()
-        && manifest
-            .files
-            .iter()
-            .any(|file| file.format == ModelFormat::Safetensors);
+    if has_safetensors && device == DeviceKind::Gpu {
+        return DType::F16;
+    }
+    let native_safetensors = has_safetensors && manifest.quantization.is_none();
     if !native_safetensors {
         return manifest.primary_dtype;
     }
@@ -368,20 +403,58 @@ fn scale_safetensors_weight_bytes(
     stored_weight_bytes: usize,
     runtime_dtype: DType,
 ) -> usize {
-    let native_safetensors = manifest.quantization.is_none()
-        && manifest
+    let has_safetensors = manifest
+        .files
+        .iter()
+        .any(|file| file.format == ModelFormat::Safetensors);
+    if !has_safetensors {
+        return stored_weight_bytes;
+    }
+
+    if let Some(element_count) = manifest
+        .parameters
+        .get(VALIDATED_SAFETENSORS_ELEMENT_COUNT)
+        .and_then(serde_json::Value::as_u64)
+        && let Some(runtime_bytes_per_element) = materialized_dtype_bytes(runtime_dtype)
+    {
+        let safetensors_disk_bytes = manifest
             .files
             .iter()
-            .any(|file| file.format == ModelFormat::Safetensors);
+            .filter(|file| file.format == ModelFormat::Safetensors)
+            .map(|file| file.size_bytes)
+            .fold(0usize, usize::saturating_add);
+        let non_safetensors_bytes = stored_weight_bytes.saturating_sub(safetensors_disk_bytes);
+        let materialized_safetensors_bytes = usize::try_from(element_count)
+            .ok()
+            .and_then(|elements| elements.checked_mul(runtime_bytes_per_element))
+            .unwrap_or(usize::MAX);
+        return non_safetensors_bytes
+            .saturating_add(safetensors_disk_bytes.max(materialized_safetensors_bytes));
+    }
+
+    let native_safetensors = manifest.quantization.is_none();
     if !native_safetensors {
         return stored_weight_bytes;
     }
+
+    // Compatibility for manifests constructed directly by callers rather
+    // than loaded through `load_manifest`. Trusted loaded manifests always
+    // carry the validated tensor element count above.
     let stored_bytes = dtype_weight_bytes(manifest.primary_dtype);
     let runtime_bytes = dtype_weight_bytes(runtime_dtype);
     if stored_bytes <= 0.0 || runtime_bytes <= stored_bytes {
         stored_weight_bytes
     } else {
         (stored_weight_bytes as f64 * runtime_bytes / stored_bytes).ceil() as usize
+    }
+}
+
+fn materialized_dtype_bytes(dtype: DType) -> Option<usize> {
+    match dtype {
+        DType::F32 => Some(4),
+        DType::F16 | DType::BF16 => Some(2),
+        DType::Q8 | DType::I8 | DType::U8 => Some(1),
+        DType::Q4 | DType::I4 | DType::NF4 | DType::Unknown => None,
     }
 }
 
@@ -831,14 +904,15 @@ pub fn load_manifest(model_path: &Path) -> Result<ModelManifest> {
         .into());
     }
 
-    let manifest = if model_path.join("bloom.json").exists() {
+    let explicit_manifest = model_path.join("bloom.json").exists();
+    let mut manifest = if explicit_manifest {
         let content = fs::read_to_string(model_path.join("bloom.json"))?;
         serde_json::from_str(&content)?
     } else if model_path.join("config.json").exists() {
         let content = fs::read_to_string(model_path.join("config.json"))?;
         let config: serde_json::Value = serde_json::from_str(&content)?;
         infer_from_hf_config(model_path, config)?
-    } else if let Some(gguf) = find_gguf_in_dir(model_path) {
+    } else if let Some(gguf) = find_gguf_in_dir(model_path)? {
         // GGUF-only directory (no config.json / bloom.json).
         #[cfg(feature = "candle-engine")]
         {
@@ -861,30 +935,244 @@ pub fn load_manifest(model_path: &Path) -> Result<ModelManifest> {
         infer_from_path(model_path)?
     };
 
-    validate_manifest(&manifest, model_path)?;
+    if explicit_manifest {
+        validate_explicit_manifest_artifact_coverage(&manifest, model_path)?;
+    }
+    validate_manifest(&mut manifest, model_path)?;
     Ok(manifest)
 }
 
-fn validate_manifest(
+fn validate_explicit_manifest_artifact_coverage(
     manifest: &ModelManifest,
     model_path: &Path,
 ) -> std::result::Result<(), BloomError> {
-    // Verify that required files exist.
-    for file in &manifest.files {
-        let path = model_path.join(&file.name);
+    let declared = manifest
+        .files
+        .iter()
+        .map(|file| safe_manifest_relative_path(&file.name))
+        .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+    let mut stack = vec![(model_path.to_path_buf(), 0usize)];
+    let mut entries = 0usize;
+    while let Some((directory, depth)) = stack.pop() {
+        if depth > MAX_MODEL_ARTIFACT_DEPTH {
+            return Err(BloomError::ModelLoad(format!(
+                "model artifact tree exceeds the {MAX_MODEL_ARTIFACT_DEPTH} level safety limit"
+            )));
+        }
+        let children =
+            fs::read_dir(&directory).map_err(|error| BloomError::ModelLoad(error.to_string()))?;
+        for child in children {
+            entries = entries.checked_add(1).ok_or_else(|| {
+                BloomError::ModelLoad("model artifact entry count overflow".to_string())
+            })?;
+            if entries > MAX_MODEL_DIRECTORY_ENTRIES {
+                return Err(BloomError::ModelLoad(format!(
+                    "model artifact tree exceeds the {MAX_MODEL_DIRECTORY_ENTRIES} entry safety limit"
+                )));
+            }
+            let child = child.map_err(|error| BloomError::ModelLoad(error.to_string()))?;
+            let file_type = child
+                .file_type()
+                .map_err(|error| BloomError::ModelLoad(error.to_string()))?;
+            if file_type.is_symlink() {
+                return Err(BloomError::ModelLoad(
+                    "model artifact trees must not contain symbolic links".to_string(),
+                ));
+            }
+            if file_type.is_dir() {
+                stack.push((child.path(), depth.saturating_add(1)));
+                continue;
+            }
+            if !file_type.is_file() || !is_executable_model_artifact(&child.path()) {
+                continue;
+            }
+            let relative = child
+                .path()
+                .strip_prefix(model_path)
+                .map_err(|_| {
+                    BloomError::ModelLoad(
+                        "model artifact escaped the configured model root".to_string(),
+                    )
+                })?
+                .to_path_buf();
+            if !declared.contains(&relative) {
+                return Err(BloomError::ModelLoad(format!(
+                    "executable model artifact '{}' is not declared by bloom.json",
+                    relative.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn safe_manifest_relative_path(name: &str) -> std::result::Result<PathBuf, BloomError> {
+    let path = Path::new(name);
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || !path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return Err(BloomError::InvalidInput(
+            "manifest model-file paths must be safe relative paths".to_string(),
+        ));
+    }
+    Ok(path.to_path_buf())
+}
+
+fn is_executable_model_artifact(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "safetensors"
+                    | "gguf"
+                    | "onnx"
+                    | "bin"
+                    | "engine"
+                    | "plan"
+                    | "spv"
+                    | "spirv"
+                    | "pt"
+                    | "pth"
+                    | "ckpt"
+                    | "npz"
+                    | "npy"
+                    | "mlmodel"
+                    | "tflite"
+                    | "pte"
+                    | "xml"
+            )
+        })
+}
+
+fn format_implied_by_extension(path: &Path) -> Option<ModelFormat> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    match extension.as_str() {
+        "safetensors" => Some(ModelFormat::Safetensors),
+        "gguf" => Some(ModelFormat::Gguf),
+        "onnx" => Some(ModelFormat::Onnx),
+        "engine" | "plan" => Some(ModelFormat::TensorRtEngine),
+        "spv" | "spirv" => Some(ModelFormat::VulkanSpirv),
+        "mlmodel" => Some(ModelFormat::CoreMl),
+        "xml" => Some(ModelFormat::OpenVinoIr),
+        // .bin/.pt/.pth/.npz/.npy are shared by multiple runtimes and do not
+        // identify one model format strongly enough for fail-closed matching.
+        _ => None,
+    }
+}
+
+fn weight_quantization_matches(declared: &QuantizationInfo, inferred: &QuantizationInfo) -> bool {
+    declared.scheme == inferred.scheme
+        && declared.bits == inferred.bits
+        && declared.group_size == inferred.group_size
+        && declared.act_order == inferred.act_order
+}
+
+fn validate_manifest(
+    manifest: &mut ModelManifest,
+    model_path: &Path,
+) -> std::result::Result<(), BloomError> {
+    manifest
+        .parameters
+        .remove(VALIDATED_SAFETENSORS_ELEMENT_COUNT);
+    let mut safetensors_element_count = 0_u64;
+    let mut has_safetensors = false;
+
+    // Verify that required files exist and normalize every declared file to
+    // its actual physical size. Runtime admission must never trust a smaller
+    // manifest declaration than the bytes the backend can map or load.
+    for file in &mut manifest.files {
+        let relative = safe_manifest_relative_path(&file.name)?;
+        if let Some(implied_format) = format_implied_by_extension(&relative)
+            && file.format != implied_format
+        {
+            return Err(BloomError::ModelLoad(format!(
+                "declared format {:?} for '{}' conflicts with the {:?} format required by its extension",
+                file.format, file.name, implied_format
+            )));
+        }
+        let path = model_path.join(relative);
         if file.required && !path.exists() {
             return Err(BloomError::MissingRequiredFile(file.name.clone()));
         }
-        if path.exists() && file.size_bytes > 0 {
-            let actual = std::fs::metadata(&path)
-                .map_err(|e| BloomError::ModelLoad(e.to_string()))?
-                .len() as usize;
-            if actual < file.size_bytes {
+        if path.exists() {
+            let metadata =
+                std::fs::metadata(&path).map_err(|e| BloomError::ModelLoad(e.to_string()))?;
+            if !metadata.is_file() {
+                return Err(BloomError::ModelLoad(format!(
+                    "declared model file '{}' is not a regular file",
+                    file.name
+                )));
+            }
+            let actual = usize::try_from(metadata.len()).map_err(|_| {
+                BloomError::ModelLoad(format!(
+                    "file '{}' exceeds the platform size limit",
+                    file.name
+                ))
+            })?;
+            if file.size_bytes > 0 && actual < file.size_bytes {
                 return Err(BloomError::ModelLoad(format!(
                     "file '{}' is smaller than declared size: actual={}, declared={}",
                     file.name, actual, file.size_bytes
                 )));
             }
+            file.size_bytes = actual;
+
+            if file.format == ModelFormat::Safetensors {
+                let summary = read_safetensors_header(&path).map_err(|error| {
+                    BloomError::ModelLoad(format!(
+                        "failed to validate Safetensors artifact '{}': {error:#}",
+                        file.name
+                    ))
+                })?;
+                safetensors_element_count = safetensors_element_count
+                    .checked_add(summary.element_count)
+                    .ok_or_else(|| {
+                        BloomError::ModelLoad(
+                            "Safetensors checkpoint element count overflow".to_string(),
+                        )
+                    })?;
+                has_safetensors = true;
+            }
+        }
+    }
+
+    if has_safetensors {
+        manifest.parameters.insert(
+            VALIDATED_SAFETENSORS_ELEMENT_COUNT.to_string(),
+            serde_json::json!(safetensors_element_count),
+        );
+    }
+
+    if has_safetensors && let Some(declared_quantization) = manifest.quantization.as_ref() {
+        let config_path = model_path.join("config.json");
+        let config = fs::read(&config_path).map_err(|error| {
+            BloomError::ModelLoad(format!(
+                "Safetensors quantization must be backed by config.json: {error}"
+            ))
+        })?;
+        let config: serde_json::Value = serde_json::from_slice(&config).map_err(|error| {
+            BloomError::ModelLoad(format!(
+                "invalid config.json for Safetensors quantization: {error}"
+            ))
+        })?;
+        let inferred_quantization = infer_quantization(&config).ok_or_else(|| {
+            BloomError::ModelLoad(
+                "manifest declares quantized Safetensors, but config.json has no supported matching quantization_config"
+                    .to_string(),
+            )
+        })?;
+        if !weight_quantization_matches(declared_quantization, &inferred_quantization) {
+            return Err(BloomError::ModelLoad(format!(
+                "manifest Safetensors quantization {:?}/{}-bit does not match config.json {:?}/{}-bit",
+                declared_quantization.scheme,
+                declared_quantization.bits,
+                inferred_quantization.scheme,
+                inferred_quantization.bits
+            )));
         }
     }
 
@@ -909,6 +1197,68 @@ fn validate_manifest(
         ));
     }
 
+    Ok(())
+}
+
+fn normalize_nested_text_config(
+    config: &serde_json::Value,
+    manifest: &mut ModelManifest,
+) -> Result<()> {
+    let Some(text_config) = config.get("text_config") else {
+        return Ok(());
+    };
+    let text_config = text_config
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("text_config must be an object"))?;
+
+    let required_fields = [
+        "num_hidden_layers",
+        "num_key_value_heads",
+        "hidden_size",
+        "intermediate_size",
+        "vocab_size",
+        "num_attention_heads",
+    ];
+    for field in required_fields {
+        let value = text_config
+            .get(field)
+            .and_then(serde_json::Value::as_u64)
+            .filter(|value| *value > 0)
+            .ok_or_else(|| anyhow::anyhow!("text_config.{field} must be a positive integer"))?;
+        usize::try_from(value).map_err(|_| {
+            anyhow::anyhow!("text_config.{field} exceeds this platform's integer range")
+        })?;
+        manifest
+            .parameters
+            .insert(field.to_string(), serde_json::Value::from(value));
+    }
+
+    let head_dim = match text_config.get("head_dim") {
+        Some(value) => value
+            .as_u64()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| anyhow::anyhow!("text_config.head_dim must be a positive integer"))?,
+        None => {
+            let hidden_size = manifest.parameters["hidden_size"]
+                .as_u64()
+                .expect("validated nested hidden_size");
+            let attention_heads = manifest.parameters["num_attention_heads"]
+                .as_u64()
+                .expect("validated nested num_attention_heads");
+            if !hidden_size.is_multiple_of(attention_heads) {
+                return Err(anyhow::anyhow!(
+                    "text_config.hidden_size must be divisible by text_config.num_attention_heads when head_dim is omitted"
+                ));
+            }
+            hidden_size / attention_heads
+        }
+    };
+    usize::try_from(head_dim).map_err(|_| {
+        anyhow::anyhow!("text_config.head_dim exceeds this platform's integer range")
+    })?;
+    manifest
+        .parameters
+        .insert("head_dim".to_string(), serde_json::Value::from(head_dim));
     Ok(())
 }
 
@@ -983,6 +1333,12 @@ fn infer_from_hf_config(model_path: &Path, config: serde_json::Value) -> Result<
             manifest.parameters.insert(k.clone(), v.clone());
         }
     }
+    // Multimodal Hugging Face configurations (for example Qwen3-VL and
+    // Gemma 4) keep the causal text model dimensions under `text_config`.
+    // The runtime builds its decoder and KV cache from those nested values,
+    // so normalize them into the canonical estimator keys and reject an
+    // incomplete shape instead of falling back to generic memory defaults.
+    normalize_nested_text_config(&config, &mut manifest)?;
     if manifest.family == ModelFamily::Bert {
         manifest.parameters.insert(
             "bloom_task".to_string(),
@@ -1020,6 +1376,9 @@ fn infer_from_hf_config(model_path: &Path, config: serde_json::Value) -> Result<
 
     let is_longcat_edit =
         matches!(&manifest.family, ModelFamily::Custom(c) if c == "longcat-image-edit");
+    // Only advertise vision when Bloom has a matching multimodal executor.
+    // The current Gemma-4 Candle path intentionally exposes its implemented
+    // text subset rather than claiming unsupported image inference.
     let is_vl = model_type.contains("vl") || arch.contains("vl");
 
     manifest.io_schema = ModelIoSchema {
@@ -1041,6 +1400,37 @@ fn infer_from_hf_config(model_path: &Path, config: serde_json::Value) -> Result<
         manifest.runtime_hints.preferred_backends = vec!["longcat".to_string()];
         manifest.runtime_hints.supports_mmap = true;
         infer_longcat_files(model_path, &mut manifest)?;
+    }
+
+    // Some Hugging Face-compatible GGUF packages retain config.json for
+    // architecture/tokenizer metadata but contain no Safetensors checkpoint.
+    // In that layout the GGUF header and physical file are the authoritative
+    // weight artifact; never leave the manifest with zero accounted files or
+    // trust config.json's unquantized torch_dtype instead.
+    if manifest.files.is_empty()
+        && let Some(gguf_path) = find_gguf_in_dir(model_path)?
+    {
+        #[cfg(feature = "candle-engine")]
+        {
+            let gguf_manifest = infer_from_gguf(model_path, &gguf_path)?;
+            manifest.family = gguf_manifest.family;
+            manifest.primary_dtype = gguf_manifest.primary_dtype;
+            manifest.quantization = gguf_manifest.quantization;
+            manifest.files = gguf_manifest.files;
+            manifest.license = gguf_manifest.license;
+            manifest.io_schema = gguf_manifest.io_schema;
+            for (key, value) in gguf_manifest.parameters {
+                manifest.parameters.insert(key, value);
+            }
+        }
+        #[cfg(not(feature = "candle-engine"))]
+        {
+            return Err(BloomError::UnsupportedFormat(
+                "config.json accompanies a GGUF checkpoint, but GGUF inspection requires the `candle-engine` feature"
+                    .to_string(),
+            )
+            .into());
+        }
     }
 
     Ok(manifest)
@@ -1319,7 +1709,26 @@ fn parse_safetensors_shard_name(name: &str) -> Result<(usize, usize)> {
     Ok((index, total))
 }
 
-fn read_safetensors_header(path: &Path) -> Result<(BTreeSet<String>, u64)> {
+#[derive(Debug)]
+struct SafetensorsHeaderSummary {
+    tensor_names: BTreeSet<String>,
+    tensor_bytes: u64,
+    element_count: u64,
+}
+
+fn safetensors_dtype_bits(dtype: &str) -> Option<u64> {
+    match dtype {
+        "F4" => Some(4),
+        "F6_E2M3" | "F6_E3M2" => Some(6),
+        "BOOL" | "U8" | "I8" | "F8_E5M2" | "F8_E4M3" | "F8_E8M0" => Some(8),
+        "I16" | "U16" | "F16" | "BF16" => Some(16),
+        "I32" | "U32" | "F32" => Some(32),
+        "I64" | "U64" | "F64" | "C64" => Some(64),
+        _ => None,
+    }
+}
+
+fn read_safetensors_header(path: &Path) -> Result<SafetensorsHeaderSummary> {
     let metadata = regular_file_metadata(path, "Safetensors shard")?
         .ok_or_else(|| anyhow::anyhow!("Safetensors shard is missing: {}", path.display()))?;
     if metadata.len() < 8 {
@@ -1366,6 +1775,7 @@ fn read_safetensors_header(path: &Path) -> Result<(BTreeSet<String>, u64)> {
     let mut names = BTreeSet::new();
     let mut ranges = Vec::new();
     let mut tensor_bytes = 0_u64;
+    let mut element_count = 0_u64;
     for (name, tensor) in tensors {
         if name == "__metadata__" {
             continue;
@@ -1397,6 +1807,47 @@ fn read_safetensors_header(path: &Path) -> Result<(BTreeSet<String>, u64)> {
                 path.display()
             ));
         }
+        let dtype = tensor
+            .get("dtype")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                anyhow::anyhow!("tensor {name:?} in {} has an invalid dtype", path.display())
+            })?;
+        let dtype_bits = safetensors_dtype_bits(dtype).ok_or_else(|| {
+            anyhow::anyhow!(
+                "tensor {name:?} in {} uses unsupported Safetensors dtype {dtype:?}",
+                path.display()
+            )
+        })?;
+        let shape = tensor
+            .get("shape")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                anyhow::anyhow!("tensor {name:?} in {} has an invalid shape", path.display())
+            })?;
+        let elements = shape.iter().try_fold(1_u64, |elements, dimension| {
+            let dimension = dimension.as_u64().ok_or_else(|| {
+                anyhow::anyhow!("tensor {name:?} has a non-integer shape dimension")
+            })?;
+            elements
+                .checked_mul(dimension)
+                .ok_or_else(|| anyhow::anyhow!("tensor {name:?} element count overflow"))
+        })?;
+        let tensor_bits = elements
+            .checked_mul(dtype_bits)
+            .ok_or_else(|| anyhow::anyhow!("tensor {name:?} bit count overflow"))?;
+        if tensor_bits % 8 != 0 || tensor_bits / 8 != end - start {
+            return Err(anyhow::anyhow!(
+                "tensor {name:?} in {} has {} bytes, but dtype {dtype} and shape {:?} require {} bits",
+                path.display(),
+                end - start,
+                shape,
+                tensor_bits
+            ));
+        }
+        element_count = element_count
+            .checked_add(elements)
+            .ok_or_else(|| anyhow::anyhow!("Safetensors element count overflow"))?;
         tensor_bytes = tensor_bytes
             .checked_add(end - start)
             .ok_or_else(|| anyhow::anyhow!("Safetensors tensor byte count overflow"))?;
@@ -1404,17 +1855,27 @@ fn read_safetensors_header(path: &Path) -> Result<(BTreeSet<String>, u64)> {
         names.insert(name.clone());
     }
     ranges.sort_by_key(|(start, end, _)| (*start, *end));
-    for pair in ranges.windows(2) {
-        if pair[1].0 < pair[0].1 {
+    let mut expected_start = 0_u64;
+    for (start, end, name) in &ranges {
+        if *start != expected_start {
             return Err(anyhow::anyhow!(
-                "Safetensors tensors {:?} and {:?} overlap in {}",
-                pair[0].2,
-                pair[1].2,
+                "Safetensors tensor {name:?} starts at byte {start}, expected {expected_start} in {}",
                 path.display()
             ));
         }
+        expected_start = *end;
     }
-    Ok((names, tensor_bytes))
+    if expected_start != data_length {
+        return Err(anyhow::anyhow!(
+            "Safetensors tensor data covers {expected_start} bytes, but {} contains {data_length} data bytes",
+            path.display()
+        ));
+    }
+    Ok(SafetensorsHeaderSummary {
+        tensor_names: names,
+        tensor_bytes,
+        element_count,
+    })
 }
 
 /// Resolve a Hugging Face Safetensors checkpoint with fail-closed shard checks.
@@ -1527,11 +1988,11 @@ pub fn resolve_hf_safetensors_files(model_path: &Path) -> Result<Vec<std::path::
     let mut paths = Vec::with_capacity(shard_names.len());
     for shard_name in &shard_names {
         let path = model_path.join(shard_name);
-        let (tensor_names, tensor_bytes) = read_safetensors_header(&path)?;
+        let summary = read_safetensors_header(&path)?;
         total_tensor_bytes = total_tensor_bytes
-            .checked_add(tensor_bytes)
+            .checked_add(summary.tensor_bytes)
             .ok_or_else(|| anyhow::anyhow!("Safetensors checkpoint byte count overflow"))?;
-        for tensor_name in tensor_names {
+        for tensor_name in summary.tensor_names {
             if let Some(previous) =
                 actual_weight_map.insert(tensor_name.clone(), shard_name.clone())
             {
@@ -1669,19 +2130,40 @@ fn infer_longcat_files(model_path: &Path, manifest: &mut ModelManifest) -> Resul
     Ok(())
 }
 
-/// Find the first `.gguf` file in a directory (non-recursive).
-fn find_gguf_in_dir(model_path: &Path) -> Option<std::path::PathBuf> {
+/// Find the only `.gguf` file in a directory (non-recursive).
+///
+/// Auto-inference cannot safely choose among multiple checkpoints because the
+/// runtime's directory iteration order is not an artifact identity contract.
+fn find_gguf_in_dir(model_path: &Path) -> Result<Option<std::path::PathBuf>> {
     if !model_path.is_dir() {
-        return None;
+        return Ok(None);
     }
-    std::fs::read_dir(model_path)
-        .ok()?
-        .flatten()
-        .find(|e| {
-            let p = e.path();
-            p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("gguf")
-        })
-        .map(|e| e.path())
+    let mut gguf_files = Vec::new();
+    for (entry_index, entry) in std::fs::read_dir(model_path)?.enumerate() {
+        if entry_index >= MAX_MODEL_DIRECTORY_ENTRIES {
+            return Err(anyhow::anyhow!(
+                "model directory exceeds the {MAX_MODEL_DIRECTORY_ENTRIES} entry safety limit"
+            ));
+        }
+        let path = entry?.path();
+        if path.is_file()
+            && path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+        {
+            gguf_files.push(path);
+        }
+    }
+    gguf_files.sort();
+    match gguf_files.len() {
+        0 => Ok(None),
+        1 => Ok(gguf_files.pop()),
+        _ => Err(anyhow::anyhow!(
+            "multiple GGUF checkpoints found in {}; select one file explicitly",
+            model_path.display()
+        )),
+    }
 }
 
 /// Find the preferred `.onnx` file in a directory (non-recursive).
@@ -2270,6 +2752,13 @@ mod tests {
             unsafe { std::env::set_var(key, value) };
             Self { key, previous }
         }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            // FIXME: Audit that the environment access only happens in single-threaded code.
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
     }
 
     impl Drop for EnvVarGuard {
@@ -2319,6 +2808,30 @@ mod tests {
         let mut bytes = u64::try_from(header.len()).unwrap().to_le_bytes().to_vec();
         bytes.extend(header);
         bytes.resize(bytes.len() + tensor_names.len() * 4, 0);
+        fs::write(path, bytes).unwrap();
+    }
+
+    fn write_test_safetensors_tensor(
+        path: &Path,
+        tensor_name: &str,
+        dtype: &str,
+        shape: &[usize],
+        data_bytes: usize,
+    ) {
+        let header = BTreeMap::from([(
+            tensor_name,
+            serde_json::json!({
+                "dtype": dtype,
+                "shape": shape,
+                "data_offsets": [0, data_bytes],
+            }),
+        )]);
+        let mut header = serde_json::to_vec(&header).unwrap();
+        let padding = (8 - header.len() % 8) % 8;
+        header.extend(std::iter::repeat_n(b' ', padding));
+        let mut bytes = u64::try_from(header.len()).unwrap().to_le_bytes().to_vec();
+        bytes.extend(header);
+        bytes.resize(bytes.len() + data_bytes, 0);
         fs::write(path, bytes).unwrap();
     }
 
@@ -2390,7 +2903,7 @@ mod tests {
     #[test]
     fn rejects_ambiguous_single_file_and_sharded_safetensors_layouts() {
         let directory = tempfile::tempdir().unwrap();
-        fs::write(directory.path().join("model.safetensors"), b"weights").unwrap();
+        write_test_safetensors(&directory.path().join("model.safetensors"), &["weight"]);
         let shard = "model-00001-of-00001.safetensors";
         write_test_safetensors(&directory.path().join(shard), &["weight"]);
         write_test_safetensors_index(directory.path(), &[("weight", shard)], 4);
@@ -2728,7 +3241,7 @@ mod tests {
             }"#,
         )
         .unwrap();
-        fs::write(dir.path().join("model.safetensors"), b"weights").unwrap();
+        write_test_safetensors(&dir.path().join("model.safetensors"), &["weight"]);
         fs::write(
             dir.path().join("tokenizer_config.json"),
             br#"{"chat_template":"<|im_start|>You are a helpful AI assistant named SmolLM<|im_end|>"}"#,
@@ -2742,7 +3255,12 @@ mod tests {
         assert_eq!(manifest.files.len(), 1);
         assert_eq!(manifest.files[0].name, "model.safetensors");
         assert_eq!(manifest.files[0].format, ModelFormat::Safetensors);
-        assert_eq!(manifest.files[0].size_bytes, 7);
+        assert_eq!(
+            manifest.files[0].size_bytes,
+            fs::metadata(dir.path().join("model.safetensors"))
+                .unwrap()
+                .len() as usize
+        );
         assert!(manifest.files[0].required);
         assert_eq!(
             manifest.parameters.get("head_dim"),
@@ -2752,6 +3270,77 @@ mod tests {
             manifest.parameters.get("chat_template_kind"),
             Some(&serde_json::json!("smollm2"))
         );
+    }
+
+    #[test]
+    fn hf_nested_text_config_drives_the_canonical_kv_estimate() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            br#"{
+                "architectures": ["Qwen3VLForConditionalGeneration"],
+                "model_type": "qwen3_vl",
+                "torch_dtype": "float16",
+                "num_hidden_layers": 1,
+                "num_key_value_heads": 1,
+                "head_dim": 1,
+                "text_config": {
+                    "num_hidden_layers": 48,
+                    "num_key_value_heads": 6,
+                    "hidden_size": 3072,
+                    "intermediate_size": 8192,
+                    "vocab_size": 151936,
+                    "num_attention_heads": 24
+                }
+            }"#,
+        )
+        .unwrap();
+        write_test_safetensors(&dir.path().join("model.safetensors"), &["weight"]);
+
+        let manifest = load_manifest(dir.path()).unwrap();
+        for (field, expected) in [
+            ("num_hidden_layers", 48),
+            ("num_key_value_heads", 6),
+            ("hidden_size", 3072),
+            ("intermediate_size", 8192),
+            ("vocab_size", 151936),
+            ("num_attention_heads", 24),
+            ("head_dim", 128),
+        ] {
+            assert_eq!(
+                manifest.parameters.get(field),
+                Some(&serde_json::json!(expected)),
+                "canonical {field} must come from text_config"
+            );
+        }
+
+        let estimate = estimate_memory(&manifest, 3);
+        let expected_per_token = 2 * 48 * 6 * 128 * 2;
+        assert_eq!(estimate.kv_cache_bytes_per_token, expected_per_token);
+        assert_eq!(estimate.kv_cache_bytes, 3 * expected_per_token);
+    }
+
+    #[test]
+    fn hf_nested_text_config_rejects_an_incomplete_memory_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = infer_from_hf_config(
+            dir.path(),
+            serde_json::json!({
+                "architectures": ["Qwen3VLForConditionalGeneration"],
+                "model_type": "qwen3_vl",
+                "text_config": {
+                    "num_hidden_layers": 48,
+                    "hidden_size": 3072,
+                    "intermediate_size": 8192,
+                    "vocab_size": 151936,
+                    "num_attention_heads": 24
+                }
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("text_config.num_key_value_heads must be a positive integer"));
     }
 
     #[test]
@@ -2813,7 +3402,7 @@ mod tests {
             }"#,
         )
         .unwrap();
-        fs::write(dir.path().join("model.safetensors"), b"weights").unwrap();
+        write_test_safetensors(&dir.path().join("model.safetensors"), &["weight"]);
         fs::write(
             dir.path().join("sentence_bert_config.json"),
             br#"{"max_seq_length":256}"#,
@@ -2881,7 +3470,7 @@ mod tests {
             br#"{"architectures":["BertModel"],"model_type":"bert"}"#,
         )
         .unwrap();
-        fs::write(dir.path().join("model.safetensors"), b"weights").unwrap();
+        write_test_safetensors(&dir.path().join("model.safetensors"), &["weight"]);
         let oversized = fs::File::create(dir.path().join("sentence_bert_config.json")).unwrap();
         oversized
             .set_len(MAX_SENTENCE_TRANSFORMER_CONFIG_BYTES.saturating_add(1))
@@ -2899,7 +3488,7 @@ mod tests {
             br#"{"model_type":"bert","hidden_size":384}"#,
         )
         .unwrap();
-        fs::write(dir.path().join("model.safetensors"), b"weights").unwrap();
+        write_test_safetensors(&dir.path().join("model.safetensors"), &["weight"]);
         fs::write(
             dir.path().join("modules.json"),
             br#"[
@@ -2922,7 +3511,7 @@ mod tests {
             br#"{"model_type":"bert","hidden_size":384}"#,
         )
         .unwrap();
-        fs::write(dir.path().join("model.safetensors"), b"weights").unwrap();
+        write_test_safetensors(&dir.path().join("model.safetensors"), &["weight"]);
         fs::create_dir(dir.path().join("1_Pooling")).unwrap();
         fs::write(
             dir.path().join("1_Pooling/config.json"),
@@ -2946,7 +3535,7 @@ mod tests {
             br#"{"model_type":"bert","hidden_size":384}"#,
         )
         .unwrap();
-        fs::write(dir.path().join("model.safetensors"), b"weights").unwrap();
+        write_test_safetensors(&dir.path().join("model.safetensors"), &["weight"]);
         fs::create_dir(dir.path().join("1_Pooling")).unwrap();
         fs::write(
             dir.path().join("1_Pooling/config.json"),
@@ -2969,7 +3558,7 @@ mod tests {
             br#"{"architectures":["LlamaForCausalLM"],"torch_dtype":"bfloat16"}"#,
         )
         .unwrap();
-        fs::write(dir.path().join("model.safetensors"), b"weights").unwrap();
+        write_test_safetensors(&dir.path().join("model.safetensors"), &["weight"]);
         let oversized = fs::File::create(dir.path().join("tokenizer_config.json")).unwrap();
         oversized
             .set_len(MAX_TOKENIZER_CONFIG_BYTES.saturating_add(1))
@@ -2980,9 +3569,157 @@ mod tests {
     }
 
     #[test]
+    fn explicit_manifest_file_sizes_are_normalized_to_physical_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("weights.bin"), vec![0_u8; 4096]).unwrap();
+        let manifest = ModelManifest {
+            id: "physical-size".to_string(),
+            family: ModelFamily::Custom("test".to_string()),
+            license: Some("MIT".to_string()),
+            primary_dtype: DType::F32,
+            io_schema: bloomai_core::ModelIoSchema {
+                inputs: vec![Modality::Text],
+                outputs: vec![Modality::Text],
+            },
+            files: vec![ModelFile {
+                name: "weights.bin".to_string(),
+                format: ModelFormat::Unknown,
+                size_bytes: 1,
+                hash_sha256: None,
+                required: true,
+            }],
+            ..ModelManifest::default()
+        };
+        fs::write(
+            dir.path().join("bloom.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_manifest(dir.path()).unwrap();
+
+        assert_eq!(loaded.files[0].size_bytes, 4096);
+        assert!(estimate_memory(&loaded, 0).weight_bytes >= 4096);
+    }
+
+    #[test]
+    fn explicit_manifest_rejects_format_that_conflicts_with_known_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("model.safetensors"), b"not-a-gguf").unwrap();
+        let manifest = ModelManifest {
+            id: "format-mismatch".to_string(),
+            family: ModelFamily::Llama,
+            license: Some("MIT".to_string()),
+            primary_dtype: DType::F16,
+            io_schema: ModelIoSchema {
+                inputs: vec![Modality::Text],
+                outputs: vec![Modality::Text],
+            },
+            files: vec![ModelFile {
+                name: "model.safetensors".to_string(),
+                format: ModelFormat::Gguf,
+                size_bytes: 0,
+                hash_sha256: None,
+                required: true,
+            }],
+            ..ModelManifest::default()
+        };
+        fs::write(
+            dir.path().join("bloom.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let error = load_manifest(dir.path()).unwrap_err().to_string();
+
+        assert!(error.contains("conflicts"));
+        assert!(error.contains("model.safetensors"));
+    }
+
+    #[test]
+    fn explicit_manifest_rejects_unbacked_safetensors_quantization_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_safetensors_tensor(
+            &dir.path().join("model.safetensors"),
+            "weight",
+            "F16",
+            &[8],
+            16,
+        );
+        let manifest = ModelManifest {
+            id: "false-quantization".to_string(),
+            family: ModelFamily::Llama,
+            license: Some("MIT".to_string()),
+            primary_dtype: DType::Q4,
+            quantization: Some(QuantizationInfo {
+                scheme: QuantScheme::INT4,
+                bits: 4,
+                ..QuantizationInfo::default()
+            }),
+            io_schema: ModelIoSchema {
+                inputs: vec![Modality::Text],
+                outputs: vec![Modality::Text],
+            },
+            files: vec![ModelFile {
+                name: "model.safetensors".to_string(),
+                format: ModelFormat::Safetensors,
+                size_bytes: 0,
+                hash_sha256: None,
+                required: true,
+            }],
+            ..ModelManifest::default()
+        };
+        fs::write(
+            dir.path().join("bloom.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let error = load_manifest(dir.path()).unwrap_err().to_string();
+
+        assert!(error.contains("quantization must be backed by config.json"));
+    }
+
+    #[test]
+    fn explicit_manifest_rejects_weight_artifacts_omitted_from_accounting() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::File::create(dir.path().join("model.safetensors"))
+            .unwrap()
+            .set_len(64 * 1024)
+            .unwrap();
+        let manifest = ModelManifest {
+            id: "omitted-weight".to_string(),
+            family: ModelFamily::Llama,
+            license: Some("MIT".to_string()),
+            primary_dtype: DType::F16,
+            io_schema: ModelIoSchema {
+                inputs: vec![Modality::Text],
+                outputs: vec![Modality::Text],
+            },
+            memory_profile: ModelMemoryProfile {
+                min_ram_bytes: 1,
+                min_vram_bytes: 0,
+                recommended_ram_bytes: 0,
+                recommended_vram_bytes: 0,
+            },
+            ..ModelManifest::default()
+        };
+        fs::write(
+            dir.path().join("bloom.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let error = load_manifest(dir.path()).unwrap_err().to_string();
+
+        assert!(error.contains("model.safetensors"));
+        assert!(error.contains("not declared"));
+    }
+
+    #[test]
     fn cpu_safetensors_memory_estimate_accounts_for_f32_materialization() {
         let _lock = ENV_LOCK.lock().unwrap();
-        let _dtype = EnvVarGuard::set("BLOOM_DTYPE", "auto");
+        let _dtype = EnvVarGuard::set("BLOOM_DTYPE", "f16");
         let manifest = ModelManifest {
             primary_dtype: DType::BF16,
             files: vec![ModelFile {
@@ -3001,6 +3738,89 @@ mod tests {
         assert_eq!(cpu.weight_bytes, 2_000);
         assert_eq!(gpu.weight_dtype, DType::F16);
         assert_eq!(gpu.weight_bytes, 1_000);
+    }
+
+    #[test]
+    fn loaded_safetensors_estimate_uses_header_shape_not_declared_primary_dtype() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _dtype = EnvVarGuard::set("BLOOM_DTYPE", "bf16");
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            br#"{
+                "architectures": ["LlamaForCausalLM"],
+                "model_type": "llama",
+                "torch_dtype": "float32"
+            }"#,
+        )
+        .unwrap();
+        write_test_safetensors_tensor(
+            &dir.path().join("model.safetensors"),
+            "weight",
+            "F16",
+            &[4096],
+            8192,
+        );
+
+        let manifest = load_manifest(dir.path()).unwrap();
+        let estimate = estimate_memory_for_device(&manifest, 0, DeviceKind::Cpu);
+
+        assert_eq!(manifest.primary_dtype, DType::F32);
+        assert_eq!(estimate.weight_dtype, DType::F32);
+        assert!(estimate.weight_bytes >= 4096 * 4);
+        assert_eq!(
+            manifest
+                .parameters
+                .get(VALIDATED_SAFETENSORS_ELEMENT_COUNT)
+                .and_then(serde_json::Value::as_u64),
+            Some(4096)
+        );
+    }
+
+    #[test]
+    fn device_aware_accelerator_estimates_default_to_full_layer_placement() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _gpu_layers = EnvVarGuard::remove("BLOOM_GPU_LAYERS");
+        let _dtype = EnvVarGuard::set("BLOOM_DTYPE", "auto");
+        let mut manifest = ModelManifest {
+            primary_dtype: DType::F16,
+            files: vec![ModelFile {
+                name: "model.safetensors".to_string(),
+                format: ModelFormat::Safetensors,
+                size_bytes: 1_000,
+                hash_sha256: None,
+                required: true,
+            }],
+            ..ModelManifest::default()
+        };
+        manifest
+            .parameters
+            .insert("num_hidden_layers".to_string(), serde_json::json!(4));
+        manifest
+            .parameters
+            .insert("num_key_value_heads".to_string(), serde_json::json!(1));
+        manifest
+            .parameters
+            .insert("head_dim".to_string(), serde_json::json!(1));
+
+        let legacy = estimate_memory(&manifest, 8);
+        let gpu = estimate_memory_for_device(&manifest, 8, DeviceKind::Gpu);
+        let npu = estimate_memory_for_device(&manifest, 8, DeviceKind::Npu);
+
+        assert_eq!(legacy.offloaded_layers, None);
+        assert_eq!(legacy.device_weight_bytes, 0);
+        for estimate in [gpu, npu] {
+            assert_eq!(estimate.offloaded_layers, Some(4));
+            assert_eq!(estimate.device_weight_bytes, estimate.weight_bytes);
+            assert_eq!(estimate.host_weight_bytes, 0);
+            assert_eq!(
+                estimate.total_bytes,
+                estimate
+                    .device_weight_bytes
+                    .saturating_add(estimate.kv_cache_bytes)
+                    .saturating_add(estimate.temp_tensor_bytes)
+            );
+        }
     }
 
     #[test]
@@ -3096,6 +3916,38 @@ mod tests {
         assert_eq!(est.kv_cache_dtype, DType::Q8);
         assert_eq!(est.kv_cache_bytes_per_token, 128);
         assert_eq!(est.kv_cache_bytes, 1_280);
+    }
+
+    #[test]
+    fn device_aware_memory_estimate_charges_the_physical_f32_kv_layout() {
+        let mut manifest = ModelManifest {
+            primary_dtype: DType::F16,
+            ..ModelManifest::default()
+        };
+        manifest
+            .parameters
+            .insert("num_hidden_layers".to_string(), serde_json::json!(2));
+        manifest
+            .parameters
+            .insert("num_key_value_heads".to_string(), serde_json::json!(4));
+        manifest
+            .parameters
+            .insert("head_dim".to_string(), serde_json::json!(8));
+        manifest.quantization = Some(QuantizationInfo {
+            kv_cache_dtype: Some(DType::Q8),
+            ..QuantizationInfo::default()
+        });
+
+        let legacy = estimate_memory(&manifest, 10);
+        let device_aware = estimate_memory_for_device(&manifest, 10, DeviceKind::Cpu);
+        let gpu = estimate_memory_for_device(&manifest, 10, DeviceKind::Gpu);
+
+        assert_eq!(legacy.kv_cache_dtype, DType::Q8);
+        assert_eq!(legacy.kv_cache_bytes, 1_280);
+        assert_eq!(device_aware.kv_cache_dtype, DType::F32);
+        assert_eq!(device_aware.kv_cache_bytes, 5_120);
+        assert_eq!(gpu.kv_cache_dtype, DType::F16);
+        assert_eq!(gpu.kv_cache_bytes, 2_560);
     }
 
     #[test]
@@ -3199,6 +4051,39 @@ mod tests {
 
         let est = estimate_memory(&m, 512);
         assert_eq!(est.weight_bytes, 320_256_000);
+    }
+
+    #[cfg(feature = "candle-engine")]
+    #[test]
+    fn config_directory_with_only_gguf_accounts_for_the_actual_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            br#"{
+                "architectures": ["LlamaForCausalLM"],
+                "model_type": "llama",
+                "torch_dtype": "float32"
+            }"#,
+        )
+        .unwrap();
+        let gguf_path = dir.path().join("actual-qwen-q4_1.gguf");
+        fs::write(&gguf_path, create_mock_gguf_bytes("qwen2", "Q4_1", 3)).unwrap();
+
+        let manifest = load_manifest(dir.path()).unwrap();
+
+        assert_eq!(manifest.family, ModelFamily::Qwen);
+        assert_eq!(manifest.primary_dtype, DType::Q4);
+        assert_eq!(manifest.files.len(), 1);
+        assert_eq!(manifest.files[0].name, "actual-qwen-q4_1.gguf");
+        assert_eq!(manifest.files[0].format, ModelFormat::Gguf);
+        assert_eq!(
+            manifest.files[0].size_bytes,
+            fs::metadata(gguf_path).unwrap().len() as usize
+        );
+        assert_eq!(
+            manifest.parameters.get("gguf_quantization_type"),
+            Some(&serde_json::json!("Q4_1"))
+        );
     }
 
     #[test]

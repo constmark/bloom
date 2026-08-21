@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Result, anyhow};
 use bloomai_backend::BackendRegistry;
 use bloomai_core::DeviceKind;
-use bloomai_engine::{MemoryPreallocationConfig, SpeculativeMode, SupportLevel};
+use bloomai_engine::{SpeculativeMode, SupportLevel};
 use serde::Serialize;
 use tokio::sync::Semaphore;
 
@@ -15,9 +15,11 @@ use super::cli::{Args, DoctorFormat, MAX_LOADED_MODELS};
 use super::model_index::validate_configuration as validate_model_index_configuration;
 use super::model_index_state::inspect_model_index_watermark_directory;
 use super::model_license::ModelLicensePolicy;
+use super::runtime_memory::RuntimeMemoryPlanner;
 use super::{
     BrowserOriginPolicy, MAX_OLLAMA_ADAPTER_BODY_BYTES, MAX_SHUTDOWN_TIMEOUT_SECONDS, ModelCatalog,
-    engine_registry, parse_browser_origin_policy, select_backend_name,
+    engine_registry, parse_browser_origin_policy, select_backend_name, validate_ifb_backend,
+    validate_strict_runtime_backend,
 };
 
 const DOCTOR_SCHEMA_VERSION: u32 = 1;
@@ -403,8 +405,20 @@ fn server_argument_errors(args: &Args) -> Vec<String> {
     ) {
         errors.push(format!("Speculative decoding is invalid: {error}."));
     }
+    if matches!(
+        args.speculative.trim().to_ascii_lowercase().as_str(),
+        "draft" | "draft_model" | "draft-model"
+    ) {
+        errors.push(
+            "Draft-model speculative decoding is unavailable until every live draft copy is covered by aggregate runtime memory admission."
+                .to_string(),
+        );
+    }
     if args.enable_chunked_prefill && !args.enable_ifb {
         errors.push("Chunked prefill requires in-flight batching.".to_string());
+    }
+    if let Err(error) = validate_ifb_backend(args.enable_ifb, args.backend.trim()) {
+        errors.push(error.to_string());
     }
     if args.enable_chunked_prefill && args.prefill_chunk_size == 0 {
         errors.push("Chunked prefill size must be at least 1 token.".to_string());
@@ -417,6 +431,17 @@ fn server_argument_errors(args: &Args) -> Vec<String> {
     }
     if args.enable_cachemesh_l3 && !args.enable_cachemesh {
         errors.push("CacheMesh L3 requires CacheMesh to be enabled.".to_string());
+    }
+    if args.enable_cachemesh_l3
+        && args
+            .cachemesh_l3_path
+            .as_ref()
+            .is_none_or(|path| path.as_os_str().is_empty())
+    {
+        errors.push(
+            "CacheMesh L3 requires a persistent directory configured with --cachemesh-l3-path."
+                .to_string(),
+        );
     }
     if args.cachemesh_write_through_l3 && !args.enable_cachemesh_l3 {
         errors.push("CacheMesh write-through requires CacheMesh L3.".to_string());
@@ -690,16 +715,33 @@ fn startup_model_check(
     device_kind: Option<DeviceKind>,
     catalog_count: Option<usize>,
 ) -> DoctorCheck {
+    let Some(device_kind) = device_kind else {
+        return DoctorCheck::fail(
+            "startup_model",
+            "Runtime memory admission cannot be evaluated with an invalid device selector.",
+            "Correct --device and run the doctor again.",
+        );
+    };
+    let memory_planner = match RuntimeMemoryPlanner::new(args, device_kind) {
+        Ok(planner) => planner,
+        Err(_) => {
+            return DoctorCheck::fail(
+                "startup_model",
+                "Strict runtime memory admission cannot obtain a trustworthy host/device budget.",
+                "Correct the memory telemetry or unsupported runtime mode before starting the server.",
+            );
+        }
+    };
     let Some(path) = args.model.as_ref() else {
         return if catalog_count.is_some_and(|count| count > 0) {
             DoctorCheck::pass(
                 "startup_model",
-                "No model is preloaded; a recognized catalog model can be selected through the UI or API.",
+                "Strict runtime memory admission is available; a recognized catalog model can be selected through the UI or API.",
             )
         } else {
             DoctorCheck::warn(
                 "startup_model",
-                "No startup model or recognized catalog model is available.",
+                "Strict runtime memory admission is available, but no startup model or recognized catalog model is present.",
                 "Add a model before expecting readiness; liveness and model-management APIs can still start.",
             )
         };
@@ -720,13 +762,6 @@ fn startup_model_check(
                 "Run inspect_gguf or correct the model manifest and required files.",
             );
         }
-    };
-    let Some(device_kind) = device_kind else {
-        return DoctorCheck::fail(
-            "startup_model",
-            "Model compatibility cannot be evaluated with an invalid device selector.",
-            "Correct --device and run the doctor again.",
-        );
     };
     let (_, device_backend_name) = match configured_device(args) {
         Ok(configured) => configured,
@@ -765,28 +800,37 @@ fn startup_model_check(
             "Choose a supported model, engine, or device from the support matrix.",
         );
     }
-    let Some(planned_context) = args.context_size.checked_mul(args.max_concurrent) else {
+    if validate_strict_runtime_backend(&selected_engine).is_err() {
         return DoctorCheck::fail(
             "startup_model",
-            "The configured context plan overflows this platform.",
-            "Reduce context size or maximum concurrency.",
+            format!(
+                "The selected '{selected_engine}' engine cannot report a verified physical device for strict aggregate memory admission."
+            ),
+            "Choose the Candle or Qwen3-VL backend until this engine exposes verified placement telemetry.",
         );
-    };
-    let estimate =
-        bloomai_engine::estimate_memory_for_device(&manifest, planned_context.max(1), device_kind);
-    if bloomai_engine::plan_memory_preallocation(
-        estimate,
-        MemoryPreallocationConfig {
-            enabled: !args.disable_memory_prealloc,
-            memory_utilization: args.memory_utilization,
-            reserve_memory_bytes: args.reserve_memory_bytes,
-        },
-    )
-    .is_err()
-    {
+    }
+    if let Err(error) = validate_ifb_backend(args.enable_ifb, &selected_engine) {
         return DoctorCheck::fail(
             "startup_model",
-            "The startup model does not fit the configured conservative memory plan.",
+            format!("The selected model route is incompatible with in-flight batching: {error}."),
+            "Disable in-flight batching or choose a model that resolves to the Candle engine.",
+        );
+    }
+    let memory_admission = (|| {
+        let assessment = memory_planner.assess_planned(&manifest)?;
+        if !args.disable_memory_prealloc
+            && args
+                .reserve_memory_bytes
+                .is_some_and(|bytes| bytes > assessment.available.host_bytes)
+        {
+            anyhow::bail!("startup page-touch reservation exceeds available host memory");
+        }
+        Ok::<(), anyhow::Error>(())
+    })();
+    if memory_admission.is_err() {
+        return DoctorCheck::fail(
+            "startup_model",
+            "The startup model does not fit the strict aggregate host/device memory budget.",
             "Reduce context size or concurrency, use a smaller model, or adjust the documented memory policy.",
         );
     }
@@ -984,6 +1028,83 @@ mod tests {
         assert_eq!(text.doctor, Some(DoctorFormat::Text));
         assert_eq!(json.doctor, Some(DoctorFormat::Json));
         assert_eq!(text.cors_allow_origin, "same-origin");
+    }
+
+    #[test]
+    fn draft_speculation_is_rejected_by_shared_server_validation() {
+        let mut args = Args::try_parse_from(["bloom_server"]).unwrap();
+        args.speculative = "draft".to_string();
+        args.draft_model = Some(std::path::PathBuf::from("draft-model"));
+
+        let errors = server_argument_errors(&args);
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("aggregate runtime memory admission"))
+        );
+        assert!(validate_server_arguments(&args).is_err());
+    }
+
+    #[test]
+    fn cachemesh_l3_requires_a_persistent_directory() {
+        let mut args = default_args();
+        args.enable_ifb = true;
+        args.enable_cachemesh = true;
+        args.enable_cachemesh_l3 = true;
+
+        let missing = validate_server_arguments(&args).unwrap_err().to_string();
+        assert!(missing.contains("--cachemesh-l3-path"));
+
+        args.cachemesh_l3_path = Some(std::path::PathBuf::new());
+        let empty = validate_server_arguments(&args).unwrap_err().to_string();
+        assert!(empty.contains("--cachemesh-l3-path"));
+
+        args.cachemesh_l3_path = Some(std::path::PathBuf::from("persistent-cachemesh"));
+        assert!(validate_server_arguments(&args).is_ok());
+    }
+
+    #[test]
+    fn explicit_non_candle_ifb_backend_is_rejected_by_shared_validation() {
+        let mut args = default_args();
+        args.enable_ifb = true;
+        args.backend = "onnxruntime".to_string();
+
+        let error = validate_server_arguments(&args).unwrap_err().to_string();
+        assert!(error.contains("verified Candle batch backend"));
+    }
+
+    #[test]
+    fn doctor_rejects_ifb_after_candle_auto_routes_to_qwen_vl() {
+        let temp = tempfile::tempdir().unwrap();
+        let model = temp.path().join("tiny-qwen-vl");
+        std::fs::create_dir(&model).unwrap();
+        std::fs::write(
+            model.join("bloom.json"),
+            r#"{
+                "id":"tiny-qwen-vl",
+                "family":"Qwen",
+                "version":"1",
+                "license":"Apache-2.0",
+                "io_schema":{"inputs":["Text","Vision"],"outputs":["Text"]},
+                "memory_profile":{"min_ram_bytes":1048576,"min_vram_bytes":0,"recommended_ram_bytes":2097152,"recommended_vram_bytes":0},
+                "files":[],
+                "parameters":{"model_type":"qwen3_vl","num_hidden_layers":1,"hidden_size":16,"num_key_value_heads":1,"head_dim":8,"vocab_size":64},
+                "runtime_hints":{"preferred_backends":["qwen3_vl"],"supports_mmap":false,"requires_streaming":false},
+                "primary_dtype":"F32"
+            }"#,
+        )
+        .unwrap();
+        let mut args = default_args();
+        args.model = Some(model);
+        args.enable_ifb = true;
+        assert!(validate_server_arguments(&args).is_ok());
+
+        let check = startup_model_check(&args, Some(DeviceKind::Cpu), None);
+
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.message.contains("in-flight batching"));
+        assert!(check.message.contains("qwen3_vl"));
     }
 
     #[test]

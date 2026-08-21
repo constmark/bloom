@@ -42,7 +42,8 @@ pub struct TextConfig {
     pub rms_norm_eps: f64,
     pub rope_scaling: Option<RopeScaling>,
     pub rope_theta: f64,
-    pub tie_word_embeddings: bool,
+    #[serde(default)]
+    pub tie_word_embeddings: Option<bool>,
     pub vocab_size: usize,
 }
 
@@ -69,6 +70,16 @@ pub struct Qwen3VLConfig {
     pub vision_start_token_id: u32,
     pub vision_end_token_id: u32,
     pub image_token_id: u32,
+    #[serde(default)]
+    pub tie_word_embeddings: bool,
+}
+
+impl Qwen3VLConfig {
+    fn tie_word_embeddings(&self) -> bool {
+        self.text_config
+            .tie_word_embeddings
+            .unwrap_or(self.tie_word_embeddings)
+    }
 }
 
 fn find_safetensors_files(model_path: &Path) -> Vec<PathBuf> {
@@ -1223,6 +1234,14 @@ impl Qwen3VLModel {
 }
 
 impl LoadedModel for Qwen3VLModel {
+    fn actual_device(&self) -> Option<DeviceKind> {
+        Some(if self.device.is_cpu() {
+            DeviceKind::Cpu
+        } else {
+            DeviceKind::Gpu
+        })
+    }
+
     fn metadata(&self) -> &ModelMetadata {
         &self.metadata
     }
@@ -1432,16 +1451,22 @@ impl Engine for Qwen3VLEngine {
                 {
                     Device::new_cuda(0)?
                 }
-                #[cfg(feature = "metal")]
+                #[cfg(all(not(feature = "cuda"), feature = "metal"))]
                 {
                     Device::new_metal(0)?
                 }
                 #[cfg(not(any(feature = "cuda", feature = "metal")))]
                 {
-                    Device::Cpu
+                    return Err(anyhow!(
+                        "Qwen3-VL GPU execution was requested, but this build has neither the `cuda` nor `metal` feature enabled"
+                    ));
                 }
             }
-            DeviceKind::Npu => Device::Cpu,
+            DeviceKind::Npu => {
+                return Err(anyhow!(
+                    "Qwen3-VL does not implement NPU execution; select CPU or use a CUDA/Metal GPU build"
+                ));
+            }
         };
 
         let dtype = match device {
@@ -1494,7 +1519,7 @@ impl Engine for Qwen3VLEngine {
             vb.pp("model.language_model.norm"),
         )?;
 
-        let lm_head = if config.text_config.tie_word_embeddings {
+        let lm_head = if config.tie_word_embeddings() {
             None
         } else {
             Some(candle_nn::linear(
@@ -1554,6 +1579,73 @@ impl Engine for Qwen3VLEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qwen3_vl_accepts_top_level_tied_embedding_configuration() {
+        let config: Qwen3VLConfig = serde_json::from_value(serde_json::json!({
+            "model_type": "qwen3_vl",
+            "tie_word_embeddings": true,
+            "text_config": {
+                "attention_bias": false,
+                "attention_dropout": 0.0,
+                "head_dim": 128,
+                "hidden_act": "silu",
+                "hidden_size": 4096,
+                "intermediate_size": 12288,
+                "max_position_embeddings": 262144,
+                "num_attention_heads": 32,
+                "num_hidden_layers": 36,
+                "num_key_value_heads": 8,
+                "rms_norm_eps": 0.000001,
+                "rope_scaling": null,
+                "rope_theta": 1000000.0,
+                "vocab_size": 151936
+            },
+            "vision_config": {
+                "depth": 32,
+                "hidden_size": 1280,
+                "in_channels": 3,
+                "intermediate_size": 3420,
+                "num_heads": 16,
+                "num_position_embeddings": 2304,
+                "out_hidden_size": 4096,
+                "patch_size": 14,
+                "spatial_merge_size": 2,
+                "temporal_patch_size": 2,
+                "deepstack_visual_indexes": [8, 16, 24]
+            },
+            "vision_start_token_id": 151652,
+            "vision_end_token_id": 151653,
+            "image_token_id": 151655
+        }))
+        .unwrap();
+
+        assert!(config.tie_word_embeddings());
+        assert_eq!(config.text_config.tie_word_embeddings, None);
+    }
+
+    #[test]
+    fn qwen3_vl_rejects_npu_before_loading_cpu_weights() {
+        let error = Qwen3VLEngine
+            .load(Path::new("/definitely/not/a/model"), DeviceKind::Npu)
+            .err()
+            .expect("NPU execution must fail before model loading")
+            .to_string();
+
+        assert!(error.contains("does not implement NPU execution"));
+    }
+
+    #[cfg(not(any(feature = "cuda", feature = "metal")))]
+    #[test]
+    fn qwen3_vl_rejects_gpu_when_no_gpu_backend_is_compiled() {
+        let error = Qwen3VLEngine
+            .load(Path::new("/definitely/not/a/model"), DeviceKind::Gpu)
+            .err()
+            .expect("a build without a GPU backend must reject GPU execution")
+            .to_string();
+
+        assert!(error.contains("neither the `cuda` nor `metal` feature"));
+    }
 
     #[test]
     fn test_vlm_minimal_path() {
