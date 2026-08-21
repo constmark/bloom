@@ -32,7 +32,7 @@ tracing = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 libloading = "0.8"
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6", features = ["trace", "cors", "request-id", "timeout"] }
+tower-http = { version = "0.7", features = ["trace", "cors", "request-id", "timeout"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bloomai-core = { version = "0.1.0", path = "crates/core" }
 bloomai-backend = { version = "0.1.0", path = "crates/backend" }
