@@ -20,6 +20,40 @@ const MAX_OLLAMA_KEEP_ALIVE: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 const OLLAMA_RESIDENCY_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const INDEFINITE_OLLAMA_EXPIRY: &str = "9999-12-31T23:59:59Z";
 
+pub(crate) fn ollama_api_router(state: Arc<ServerState>) -> Router<Arc<ServerState>> {
+    let inference_routes = Router::new()
+        .route("/version", get(handle_ollama_version))
+        .route("/tags", get(handle_ollama_tags))
+        .route("/ps", get(handle_ollama_ps))
+        .route("/show", post(handle_ollama_show))
+        .route(
+            "/chat",
+            post(handle_ollama_chat).layer(DefaultBodyLimit::max(state.max_ollama_body_bytes)),
+        )
+        .route(
+            "/generate",
+            post(handle_ollama_generate).layer(DefaultBodyLimit::max(state.max_ollama_body_bytes)),
+        )
+        .route("/embed", post(handle_ollama_embed))
+        .route("/embeddings", post(handle_ollama_legacy_embeddings))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            require_ollama_api_key,
+        ));
+    let operator_routes = Router::new()
+        .route("/pull", post(handle_ollama_pull))
+        .route("/delete", delete(handle_ollama_delete))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            require_ollama_operator_api_key,
+        ));
+
+    inference_routes
+        .merge(operator_routes)
+        .fallback(handle_ollama_route_not_found)
+        .method_not_allowed_fallback(handle_ollama_method_not_allowed)
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct OllamaChatRequest {
     #[serde(default)]
@@ -1231,6 +1265,20 @@ impl OllamaActivationError {
     }
 }
 
+fn admit_ollama_runtime(
+    state: &ServerState,
+    runtime: Arc<LoadedRuntime>,
+) -> std::result::Result<Arc<LoadedRuntime>, OllamaActivationError> {
+    if state.runtime_is_revoked(&runtime) {
+        Err(OllamaActivationError::new(
+            axum::http::StatusCode::GONE,
+            "the verified signed-index model version has been permanently revoked; install a replacement with a different digest",
+        ))
+    } else {
+        Ok(runtime)
+    }
+}
+
 #[cfg(test)]
 pub(crate) async fn activate_ollama_model(
     state: &Arc<ServerState>,
@@ -1263,12 +1311,13 @@ async fn activate_ollama_model_with_permission(
     let resident = state.runtime_pool.read().await.snapshot();
 
     if requested == "default" {
-        return resident.default_runtime().ok_or_else(|| {
+        let runtime = resident.default_runtime().ok_or_else(|| {
             OllamaActivationError::new(
                 axum::http::StatusCode::NOT_FOUND,
                 "model \"default\" is not loaded",
             )
-        });
+        })?;
+        return admit_ollama_runtime(state, runtime);
     }
 
     let mut candidates = catalog
@@ -1297,7 +1346,7 @@ async fn activate_ollama_model_with_permission(
                 "the selected model was unloaded before inference admission",
             ));
         }
-        return Ok(runtime);
+        return admit_ollama_runtime(state, runtime);
     }
     if !allow_lifecycle_change {
         return Err(OllamaActivationError::new(
@@ -1353,7 +1402,7 @@ async fn activate_ollama_model_with_permission(
                 "the selected model was unloaded before inference admission",
             ));
         }
-        return Ok(runtime);
+        return admit_ollama_runtime(state, runtime);
     }
 
     let catalog_id = entry.id.clone();
@@ -1375,7 +1424,7 @@ async fn activate_ollama_model_with_permission(
     drop(_storage_guard);
 
     match admission {
-        ModelLoadAdmission::AlreadyReady { runtime } => Ok(runtime),
+        ModelLoadAdmission::AlreadyReady { runtime } => admit_ollama_runtime(state, runtime),
         ModelLoadAdmission::Loading {
             sequence,
             queued,
@@ -1387,7 +1436,8 @@ async fn activate_ollama_model_with_permission(
                 model = requested,
                 "Waiting for model activation"
             );
-            wait_for_model_activation(completion).await
+            let runtime = wait_for_model_activation(completion).await?;
+            admit_ollama_runtime(state, runtime)
         }
     }
 }

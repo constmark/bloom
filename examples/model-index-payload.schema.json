@@ -13,7 +13,7 @@
     "models"
   ],
   "properties": {
-    "schema_version": { "enum": [1, 2] },
+    "schema_version": { "enum": [1, 2, 3] },
     "object": { "const": "bloom.model_index" },
     "name": { "type": "string", "minLength": 1, "maxLength": 80 },
     "generated_at": { "type": "integer", "minimum": 1 },
@@ -22,9 +22,33 @@
       "type": "array",
       "maxItems": 200,
       "items": { "$ref": "#/definitions/model" }
+    },
+    "revocations": {
+      "type": "array",
+      "maxItems": 200,
+      "items": { "$ref": "#/definitions/revocation" }
     }
   },
   "definitions": {
+    "revocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "sha256", "reason", "revoked_at"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-z0-9][a-z0-9._-]*$"
+        },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "reason": {
+          "type": "string",
+          "enum": ["security", "integrity", "license", "publisher_withdrawal"]
+        },
+        "revoked_at": { "type": "integer", "minimum": 1 }
+      }
+    },
     "model": {
       "type": "object",
       "additionalProperties": false,
@@ -182,12 +206,27 @@
         "properties": { "schema_version": { "const": 1 } }
       },
       "then": {
+        "not": { "required": ["revocations"] },
         "properties": {
           "models": {
             "items": { "not": { "required": ["files"] } }
           }
         }
       }
+    },
+    {
+      "if": {
+        "required": ["schema_version"],
+        "properties": { "schema_version": { "const": 2 } }
+      },
+      "then": { "not": { "required": ["revocations"] } }
+    },
+    {
+      "if": {
+        "required": ["schema_version"],
+        "properties": { "schema_version": { "const": 3 } }
+      },
+      "then": { "required": ["revocations"] }
     }
   ]
 }

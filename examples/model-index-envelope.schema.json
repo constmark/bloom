@@ -13,7 +13,7 @@
     "signature"
   ],
   "properties": {
-    "schema_version": { "enum": [1, 2] },
+    "schema_version": { "enum": [1, 2, 3] },
     "object": { "const": "bloom.signed_model_index" },
     "algorithm": { "const": "ed25519" },
     "key_id": { "type": "string", "pattern": "^[0-9a-f]{64}$" },

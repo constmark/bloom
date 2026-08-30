@@ -845,6 +845,25 @@ def basic_validate() -> list[tuple[Path, str]]:
             raise AssertionError(f"{model_index_payload_v2_path}: invalid package manifest")
     checked.append((model_index_payload_v2_path, "model-index-payload-v2-basic"))
 
+    model_index_payload_v3_path = ROOT / "examples/model-index-payload-v3.json"
+    model_index_payload_v3 = load_json(model_index_payload_v3_path)
+    if (
+        model_index_payload_v3["schema_version"] != 3
+        or model_index_payload_v3["object"] != "bloom.model_index"
+        or "revocations" not in model_index_payload_v3
+    ):
+        raise AssertionError(f"{model_index_payload_v3_path}: invalid v3 index identity")
+    revoked = {
+        (revocation["id"], revocation["sha256"])
+        for revocation in model_index_payload_v3["revocations"]
+    }
+    if len(revoked) != len(model_index_payload_v3["revocations"]) or any(
+        (model["id"], model["sha256"]) in revoked
+        for model in model_index_payload_v3["models"]
+    ):
+        raise AssertionError(f"{model_index_payload_v3_path}: invalid revocation state")
+    checked.append((model_index_payload_v3_path, "model-index-payload-v3-basic"))
+
     signed_index_path = ROOT / "examples/model-index.signed.json"
     signed_index = load_json(signed_index_path)
     require_keys(
@@ -920,6 +939,24 @@ def basic_validate() -> list[tuple[Path, str]]:
         ):
             raise AssertionError(f"{model_index_response_v2_path}: invalid package identity")
     checked.append((model_index_response_v2_path, "model-index-response-v2-basic"))
+    model_index_response_v3_path = ROOT / "examples/model-index-response-v3.json"
+    model_index_response_v3 = load_json(model_index_response_v3_path)
+    if (
+        model_index_response_v3["schema_version"] != 3
+        or model_index_response_v3["object"] != "bloom.model_index"
+        or "revocations" not in model_index_response_v3
+    ):
+        raise AssertionError(f"{model_index_response_v3_path}: invalid v3 response identity")
+    revoked = {
+        (revocation["id"], revocation["sha256"])
+        for revocation in model_index_response_v3["revocations"]
+    }
+    if any(
+        (entry["id"], entry["sha256"]) in revoked
+        for entry in model_index_response_v3["data"]
+    ):
+        raise AssertionError(f"{model_index_response_v3_path}: active entry is revoked")
+    checked.append((model_index_response_v3_path, "model-index-response-v3-basic"))
     return checked
 
 
@@ -1050,6 +1087,9 @@ def jsonschema_validate() -> list[tuple[Path, str]]:
     model_index_payload_v2_path = ROOT / "examples/model-index-payload-v2.json"
     jsonschema.validate(load_json(model_index_payload_v2_path), model_index_payload_schema)
     checked.append((model_index_payload_v2_path, "model-index-payload-v2-draft7"))
+    model_index_payload_v3_path = ROOT / "examples/model-index-payload-v3.json"
+    jsonschema.validate(load_json(model_index_payload_v3_path), model_index_payload_schema)
+    checked.append((model_index_payload_v3_path, "model-index-payload-v3-draft7"))
 
     signed_index_path = ROOT / "examples/model-index.signed.json"
     jsonschema.Draft7Validator.check_schema(model_index_envelope_schema)
@@ -1063,6 +1103,9 @@ def jsonschema_validate() -> list[tuple[Path, str]]:
     model_index_response_v2_path = ROOT / "examples/model-index-response-v2.json"
     jsonschema.validate(load_json(model_index_response_v2_path), model_index_response_schema)
     checked.append((model_index_response_v2_path, "model-index-response-v2-draft7"))
+    model_index_response_v3_path = ROOT / "examples/model-index-response-v3.json"
+    jsonschema.validate(load_json(model_index_response_v3_path), model_index_response_schema)
+    checked.append((model_index_response_v3_path, "model-index-response-v3-draft7"))
     return checked
 
 

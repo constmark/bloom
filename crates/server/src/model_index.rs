@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::RwLock as StdRwLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
@@ -18,7 +19,8 @@ use tokio::io::AsyncReadExt as _;
 use tokio::sync::{Mutex, RwLock};
 
 use super::model_index_state::{
-    ModelIndexWatermark, ModelIndexWatermarkAdmission, ModelIndexWatermarkStore,
+    MAX_MODEL_INDEX_REVOCATIONS, ModelIndexRevocation, ModelIndexWatermark,
+    ModelIndexWatermarkAdmission, ModelIndexWatermarkStore,
 };
 use super::model_license::ModelLicensePolicy;
 use super::model_manager::{ModelCatalog, ModelCatalogEntry, validate_model_filename};
@@ -38,8 +40,10 @@ const MAX_CLOCK_SKEW_SECONDS: u64 = 3_600;
 const MAX_INDEX_LIFETIME_SECONDS: u64 = 366 * 24 * 60 * 60;
 const SIGNATURE_DOMAIN_V1: &[u8] = b"bloom.model_index.v1\0";
 const SIGNATURE_DOMAIN_V2: &[u8] = b"bloom.model_index.v2\0";
+const SIGNATURE_DOMAIN_V3: &[u8] = b"bloom.model_index.v3\0";
 const GENERATION_ID_DOMAIN: &[u8] = b"bloom.model_index.generation.v1\0";
 const GENERATION_ID_DOMAIN_V2: &[u8] = b"bloom.model_index.generation.v2\0";
+const GENERATION_ID_DOMAIN_V3: &[u8] = b"bloom.model_index.generation.v3\0";
 const SOURCE_ID_DOMAIN: &[u8] = b"bloom.model_index.source.v1\0";
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -63,6 +67,17 @@ struct ModelIndexPayload {
     expires_at: u64,
     #[serde(default)]
     models: Vec<ModelIndexPayloadEntry>,
+    #[serde(default)]
+    revocations: Option<Vec<ModelIndexPayloadRevocation>>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ModelIndexPayloadRevocation {
+    id: String,
+    sha256: String,
+    reason: String,
+    revoked_at: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -111,6 +126,8 @@ pub(crate) struct ModelIndexSnapshot {
     pub cache_status: &'static str,
     pub warning: Option<String>,
     pub data: Vec<ModelIndexEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revocations: Option<Vec<ModelIndexRevocation>>,
     #[serde(skip_serializing)]
     generation_id: String,
 }
@@ -350,6 +367,7 @@ pub(crate) struct ModelIndexManager {
     client: Client,
     refresh_gate: Mutex<()>,
     cache: RwLock<Option<CachedModelIndex>>,
+    revocations: StdRwLock<Vec<ModelIndexRevocation>>,
 }
 
 impl ModelIndexManager {
@@ -371,6 +389,7 @@ impl ModelIndexManager {
             cache_status: "fresh",
             warning: None,
             data: vec![entry],
+            revocations: None,
             generation_id: "03".repeat(32),
         };
         Ok(Arc::new(Self {
@@ -387,6 +406,45 @@ impl ModelIndexManager {
                 refreshed_at: Instant::now(),
                 snapshot,
             })),
+            revocations: StdRwLock::new(Vec::new()),
+        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_revocations(
+        revocations: Vec<ModelIndexRevocation>,
+        state_directory: PathBuf,
+    ) -> Result<Arc<Self>> {
+        let now = unix_time()?;
+        let snapshot = ModelIndexSnapshot {
+            schema_version: 3,
+            object: "bloom.model_index",
+            key_id: "02".repeat(32),
+            name: "Test Revocations".to_string(),
+            generated_at: now.saturating_sub(1),
+            expires_at: now.saturating_add(3600),
+            source_kind: "file",
+            cache_status: "fresh",
+            warning: None,
+            data: Vec::new(),
+            revocations: Some(revocations.clone()),
+            generation_id: "03".repeat(32),
+        };
+        Ok(Arc::new(Self {
+            source: ModelIndexSource::File(state_directory.join("unused-test-index.json")),
+            verifying_keys: BTreeMap::new(),
+            trust_id: "04".repeat(32),
+            refresh_interval: Duration::from_secs(3600),
+            max_download_bytes: u64::MAX,
+            license_policy: Arc::new(ModelLicensePolicy::default()),
+            watermark_store: ModelIndexWatermarkStore::new(state_directory, "01".repeat(32))?,
+            client: Client::new(),
+            refresh_gate: Mutex::new(()),
+            cache: RwLock::new(Some(CachedModelIndex {
+                refreshed_at: Instant::now(),
+                snapshot,
+            })),
+            revocations: StdRwLock::new(revocations),
         }))
     }
 
@@ -408,6 +466,7 @@ impl ModelIndexManager {
         };
         let watermark_store =
             ModelIndexWatermarkStore::new(manager_config.state_directory, config.source_id)?;
+        let persisted_revocations = watermark_store.revocations()?;
         let redirect_policy = url_policy;
         let client = Client::builder()
             .user_agent(concat!("bloom/", env!("CARGO_PKG_VERSION")))
@@ -435,6 +494,7 @@ impl ModelIndexManager {
             client,
             refresh_gate: Mutex::new(()),
             cache: RwLock::new(None),
+            revocations: StdRwLock::new(persisted_revocations),
         })))
     }
 
@@ -452,6 +512,16 @@ impl ModelIndexManager {
 
     pub(crate) fn persistent_rollback_protection(&self) -> bool {
         true
+    }
+
+    pub(crate) fn is_revoked(&self, model_index_id: &str, sha256: &str) -> bool {
+        self.revocations
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .any(|revocation| {
+                revocation.id == model_index_id && revocation.sha256.eq_ignore_ascii_case(sha256)
+            })
     }
 
     pub(crate) fn single_key_id(&self) -> Option<&str> {
@@ -498,6 +568,7 @@ impl ModelIndexManager {
                     (rollback || conflict).then(|| ModelIndexWatermark {
                         generated_at: cached.snapshot.generated_at,
                         generation_id: cached.snapshot.generation_id.clone(),
+                        revocations: cached.snapshot.revocations.clone().unwrap_or_default(),
                     })
                 });
                 if let Some(current) = cached_rejection {
@@ -508,6 +579,7 @@ impl ModelIndexManager {
                     .admit(ModelIndexWatermark {
                         generated_at: snapshot.generated_at,
                         generation_id: snapshot.generation_id.clone(),
+                        revocations: snapshot.revocations.clone().unwrap_or_default(),
                     })
                     .await
                     .map_err(|error| {
@@ -518,10 +590,16 @@ impl ModelIndexManager {
                         )
                     })?;
                 if let ModelIndexWatermarkAdmission::Rollback(current)
-                | ModelIndexWatermarkAdmission::Conflict(current) = admission
+                | ModelIndexWatermarkAdmission::Conflict(current)
+                | ModelIndexWatermarkAdmission::RevocationRollback(current) = admission
                 {
                     return self.reject_persisted_generation(current).await;
                 }
+                *self
+                    .revocations
+                    .write()
+                    .unwrap_or_else(|error| error.into_inner()) =
+                    snapshot.revocations.clone().unwrap_or_default();
                 *self.cache.write().await = Some(CachedModelIndex {
                     refreshed_at: Instant::now(),
                     snapshot: snapshot.clone(),
@@ -560,13 +638,13 @@ impl ModelIndexManager {
             let mut retained = cached.snapshot.clone();
             retained.cache_status = "stale";
             retained.warning = Some(
-                    "A signed index rollback or conflicting generation was rejected. Bloom is showing the newer verified, unexpired snapshot."
+                    "A signed index rollback, conflicting generation, or revocation removal was rejected. Bloom is showing the newer verified, unexpired snapshot."
                         .to_string(),
                 );
             return Ok(retained);
         }
         Err(ModelIndexError::Invalid(
-            "The signed model index is older than, or conflicts with, the persisted verified generation."
+            "The signed model index is older than, conflicts with, or removes revocations from the persisted verified generation."
                 .to_string(),
         ))
     }
@@ -783,10 +861,10 @@ fn source_id(source: &ModelIndexSource) -> Result<String> {
 
 fn generation_id(schema_version: u8, key_id: &str, payload: &[u8]) -> String {
     let mut digest = Sha256::new();
-    digest.update(if schema_version == 1 {
-        GENERATION_ID_DOMAIN
-    } else {
-        GENERATION_ID_DOMAIN_V2
+    digest.update(match schema_version {
+        1 => GENERATION_ID_DOMAIN,
+        2 => GENERATION_ID_DOMAIN_V2,
+        _ => GENERATION_ID_DOMAIN_V3,
     });
     digest.update(key_id.as_bytes());
     digest.update([0]);
@@ -809,7 +887,7 @@ fn decode_signed_index(
     }
     let envelope = serde_json::from_slice::<SignedModelIndexEnvelope>(envelope_bytes)
         .context("model index envelope is invalid")?;
-    if !matches!(envelope.schema_version, 1 | 2) || envelope.object != "bloom.signed_model_index" {
+    if !matches!(envelope.schema_version, 1..=3) || envelope.object != "bloom.signed_model_index" {
         return Err(anyhow!("unsupported model index envelope identity"));
     }
     if envelope.algorithm != "ed25519" {
@@ -839,10 +917,10 @@ fn decode_signed_index(
         .context("model index signature is not valid unpadded base64url")?;
     let signature = Signature::from_slice(&signature_bytes)
         .context("model index signature must contain exactly 64 bytes")?;
-    let signature_domain = if envelope.schema_version == 1 {
-        SIGNATURE_DOMAIN_V1
-    } else {
-        SIGNATURE_DOMAIN_V2
+    let signature_domain = match envelope.schema_version {
+        1 => SIGNATURE_DOMAIN_V1,
+        2 => SIGNATURE_DOMAIN_V2,
+        _ => SIGNATURE_DOMAIN_V3,
     };
     let mut signed_message = Vec::with_capacity(signature_domain.len() + payload.len());
     signed_message.extend_from_slice(signature_domain);
@@ -879,7 +957,7 @@ fn validate_payload(
     now: u64,
     generation_id: String,
 ) -> Result<ModelIndexSnapshot> {
-    if !matches!(payload.schema_version, 1 | 2) || payload.object != "bloom.model_index" {
+    if !matches!(payload.schema_version, 1..=3) || payload.object != "bloom.model_index" {
         return Err(anyhow!("unsupported model index payload identity"));
     }
     validate_text(&payload.name, "model index name", 1, 80)?;
@@ -900,6 +978,50 @@ fn validate_payload(
         ));
     }
 
+    let mut revocations = match (payload.schema_version, payload.revocations) {
+        (3, Some(revocations)) => revocations
+            .into_iter()
+            .map(|revocation| {
+                validate_index_id(&revocation.id)?;
+                let sha256 = revocation.sha256.trim().to_ascii_lowercase();
+                if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    return Err(anyhow!("model index revocation SHA-256 is invalid"));
+                }
+                if !matches!(
+                    revocation.reason.as_str(),
+                    "security" | "integrity" | "license" | "publisher_withdrawal"
+                ) || revocation.revoked_at == 0
+                    || revocation.revoked_at > payload.generated_at
+                {
+                    return Err(anyhow!("model index revocation metadata is invalid"));
+                }
+                Ok(ModelIndexRevocation {
+                    id: revocation.id,
+                    sha256,
+                    reason: revocation.reason,
+                    revoked_at: revocation.revoked_at,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+        (3, None) => return Err(anyhow!("model index schema version 3 requires revocations")),
+        (_, Some(_)) => {
+            return Err(anyhow!("model index revocations require schema version 3"));
+        }
+        (_, None) => Vec::new(),
+    };
+    if revocations.len() > MAX_MODEL_INDEX_REVOCATIONS {
+        return Err(anyhow!(
+            "model index contains more than {MAX_MODEL_INDEX_REVOCATIONS} revocations"
+        ));
+    }
+    revocations.sort();
+    if revocations
+        .windows(2)
+        .any(|pair| pair[0].id == pair[1].id && pair[0].sha256 == pair[1].sha256)
+    {
+        return Err(anyhow!("model index contains duplicate revocations"));
+    }
+
     let mut ids = HashSet::with_capacity(payload.models.len());
     let mut filenames = HashSet::with_capacity(payload.models.len());
     let mut data = Vec::with_capacity(payload.models.len());
@@ -913,7 +1035,7 @@ fn validate_payload(
         validate_text(&model.description, "model index entry description", 1, 400)?;
         let is_package = !model.files.is_empty();
         if is_package {
-            if schema_version != 2 {
+            if schema_version < 2 {
                 return Err(anyhow!(
                     "multi-file model packages require model index schema version 2"
                 ));
@@ -1049,6 +1171,14 @@ fn validate_payload(
         if license_policy.enforce(Some(license.clone())).is_err() {
             blocking_reasons.push("license_policy".to_string());
         }
+        if revocations
+            .iter()
+            .any(|revocation| revocation.id == model.id && revocation.sha256 == sha256)
+        {
+            return Err(anyhow!(
+                "model index cannot publish an actively revoked model version"
+            ));
+        }
         data.push(ModelIndexEntry {
             id: model.id,
             name: model.name,
@@ -1081,6 +1211,7 @@ fn validate_payload(
         cache_status: "fresh",
         warning: None,
         data,
+        revocations: (schema_version == 3).then_some(revocations),
         generation_id,
     })
 }
@@ -1364,15 +1495,41 @@ mod tests {
         serde_json::to_vec(&value).unwrap()
     }
 
+    fn revocation_payload(
+        now: u64,
+        generated_at: u64,
+        revision: &str,
+        active_sha256: &str,
+        include_revocation: bool,
+    ) -> Vec<u8> {
+        let mut value =
+            serde_json::from_slice::<serde_json::Value>(&payload(now, revision)).unwrap();
+        value["schema_version"] = serde_json::Value::from(3);
+        value["generated_at"] = serde_json::Value::from(generated_at);
+        value["expires_at"] = serde_json::Value::from(now.saturating_add(3600));
+        value["models"][0]["sha256"] = serde_json::Value::from(active_sha256);
+        value["revocations"] = if include_revocation {
+            serde_json::json!([{
+                "id": "tiny-q4",
+                "sha256": "ab".repeat(32),
+                "reason": "integrity",
+                "revoked_at": now.saturating_sub(120)
+            }])
+        } else {
+            serde_json::json!([])
+        };
+        serde_json::to_vec(&value).unwrap()
+    }
+
     fn envelope(payload: &[u8], key: &SigningKey) -> Vec<u8> {
         let schema_version =
             serde_json::from_slice::<serde_json::Value>(payload).unwrap()["schema_version"]
                 .as_u64()
                 .unwrap() as u8;
-        let mut message = if schema_version == 1 {
-            SIGNATURE_DOMAIN_V1.to_vec()
-        } else {
-            SIGNATURE_DOMAIN_V2.to_vec()
+        let mut message = match schema_version {
+            1 => SIGNATURE_DOMAIN_V1.to_vec(),
+            2 => SIGNATURE_DOMAIN_V2.to_vec(),
+            _ => SIGNATURE_DOMAIN_V3.to_vec(),
         };
         message.extend_from_slice(payload);
         let signature = key.sign(&message);
@@ -1621,6 +1778,51 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn signed_v3_index_admits_replacement_digests_and_rejects_active_revocations() {
+        let now = unix_time().unwrap();
+        let key = signing_key();
+        let revision = "45".repeat(20);
+        let payload = revocation_payload(
+            now,
+            now.saturating_sub(30),
+            &revision,
+            &"cd".repeat(32),
+            true,
+        );
+        let snapshot = decode_signed_index(
+            &envelope(&payload, &key),
+            &keyring(&[key.verifying_key()]),
+            "file",
+            8192,
+            &ModelLicensePolicy::default(),
+            now,
+        )
+        .unwrap();
+        assert_eq!(snapshot.schema_version, 3);
+        assert_eq!(snapshot.revocations.as_ref().unwrap().len(), 1);
+        assert_eq!(snapshot.data[0].sha256, "cd".repeat(32));
+
+        let active_revoked = revocation_payload(
+            now,
+            now.saturating_sub(30),
+            &revision,
+            &"ab".repeat(32),
+            true,
+        );
+        assert!(
+            decode_signed_index(
+                &envelope(&active_revoked, &key),
+                &keyring(&[key.verifying_key()]),
+                "file",
+                8192,
+                &ModelLicensePolicy::default(),
+                now,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1909,6 +2111,88 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(conflicting.snapshot(false).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn revocations_survive_restart_and_cannot_be_removed_by_a_newer_index() {
+        let now = unix_time().unwrap();
+        let key = signing_key();
+        let revision = "91".repeat(20);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("index.json");
+        let state_directory = temp.path().join("index-state");
+        fs::write(
+            &path,
+            envelope(
+                &revocation_payload(
+                    now,
+                    now.saturating_sub(20),
+                    &revision,
+                    &"cd".repeat(32),
+                    true,
+                ),
+                &key,
+            ),
+        )
+        .await
+        .unwrap();
+        let config = || ModelIndexManagerConfig {
+            file: Some(path.clone()),
+            url: None,
+            public_key: Some(key_hex(&key)),
+            public_keys: vec![],
+            refresh_seconds: 300,
+            max_download_bytes: 8192,
+            state_directory: state_directory.clone(),
+        };
+        let manager =
+            ModelIndexManager::from_config(config(), Arc::new(ModelLicensePolicy::default()))
+                .unwrap()
+                .unwrap();
+        manager.snapshot(false).await.unwrap();
+        assert!(manager.is_revoked("tiny-q4", &"ab".repeat(32)));
+        drop(manager);
+
+        fs::write(
+            &path,
+            envelope(
+                &revocation_payload(
+                    now,
+                    now.saturating_sub(10),
+                    &revision,
+                    &"ef".repeat(32),
+                    false,
+                ),
+                &key,
+            ),
+        )
+        .await
+        .unwrap();
+        let restarted =
+            ModelIndexManager::from_config(config(), Arc::new(ModelLicensePolicy::default()))
+                .unwrap()
+                .unwrap();
+        assert!(restarted.is_revoked("tiny-q4", &"ab".repeat(32)));
+        assert!(restarted.snapshot(false).await.is_err());
+
+        fs::write(
+            &path,
+            envelope(
+                &revocation_payload(
+                    now,
+                    now.saturating_sub(5),
+                    &revision,
+                    &"ef".repeat(32),
+                    true,
+                ),
+                &key,
+            ),
+        )
+        .await
+        .unwrap();
+        let recovered = restarted.snapshot(true).await.unwrap();
+        assert_eq!(recovered.data[0].sha256, "ef".repeat(32));
+        assert!(restarted.is_revoked("tiny-q4", &"ab".repeat(32)));
     }
 
     #[test]

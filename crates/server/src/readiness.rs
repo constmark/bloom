@@ -45,9 +45,13 @@ pub(crate) async fn handle_ready(
     let mut memory = bloomai_engine::MemoryTelemetry::new();
     memory.refresh_ram();
     let memory_pressure_high = memory.is_high_pressure();
-    let ready =
-        state.ready.load(Ordering::Acquire) && available_permits > 0 && !memory_pressure_high;
     let runtime = state.runtime_pool.read().await.default_runtime();
+    let ready = state.ready.load(Ordering::Acquire)
+        && runtime
+            .as_ref()
+            .is_none_or(|runtime| !state.runtime_is_revoked(runtime))
+        && available_permits > 0
+        && !memory_pressure_high;
     let model = runtime
         .as_ref()
         .map(|runtime| runtime.model_id.as_str())

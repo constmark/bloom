@@ -503,6 +503,27 @@ called out in release notes.
 
 ### Server
 
+- Add signed model-index schema v3 with a permanent, bounded exact
+  `(id, sha256)` revocation ledger. Persist the canonical revocation set beside
+  rollback watermarks and reject removal across refreshes and restarts. Block
+  matching signed provenance before load, before runtime publication, and at
+  every new OpenAI/Ollama inference admission, including already resident
+  runtimes; hide them from OpenAI discovery, fail default-runtime readiness,
+  and return HTTP 410 `model_version_revoked`. Add different-digest
+  recovery, schemas/examples, offline-signer and UI validation, visible drawer
+  warnings, and focused protocol/state/runtime regressions.
+- Extract browser-origin validation, CORS, request correlation, protocol error
+  shaping, cache/retry/authentication headers, and inference/operator credential
+  guards from the server composition root into a focused HTTP boundary module.
+  The existing 374-test server suite continues to cover the unchanged route and
+  middleware contracts. Reconcile the live HTTP boundary gate with the newer
+  independent Ollama image-body limit so it continues to exercise an actual
+  413 response instead of sending an in-limit malformed payload.
+- Move Ollama route assembly beside its protocol adapters, and extract model
+  loading/publication plus optional IFB scheduling construction into focused
+  runtime modules. Scheduler worker ownership now explicitly groups the model
+  wrappers, aggregate-memory permit, runtime lifetime marker, shutdown token,
+  KV pool, and CacheMesh resources that must drain together.
 - Reset every start-at-zero native Candle sequence before execution, including
   the first embedding after startup verification and every item in an embedding
   batch. Qwen2, Qwen3, Gemma, and streaming wrappers now clear their KV caches
@@ -817,6 +838,12 @@ called out in release notes.
 
 ### CI / open-source readiness
 
+- Add a pinned real-Chromium gate against the embedded release-container UI.
+  It validates the WASM application shell and security headers, empty-model
+  fail-closed admission, the product heading and conversations landmark,
+  Models/Settings dialog naming and descriptions, initial focus, bidirectional
+  Tab loops, Escape dismissal, opener-focus restoration, reduced-motion CSS,
+  and the absence of unexpected page, request, or console failures.
 - Give the embedded UI a single descriptive document title and favicon, promote
   the product name to the page's level-one heading, name the conversations
   landmark, and announce connection/runtime state through a polite live status.

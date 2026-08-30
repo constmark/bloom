@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 const MAX_PAYLOAD_BYTES: usize = 384 * 1024;
 const SIGNATURE_DOMAIN_V1: &[u8] = b"bloom.model_index.v1\0";
 const SIGNATURE_DOMAIN_V2: &[u8] = b"bloom.model_index.v2\0";
+const SIGNATURE_DOMAIN_V3: &[u8] = b"bloom.model_index.v3\0";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -27,6 +28,17 @@ struct ModelIndexPayload {
     generated_at: u64,
     expires_at: u64,
     models: Vec<ModelIndexEntry>,
+    #[serde(default)]
+    revocations: Option<Vec<ModelIndexRevocation>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelIndexRevocation {
+    id: String,
+    sha256: String,
+    reason: String,
+    revoked_at: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,7 +81,7 @@ struct ModelIndexFile {
     about = "Sign one Bloom model index payload with an offline Ed25519 seed"
 )]
 struct Args {
-    /// JSON payload containing a bloom.model_index version 1 or 2 object.
+    /// JSON payload containing a bloom.model_index version 1, 2, or 3 object.
     #[arg(long)]
     payload: PathBuf,
 
@@ -94,10 +106,10 @@ fn main() -> Result<()> {
         return Err(anyhow!("the derived Ed25519 public key is weak"));
     }
     let key_id = format!("{:x}", Sha256::digest(verifying_key.as_bytes()));
-    let signature_domain = if schema_version == 1 {
-        SIGNATURE_DOMAIN_V1
-    } else {
-        SIGNATURE_DOMAIN_V2
+    let signature_domain = match schema_version {
+        1 => SIGNATURE_DOMAIN_V1,
+        2 => SIGNATURE_DOMAIN_V2,
+        _ => SIGNATURE_DOMAIN_V3,
     };
     let mut message = Vec::with_capacity(signature_domain.len() + payload.len());
     message.extend_from_slice(signature_domain);
@@ -183,9 +195,9 @@ fn validate_private_key_permissions(_path: &Path) -> Result<()> {
 fn validate_payload_identity(payload: &[u8]) -> Result<u8> {
     let payload = serde_json::from_slice::<ModelIndexPayload>(payload)
         .context("payload is not a valid model index JSON object")?;
-    if !matches!(payload.schema_version, 1 | 2) || payload.object != "bloom.model_index" {
+    if !matches!(payload.schema_version, 1..=3) || payload.object != "bloom.model_index" {
         return Err(anyhow!(
-            "payload must identify bloom.model_index schema version 1 or 2"
+            "payload must identify bloom.model_index schema version 1, 2, or 3"
         ));
     }
     validate_text(&payload.name, "index name", 1, 80)?;
@@ -204,28 +216,74 @@ fn validate_payload_identity(payload: &[u8]) -> Result<u8> {
     if payload.models.len() > 200 {
         return Err(anyhow!("payload contains more than 200 model entries"));
     }
+    let mut revocations = match (payload.schema_version, payload.revocations) {
+        (3, Some(revocations)) => revocations,
+        (3, None) => return Err(anyhow!("schema version 3 requires revocations")),
+        (_, Some(_)) => return Err(anyhow!("revocations require schema version 3")),
+        (_, None) => Vec::new(),
+    };
+    if revocations.len() > 200 {
+        return Err(anyhow!("payload contains more than 200 revocations"));
+    }
+    revocations.sort_by(|left, right| {
+        left.id
+            .cmp(&right.id)
+            .then(left.sha256.cmp(&right.sha256))
+            .then(left.reason.cmp(&right.reason))
+            .then(left.revoked_at.cmp(&right.revoked_at))
+    });
+    let mut revoked_versions = std::collections::HashSet::with_capacity(revocations.len());
+    for revocation in &revocations {
+        validate_entry_id(&revocation.id)?;
+        validate_sha256(&revocation.sha256)?;
+        if !matches!(
+            revocation.reason.as_str(),
+            "security" | "integrity" | "license" | "publisher_withdrawal"
+        ) || revocation.revoked_at == 0
+            || revocation.revoked_at > payload.generated_at
+            || !revoked_versions.insert((
+                revocation.id.to_string(),
+                revocation.sha256.to_ascii_lowercase(),
+            ))
+        {
+            return Err(anyhow!(
+                "payload contains an invalid or duplicate revocation"
+            ));
+        }
+    }
+
     let mut ids = std::collections::HashSet::with_capacity(payload.models.len());
     let mut filenames = std::collections::HashSet::with_capacity(payload.models.len());
     for model in payload.models {
-        validate_entry(&model, payload.schema_version)?;
+        let sha256 = validate_entry(&model, payload.schema_version)?;
         if !ids.insert(model.id.to_ascii_lowercase())
             || !filenames.insert(model.filename.to_ascii_lowercase())
         {
             return Err(anyhow!("payload contains duplicate IDs or filenames"));
         }
+        if revoked_versions.contains(&(model.id.clone(), sha256)) {
+            return Err(anyhow!(
+                "payload cannot publish an actively revoked model version"
+            ));
+        }
     }
     Ok(payload.schema_version)
 }
 
-fn validate_entry(model: &ModelIndexEntry, schema_version: u8) -> Result<()> {
-    validate_text(&model.id, "entry ID", 1, 64)?;
-    if !model.id.bytes().enumerate().all(|(index, byte)| {
+fn validate_entry_id(id: &str) -> Result<()> {
+    validate_text(id, "entry ID", 1, 64)?;
+    if !id.bytes().enumerate().all(|(index, byte)| {
         byte.is_ascii_lowercase()
             || byte.is_ascii_digit()
             || (index > 0 && matches!(byte, b'-' | b'_' | b'.'))
     }) {
         return Err(anyhow!("entry ID contains unsupported characters"));
     }
+    Ok(())
+}
+
+fn validate_entry(model: &ModelIndexEntry, schema_version: u8) -> Result<String> {
+    validate_entry_id(&model.id)?;
     validate_text(&model.name, "entry name", 1, 80)?;
     validate_text(&model.description, "entry description", 1, 400)?;
     if model.size_bytes == 0 {
@@ -244,7 +302,7 @@ fn validate_entry(model: &ModelIndexEntry, schema_version: u8) -> Result<()> {
             .ok_or_else(|| anyhow!("single-file entry SHA-256 is missing"))?;
         validate_sha256(sha256)?;
     } else {
-        if schema_version != 2 || model.download_url.is_some() || model.sha256.is_some() {
+        if schema_version < 2 || model.download_url.is_some() || model.sha256.is_some() {
             return Err(anyhow!(
                 "multi-file entries require schema version 2 and per-file verification metadata"
             ));
@@ -276,7 +334,31 @@ fn validate_entry(model: &ModelIndexEntry, schema_version: u8) -> Result<()> {
             return Err(anyhow!("entry tags are invalid or duplicated"));
         }
     }
-    Ok(())
+    if model.files.is_empty() {
+        Ok(model
+            .sha256
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase())
+    } else {
+        package_digest(&model.files)
+    }
+}
+
+fn package_digest(files: &[ModelIndexFile]) -> Result<String> {
+    let mut ordered = files.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| left.filename.as_bytes().cmp(right.filename.as_bytes()));
+    let mut digest = Sha256::new();
+    digest.update(b"bloom.model_package.v1\0");
+    digest.update(u32::try_from(ordered.len())?.to_be_bytes());
+    for file in ordered {
+        let filename = file.filename.as_bytes();
+        digest.update(u32::try_from(filename.len())?.to_be_bytes());
+        digest.update(filename);
+        digest.update(file.size_bytes.to_be_bytes());
+        digest.update(decode_hex(&file.sha256)?);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn validate_package_directory(value: &str) -> Result<()> {
@@ -581,6 +663,27 @@ mod tests {
 
         payload["models"][0]["files"][1]["filename"] =
             serde_json::Value::from("../model.safetensors");
+        assert!(validate_payload_identity(&serde_json::to_vec(&payload).unwrap()).is_err());
+    }
+
+    #[test]
+    fn version_three_payload_requires_permanent_revocations_and_a_replacement_digest() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut payload = serde_json::from_slice::<serde_json::Value>(include_bytes!(
+            "../../../examples/model-index-payload-v3.json"
+        ))
+        .unwrap();
+        payload["generated_at"] = serde_json::Value::from(now.saturating_sub(1));
+        payload["expires_at"] = serde_json::Value::from(now.saturating_add(3600));
+        assert_eq!(
+            validate_payload_identity(&serde_json::to_vec(&payload).unwrap()).unwrap(),
+            3
+        );
+
+        payload["models"][0]["sha256"] = payload["revocations"][0]["sha256"].clone();
         assert!(validate_payload_identity(&serde_json::to_vec(&payload).unwrap()).is_err());
     }
 

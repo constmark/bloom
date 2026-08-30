@@ -2983,6 +2983,11 @@ fn ModelDrawer(config: Signal<ConnConfig>, on_close: EventHandler<()>) -> Elemen
                                     if let Some(warning) = index.warning.as_ref() {
                                         div { class: "integrity-result warning", role: "status", "{warning}" }
                                     }
+                                    if let Some(revocations) = index.revocations.as_ref().filter(|items| !items.is_empty()) {
+                                        div { class: "integrity-result warning", role: "status",
+                                            "{revocations.len()} signed model version(s) are permanently revoked. Matching installed versions cannot be loaded or used; recovery requires a replacement with a different digest."
+                                        }
+                                    }
                                     label { class: "model-index-search",
                                         span { "Search verified models" }
                                         input {

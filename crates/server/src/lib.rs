@@ -9,7 +9,7 @@
 
 #![cfg_attr(not(test), warn(clippy::unwrap_used))]
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -43,10 +43,7 @@ use tokio::task;
 use tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream};
 use tokio_util::sync::CancellationToken;
 use tower_http::{
-    classify::ServerErrorsFailureClass,
-    cors::{Any, CorsLayer},
-    request_id::{MakeRequestId as _, MakeRequestUuid, RequestId},
-    timeout::TimeoutLayer,
+    classify::ServerErrorsFailureClass, request_id::RequestId, timeout::TimeoutLayer,
     trace::TraceLayer,
 };
 use tracing_subscriber::EnvFilter;
@@ -82,6 +79,7 @@ mod doctor;
 mod embedding;
 mod handlers;
 mod helpers;
+mod http_boundary;
 mod metrics;
 mod model_download;
 mod model_import;
@@ -99,8 +97,10 @@ mod model_upgrade;
 mod ollama;
 mod readiness;
 mod response_store;
+mod runtime_loader;
 mod runtime_memory;
 mod runtime_pool;
+mod runtime_scheduling;
 mod shutdown;
 mod tool_calling;
 mod ui;
@@ -112,6 +112,7 @@ use doctor::{inspect_server, validate_server_arguments};
 use embedding::*;
 use handlers::*;
 use helpers::*;
+use http_boundary::*;
 use metrics::ServerMetrics;
 use model_download::{
     ModelDownloadInspectError, ModelDownloadManager, ModelDownloadRequest,
@@ -128,8 +129,10 @@ use model_storage::ModelStorageManager;
 use ollama::*;
 use readiness::*;
 use response_store::ResponseStore;
+use runtime_loader::*;
 use runtime_memory::{RuntimeMemoryPermit, RuntimeMemoryPlanner};
 use runtime_pool::RuntimePool;
+use runtime_scheduling::*;
 #[cfg(test)]
 use shutdown::ShutdownSignal;
 use shutdown::{
@@ -187,134 +190,6 @@ const MAX_MULTIMODAL_AUDIO_SECONDS: usize = 600;
 const MAX_MULTIMODAL_AUDIO_SAMPLES: usize =
     MIN_MULTIMODAL_AUDIO_SAMPLE_RATE as usize * MAX_MULTIMODAL_AUDIO_SECONDS;
 const MAX_SHUTDOWN_TIMEOUT_SECONDS: u64 = 3_600;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ValidatedBrowserOrigin {
-    serialized: String,
-    header: HeaderValue,
-    scheme: String,
-    authority: String,
-    host: String,
-}
-
-impl ValidatedBrowserOrigin {
-    fn parse(value: &str) -> std::result::Result<Self, String> {
-        let value = value.trim();
-        if value.is_empty() || value.len() > MAX_BROWSER_ORIGIN_CHARS {
-            return Err(format!(
-                "browser origin must contain between 1 and {MAX_BROWSER_ORIGIN_CHARS} characters"
-            ));
-        }
-        if value.eq_ignore_ascii_case("null") {
-            return Err("opaque browser origins are not allowed".to_string());
-        }
-        let uri = value
-            .parse::<axum::http::Uri>()
-            .map_err(|_| "browser origin must be an absolute HTTP(S) origin".to_string())?;
-        let scheme = uri
-            .scheme_str()
-            .filter(|scheme| matches!(*scheme, "http" | "https"))
-            .ok_or_else(|| "browser origin scheme must be http or https".to_string())?
-            .to_ascii_lowercase();
-        let authority = uri
-            .authority()
-            .ok_or_else(|| "browser origin must include a host".to_string())?;
-        if authority.as_str().contains('@') {
-            return Err("browser origin must not include user information".to_string());
-        }
-        if uri
-            .path_and_query()
-            .is_some_and(|path| path.as_str() != "/")
-        {
-            return Err("browser origin must not include a path, query, or fragment".to_string());
-        }
-        let authority = authority.as_str().to_ascii_lowercase();
-        let host = uri
-            .authority()
-            .map(|value| value.host().to_ascii_lowercase())
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| "browser origin must include a host".to_string())?;
-        let serialized = format!("{scheme}://{authority}");
-        let header = HeaderValue::from_str(&serialized)
-            .map_err(|_| "browser origin is not a valid HTTP header value".to_string())?;
-        Ok(Self {
-            serialized,
-            header,
-            scheme,
-            authority,
-            host,
-        })
-    }
-
-    fn has_loopback_host(&self) -> bool {
-        let unbracketed = self.host.trim_start_matches('[').trim_end_matches(']');
-        unbracketed.eq_ignore_ascii_case("localhost")
-            || unbracketed
-                .parse::<IpAddr>()
-                .is_ok_and(|address| address.is_loopback())
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum BrowserOriginPolicy {
-    SameOrigin,
-    Exact(ValidatedBrowserOrigin),
-    Any,
-}
-
-fn parse_browser_origin_policy(value: &str) -> std::result::Result<BrowserOriginPolicy, String> {
-    let value = value.trim();
-    if value.eq_ignore_ascii_case(DEFAULT_BROWSER_ORIGIN_POLICY) {
-        Ok(BrowserOriginPolicy::SameOrigin)
-    } else if value == "*" {
-        Ok(BrowserOriginPolicy::Any)
-    } else {
-        ValidatedBrowserOrigin::parse(value).map(BrowserOriginPolicy::Exact)
-    }
-}
-
-#[derive(Clone, Debug)]
-struct BrowserOriginGuard {
-    policy: BrowserOriginPolicy,
-    loopback_listener: bool,
-}
-
-impl BrowserOriginGuard {
-    fn permits(&self, request: &AxumRequest) -> bool {
-        let mut values = request.headers().get_all(header::ORIGIN).iter();
-        let Some(value) = values.next() else {
-            return true;
-        };
-        if values.next().is_some() {
-            return false;
-        }
-        let Ok(value) = value.to_str() else {
-            return false;
-        };
-        let Ok(origin) = ValidatedBrowserOrigin::parse(value) else {
-            return false;
-        };
-        if self.policy == BrowserOriginPolicy::Any {
-            return true;
-        }
-        if let BrowserOriginPolicy::Exact(allowed) = &self.policy
-            && origin.serialized == allowed.serialized
-        {
-            return true;
-        }
-        if origin.scheme != "http" {
-            return false;
-        }
-        if self.loopback_listener && !origin.has_loopback_host() {
-            return false;
-        }
-        request
-            .headers()
-            .get(header::HOST)
-            .and_then(|host| host.to_str().ok())
-            .is_some_and(|host| host.eq_ignore_ascii_case(&origin.authority))
-    }
-}
 
 fn default_model_index_state_directory(config_path: &Path) -> PathBuf {
     config_path
@@ -506,10 +381,17 @@ struct LoadedRuntime {
     published_at: u64,
     source_path: PathBuf,
     catalog_id: Option<String>,
+    signed_model_version: Option<SignedModelVersion>,
     _runtime_memory_permit: Option<RuntimeMemoryPermit>,
     /// Declared last so its final strong reference is released only after all
     /// heavyweight runtime fields have finished teardown.
     active_request_leases: Arc<AtomicU64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SignedModelVersion {
+    model_index_id: String,
+    sha256: String,
 }
 
 impl Drop for LoadedRuntime {
@@ -969,9 +851,14 @@ impl ServerState {
         requested: Option<&str>,
     ) -> std::result::Result<Option<RuntimeRequestLease>, RequestedModelError> {
         let runtime_pool = self.runtime_pool.read().await;
-        Ok(runtime_pool
-            .resolve(requested)?
-            .and_then(RuntimeRequestLease::try_new))
+        let runtime = runtime_pool.resolve(requested)?;
+        if runtime
+            .as_ref()
+            .is_some_and(|runtime| self.runtime_is_revoked(runtime))
+        {
+            return Err(RequestedModelError::Revoked);
+        }
+        Ok(runtime.and_then(RuntimeRequestLease::try_new))
     }
 
     async fn lease_exact_runtime(
@@ -979,16 +866,31 @@ impl ServerState {
         expected: &Arc<LoadedRuntime>,
     ) -> Option<RuntimeRequestLease> {
         let runtime_pool = self.runtime_pool.read().await;
-        runtime_pool
-            .contains_exact(expected)
+        (runtime_pool.contains_exact(expected) && !self.runtime_is_revoked(expected))
             .then(|| Arc::clone(expected))
             .and_then(RuntimeRequestLease::try_new)
+    }
+
+    fn runtime_is_revoked(&self, runtime: &LoadedRuntime) -> bool {
+        let Some(index) = self.model_index.as_ref() else {
+            return false;
+        };
+        runtime
+            .signed_model_version
+            .as_ref()
+            .is_some_and(|version| index.is_revoked(&version.model_index_id, &version.sha256))
     }
 
     async fn publish_default_runtime(
         &self,
         runtime: Arc<LoadedRuntime>,
     ) -> std::result::Result<Vec<Arc<LoadedRuntime>>, String> {
+        if self.runtime_is_revoked(&runtime) {
+            return Err(
+                "The verified signed-index model version was revoked before runtime publication. Install a replacement with a different digest."
+                    .to_string(),
+            );
+        }
         let mut runtime_pool = self.runtime_pool.write().await;
         let (draining_generations, _, _) = self.inspect_draining_runtimes(None);
         let physical_limit = runtime_pool
@@ -1366,481 +1268,6 @@ impl ApiError {
 }
 
 // ─── Unified error helper ───────────────────────────────────────────────────
-
-fn error_response(
-    status: axum::http::StatusCode,
-    error_type: &str,
-    message: impl std::fmt::Display,
-) -> axum::response::Response {
-    (
-        status,
-        Json(json!({
-            "error": {
-                "message": message.to_string(),
-                "type": error_type
-            }
-        })),
-    )
-        .into_response()
-}
-
-fn api_error(err: ApiError, message: impl std::fmt::Display) -> axum::response::Response {
-    error_response(err.status(), err.error_type(), message)
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let max_len = left.len().max(right.len());
-    let mut diff = left.len() ^ right.len();
-    for idx in 0..max_len {
-        let l = left.get(idx).copied().unwrap_or(0);
-        let r = right.get(idx).copied().unwrap_or(0);
-        diff |= (l ^ r) as usize;
-    }
-    diff == 0
-}
-
-fn valid_http_request_id(value: &HeaderValue) -> bool {
-    let bytes = value.as_bytes();
-    !bytes.is_empty()
-        && bytes.len() <= MAX_HTTP_REQUEST_ID_CHARS
-        && bytes
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
-}
-
-fn normalized_http_request_id(request: &AxumRequest) -> RequestId {
-    if let Some(value) = request
-        .headers()
-        .get(HTTP_REQUEST_ID_HEADER)
-        .filter(|value| valid_http_request_id(value))
-    {
-        return RequestId::new(value.clone());
-    }
-
-    MakeRequestUuid
-        .make_request_id(request)
-        .expect("MakeRequestUuid always returns a request ID")
-}
-
-async fn correlate_http_request(mut request: AxumRequest, next: Next) -> Response {
-    let request_id = normalized_http_request_id(&request);
-    request.headers_mut().insert(
-        header::HeaderName::from_static(HTTP_REQUEST_ID_HEADER),
-        request_id.header_value().clone(),
-    );
-    request.extensions_mut().insert(request_id.clone());
-
-    let mut response = next.run(request).await;
-    response.headers_mut().insert(
-        header::HeaderName::from_static(HTTP_REQUEST_ID_HEADER),
-        request_id.header_value().clone(),
-    );
-    response.extensions_mut().insert(request_id);
-    response
-}
-
-fn requires_no_store(path: &str) -> bool {
-    matches!(path, "/health" | "/ready" | "/metrics" | "/v1" | "/api")
-        || path.starts_with("/v1/")
-        || path.starts_with("/api/")
-}
-
-#[derive(Clone, Copy)]
-enum ApiProtocolFamily {
-    OpenAi,
-    Ollama,
-}
-
-fn api_protocol_family(path: &str) -> Option<ApiProtocolFamily> {
-    if path == "/v1" || path.starts_with("/v1/") {
-        Some(ApiProtocolFamily::OpenAi)
-    } else if path == "/api" || path.starts_with("/api/") {
-        Some(ApiProtocolFamily::Ollama)
-    } else {
-        None
-    }
-}
-
-fn has_protocol_error_content_type(response: &Response) -> bool {
-    let Some(content_type) = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return false;
-    };
-    let media_type = content_type
-        .split(';')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
-    media_type == "application/json"
-        || media_type.ends_with("+json")
-        || media_type == "text/event-stream"
-        || media_type == "application/x-ndjson"
-}
-
-fn openai_framework_error(status: axum::http::StatusCode) -> (&'static str, &'static str) {
-    match status {
-        axum::http::StatusCode::REQUEST_TIMEOUT => (
-            ApiError::Timeout.error_type(),
-            "The request timed out before it could be completed.",
-        ),
-        axum::http::StatusCode::PAYLOAD_TOO_LARGE => (
-            ApiError::InvalidRequest.error_type(),
-            "The request body exceeds the configured size limit.",
-        ),
-        axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE => (
-            ApiError::InvalidRequest.error_type(),
-            "The request Content-Type is not supported for this API route.",
-        ),
-        axum::http::StatusCode::UNPROCESSABLE_ENTITY => (
-            ApiError::InvalidRequest.error_type(),
-            "The request body does not match the endpoint schema.",
-        ),
-        axum::http::StatusCode::TOO_MANY_REQUESTS => (
-            ApiError::RateLimitExceeded.error_type(),
-            "The server is temporarily at request capacity.",
-        ),
-        axum::http::StatusCode::NOT_FOUND => (
-            ApiError::NotFound.error_type(),
-            "The requested OpenAI-compatible API resource does not exist.",
-        ),
-        axum::http::StatusCode::UNAUTHORIZED => (
-            ApiError::AuthenticationError.error_type(),
-            "Authentication is required for this API route.",
-        ),
-        axum::http::StatusCode::SERVICE_UNAVAILABLE => (
-            ApiError::ServiceUnavailable.error_type(),
-            "The service is temporarily unavailable.",
-        ),
-        status if status.is_server_error() => (
-            ApiError::InternalError.error_type(),
-            "The server could not process the request.",
-        ),
-        _ => (
-            ApiError::InvalidRequest.error_type(),
-            "The request is malformed or unsupported.",
-        ),
-    }
-}
-
-fn ollama_framework_error(status: axum::http::StatusCode) -> &'static str {
-    match status {
-        axum::http::StatusCode::REQUEST_TIMEOUT => "request timed out before it could be completed",
-        axum::http::StatusCode::PAYLOAD_TOO_LARGE => {
-            "request body exceeds the configured size limit"
-        }
-        axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE => {
-            "request Content-Type is not supported for this API route"
-        }
-        axum::http::StatusCode::UNPROCESSABLE_ENTITY => {
-            "request body does not match the endpoint schema"
-        }
-        axum::http::StatusCode::TOO_MANY_REQUESTS => "server is temporarily at request capacity",
-        axum::http::StatusCode::NOT_FOUND => "requested Ollama-compatible API resource not found",
-        axum::http::StatusCode::UNAUTHORIZED => "authentication is required for this API route",
-        axum::http::StatusCode::SERVICE_UNAVAILABLE => "service is temporarily unavailable",
-        status if status.is_server_error() => "server could not process the request",
-        _ => "request is malformed or unsupported",
-    }
-}
-
-async fn normalize_protocol_error_response(request: AxumRequest, next: Next) -> Response {
-    let family = api_protocol_family(request.uri().path());
-    let response = next.run(request).await;
-    let Some(family) = family else {
-        return response;
-    };
-    let status = response.status();
-    if !(status.is_client_error() || status.is_server_error())
-        || has_protocol_error_content_type(&response)
-    {
-        return response;
-    }
-
-    let shaped = match family {
-        ApiProtocolFamily::OpenAi => {
-            let (error_type, message) = openai_framework_error(status);
-            error_response(status, error_type, message)
-        }
-        ApiProtocolFamily::Ollama => ollama_error_response(status, ollama_framework_error(status)),
-    };
-    let (_, shaped_body) = shaped.into_parts();
-    let (mut parts, _) = response.into_parts();
-    parts.headers.remove(header::CONTENT_LENGTH);
-    parts.headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    Response::from_parts(parts, shaped_body)
-}
-
-async fn prevent_dynamic_response_caching(request: AxumRequest, next: Next) -> Response {
-    let no_store = requires_no_store(request.uri().path());
-    let mut response = next.run(request).await;
-    if no_store {
-        response
-            .headers_mut()
-            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    }
-    response
-}
-
-async fn publish_transient_retry_after(request: AxumRequest, next: Next) -> Response {
-    let mut response = next.run(request).await;
-    if response.status() == axum::http::StatusCode::TOO_MANY_REQUESTS {
-        response
-            .headers_mut()
-            .entry(header::RETRY_AFTER)
-            .or_insert(HeaderValue::from_static(
-                DEFAULT_CAPACITY_RETRY_AFTER_SECONDS,
-            ));
-    }
-    response
-}
-
-async fn publish_authentication_challenge(request: AxumRequest, next: Next) -> Response {
-    let mut response = next.run(request).await;
-    if response.status() == axum::http::StatusCode::UNAUTHORIZED {
-        response
-            .headers_mut()
-            .entry(header::WWW_AUTHENTICATE)
-            .or_insert(HeaderValue::from_static(
-                DEFAULT_BEARER_AUTHENTICATION_CHALLENGE,
-            ));
-    }
-    response
-}
-
-fn configured_cors_layer(policy: &BrowserOriginPolicy) -> CorsLayer {
-    let layer = match policy {
-        BrowserOriginPolicy::SameOrigin => CorsLayer::new(),
-        BrowserOriginPolicy::Exact(origin) => CorsLayer::new().allow_origin(origin.header.clone()),
-        BrowserOriginPolicy::Any => CorsLayer::new().allow_origin(Any),
-    };
-    layer.allow_methods(Any).allow_headers(Any).expose_headers([
-        header::HeaderName::from_static(HTTP_REQUEST_ID_HEADER),
-        header::RETRY_AFTER,
-        header::WWW_AUTHENTICATE,
-    ])
-}
-
-async fn enforce_browser_origin(
-    State(guard): State<BrowserOriginGuard>,
-    request: AxumRequest,
-    next: Next,
-) -> Response {
-    if guard.permits(&request) {
-        next.run(request).await
-    } else {
-        (
-            axum::http::StatusCode::FORBIDDEN,
-            "The browser origin is not allowed by the Bloom server policy.",
-        )
-            .into_response()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CredentialScope {
-    Inference,
-    Operator,
-}
-
-fn request_matches_api_key(req: &AxumRequest, expected: &str) -> bool {
-    let bearer = format!("Bearer {expected}");
-    let authorization_ok = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| constant_time_eq(value.as_bytes(), bearer.as_bytes()));
-    let x_api_key_ok = req
-        .headers()
-        .get("x-api-key")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| constant_time_eq(value.as_bytes(), expected.as_bytes()));
-    authorization_ok || x_api_key_ok
-}
-
-fn request_credential_scope(state: &ServerState, req: &AxumRequest) -> Option<CredentialScope> {
-    if state
-        .operator_api_key
-        .as_deref()
-        .is_some_and(|key| request_matches_api_key(req, key))
-    {
-        return Some(CredentialScope::Operator);
-    }
-    if state
-        .api_key
-        .as_deref()
-        .is_some_and(|key| request_matches_api_key(req, key))
-    {
-        return Some(if state.operator_api_key.is_some() {
-            CredentialScope::Inference
-        } else {
-            CredentialScope::Operator
-        });
-    }
-    None
-}
-
-fn authentication_disabled(state: &ServerState) -> bool {
-    state.api_key.is_none() && state.operator_api_key.is_none()
-}
-
-async fn continue_with_scope(mut req: AxumRequest, next: Next, scope: CredentialScope) -> Response {
-    req.extensions_mut().insert(scope);
-    next.run(req).await
-}
-
-async fn require_api_key(
-    State(state): State<Arc<ServerState>>,
-    req: AxumRequest,
-    next: Next,
-) -> Response {
-    if authentication_disabled(&state) {
-        return continue_with_scope(req, next, CredentialScope::Operator).await;
-    }
-
-    match request_credential_scope(&state, &req) {
-        Some(scope) => continue_with_scope(req, next, scope).await,
-        None => api_error(
-            ApiError::AuthenticationError,
-            "Missing or invalid API key for protected API endpoint.",
-        ),
-    }
-}
-
-async fn require_operator_api_key(
-    State(state): State<Arc<ServerState>>,
-    req: AxumRequest,
-    next: Next,
-) -> Response {
-    if authentication_disabled(&state) {
-        return continue_with_scope(req, next, CredentialScope::Operator).await;
-    }
-
-    match request_credential_scope(&state, &req) {
-        Some(CredentialScope::Operator) => {
-            continue_with_scope(req, next, CredentialScope::Operator).await
-        }
-        Some(CredentialScope::Inference) => api_error(
-            ApiError::PermissionDenied,
-            "The inference API key cannot access operator model-management endpoints.",
-        ),
-        None => api_error(
-            ApiError::AuthenticationError,
-            "Missing or invalid operator API key for model-management endpoint.",
-        ),
-    }
-}
-
-async fn require_ollama_api_key(
-    State(state): State<Arc<ServerState>>,
-    req: AxumRequest,
-    next: Next,
-) -> Response {
-    if authentication_disabled(&state) {
-        return continue_with_scope(req, next, CredentialScope::Operator).await;
-    }
-
-    match request_credential_scope(&state, &req) {
-        Some(scope) => continue_with_scope(req, next, scope).await,
-        None => ollama_error_response(
-            axum::http::StatusCode::UNAUTHORIZED,
-            "missing or invalid API key for protected API endpoint",
-        ),
-    }
-}
-
-async fn require_ollama_operator_api_key(
-    State(state): State<Arc<ServerState>>,
-    req: AxumRequest,
-    next: Next,
-) -> Response {
-    if authentication_disabled(&state) {
-        return continue_with_scope(req, next, CredentialScope::Operator).await;
-    }
-
-    match request_credential_scope(&state, &req) {
-        Some(CredentialScope::Operator) => {
-            continue_with_scope(req, next, CredentialScope::Operator).await
-        }
-        Some(CredentialScope::Inference) => ollama_error_response(
-            axum::http::StatusCode::FORBIDDEN,
-            "the inference API key cannot access operator model-management endpoints",
-        ),
-        None => ollama_error_response(
-            axum::http::StatusCode::UNAUTHORIZED,
-            "missing or invalid operator API key for model-management endpoint",
-        ),
-    }
-}
-
-async fn handle_openai_route_not_found() -> Response {
-    api_error(
-        ApiError::NotFound,
-        "The requested OpenAI-compatible API route does not exist.",
-    )
-}
-
-async fn handle_openai_method_not_allowed() -> Response {
-    error_response(
-        axum::http::StatusCode::METHOD_NOT_ALLOWED,
-        ApiError::InvalidRequest.error_type(),
-        "The HTTP method is not supported for this OpenAI-compatible API route.",
-    )
-}
-
-async fn handle_ollama_route_not_found() -> Response {
-    ollama_error_response(
-        axum::http::StatusCode::NOT_FOUND,
-        "Ollama-compatible API route not found",
-    )
-}
-
-async fn handle_ollama_method_not_allowed() -> Response {
-    ollama_error_response(
-        axum::http::StatusCode::METHOD_NOT_ALLOWED,
-        "HTTP method not allowed for this Ollama-compatible API route",
-    )
-}
-
-fn ollama_api_router(state: Arc<ServerState>) -> Router<Arc<ServerState>> {
-    let inference_routes = Router::new()
-        .route("/version", get(handle_ollama_version))
-        .route("/tags", get(handle_ollama_tags))
-        .route("/ps", get(handle_ollama_ps))
-        .route("/show", post(handle_ollama_show))
-        .route(
-            "/chat",
-            post(handle_ollama_chat).layer(DefaultBodyLimit::max(state.max_ollama_body_bytes)),
-        )
-        .route(
-            "/generate",
-            post(handle_ollama_generate).layer(DefaultBodyLimit::max(state.max_ollama_body_bytes)),
-        )
-        .route("/embed", post(handle_ollama_embed))
-        .route("/embeddings", post(handle_ollama_legacy_embeddings))
-        .route_layer(middleware::from_fn_with_state(
-            Arc::clone(&state),
-            require_ollama_api_key,
-        ));
-    let operator_routes = Router::new()
-        .route("/pull", post(handle_ollama_pull))
-        .route("/delete", delete(handle_ollama_delete))
-        .route_layer(middleware::from_fn_with_state(
-            Arc::clone(&state),
-            require_ollama_operator_api_key,
-        ));
-
-    inference_routes
-        .merge(operator_routes)
-        .fallback(handle_ollama_route_not_found)
-        .method_not_allowed_fallback(handle_ollama_method_not_allowed)
-}
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
@@ -2420,675 +1847,6 @@ async fn run_server(args: Args, config_path: PathBuf) -> Result<()> {
 
     tracing::info!("Server shut down gracefully");
     Ok(())
-}
-
-fn engine_registry() -> EngineRegistry {
-    let mut registry = EngineRegistry::default();
-    registry.register("candle", Box::new(CandleEngine));
-    registry.register("openvino", Box::new(OpenVINOEngine));
-    registry.register("funasr", Box::new(FunASREngine));
-    registry.register("qwen3_vl", Box::new(Qwen3VLEngine));
-    registry.register("intel-npu", Box::new(IntelNpuEngine));
-    registry.register("npu-tts", Box::new(NpuTtsEngine));
-    registry.register("onnxruntime", Box::new(OnnxRuntimeEngine));
-    registry.register("coreml", Box::new(CoreMlEngine));
-    registry.register("mlx", Box::new(MlxEngine));
-    registry.register("vulkan", Box::new(VulkanEngine));
-    registry.register("llamacpp", Box::new(LlamaCppEngine));
-    registry.register("longcat", Box::new(LongCatImageEditEngine));
-    #[cfg(feature = "candle-engine")]
-    registry.register("wan", Box::new(WanEngine));
-    registry
-}
-
-async fn model_loader_loop(
-    state: Arc<ServerState>,
-    args: Args,
-    device_kind: DeviceKind,
-    mut requests: mpsc::Receiver<ModelLoadRequest>,
-) {
-    while let Some(request) = requests.recv().await {
-        let request_label = request
-            .catalog_id
-            .clone()
-            .unwrap_or_else(|| model_path_label(&request.path));
-        tracing::info!(model = %request_label, "Starting model load");
-        state.load_progress.store(1, Ordering::Release);
-        *state.load_error.write().await = None;
-
-        // Keep the managed model source immutable from the final manifest
-        // read through publication. Pull/delete/upgrade use the same storage
-        // fence, so the engine cannot load one artifact generation while the
-        // memory permit and catalog identity describe another.
-        let _storage_guard = state.model_storage.serial().await;
-
-        match prepare_loaded_runtime(
-            Arc::clone(&state),
-            &args,
-            device_kind,
-            request.path,
-            request.catalog_id,
-            request.memory_permit,
-        )
-        .await
-        {
-            Ok(runtime) => {
-                // Runtime preparation is isolated from publication so an
-                // existing resident remains available during a long load.
-                // Publication under the pool write lock is the admission
-                // boundary. Existing request leases keep retired generations
-                // alive without blocking unrelated model traffic.
-                let runtime = Arc::new(runtime);
-                let model_id = runtime.model_id.clone();
-                match state.publish_default_runtime(Arc::clone(&runtime)).await {
-                    Ok(retired) => {
-                        drop(retired);
-                        state.load_progress.store(100, Ordering::Release);
-                        state
-                            .finish_model_load(
-                                request.sequence,
-                                ModelLoadOutcome::Ready { runtime },
-                            )
-                            .await;
-                        tracing::info!(model = %model_id, "Model load completed");
-                    }
-                    Err(message) => {
-                        tracing::error!(model = %model_id, error = %message, "Model publication failed");
-                        state.discard_unpublished_runtime(runtime);
-                        *state.load_error.write().await = Some(message.clone());
-                        state.load_progress.store(0, Ordering::Release);
-                        let has_fallback = !state.runtime_pool.read().await.is_empty();
-                        state.ready.store(has_fallback, Ordering::Release);
-                        state
-                            .finish_model_load(
-                                request.sequence,
-                                ModelLoadOutcome::Failed { message },
-                            )
-                            .await;
-                    }
-                }
-            }
-            Err(error) => {
-                let message = error.to_string();
-                let requested_model = state
-                    .requested_model
-                    .read()
-                    .await
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string());
-                tracing::error!(path = %requested_model, error = %message, "Model load failed");
-                *state.load_error.write().await = Some(message.clone());
-                state.load_progress.store(0, Ordering::Release);
-                let has_fallback = !state.runtime_pool.read().await.is_empty();
-                state.ready.store(has_fallback, Ordering::Release);
-                state
-                    .finish_model_load(
-                        request.sequence,
-                        ModelLoadOutcome::Failed {
-                            message: message.clone(),
-                        },
-                    )
-                    .await;
-            }
-        }
-    }
-    tracing::error!("Model loader stopped because its request channel was closed");
-}
-
-fn model_path_label(path: &std::path::Path) -> String {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or("external model")
-        .to_string()
-}
-
-fn validate_loaded_runtime_model_id(model_id: &str) -> Result<()> {
-    if model_id == "default" {
-        return Err(anyhow!(
-            "loaded model ID 'default' is reserved for the current default runtime selector"
-        ));
-    }
-    validate_model_selector(model_id).map_err(|_| {
-        anyhow!(
-            "loaded model ID must contain 1 to 256 characters without surrounding whitespace or control characters"
-        )
-    })
-}
-
-async fn prepare_loaded_runtime(
-    state: Arc<ServerState>,
-    args: &Args,
-    device_kind: DeviceKind,
-    model_path: PathBuf,
-    catalog_id: Option<String>,
-    mut memory_permit: Option<RuntimeMemoryPermit>,
-) -> Result<LoadedRuntime> {
-    let model_path = tokio::fs::canonicalize(&model_path)
-        .await
-        .map_err(|error| anyhow!("failed to resolve the model source: {error}"))?;
-    state.load_progress.store(5, Ordering::Release);
-    let manifest = bloomai_engine::load_manifest(&model_path)?;
-    let backend_name = select_backend_name(&args.backend, &args.speculative, &manifest);
-    validate_ifb_backend(args.enable_ifb, &backend_name)?;
-    validate_strict_runtime_backend(&backend_name)?;
-    engine_registry().get(&backend_name).map_err(|error| {
-        anyhow!(
-            "{}. Supported engines are: candle, openvino, funasr, qwen3_vl, longcat, intel-npu, npu-tts, onnxruntime, coreml, mlx, vulkan, llamacpp, wan.",
-            error
-        )
-    })?;
-
-    // Re-read and re-account at the loader boundary so a source changed after
-    // admission cannot bypass the aggregate budget. Missing/corrupt sources
-    // still arrive here through the historical asynchronous error path.
-    let planned_memory = state
-        .runtime_memory
-        .planned_estimate(&manifest)
-        .map_err(|error| anyhow!("runtime memory estimation failed before model load: {error}"))?;
-    let planned_footprint = state
-        .runtime_memory
-        .footprint(&manifest, &planned_memory)
-        .map_err(|error| anyhow!("runtime memory planning failed before model load: {error}"))?;
-    let planned_available = state
-        .runtime_memory
-        .available()
-        .map_err(|error| anyhow!("runtime memory probe failed before model load: {error}"))?;
-    match memory_permit.as_mut() {
-        Some(permit) => permit
-            .resize(planned_footprint, planned_available)
-            .map_err(|error| {
-                anyhow!("runtime memory admission failed before model load: {error}")
-            })?,
-        None => {
-            memory_permit = Some(
-                state
-                    .runtime_memory
-                    .reserve(planned_footprint, planned_available)
-                    .map_err(|error| {
-                        anyhow!("runtime memory admission failed before model load: {error}")
-                    })?,
-            );
-        }
-    }
-    state.load_progress.store(15, Ordering::Release);
-    // This short-lived allocation is only a physical page-touch probe. The
-    // aggregate runtime ledger above remains authoritative regardless of the
-    // `disable_memory_prealloc` optimization switch.
-    let page_touch_bytes = if args.disable_memory_prealloc {
-        0
-    } else if let Some(bytes) = args.reserve_memory_bytes {
-        bytes
-    } else {
-        planned_memory
-            .kv_cache_bytes
-            .checked_add(planned_memory.temp_tensor_bytes)
-            .ok_or_else(|| anyhow!("startup page-touch memory estimate overflow"))?
-    };
-    if page_touch_bytes > isize::MAX as usize {
-        return Err(anyhow!(
-            "startup page-touch reservation exceeds the platform allocation limit"
-        ));
-    }
-    state.load_progress.store(25, Ordering::Release);
-    drop(
-        bloomai_engine::MemoryReservation::reserve(page_touch_bytes)
-            .map_err(|error| anyhow!("startup page-touch reservation failed: {error}"))?,
-    );
-
-    let load_available = state
-        .runtime_memory
-        .available()
-        .map_err(|error| anyhow!("runtime memory probe failed immediately before load: {error}"))?;
-    memory_permit
-        .as_ref()
-        .ok_or_else(|| anyhow!("runtime memory permit is missing after admission"))?
-        .revalidate_available(load_available)
-        .map_err(|error| anyhow!("runtime memory headroom changed before model load: {error}"))?;
-
-    state.load_progress.store(35, Ordering::Release);
-    let context_size = args.context_size;
-    let pipeline_path = model_path.clone();
-    let pipeline = task::spawn_blocking(move || {
-        let registry = engine_registry();
-        let engine = registry
-            .get(&backend_name)
-            .map_err(|error| anyhow!(error.to_string()))?;
-        InferencePipeline::load_standalone_with_context_strict(
-            engine,
-            device_kind,
-            &pipeline_path,
-            context_size,
-        )
-    })
-    .await
-    .map_err(|error| anyhow!("model loader task failed: {error}"))??;
-    let pipeline = Arc::new(pipeline);
-    let model_id = pipeline.metadata().id.clone();
-    let loaded_manifest = pipeline.metadata().manifest.clone();
-    validate_loaded_runtime_model_id(&model_id)?;
-    let actual_device = pipeline.device();
-    if actual_device != device_kind {
-        return Err(anyhow!(
-            "loaded pipeline changed device from {device_kind:?} to {actual_device:?}; refusing to publish a runtime whose memory topology cannot be accounted safely"
-        ));
-    }
-    if args.enable_ifb {
-        // IFB creates independently accounted execution wrappers. Do not keep
-        // the startup verification wrapper as an untracked extra weight copy.
-        pipeline.release_idle_weights();
-    }
-    tracing::info!(model = %model_id, "Model pipeline is loaded; preparing runtime services");
-
-    let actual_context_size = pipeline
-        .context_size()
-        .checked_mul(args.max_concurrent.max(1))
-        .ok_or_else(|| anyhow!("loaded runtime context memory estimate overflow"))?;
-    let memory_estimate = state
-        .runtime_memory
-        .estimate_for_context(&loaded_manifest, actual_context_size, actual_device)
-        .map_err(|error| anyhow!("loaded runtime memory estimation failed: {error}"))?;
-    let actual_footprint = state
-        .runtime_memory
-        .footprint(&loaded_manifest, &memory_estimate)
-        .map_err(|error| anyhow!("loaded runtime memory planning failed: {error}"))?;
-    let actual_available = state
-        .runtime_memory
-        .available()
-        .map_err(|error| anyhow!("loaded runtime memory probe failed: {error}"))?;
-    memory_permit
-        .as_mut()
-        .ok_or_else(|| anyhow!("runtime memory permit is missing after admission"))?
-        .resize(actual_footprint, actual_available)
-        .map_err(|error| anyhow!("loaded runtime exceeds its memory admission: {error}"))?;
-    state.load_progress.store(65, Ordering::Release);
-    let active_request_leases = Arc::new(AtomicU64::new(0));
-    let scheduling = build_scheduling_runtime(
-        &state,
-        args,
-        &loaded_manifest,
-        Arc::clone(&pipeline),
-        &model_id,
-        SchedulingRuntimeBuildContext {
-            memory_context_size: actual_context_size,
-            memory_estimate: &memory_estimate,
-            runtime_lifetime_marker: Arc::clone(&active_request_leases),
-            runtime_memory_permit: memory_permit.clone(),
-        },
-    )?;
-
-    state.load_progress.store(95, Ordering::Release);
-    let model_architecture = loaded_manifest
-        .parameters
-        .get("gguf_architecture")
-        .or_else(|| loaded_manifest.parameters.get("model_type"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
-    let model_chat_template = loaded_manifest
-        .parameters
-        .get("chat_template_kind")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
-    Ok(LoadedRuntime {
-        pipeline,
-        model_id,
-        model_family: loaded_manifest.family,
-        model_architecture,
-        model_chat_template,
-        input_modalities: manifest.io_schema.inputs,
-        memory_estimate,
-        kv_cache_pool: scheduling.kv_cache_pool,
-        cachemesh: scheduling.cachemesh,
-        scheduler: scheduling.scheduler,
-        _memory_reservation: scheduling.memory_reservation,
-        scheduler_shutdown: scheduling.shutdown,
-        published_at: unix_seconds(),
-        source_path: model_path,
-        catalog_id,
-        _runtime_memory_permit: memory_permit,
-        active_request_leases,
-    })
-}
-
-pub(crate) fn validate_ifb_backend(enable_ifb: bool, backend_name: &str) -> Result<()> {
-    if enable_ifb && backend_name != "candle" {
-        return Err(anyhow!(
-            "in-flight batching requires the verified Candle batch backend; selected backend '{backend_name}' cannot be published with IFB enabled"
-        ));
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_strict_runtime_backend(backend_name: &str) -> Result<()> {
-    if !matches!(backend_name, "candle" | "qwen3_vl") {
-        return Err(anyhow!(
-            "strict aggregate memory admission requires a backend that reports its verified physical device; selected backend '{backend_name}' does not yet provide that contract"
-        ));
-    }
-    Ok(())
-}
-
-struct SchedulingRuntime {
-    kv_cache_pool: Option<Arc<BloomKvCachePool>>,
-    cachemesh: Option<Arc<CacheMesh>>,
-    scheduler: Option<Arc<InferenceScheduler>>,
-    memory_reservation: Option<bloomai_engine::MemoryReservation>,
-    shutdown: CancellationToken,
-}
-
-/// Owns every resource whose physical lifetime may extend past logical
-/// runtime unload. Declaration order is intentional: scheduler-owned model
-/// wrappers are destroyed before the accounting permit, and the source marker
-/// is released last even when the worker future unwinds or is aborted.
-struct SchedulingWorkerLifetime {
-    scheduler: Arc<InferenceScheduler>,
-    _runtime_memory_permit: Option<RuntimeMemoryPermit>,
-    _runtime_lifetime_marker: Arc<AtomicU64>,
-}
-
-struct SchedulingRuntimeBuildContext<'a> {
-    memory_context_size: usize,
-    memory_estimate: &'a bloomai_engine::MemoryEstimate,
-    runtime_lifetime_marker: Arc<AtomicU64>,
-    runtime_memory_permit: Option<RuntimeMemoryPermit>,
-}
-
-fn build_scheduling_runtime(
-    state: &ServerState,
-    args: &Args,
-    manifest: &bloomai_core::ModelManifest,
-    pipeline: Arc<InferencePipeline>,
-    model_id: &str,
-    build: SchedulingRuntimeBuildContext<'_>,
-) -> Result<SchedulingRuntime> {
-    let SchedulingRuntimeBuildContext {
-        memory_context_size,
-        memory_estimate,
-        runtime_lifetime_marker,
-        runtime_memory_permit,
-    } = build;
-    let shutdown = CancellationToken::new();
-    if !args.enable_ifb {
-        return Ok(SchedulingRuntime {
-            kv_cache_pool: None,
-            cachemesh: None,
-            scheduler: None,
-            memory_reservation: None,
-            shutdown,
-        });
-    }
-
-    let block_size = 16;
-    let total_blocks = div_ceil_usize(memory_context_size, block_size).max(1);
-    let num_layers = manifest_param_usize(
-        manifest,
-        &["num_hidden_layers", "num_layers", "block_count"],
-        28,
-    );
-    let num_kv_heads = manifest_param_usize(
-        manifest,
-        &[
-            "num_key_value_heads",
-            "num_kv_heads",
-            "attention_head_count_kv",
-        ],
-        8,
-    );
-    let head_dim = manifest_param_usize(manifest, &["head_dim"], 128);
-    let kv_dim = num_kv_heads.saturating_mul(head_dim).max(1);
-    let long_context_policy = build_long_context_policy(args)?;
-    let memory_reservation = if !args.disable_memory_prealloc && memory_estimate.kv_cache_bytes > 0
-    {
-        Some(bloomai_engine::MemoryReservation::reserve(
-            memory_estimate.kv_cache_bytes,
-        )?)
-    } else {
-        None
-    };
-    let kv_pool = Arc::new(BloomKvCachePool::new(block_size, total_blocks));
-
-    let device = build_ifb_scheduler_device(&pipeline)?;
-
-    let request_models = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
-        usize,
-        Arc<std::sync::Mutex<bloomai_engine::executor::candle::QwenModelWrapper>>,
-    >::new()));
-    let request_models_for_free = Arc::clone(&request_models);
-    kv_pool.set_on_free(move |handle| {
-        if let Ok(mut models) = request_models_for_free.lock() {
-            models.remove(&handle);
-        }
-    });
-
-    let pipeline_for_forward = Arc::clone(&pipeline);
-    let request_models_for_forward = Arc::clone(&request_models);
-    let forward_fn = Box::new(
-        move |input_ids: &candle_core::Tensor,
-              start_pos: usize,
-              kv_handle: Option<usize>|
-              -> Result<candle_core::Tensor> {
-            let handle = kv_handle.ok_or_else(|| {
-                BloomError::Engine("scheduler request is missing its KV cache handle".into())
-            })?;
-            let model = {
-                let mut models = request_models_for_forward
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                use std::collections::hash_map::Entry;
-                Arc::clone(match models.entry(handle) {
-                    Entry::Occupied(entry) => entry.into_mut(),
-                    Entry::Vacant(entry) => {
-                        let wrapper = pipeline_for_forward.model().create_wrapper()?;
-                        let model = *wrapper
-                            .downcast::<bloomai_engine::executor::candle::QwenModelWrapper>()
-                            .map_err(|_| {
-                                BloomError::Engine("failed to downcast model wrapper".into())
-                            })?;
-                        entry.insert(Arc::new(std::sync::Mutex::new(model)))
-                    }
-                })
-            };
-
-            model
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .forward(input_ids, start_pos)
-        },
-    );
-
-    let pipeline_for_batch = Arc::clone(&pipeline);
-    let request_models_for_batch = Arc::clone(&request_models);
-    let forward_batch_fn = Box::new(
-        move |input_ids: &candle_core::Tensor,
-              start_positions: &[usize],
-              kv_handles: &[usize],
-              cu_seqlens: &[usize]|
-              -> Result<candle_core::Tensor> {
-            let batch_size = kv_handles.len();
-            if batch_size == 0 {
-                return Ok(candle_core::Tensor::zeros(
-                    (0, 0),
-                    candle_core::DType::F32,
-                    input_ids.device(),
-                )?);
-            }
-            if cu_seqlens.len() != batch_size + 1 {
-                return Err(anyhow!("invalid continuous-batching sequence offsets"));
-            }
-            let mut models_to_run = Vec::with_capacity(batch_size);
-            {
-                let mut models = request_models_for_batch
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                use std::collections::hash_map::Entry;
-                for &handle in kv_handles {
-                    let model = match models.entry(handle) {
-                        Entry::Occupied(entry) => entry.into_mut(),
-                        Entry::Vacant(entry) => {
-                            let wrapper = pipeline_for_batch.model().create_wrapper()?;
-                            let model = *wrapper
-                                .downcast::<bloomai_engine::executor::candle::QwenModelWrapper>()
-                                .map_err(|_| {
-                                    BloomError::Engine("failed to downcast model wrapper".into())
-                                })?;
-                            entry.insert(Arc::new(std::sync::Mutex::new(model)))
-                        }
-                    };
-                    models_to_run.push(Arc::clone(model));
-                }
-            }
-            let mut logits = Vec::with_capacity(batch_size);
-            for (index, model) in models_to_run.iter().enumerate() {
-                let start = cu_seqlens[index];
-                let end = cu_seqlens[index + 1];
-                let sequence_len = end.checked_sub(start).ok_or_else(|| {
-                    anyhow!("continuous-batching sequence offsets are not ordered")
-                })?;
-                let start_pos = start_positions.get(index).copied().unwrap_or(0);
-                let request_input = input_ids.narrow(0, start, sequence_len)?.unsqueeze(0)?;
-                let result = model
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .forward(&request_input, start_pos)?;
-                logits.push(result.squeeze(0)?);
-            }
-            candle_core::Tensor::cat(&logits, 0).map_err(Into::into)
-        },
-    );
-
-    let cachemesh = if args.enable_cachemesh {
-        let config = CacheMeshConfig {
-            enabled: true,
-            namespace: model_id.to_string(),
-            l2_capacity_bytes: args.cachemesh_l2_capacity_bytes,
-            l3_enabled: args.enable_cachemesh_l3,
-            write_through_l3: args.cachemesh_write_through_l3,
-        };
-        let mesh = if args.enable_cachemesh_l3 {
-            let path = args
-                .cachemesh_l3_path
-                .as_ref()
-                .filter(|path| !path.as_os_str().is_empty())
-                .ok_or_else(|| {
-                    anyhow!(
-                        "CacheMesh L3 requires a persistent directory configured with --cachemesh-l3-path"
-                    )
-                })?;
-            let remote: Arc<dyn bloomai_engine::RemoteCacheBackend> =
-                Arc::new(FileSystemRemoteCache::new(path)?);
-            CacheMesh::with_remote(config, remote)
-        } else {
-            CacheMesh::new(config)
-        };
-        Some(Arc::new(mesh))
-    } else {
-        None
-    };
-
-    state.load_progress.store(85, Ordering::Release);
-    let paged_cache = Arc::new(PagedAttentionCache::from_pool_and_cachemesh(
-        Arc::clone(&kv_pool),
-        PagedCacheConfig {
-            block_size,
-            total_blocks,
-            num_layers,
-            kv_dim,
-            kv_dtype: bloomai_engine::core::quantization::KvCacheDtype::F16,
-            long_context_policy,
-        },
-        cachemesh.clone(),
-    ));
-    let executor = Arc::new({
-        let model = pipeline.model();
-        let base = CandleBatchExecutor::new(forward_fn, device, 4, 32)
-            .with_cache(Arc::clone(&paged_cache))
-            .with_vocab_and_tokenizer(
-                model.vocab_strings().to_vec(),
-                model.eos_token_ids().to_vec(),
-                model.tokenizer().cloned(),
-            )
-            .with_forward_batch_fn(forward_batch_fn);
-        if model.supports_paged_kv() {
-            let hook = Arc::new(ServerKvHook::new(
-                Arc::clone(&request_models),
-                num_layers,
-                num_kv_heads,
-                head_dim,
-            ));
-            base.with_kv_hook(hook as Arc<dyn bloomai_engine::scheduler::kv_hook::KvHook>)
-        } else {
-            base
-        }
-    });
-    let mut scheduling_config = TokenSchedulingConfig {
-        max_total_tokens_per_step: args.max_num_tokens,
-        ..Default::default()
-    };
-    scheduling_config.chunked_prefill.enabled = args.enable_chunked_prefill;
-    scheduling_config.chunked_prefill.chunk_size = args.prefill_chunk_size;
-    let scheduler = Arc::new(InferenceScheduler::with_config(
-        executor,
-        Arc::clone(&kv_pool) as Arc<dyn KvCachePool>,
-        scheduling_config,
-    ));
-
-    let worker_lifetime = SchedulingWorkerLifetime {
-        scheduler: Arc::clone(&scheduler),
-        _runtime_memory_permit: runtime_memory_permit,
-        _runtime_lifetime_marker: runtime_lifetime_marker,
-    };
-    let worker_shutdown = shutdown.clone();
-    tokio::spawn(async move {
-        tracing::info!("Starting continuous-batching scheduler worker");
-        loop {
-            tokio::select! {
-                _ = worker_shutdown.cancelled() => break,
-                _ = tokio::time::sleep(Duration::from_millis(5)) => {
-                    if let Err(error) = worker_lifetime.scheduler.step() {
-                        tracing::error!(%error, "Scheduler step failed");
-                    }
-                }
-            }
-        }
-        tracing::info!("Continuous-batching scheduler worker stopped");
-    });
-
-    Ok(SchedulingRuntime {
-        kv_cache_pool: Some(kv_pool),
-        cachemesh,
-        scheduler: Some(scheduler),
-        memory_reservation,
-        shutdown,
-    })
-}
-
-fn build_ifb_scheduler_device(pipeline: &InferencePipeline) -> Result<candle_core::Device> {
-    #[cfg(feature = "candle-engine")]
-    {
-        let device = pipeline.model().candle_device().ok_or_else(|| {
-            anyhow!(
-                "in-flight batching requires the exact Candle device identity owned by the loaded model"
-            )
-        })?;
-        let actual_kind = if device.is_cpu() {
-            DeviceKind::Cpu
-        } else {
-            DeviceKind::Gpu
-        };
-        if actual_kind != pipeline.device() {
-            return Err(anyhow!(
-                "the IFB scheduler device does not match the admitted pipeline device"
-            ));
-        }
-        Ok(device)
-    }
-    #[cfg(not(feature = "candle-engine"))]
-    {
-        let _ = pipeline;
-        Err(anyhow!(
-            "in-flight batching requires a server built with Candle support"
-        ))
-    }
 }
 
 // ─── Health / readiness ─────────────────────────────────────────────────────
@@ -5674,6 +4432,15 @@ mod tests {
                 .unwrap()
                 .contains("other.gguf")
         );
+
+        let revoked =
+            helpers::requested_model_error_response(helpers::RequestedModelError::Revoked);
+        assert_eq!(revoked.status(), axum::http::StatusCode::GONE);
+        let bytes = axum::body::to_bytes(revoked.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "model_version_revoked");
     }
 
     #[tokio::test]
@@ -5913,14 +4680,6 @@ mod tests {
     }
 
     #[test]
-    fn loaded_runtime_model_ids_exclude_the_reserved_default_alias() {
-        assert!(validate_loaded_runtime_model_id("resident-model").is_ok());
-        assert!(validate_loaded_runtime_model_id("default").is_err());
-        assert!(validate_loaded_runtime_model_id(" invalid ").is_err());
-        assert!(validate_loaded_runtime_model_id("").is_err());
-    }
-
-    #[test]
     fn generation_admission_validates_controls_prompt_shape_and_context_budget() {
         assert!(helpers::validate_generation_controls(128, 0.7, 0.9).is_ok());
         assert!(helpers::validate_generation_controls(MAX_GENERATED_TOKENS, 0.7, 0.9).is_ok());
@@ -5995,6 +4754,7 @@ mod tests {
             published_at: unix_seconds(),
             source_path: model_path,
             catalog_id: None,
+            signed_model_version: None,
             _runtime_memory_permit: None,
             active_request_leases: Arc::new(AtomicU64::new(0)),
         });
@@ -6056,6 +4816,7 @@ mod tests {
             published_at: unix_seconds(),
             source_path: model_path,
             catalog_id: None,
+            signed_model_version: None,
             _runtime_memory_permit: None,
             active_request_leases: Arc::new(AtomicU64::new(0)),
         });
@@ -6106,6 +4867,7 @@ mod tests {
             published_at: unix_seconds(),
             source_path: model_path,
             catalog_id: None,
+            signed_model_version: None,
             _runtime_memory_permit: None,
             active_request_leases: Arc::new(AtomicU64::new(0)),
         });
@@ -6164,6 +4926,7 @@ mod tests {
             published_at: unix_seconds(),
             source_path: model_path,
             catalog_id: None,
+            signed_model_version: None,
             _runtime_memory_permit: None,
             active_request_leases: Arc::new(AtomicU64::new(0)),
         })
@@ -6294,26 +5057,6 @@ mod tests {
             select_backend_name("candle", "draft-mtp", &manifest),
             "llamacpp"
         );
-    }
-
-    #[test]
-    fn ifb_rejects_non_candle_backends_before_runtime_publication() {
-        let error = validate_ifb_backend(true, "onnxruntime")
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("verified Candle batch backend"));
-        assert!(validate_ifb_backend(true, "candle").is_ok());
-        assert!(validate_ifb_backend(false, "onnxruntime").is_ok());
-    }
-
-    #[test]
-    fn strict_admission_rejects_backends_without_verified_device_reporting() {
-        assert!(validate_strict_runtime_backend("candle").is_ok());
-        assert!(validate_strict_runtime_backend("qwen3_vl").is_ok());
-        let error = validate_strict_runtime_backend("wan")
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("verified physical device"));
     }
 
     #[tokio::test]
@@ -7610,6 +6353,138 @@ mod tests {
         assert_eq!(state.load_progress.load(Ordering::Acquire), 0);
         assert!(state.requested_model.read().await.is_none());
         assert!(state.load_error.read().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn signed_index_revocation_blocks_resident_leases_and_runtime_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let revoked_sha256 = "ab".repeat(32);
+        let index = ModelIndexManager::from_test_revocations(
+            vec![model_index_state::ModelIndexRevocation {
+                id: "tiny-q4".to_string(),
+                sha256: revoked_sha256.clone(),
+                reason: "integrity".to_string(),
+                revoked_at: 1,
+            }],
+            temp.path().join("index-state"),
+        )
+        .unwrap();
+        let (state, _receiver) =
+            test_server_state_with_services(temp.path().to_path_buf(), None, None, Some(index));
+        let signed_version = |sha256: String| SignedModelVersion {
+            model_index_id: "tiny-q4".to_string(),
+            sha256,
+        };
+
+        let mut resident = test_text_runtime(
+            temp.path().join("resident.gguf"),
+            Arc::new(AtomicU64::new(0)),
+        );
+        Arc::get_mut(&mut resident).unwrap().signed_model_version =
+            Some(signed_version(revoked_sha256.clone()));
+        assert!(
+            state
+                .runtime_pool
+                .write()
+                .await
+                .publish_default(Arc::clone(&resident))
+                .is_empty()
+        );
+        state.ready.store(true, Ordering::Release);
+        assert_eq!(
+            handle_ready(State(Arc::clone(&state))).await.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        let models = handle_models(State(Arc::clone(&state)))
+            .await
+            .into_response();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(models.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["data"], json!([]));
+        let retrieve = handle_model_retrieve(
+            State(Arc::clone(&state)),
+            axum::extract::Path(resident.model_id.clone()),
+            Ok(axum::extract::Query(ModelResourceQuery::default())),
+        )
+        .await;
+        assert_eq!(retrieve.status(), axum::http::StatusCode::GONE);
+        assert!(matches!(
+            state.lease_runtime(None).await,
+            Err(RequestedModelError::Revoked)
+        ));
+        assert!(state.lease_exact_runtime(&resident).await.is_none());
+        let mut blocked = test_text_runtime(
+            temp.path().join("blocked.gguf"),
+            Arc::new(AtomicU64::new(0)),
+        );
+        Arc::get_mut(&mut blocked).unwrap().signed_model_version =
+            Some(signed_version(revoked_sha256));
+        assert!(state.publish_default_runtime(blocked).await.is_err());
+
+        let mut replacement = test_text_runtime(
+            temp.path().join("replacement.gguf"),
+            Arc::new(AtomicU64::new(0)),
+        );
+        Arc::get_mut(&mut replacement).unwrap().signed_model_version =
+            Some(signed_version("cd".repeat(32)));
+        assert!(
+            state
+                .publish_default_runtime(Arc::clone(&replacement))
+                .await
+                .is_ok()
+        );
+        assert!(state.lease_runtime(None).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn signed_index_revocation_blocks_catalog_load_before_preflight() {
+        let temp = tempfile::tempdir().unwrap();
+        let bytes = b"withdrawn signed model";
+        let filename = "withdrawn.gguf";
+        let sha256 = format!("{:x}", Sha256::digest(bytes));
+        tokio::fs::write(temp.path().join(filename), bytes)
+            .await
+            .unwrap();
+        model_provenance::write_provenance(
+            temp.path(),
+            model_provenance::ModelProvenanceDraft {
+                acquisition: model_provenance::ModelAcquisitionKind::Download,
+                model_index_id: Some("withdrawn-model".to_string()),
+                filename: filename.to_string(),
+                size_bytes: bytes.len() as u64,
+                source_url: Some(format!(
+                    "https://huggingface.co/acme/model/resolve/{}/withdrawn.gguf",
+                    "11".repeat(20)
+                )),
+                source_host: Some("huggingface.co".to_string()),
+                sha256: sha256.clone(),
+                license: Some("Apache-2.0".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        let index = ModelIndexManager::from_test_revocations(
+            vec![model_index_state::ModelIndexRevocation {
+                id: "withdrawn-model".to_string(),
+                sha256,
+                reason: "security".to_string(),
+                revoked_at: 1,
+            }],
+            temp.path().join("index-state"),
+        )
+        .unwrap();
+        let (state, _receiver) =
+            test_server_state_with_services(temp.path().to_path_buf(), None, None, Some(index));
+
+        let error = prepare_catalog_model_load(&state, filename)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::GONE);
+        assert_eq!(error.code, "model_version_revoked");
     }
 
     #[tokio::test]

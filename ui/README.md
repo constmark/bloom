@@ -172,6 +172,13 @@ loaded, removed, or reverified while that upgrade is active. Duplicate aliases,
 an occupied destination, quarantine, and ambiguous local state disable the
 action instead of guessing which entry to replace.
 
+Signed-index response version 3 also carries the server-verified permanent
+revocation ledger. The drawer validates its exact ID/digest identities, reason,
+time, bound, ordering, and schema-version presence before replacing the current
+view, then shows a visible warning when any versions are withdrawn. Bloom
+blocks matching installed or resident versions server-side; recovery requires
+a newly signed entry with a different digest.
+
 Each model card has a `Review` action. It asks the authenticated server to
 inspect bounded manifest metadata and shows the trusted generation or
 embedding/rerank tasks, architecture, precision or quantization, modalities,
@@ -486,17 +493,22 @@ rustup target add wasm32-unknown-unknown
 just ui-check
 just ui-test
 just ui-clippy
+
+# One-time Chromium installation for the pinned browser-test driver.
+npx --yes --package @playwright/cli@0.1.18 playwright-cli install-browser chromium
+just ui-build
+just ui-browser-test
 ```
 
 Pure conversation-state, archive-merge, submission-preflight, history-window,
 streaming-protocol, and modal keyboard-boundary tests run on the host. The UI
-type check targets `wasm32-unknown-unknown`, matching production builds. Before
-a release, validate initial focus, Tab and Shift+Tab cycling, Escape dismissal,
-opener-focus restoration, accessible names and descriptions, status
-announcements, and reduced-motion behavior in every supported browser with the
-target assistive technology. The embedded empty state and Models/Settings
-controls have a manual Chromium accessibility-tree and keyboard audit; this
-does not replace the target-browser release check.
+type check targets `wasm32-unknown-unknown`, matching production builds. The
+pinned Chromium gate loads the real embedded WASM shell, validates its security
+headers and empty state, and exercises Models/Settings focus entry, forward and
+reverse containment, Escape dismissal, opener restoration, accessible names,
+and reduced motion. CI runs that gate against the release-shaped container.
+Clipboard, downloads, other browser engines, automated accessibility scanning,
+and target assistive technology remain release checks.
 
 ### Embedded in bloom_server
 

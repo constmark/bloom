@@ -1,0 +1,31 @@
+{
+  "schema_version": 3,
+  "object": "bloom.model_index",
+  "name": "Bloom Example Models with Revocation",
+  "generated_at": 1785513600,
+  "expires_at": 1816963200,
+  "models": [
+    {
+      "id": "example-tiny-q4",
+      "name": "Example Tiny Q4 v2",
+      "description": "A documentation-only replacement for a permanently revoked model digest.",
+      "download_url": "https://huggingface.co/example-org/example-model/resolve/0123456789abcdef0123456789abcdef01234567/example-tiny-q4-v2.gguf",
+      "filename": "example-tiny-q4-v2.gguf",
+      "size_bytes": 1048576,
+      "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "license": "Apache-2.0",
+      "family": "Llama",
+      "parameter_count": 1000000,
+      "quantization": "Q4_K_M",
+      "tags": ["example", "cpu"]
+    }
+  ],
+  "revocations": [
+    {
+      "id": "example-tiny-q4",
+      "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "reason": "integrity",
+      "revoked_at": 1785513500
+    }
+  ]
+}

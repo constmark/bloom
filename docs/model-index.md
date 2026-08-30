@@ -19,6 +19,8 @@ admission policies, downloads only an exact Hugging Face commit, and verifies
 every acquired byte against signed SHA-256 metadata before installation. A
 version 1 entry describes one catalog file. A version 2 package entry describes
 one contained Transformers directory and every file that may appear below it.
+Version 3 adds a permanent, signed revocation ledger for exact model ID and
+digest pairs while retaining both entry shapes.
 
 Keep signing seeds offline and configure only public keys on Bloom hosts.
 TLS still protects request privacy and availability for a remote index; the
@@ -74,8 +76,9 @@ the source path, URL, or public-key material.
 
 ## Publisher workflow
 
-Start from the version 1 [single-file payload example](../examples/model-index-payload.json)
-or the version 2 [package payload example](../examples/model-index-payload-v2.json),
+Start from the version 1 [single-file payload example](../examples/model-index-payload.json),
+the version 2 [package payload example](../examples/model-index-payload-v2.json),
+or the version 3 [revocation and replacement example](../examples/model-index-payload-v3.json),
 then validate it with the shared
 [Draft-07 payload schema](../examples/model-index-payload.schema.json). Every
 download URL must use this shape:
@@ -135,6 +138,7 @@ message is one of these byte concatenations:
 ```text
 schema 1: "bloom.model_index.v1\0" || raw_payload_bytes
 schema 2: "bloom.model_index.v2\0" || raw_payload_bytes
+schema 3: "bloom.model_index.v3\0" || raw_payload_bytes
 ```
 
 Domain separation prevents a valid signature from being reused as another
@@ -150,9 +154,9 @@ and `sha256`. Its destination is one direct catalog child ending in `.gguf`,
 forward-compatible publishers, but it does not change the installation
 semantics.
 
-### Version 2 model packages
+### Version 2 and 3 model packages
 
-A multi-file entry is valid only in version 2. Its top-level `filename` is a
+A multi-file entry is valid in version 2 or 3. Its top-level `filename` is a
 non-hidden catalog directory name, `size_bytes` is the exact sum of all file
 sizes, and top-level `download_url` and input `sha256` are absent. The `files`
 array is the complete signed manifest. It contains between 2 and 256 unique,
@@ -198,11 +202,40 @@ per-file manifest and package digest. Later integrity checks rescan the exact
 tree and every file; removal deletes both the directory and its provenance
 record.
 
+### Version 3 permanent revocations
+
+Version 3 requires a `revocations` array, which may be empty. Each item names
+one exact previously signed version with `id`, lowercase `sha256`, `revoked_at`,
+and one bounded reason: `security`, `integrity`, `license`, or
+`publisher_withdrawal`. The array is limited to 200 entries. The revocation
+time must be positive and no later than the index generation time. Duplicate
+`(id, sha256)` identities and a current model entry with the same identity are
+rejected.
+
+Revocations are permanent for one configured index source. Every later signed
+generation must carry the complete prior revocation set; a generation that
+removes or changes a prior record fails closed across process restarts. This is
+intentional even when a publisher later decides that the original withdrawal
+was mistaken. Recovery is a new model entry with a different digest, as shown
+in the version 3 example, followed by a normal verified download or upgrade.
+
+Once a version 3 refresh is admitted, Bloom blocks new loads and new inference
+admission for matching installed provenance. This includes a matching runtime
+that was already resident before the refresh. It remains physically owned until
+normal unload or replacement so existing exact leases can drain safely, but it
+is hidden from OpenAI model discovery and makes readiness fail when selected as
+the default. Requests that already hold an exact runtime lease may finish;
+later OpenAI-compatible requests receive HTTP 410 with
+`model_version_revoked`, and Ollama activation also returns HTTP 410.
+The loader rechecks provenance before construction and publication so a refresh
+racing a long model load cannot publish the withdrawn version.
+
 ## Bounds and refresh behavior
 
 - Signed envelope: at most 512 KiB.
 - Decoded payload: at most 384 KiB.
 - Entries: at most 200.
+- Version 3 revocations: at most 200 permanent exact ID/digest identities.
 - Index validity: at most 366 days; generation may be at most one hour ahead of
   the server clock.
 - Entry URLs: at most 2,048 bytes and pinned to an immutable commit.
@@ -214,11 +247,12 @@ returns the verified cache. `POST` forces a refresh. If refresh fails, Bloom may
 return only the last verified snapshot while it remains unexpired, marked
 `cache_status: "stale"` with a warning. An expired snapshot is never returned.
 Both methods require the same API authentication as other `/v1` endpoints and
-return `Cache-Control: no-store`. Clients must require `schema_version: 1` or
-`2` and `object: "bloom.model_index"` before consuming the normalized response.
+return `Cache-Control: no-store`. Clients must require `schema_version: 1`,
+`2`, or `3` and `object: "bloom.model_index"` before consuming the normalized response.
 See the [response schema](../examples/model-index-response.schema.json),
 [version 1 example](../examples/model-index-response.json), and
-[version 2 package example](../examples/model-index-response-v2.json).
+[version 2 package example](../examples/model-index-response-v2.json), and
+[version 3 revocation example](../examples/model-index-response-v3.json).
 
 A successfully verified generation becomes a source-scoped persistent rollback
 watermark before the response is exposed. A signed response with an older
@@ -229,6 +263,8 @@ records. Corrupt, unexpected, symlinked, oversized, or unwritable state fails
 closed. The newer in-memory snapshot remains available only while unexpired.
 Publishers must therefore increase `generated_at` for every content or
 signing-key transition.
+For version 3, the watermark also retains the canonical revocation set. A
+newer generation is admitted only when it is a superset of that persisted set.
 
 Entries exceeding the server download-size limit or acquisition-license policy
 remain visible but have `downloadable: false` and a bounded blocking reason.
@@ -304,10 +340,19 @@ reload. A missing snapshot is retried within 30 seconds.
 The same capability reports `persistent_rollback_protection: true`; the Models
 drawer displays this state beside the verified cache status.
 
-Bloom does not fetch a remote revocation list. Short index validity windows and
-prompt removal of retired keys therefore remain important. If a seed may be
-compromised, preserve the rollback state, remove the key or disable the index
-immediately, publish a newer generation under a new key, review installed
-provenance, and reverify model files from a known trusted source. A privileged
-local actor that can delete both the state directory and process memory can
-reset this protection; local state integrity remains an operator responsibility.
+For an urgent model withdrawal, publish a version 3 generation that carries all
+previous revocations and adds the affected exact ID/digest pairs. Force-refresh
+the authenticated endpoint on every deployment and confirm the response shows
+the expected entries before considering the incident contained. Publish a
+fixed model only under a different digest; do not try to remove or rewrite the
+old revocation.
+
+If a signing seed may be compromised, preserve the rollback/revocation state,
+remove the key or disable the index immediately, add a replacement public key,
+and publish a strictly newer version 3 generation containing the complete
+revocation history. Review installed provenance and reverify model files from
+a known trusted source. Short validity windows and prompt removal of retired
+keys remain important because a compromised still-trusted key can publish new
+identities until it is removed. A privileged local actor that can delete both
+the state directory and process memory can reset this protection; local state
+integrity and backup remain operator responsibilities.

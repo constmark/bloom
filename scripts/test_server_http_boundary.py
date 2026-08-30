@@ -768,6 +768,8 @@ def main() -> int:
                     "0",
                     "--max-body-bytes",
                     "4096",
+                    "--max-ollama-body-bytes",
+                    "4096",
                     "--cors-allow-origin",
                     ALLOWED_BROWSER_ORIGIN,
                 ],

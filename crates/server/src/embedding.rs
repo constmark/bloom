@@ -166,6 +166,13 @@ async fn execute_embedding_batch_inner(
     }
 
     let runtime_lease = match exact_runtime {
+        Some(runtime) if state.runtime_is_revoked(&runtime) => {
+            return Err(EmbeddingExecutionError::new(
+                axum::http::StatusCode::GONE,
+                "model_version_revoked",
+                "The loaded signed-index model version has been permanently revoked. Install a replacement with a different digest before retrying.",
+            ));
+        }
         Some(runtime) => match state.lease_exact_runtime(&runtime).await {
             Some(runtime_lease) => runtime_lease,
             None => {
@@ -198,6 +205,13 @@ async fn execute_embedding_batch_inner(
                     axum::http::StatusCode::NOT_FOUND,
                     "model_not_found",
                     "The requested model is not loaded. Query the model discovery endpoint or switch the active runtime before retrying.",
+                ));
+            }
+            Err(RequestedModelError::Revoked) => {
+                return Err(EmbeddingExecutionError::new(
+                    axum::http::StatusCode::GONE,
+                    "model_version_revoked",
+                    "The loaded signed-index model version has been permanently revoked. Install a replacement with a different digest before retrying.",
                 ));
             }
         },

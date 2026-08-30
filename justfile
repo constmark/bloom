@@ -65,6 +65,11 @@ server-shutdown-test:
 server-http-boundary-test:
     python3 scripts/test_server_http_boundary.py
 
+# Exercise the embedded application shell and modal focus lifecycle in Chromium.
+# Run `just ui-build` and `playwright-cli install-browser chromium` once first.
+ui-browser-test:
+    python3 scripts/test_ui_browser.py
+
 # Generate a deterministic tiny Qwen2 model and cross both public API adapters.
 tiny-model-runtime-test:
     ./scripts/test_tiny_model_runtime.sh

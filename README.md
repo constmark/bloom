@@ -282,6 +282,9 @@ verifies every signed file, validates indexed shard names against the actual
 Safetensors index and tensor headers, and exposes a new directory only after one
 atomic no-overwrite rename. Transactional upgrades preserve the previous entry
 under `.bloom-upgrade` until replacement data and provenance are committed.
+Version 3 adds permanent exact ID/digest revocations: matching installed and
+resident versions reject new loads and inference with HTTP 410, while recovery
+publishes a differently hashed replacement without removing the old revocation.
 Each server also holds a non-blocking operating-system lease on
 `.bloom-catalog.lock` for its complete process lifetime. A second Bloom server
 cannot share that mutable catalog, including during startup recovery and Tokio

@@ -1177,6 +1177,16 @@ pub struct ModelIndexSnapshot {
     pub cache_status: String,
     pub warning: Option<String>,
     pub data: Vec<ModelIndexEntry>,
+    pub revocations: Option<Vec<ModelIndexRevocation>>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ModelIndexRevocation {
+    pub id: String,
+    pub sha256: String,
+    pub reason: String,
+    pub revoked_at: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -2996,7 +3006,7 @@ fn decode_model_index(text: &str) -> Result<ModelIndexSnapshot, String> {
 
 impl ModelIndexSnapshot {
     fn validate(&self) -> Result<(), String> {
-        if !matches!(self.schema_version, 1 | 2) || self.object != "bloom.model_index" {
+        if !matches!(self.schema_version, 1..=3) || self.object != "bloom.model_index" {
             return Err("unsupported model index response".to_string());
         }
         if !is_lower_hex(&self.key_id, 64) {
@@ -3022,6 +3032,35 @@ impl ModelIndexSnapshot {
         if self.data.len() > MAX_MODEL_INDEX_ENTRIES {
             return Err("model index response contains too many entries".to_string());
         }
+        let revocations = match (self.schema_version, self.revocations.as_deref()) {
+            (3, Some(revocations)) => revocations,
+            (3, None) => {
+                return Err("model index version 3 response omits revocations".to_string());
+            }
+            (_, Some(_)) => {
+                return Err("model index revocations require schema version 3".to_string());
+            }
+            (_, None) => &[],
+        };
+        if revocations.len() > MAX_MODEL_INDEX_ENTRIES {
+            return Err("model index response contains too many revocations".to_string());
+        }
+        let mut previous = None;
+        for revocation in revocations {
+            revocation.validate(self.generated_at)?;
+            let identity = (
+                revocation.id.as_str(),
+                revocation.sha256.as_str(),
+                revocation.reason.as_str(),
+                revocation.revoked_at,
+            );
+            if previous.is_some_and(|previous| previous >= identity) {
+                return Err(
+                    "model index revocations are duplicated or not canonically sorted".to_string(),
+                );
+            }
+            previous = Some(identity);
+        }
         let mut ids = HashSet::with_capacity(self.data.len());
         let mut filenames = HashSet::with_capacity(self.data.len());
         for entry in &self.data {
@@ -3031,6 +3070,35 @@ impl ModelIndexSnapshot {
             {
                 return Err("model index response contains duplicate entries".to_string());
             }
+            if revocations
+                .iter()
+                .any(|revocation| revocation.id == entry.id && revocation.sha256 == entry.sha256)
+            {
+                return Err(
+                    "model index response publishes an actively revoked model version".to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ModelIndexRevocation {
+    fn validate(&self, generated_at: u64) -> Result<(), String> {
+        validate_index_text("revocation ID", &self.id, 1, 64)?;
+        if !self.id.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || (index > 0 && matches!(byte, b'-' | b'_' | b'.'))
+        }) || !is_lower_hex(&self.sha256, 64)
+            || !matches!(
+                self.reason.as_str(),
+                "security" | "integrity" | "license" | "publisher_withdrawal"
+            )
+            || self.revoked_at == 0
+            || self.revoked_at > generated_at
+        {
+            return Err("model index response contains invalid revocation metadata".to_string());
         }
         Ok(())
     }
@@ -3058,7 +3126,7 @@ impl ModelIndexEntry {
             })?;
             validate_index_download_url(url, &self.filename)?;
         } else {
-            if schema_version != 2
+            if schema_version < 2
                 || self.download_url.is_some()
                 || self.format != "transformers"
                 || !valid_package_directory(&self.filename)
@@ -6740,6 +6808,52 @@ mod tests {
             decode_model_index(&unsafe_path.to_string())
                 .unwrap_err()
                 .contains("package filename")
+        );
+    }
+
+    #[test]
+    fn model_index_decoder_enforces_v3_revocation_identity_and_ordering() {
+        let snapshot = serde_json::from_str::<serde_json::Value>(include_str!(
+            "../../examples/model-index-response-v3.json"
+        ))
+        .unwrap();
+        let decoded = decode_model_index(&snapshot.to_string()).unwrap();
+        assert_eq!(decoded.schema_version, 3);
+        assert_eq!(decoded.revocations.as_ref().unwrap().len(), 1);
+
+        let mut missing = snapshot.clone();
+        missing.as_object_mut().unwrap().remove("revocations");
+        assert!(
+            decode_model_index(&missing.to_string())
+                .unwrap_err()
+                .contains("omits revocations")
+        );
+
+        let mut active_revoked = snapshot.clone();
+        active_revoked["data"][0]["sha256"] = active_revoked["revocations"][0]["sha256"].clone();
+        assert!(
+            decode_model_index(&active_revoked.to_string())
+                .unwrap_err()
+                .contains("actively revoked")
+        );
+
+        let mut duplicate = snapshot.clone();
+        duplicate["revocations"] = serde_json::json!([
+            duplicate["revocations"][0].clone(),
+            duplicate["revocations"][0].clone()
+        ]);
+        assert!(
+            decode_model_index(&duplicate.to_string())
+                .unwrap_err()
+                .contains("canonically sorted")
+        );
+
+        let mut legacy = snapshot;
+        legacy["schema_version"] = serde_json::Value::from(2);
+        assert!(
+            decode_model_index(&legacy.to_string())
+                .unwrap_err()
+                .contains("require schema version 3")
         );
     }
 

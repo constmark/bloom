@@ -426,3 +426,89 @@ and limit values. Strict cgroup/CUDA probes and manifest artifact accounting
 fail closed when the physical placement cannot be verified. The remaining
 code-structure priority is behavior-preserving decomposition of the oversized
 handler, composition, UI, and Candle executor modules.
+
+## 13. HTTP Boundary Decomposition (2026-08-24)
+
+The server composition root no longer owns the complete HTTP security and
+compatibility middleware implementation. Browser-origin parsing and the
+same-origin guard, CORS alignment, request-ID normalization, protocol-specific
+framework error shaping, no-store/retry/authentication headers, and distinct
+inference/operator credential admission now live in
+`crates/server/src/http_boundary.rs`.
+
+This removes more than 570 lines from `crates/server/src/lib.rs` while keeping
+the existing route wiring and behavior unchanged. The live HTTP gate was also
+updated to set the independently configurable Ollama image-body limit before
+asserting its 4,097-byte rejection; the previous probe had become an in-limit
+malformed request when Ollama vision support added a dedicated 16 MiB default.
+Server all-target compilation, strict Clippy, all 374 server tests, and the live
+process boundary pass after the split. The composition root and
+handler/model-management surfaces remain large, so the P1 is reduced rather
+than closed; the next safe split should isolate runtime construction or one
+complete protocol family with its focused tests.
+
+## 14. Protocol and Runtime Construction Decomposition (2026-08-24)
+
+The next behavior-preserving split completed both follow-ups identified in
+Section 13. Ollama route assembly now lives beside the protocol adapters in
+`crates/server/src/ollama.rs`. Model-loader sequencing, backend admission,
+memory revalidation, pipeline construction, and atomic runtime publication now
+live in `crates/server/src/runtime_loader.rs`. Optional IFB construction and
+its coupled KV pool, CacheMesh, per-request model wrappers, memory permit,
+lifetime marker, worker, and shutdown token live in
+`crates/server/src/runtime_scheduling.rs`.
+
+Together with the HTTP boundary extraction, these changes reduce
+`crates/server/src/lib.rs` from 13,090 to 11,793 lines while preserving its
+composition-root role. Backend-admission and loaded-model-ID unit tests moved
+with the loader boundary instead of remaining in the root test module. Server
+all-target compilation, strict Clippy, all 374 tests, and the live HTTP process
+boundary pass. The remaining structure P1 now centers on the still-large
+request/response state in the composition root, `handlers.rs`, model-management
+modules, UI modules, and Candle executor.
+
+## 15. Automated Chromium Application Gate (2026-08-30)
+
+The earlier manual empty-state browser audit is now a repeatable CI gate. A
+pinned `playwright-cli` drives Chromium against the embedded UI in the same
+hardened container image that CI builds, while a local mode can start a
+`serve-ui` binary against an isolated empty catalog.
+
+The gate validates the HTTP 200 app shell and its CSP, framing, MIME-sniffing,
+referrer, and permissions headers before waiting for the real WASM UI. It then
+checks the single product heading, named conversations landmark, empty-model
+status, disabled generation, and self-contained favicon. Models and Settings
+must expose named and described modal dialogs, move focus to their first
+control, contain forward and reverse Tab navigation, close with Escape, and
+restore the exact opener. Settings controls must retain accessible names, and
+the reduced-motion media query must collapse animation and transition duration.
+Unexpected request failures, page errors, and console errors fail the gate;
+the expected no-model `/ready` HTTP 503 is the only console exception.
+
+This closes the repeatable Chromium shell/focus baseline, not the complete
+browser-readiness gap. Clipboard and download flows, Firefox/WebKit, an
+automated accessibility scanner, and target screen readers remain next.
+
+## 16. Signed-Index Revocation and Recovery (2026-08-30)
+
+The model-distribution trust path now has an urgent withdrawal mechanism rather
+than relying only on expiry, key removal, and rollback rejection. Signed-index
+schema v3 carries at most 200 exact model ID/SHA-256 revocations with bounded
+reasons and times. The private watermark state persists the canonical set and
+requires every later generation to be a superset, so a publisher cannot
+silently un-revoke a version after restart. An active entry may reuse the
+logical ID only with a different digest.
+
+Enforcement crosses the full runtime race window. Bloom checks installed signed
+provenance before load, captures that identity on the loaded runtime, rechecks
+before publication, and rejects every new exact or selected inference lease if
+the identity is withdrawn. Matching runtimes are hidden from OpenAI discovery
+and fail readiness when selected as default, while already admitted work may
+drain; later OpenAI-compatible and Ollama admissions return HTTP 410. Protocol,
+offline signer, persistent-state,
+restart, resident-runtime, schema/example, and UI decoder tests cover the
+negative and replacement-digest recovery paths.
+
+This closes the local revocation mechanism gap. The remaining operational gap
+is evidence from a multi-host incident drill: bounded fleet refresh latency,
+alerting, durable state backup/restore, and verified replacement rollout.

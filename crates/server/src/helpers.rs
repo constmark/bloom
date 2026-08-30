@@ -16,6 +16,7 @@ const MAX_JSON_SCHEMA_ANNOTATION_CHARS: usize = 1_024;
 pub(crate) enum RequestedModelError {
     Invalid,
     NotLoaded,
+    Revoked,
 }
 
 /// Bind an optional OpenAI-compatible model selector to the active runtime.
@@ -68,6 +69,11 @@ pub(crate) fn requested_model_error_response(
             axum::http::StatusCode::NOT_FOUND,
             "model_not_found",
             "The requested model is not loaded. Query GET /v1/models or switch the active runtime before retrying.",
+        ),
+        RequestedModelError::Revoked => error_response(
+            axum::http::StatusCode::GONE,
+            "model_version_revoked",
+            "The loaded signed-index model version has been permanently revoked. Install a replacement with a different digest before retrying.",
         ),
     }
 }

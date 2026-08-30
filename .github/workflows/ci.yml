@@ -176,6 +176,13 @@ jobs:
         run: ./scripts/compare_llamacpp.py
       - name: Docker build smoke
         run: docker build -t bloom:ci .
+      - name: Test embedded UI in Chromium
+        run: |
+          npx --yes --package @playwright/cli@0.1.18 playwright-cli install-browser chromium
+          docker run --detach --name bloom-ui-browser-ci --network host \
+            bloom:ci --host 127.0.0.1 --port 31373
+          trap 'docker rm --force bloom-ui-browser-ci >/dev/null' EXIT
+          python3 scripts/test_ui_browser.py --base-url http://127.0.0.1:31373
       - name: Check hardened Docker runtime defaults
         run: |
           docker run --rm --entrypoint sh bloom:ci -c '

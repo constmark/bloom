@@ -84,6 +84,7 @@ nano-vllm/
 *.qdstrm
 *.sqlite
 output.gif
+output/playwright/
 
 # Temporary tests and mock scripts
 test_*.py
@@ -96,6 +97,7 @@ test_*.rs
 !scripts/test_generate_sbom.py
 !scripts/test_validate_release_artifact.py
 !scripts/test_ui_tool_version.py
+!scripts/test_ui_browser.py
 !python/tests/test_*.py
 mock_wan.py
 dummy_wan/

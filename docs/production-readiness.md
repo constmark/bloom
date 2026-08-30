@@ -10,7 +10,8 @@ criteria that cut across those capabilities.
 - Bounded request admission, cancellation ownership, readiness, request
   correlation, no-store policy, and graceful shutdown have automated coverage.
 - Model acquisition verifies hashes, records provenance, bounds storage, and
-  supports crash-safe signed upgrades and persistent index rollback protection.
+  supports crash-safe signed upgrades plus persistent index rollback and
+  permanent exact-version revocation protection.
 - Release archives are deterministic at the archive layer, self-checked, and
   published with build-provenance attestations.
 - Pinned trained CPU gates cover maintained Qwen2, Qwen3, SmolLM2, and MiniLM
@@ -44,12 +45,13 @@ promote other model families, accelerators, or external-runtime adapters.
 
 ### P0: complete the chosen deployment artifact
 
-Release archives have provenance, while the Dockerfile is only build-tested in
-CI and no official container publication contract exists. If containers are a
-supported deployment, publish a multi-architecture image by digest, attach an
-SBOM and signed provenance, scan the final runtime layer, document a read-only
-root filesystem/security context, and exercise liveness/readiness plus signal
-drain under the target orchestrator. The Docker build now installs fixed
+Release archives have provenance, while the Dockerfile is CI-built and receives
+short-lived runtime, strict-default, doctor, and embedded-browser checks but no
+official container publication contract exists. If containers are a supported
+deployment, publish a multi-architecture image by digest, attach an SBOM and
+signed provenance, scan the final runtime layer, document a read-only root
+filesystem/security context, and exercise liveness/readiness plus signal drain
+under the target orchestrator. The Docker build now installs fixed
 Linux/amd64 and Linux/arm64 `wasm-bindgen`, `esbuild`, and `wasm-opt` binaries,
 verifies their SHA-256 digests, selects the compiler already present in the
 digest-pinned builder without refreshing its online channel, and runs a
@@ -58,10 +60,14 @@ non-container macOS and Windows archive builders.
 
 ## High-priority gaps
 
-- Add real-browser end-to-end and accessibility gates for the embedded UI;
-  the empty state and Models/Settings focus lifecycle have a manual browser
-  audit, while clipboard, download, cross-browser, scanner, and target
-  assistive-technology behavior still require repeatable validation.
+- Extend the required Chromium embedded-UI gate to clipboard and download
+  flows, then add cross-browser, automated accessibility-scanner, and target
+  assistive-technology validation. The current release-container gate already
+  covers the real WASM application shell, security headers, empty-model
+  admission, document/landmark/control semantics, Models/Settings initial
+  focus and bidirectional Tab containment, Escape dismissal, opener-focus
+  restoration, reduced motion, request failures, page errors, and unexpected
+  console errors.
 - Add dedicated target-hardware runners and published performance budgets for
   each claimed Metal or CUDA deployment. Feature compilation alone is not
   execution evidence.
@@ -70,16 +76,21 @@ non-container macOS and Windows archive builders.
   ownership/status contracts, cooperative stream cancellation, and revision 1
   fallback tests; binary wheels, a declared compatibility window, and packaged
   cross-version ABI tests remain before production support.
-- Define a signed-index revocation and incident-recovery mechanism; expiry and
-  rollback watermarks do not provide urgent remote revocation.
+- Exercise signed-index v3 urgent revocation through a multi-host deployment
+  drill, including forced refresh latency, operator alerting, state backup, and
+  replacement-digest recovery evidence. The protocol and local fail-closed
+  enforcement are implemented; fleet incident operations are not yet proven.
 - Extend the native archive's dependency policy and target-filtered CycloneDX
   SBOM gate to any future official container image, including final-layer
   package inventory and signed image provenance.
 - Split the largest server, CLI, scheduler, executor, and browser modules so
   security and lifecycle boundaries remain reviewable as features grow. Loaded
   runtime ownership now has a focused bounded pool, exact draining leases, and
-  aggregate host/device memory admission, but the surrounding composition and
-  handler modules remain oversized.
+  aggregate host/device memory admission; HTTP origin, correlation, protocol
+  error, cache, retry, and credential middleware now has a focused boundary;
+  model loading/publication and optional IFB scheduling construction are also
+  isolated with their coupled resource lifetimes. The remaining request state,
+  route composition, handler, UI, and Candle modules remain oversized.
 
 ## Operational boundaries
 

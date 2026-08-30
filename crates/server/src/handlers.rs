@@ -144,7 +144,10 @@ pub(crate) async fn handle_observability(
         .and_then(|runtime| runtime.cachemesh.as_ref())
         .map(|mesh| mesh.metrics());
     let loading = state.load_in_progress.load(Ordering::Relaxed);
-    let ready = state.ready.load(Ordering::Acquire);
+    let ready = state.ready.load(Ordering::Acquire)
+        && runtime
+            .as_ref()
+            .is_none_or(|runtime| !state.runtime_is_revoked(runtime));
     let load_failed = state.load_error.read().await.is_some();
     let load_phase = if loading {
         "loading"
@@ -281,7 +284,9 @@ fn openai_model_resource(runtime: &LoadedRuntime) -> serde_json::Value {
 
 pub(crate) async fn handle_models(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
     let snapshot = state.runtime_pool.read().await.snapshot();
-    let default = snapshot.default_runtime();
+    let default = snapshot
+        .default_runtime()
+        .filter(|runtime| !state.runtime_is_revoked(runtime));
     let mut models = Vec::with_capacity(snapshot.entries().len());
     if let Some(runtime) = default.as_ref() {
         models.push(openai_model_resource(runtime));
@@ -292,9 +297,10 @@ pub(crate) async fn handle_models(State(state): State<Arc<ServerState>>) -> impl
             .iter()
             .map(|(_, runtime)| runtime)
             .filter(|runtime| {
-                default
-                    .as_ref()
-                    .is_none_or(|default| !Arc::ptr_eq(runtime, default))
+                !state.runtime_is_revoked(runtime)
+                    && default
+                        .as_ref()
+                        .is_none_or(|default| !Arc::ptr_eq(runtime, default))
             })
             .map(|runtime| openai_model_resource(runtime)),
     );
@@ -338,6 +344,9 @@ pub(crate) async fn handle_model_retrieve(
         Ok(None) => return requested_model_error_response(RequestedModelError::NotLoaded),
         Err(error) => return requested_model_error_response(error),
     };
+    if state.runtime_is_revoked(&runtime) {
+        return requested_model_error_response(RequestedModelError::Revoked);
+    }
     Json(openai_model_resource(&runtime)).into_response()
 }
 
@@ -424,7 +433,10 @@ pub(crate) async fn handle_model_catalog(
     };
 
     let loading = state.load_in_progress.load(Ordering::Acquire);
-    let ready = state.ready.load(Ordering::Acquire);
+    let ready = state.ready.load(Ordering::Acquire)
+        && runtime
+            .as_ref()
+            .is_none_or(|runtime| !state.runtime_is_revoked(runtime));
     let error = state.load_error.read().await.clone();
     let requested_model = state.requested_model.read().await.clone();
     let phase = if loading {
@@ -1371,6 +1383,37 @@ pub(crate) async fn prepare_catalog_model_load(
             "Wait for the signed-model upgrade to finish before loading this model.",
         ));
     }
+    if let Some(index) = state.model_index.as_ref() {
+        let (catalog, _) = state
+            .fresh_model_catalog_snapshot()
+            .await
+            .map_err(|error| {
+                ModelActivationError::new(
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "model_catalog_error",
+                    format!("model catalog inspection failed: {error}"),
+                )
+            })?;
+        if catalog
+            .models
+            .iter()
+            .find(|entry| entry.id == model_id)
+            .and_then(|entry| entry.provenance.as_ref())
+            .and_then(|provenance| {
+                provenance
+                    .model_index_id
+                    .as_deref()
+                    .map(|id| (id, provenance.sha256.as_str()))
+            })
+            .is_some_and(|(id, sha256)| index.is_revoked(id, sha256))
+        {
+            return Err(ModelActivationError::new(
+                axum::http::StatusCode::GONE,
+                "model_version_revoked",
+                "The verified signed-index model version has been permanently revoked. Install a replacement with a different digest before loading it.",
+            ));
+        }
+    }
     if state.model_integrity.is_active(model_id).await {
         return Err(ModelActivationError::new(
             axum::http::StatusCode::CONFLICT,
@@ -2095,6 +2138,9 @@ async fn handle_chat_completions_inner(
     }
 
     let runtime_lease = match exact_runtime {
+        Some(runtime) if state.runtime_is_revoked(&runtime) => {
+            return requested_model_error_response(RequestedModelError::Revoked);
+        }
         Some(runtime) => match state.lease_exact_runtime(&runtime).await {
             Some(lease) => lease,
             None => {
@@ -4685,6 +4731,9 @@ async fn run_multimodal_request_inner(
     }
 
     let runtime_lease = match exact_runtime {
+        Some(runtime) if state.runtime_is_revoked(&runtime) => {
+            return requested_model_error_response(RequestedModelError::Revoked);
+        }
         Some(runtime) => match state.lease_exact_runtime(&runtime).await {
             Some(lease) => lease,
             None => {

@@ -9,14 +9,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
-const WATERMARK_SCHEMA_VERSION: u8 = 1;
+const WATERMARK_SCHEMA_VERSION: u8 = 2;
 const WATERMARK_OBJECT: &str = "bloom.model_index_watermark";
 const WATERMARK_PREFIX: &str = "watermark-";
 const WATERMARK_SUFFIX: &str = ".json";
-const MAX_WATERMARK_BYTES: u64 = 1_024;
+const MAX_WATERMARK_BYTES: u64 = 64 * 1_024;
 const MAX_WATERMARK_RECORDS: usize = 64;
 const MAX_TEMPORARY_RECORDS: usize = 16;
 const RETAINED_GENERATIONS_PER_SOURCE: usize = 2;
+pub(crate) const MAX_MODEL_INDEX_REVOCATIONS: usize = 200;
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -27,12 +28,26 @@ struct WatermarkRecord {
     source_id: String,
     generated_at: u64,
     generation_id: String,
+    #[serde(default)]
+    revocations: Option<Vec<ModelIndexRevocation>>,
+}
+
+/// One permanently withdrawn signed-index model version. Recovery publishes a
+/// different digest; a verified `(id, sha256)` pair is never unrevoked.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ModelIndexRevocation {
+    pub id: String,
+    pub sha256: String,
+    pub reason: String,
+    pub revoked_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ModelIndexWatermark {
     pub generated_at: u64,
     pub generation_id: String,
+    pub revocations: Vec<ModelIndexRevocation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +55,7 @@ pub(crate) enum ModelIndexWatermarkAdmission {
     Accepted,
     Rollback(ModelIndexWatermark),
     Conflict(ModelIndexWatermark),
+    RevocationRollback(ModelIndexWatermark),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +97,13 @@ impl ModelIndexWatermarkStore {
             .await
             .context("model index watermark task failed")?
     }
+
+    pub(crate) fn revocations(&self) -> Result<Vec<ModelIndexRevocation>> {
+        let records = read_records(&self.directory)?;
+        Ok(latest_watermark(&records, &self.source_id)?
+            .map(|watermark| watermark.revocations)
+            .unwrap_or_default())
+    }
 }
 
 pub(crate) fn inspect_model_index_watermark_directory(
@@ -108,9 +131,15 @@ fn admit_sync(
     ensure_directory(directory)?;
     let mut records = read_records(directory)?;
     if let Some(current) = latest_watermark(&records, source_id)? {
+        if !revocations_include(&candidate.revocations, &current.revocations) {
+            return Ok(ModelIndexWatermarkAdmission::RevocationRollback(current));
+        }
         match candidate.generated_at.cmp(&current.generated_at) {
             std::cmp::Ordering::Less => return Ok(ModelIndexWatermarkAdmission::Rollback(current)),
-            std::cmp::Ordering::Equal if candidate.generation_id == current.generation_id => {
+            std::cmp::Ordering::Equal
+                if candidate.generation_id == current.generation_id
+                    && candidate.revocations == current.revocations =>
+            {
                 return Ok(ModelIndexWatermarkAdmission::Accepted);
             }
             std::cmp::Ordering::Equal => {
@@ -138,6 +167,7 @@ fn admit_sync(
         source_id: source_id.to_string(),
         generated_at: candidate.generated_at,
         generation_id: candidate.generation_id.clone(),
+        revocations: Some(candidate.revocations.clone()),
     };
     let publication = publish_record(directory, &candidate_record)?;
     if let PublishOutcome::Conflict(existing) = publication {
@@ -145,6 +175,7 @@ fn admit_sync(
             ModelIndexWatermark {
                 generated_at: existing.generated_at,
                 generation_id: existing.generation_id,
+                revocations: existing.revocations.unwrap_or_default(),
             },
         ));
     }
@@ -176,32 +207,51 @@ fn latest_watermark(
     records: &[WatermarkRecord],
     source_id: &str,
 ) -> Result<Option<ModelIndexWatermark>> {
-    let Some(latest_generation) = records
+    let by_generation = records
         .iter()
         .filter(|record| record.source_id == source_id)
-        .map(|record| record.generated_at)
-        .max()
-    else {
+        .fold(
+            BTreeMap::<u64, Vec<&WatermarkRecord>>::new(),
+            |mut map, record| {
+                map.entry(record.generated_at).or_default().push(record);
+                map
+            },
+        );
+    if by_generation.is_empty() {
         return Ok(None);
-    };
-    let generation_ids = records
-        .iter()
-        .filter(|record| record.source_id == source_id && record.generated_at == latest_generation)
-        .map(|record| record.generation_id.as_str())
-        .collect::<BTreeSet<_>>();
-    if generation_ids.len() != 1 {
-        return Err(anyhow!(
-            "persisted model index watermarks conflict at the latest generation"
-        ));
     }
-    Ok(Some(ModelIndexWatermark {
-        generated_at: latest_generation,
-        generation_id: generation_ids
-            .into_iter()
-            .next()
-            .unwrap_or_default()
-            .to_string(),
-    }))
+    let mut previous_revocations = Vec::new();
+    let mut latest = None;
+    for (generated_at, generation) in by_generation {
+        if generation.len() != 1 {
+            return Err(anyhow!(
+                "persisted model index watermarks conflict at one generation"
+            ));
+        }
+        let record = generation[0];
+        let revocations = record.revocations.as_deref().unwrap_or_default();
+        if !revocations_include(revocations, &previous_revocations) {
+            return Err(anyhow!(
+                "persisted model index revocation history moved backwards"
+            ));
+        }
+        previous_revocations = revocations.to_vec();
+        latest = Some(ModelIndexWatermark {
+            generated_at,
+            generation_id: record.generation_id.clone(),
+            revocations: revocations.to_vec(),
+        });
+    }
+    Ok(latest)
+}
+
+fn revocations_include(
+    candidate: &[ModelIndexRevocation],
+    required: &[ModelIndexRevocation],
+) -> bool {
+    required
+        .iter()
+        .all(|revocation| candidate.binary_search(revocation).is_ok())
 }
 
 fn publish_record(directory: &Path, record: &WatermarkRecord) -> Result<PublishOutcome> {
@@ -402,7 +452,13 @@ fn read_record(path: &Path) -> Result<WatermarkRecord> {
 }
 
 fn validate_record(record: &WatermarkRecord) -> Result<()> {
-    if record.schema_version != WATERMARK_SCHEMA_VERSION || record.object != WATERMARK_OBJECT {
+    if !matches!(record.schema_version, 1 | WATERMARK_SCHEMA_VERSION)
+        || record.object != WATERMARK_OBJECT
+        || !matches!(
+            (record.schema_version, record.revocations.as_ref()),
+            (1, None) | (WATERMARK_SCHEMA_VERSION, Some(_))
+        )
+    {
         return Err(anyhow!("unsupported model index watermark identity"));
     }
     validate_digest(&record.source_id, "model index watermark source ID")?;
@@ -412,7 +468,10 @@ fn validate_record(record: &WatermarkRecord) -> Result<()> {
             "model index watermark generation must be greater than zero"
         ));
     }
-    Ok(())
+    validate_revocations(
+        record.revocations.as_deref().unwrap_or_default(),
+        record.generated_at,
+    )
 }
 
 fn validate_candidate(candidate: &ModelIndexWatermark) -> Result<()> {
@@ -424,7 +483,43 @@ fn validate_candidate(candidate: &ModelIndexWatermark) -> Result<()> {
     validate_digest(
         &candidate.generation_id,
         "model index watermark generation ID",
-    )
+    )?;
+    validate_revocations(&candidate.revocations, candidate.generated_at)
+}
+
+fn validate_revocations(revocations: &[ModelIndexRevocation], generated_at: u64) -> Result<()> {
+    if revocations.len() > MAX_MODEL_INDEX_REVOCATIONS {
+        return Err(anyhow!("model index contains too many revocations"));
+    }
+    let mut previous = None;
+    for revocation in revocations {
+        if revocation.id.is_empty()
+            || revocation.id.len() > 64
+            || !revocation.id.bytes().enumerate().all(|(index, byte)| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || (index > 0 && matches!(byte, b'-' | b'_' | b'.'))
+            })
+        {
+            return Err(anyhow!("model index revocation ID is invalid"));
+        }
+        validate_digest(&revocation.sha256, "model index revocation SHA-256")?;
+        if !matches!(
+            revocation.reason.as_str(),
+            "security" | "integrity" | "license" | "publisher_withdrawal"
+        ) || revocation.revoked_at == 0
+            || revocation.revoked_at > generated_at
+        {
+            return Err(anyhow!("model index revocation metadata is invalid"));
+        }
+        if previous.is_some_and(|previous| previous >= revocation) {
+            return Err(anyhow!(
+                "model index revocations must be unique and canonically sorted"
+            ));
+        }
+        previous = Some(revocation);
+    }
+    Ok(())
 }
 
 fn validate_digest(value: &str, name: &str) -> Result<()> {
@@ -539,6 +634,16 @@ mod tests {
         ModelIndexWatermark {
             generated_at,
             generation_id: byte.repeat(64),
+            revocations: Vec::new(),
+        }
+    }
+
+    fn revocation(byte: &str, revoked_at: u64) -> ModelIndexRevocation {
+        ModelIndexRevocation {
+            id: "tiny-q4".to_string(),
+            sha256: byte.repeat(64),
+            reason: "integrity".to_string(),
+            revoked_at,
         }
     }
 
@@ -568,6 +673,26 @@ mod tests {
         let status = inspect_model_index_watermark_directory(&state).unwrap();
         assert_eq!(status.record_count, 2);
         assert_eq!(status.source_count, 1);
+    }
+
+    #[tokio::test]
+    async fn persisted_revocations_are_monotonic_across_store_instances() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let source_id = "ab".repeat(32);
+        let store = ModelIndexWatermarkStore::new(state.clone(), source_id.clone()).unwrap();
+        let mut withdrawn = candidate(10, "a");
+        withdrawn.revocations = vec![revocation("b", 9)];
+        assert_eq!(
+            store.admit(withdrawn.clone()).await.unwrap(),
+            ModelIndexWatermarkAdmission::Accepted
+        );
+        let restarted = ModelIndexWatermarkStore::new(state, source_id).unwrap();
+        assert_eq!(restarted.revocations().unwrap(), withdrawn.revocations);
+        assert_eq!(
+            restarted.admit(candidate(20, "c")).await.unwrap(),
+            ModelIndexWatermarkAdmission::RevocationRollback(withdrawn)
+        );
     }
 
     #[tokio::test]
@@ -640,6 +765,23 @@ mod tests {
 
     #[test]
     fn rejects_corrupt_unknown_and_symlink_state() {
+        let missing_v2_revocations = WatermarkRecord {
+            schema_version: WATERMARK_SCHEMA_VERSION,
+            object: WATERMARK_OBJECT.to_string(),
+            source_id: "ab".repeat(32),
+            generated_at: 1,
+            generation_id: "cd".repeat(32),
+            revocations: None,
+        };
+        assert!(validate_record(&missing_v2_revocations).is_err());
+        assert!(
+            validate_record(&WatermarkRecord {
+                schema_version: 1,
+                ..missing_v2_revocations
+            })
+            .is_ok()
+        );
+
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("unexpected.txt"), b"unexpected").unwrap();
         assert!(inspect_model_index_watermark_directory(temp.path()).is_err());
