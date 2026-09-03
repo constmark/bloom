@@ -506,9 +506,11 @@ type check targets `wasm32-unknown-unknown`, matching production builds. The
 pinned Chromium gate loads the real embedded WASM shell, validates its security
 headers and empty state, and exercises Models/Settings focus entry, forward and
 reverse containment, Escape dismissal, opener restoration, accessible names,
-and reduced motion. CI runs that gate against the release-shaped container.
-Clipboard, downloads, other browser engines, automated accessibility scanning,
-and target assistive technology remain release checks.
+reduced motion, an imported message's real clipboard write, and a versioned
+conversation download whose filename and decoded contents are checked. CI runs
+that gate against the release-shaped container. Other browser engines,
+automated accessibility scanning, and target assistive technology remain
+release checks.
 
 ### Embedded in bloom_server
 

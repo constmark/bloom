@@ -60,14 +60,13 @@ non-container macOS and Windows archive builders.
 
 ## High-priority gaps
 
-- Extend the required Chromium embedded-UI gate to clipboard and download
-  flows, then add cross-browser, automated accessibility-scanner, and target
-  assistive-technology validation. The current release-container gate already
-  covers the real WASM application shell, security headers, empty-model
-  admission, document/landmark/control semantics, Models/Settings initial
-  focus and bidirectional Tab containment, Escape dismissal, opener-focus
-  restoration, reduced motion, request failures, page errors, and unexpected
-  console errors.
+- Add cross-browser, automated accessibility-scanner, and target
+  assistive-technology validation. The current release-container gate covers
+  the real WASM application shell, security headers, empty-model admission,
+  document/landmark/control semantics, Models/Settings/import-dialog focus
+  behavior, bidirectional Tab containment, Escape dismissal, opener-focus
+  restoration, reduced motion, real clipboard writes, versioned conversation
+  downloads, request failures, page errors, and unexpected console errors.
 - Add dedicated target-hardware runners and published performance budgets for
   each claimed Metal or CUDA deployment. Feature compilation alone is not
   execution evidence.

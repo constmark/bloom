@@ -280,6 +280,17 @@ async (page) => {
       `${label} description is missing`);
   };
   const assertFocusLoop = async (dialog, label) => {
+    const dialogId = await dialog.getAttribute('id');
+    assert(dialogId, `${label} dialog has no stable ID`);
+    await page.waitForFunction(({ dialogId, selector }) => {
+      const root = document.getElementById(dialogId);
+      if (!root) return false;
+      const elements = Array.from(root.querySelectorAll(selector)).filter((element) =>
+        !element.closest('[hidden],[aria-hidden="true"]') &&
+        element.getClientRects().length > 0
+      );
+      return elements.length >= 2 && document.activeElement === elements[0];
+    }, { dialogId, selector: focusableSelector });
     let state = await visibleFocusableState(dialog);
     assert(state.count >= 2 && state.activeFirst, `${label} did not focus its first control`);
     await page.keyboard.press('Shift+Tab');
@@ -329,6 +340,83 @@ async (page) => {
   assert(await settingsButton.evaluate((button) => document.activeElement === button),
     'Settings did not restore focus to its opener');
 
+  const clipboardText = 'Bloom browser clipboard gate';
+  const archive = {
+    version: 2,
+    object: 'bloom.conversation_archive',
+    active_conversation: 0,
+    conversations: [{
+      title: 'Browser transfer fixture',
+      messages: [
+        { role: 'user', content: 'Exercise browser transfer actions.' },
+        { role: 'assistant', content: clipboardText },
+      ],
+    }],
+  };
+  const importInput = page.locator('.conversation-backup input[type="file"]');
+  assert(await importInput.count() === 1, 'conversation archive input is missing');
+  await importInput.evaluate((input, archiveText) => {
+    const transfer = new DataTransfer();
+    transfer.items.add(new File(
+      [archiveText],
+      'browser-transfer-fixture.json',
+      { type: 'application/json' },
+    ));
+    input.files = transfer.files;
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }, JSON.stringify(archive));
+  const importDialog = page.getByRole('dialog', { name: 'Import conversations' });
+  await importDialog.waitFor();
+  await assertDialogContract(importDialog, 'Import conversations');
+  await importDialog.getByRole('button', { name: 'Replace all', exact: true }).click();
+  await importDialog.waitFor({ state: 'detached' });
+
+  const assistantMessage = page.getByText(clipboardText, { exact: true });
+  await assistantMessage.waitFor();
+  await page.context().grantPermissions(
+    ['clipboard-read', 'clipboard-write'],
+    { origin: baseUrl },
+  );
+  const copyButton = page.getByRole('button', {
+    name: 'Copy assistant message',
+    exact: true,
+  });
+  await copyButton.click();
+  await page.waitForFunction(
+    async (expected) => await navigator.clipboard.readText() === expected,
+    clipboardText,
+  );
+  assert(await copyButton.textContent() === 'Copied',
+    'message copy did not publish its success state');
+
+  const exportButton = page.locator('.conversation-backup-actions').getByRole('button', {
+    name: 'Export',
+    exact: true,
+  });
+  const downloadPromise = page.waitForEvent('download');
+  await exportButton.click();
+  const download = await downloadPromise;
+  assert(download.suggestedFilename() === 'bloom-conversations.json',
+    'conversation export filename drifted');
+  const downloadStream = await download.createReadStream();
+  assert(downloadStream !== null, 'conversation export has no readable payload');
+  let downloadedText = '';
+  for await (const chunk of downloadStream) {
+    downloadedText += chunk.toString('utf8');
+  }
+  const downloadedArchive = JSON.parse(downloadedText);
+  assert(downloadedArchive.object === 'bloom.conversation_archive',
+    'downloaded conversation archive object drifted');
+  assert(downloadedArchive.version === 2,
+    'downloaded conversation archive version drifted');
+  assert(downloadedArchive.conversations?.length === 1,
+    'downloaded conversation archive count drifted');
+  assert(downloadedArchive.conversations[0]?.messages?.[1]?.content === clipboardText,
+    'downloaded conversation archive lost message content');
+  assert(await page.getByRole('status').filter({
+    hasText: 'Exported 1 conversation(s).',
+  }).count() === 1, 'conversation export did not publish its success state');
+
   await page.waitForTimeout(250);
   const unexpectedConsoleErrors = consoleErrors.filter((entry) => !(
     entry.url.endsWith('/ready') &&
@@ -345,7 +433,8 @@ async (page) => {
   page.off('requestfailed', onRequestFailed);
   return {
     title: await page.title(),
-    dialogs: ['Models', 'Settings'],
+    dialogs: ['Models', 'Settings', 'Import conversations'],
+    transfers: ['clipboard', 'conversation download'],
     expectedReadinessErrors: consoleErrors.length,
   };
 }
@@ -406,7 +495,8 @@ def main() -> int:
                 stop_process(process)
     print(
         "OK: embedded Bloom UI Chromium shell, security headers, semantics, "
-        "focus loops, Escape dismissal, focus restoration, and reduced motion"
+        "focus loops, Escape dismissal, focus restoration, reduced motion, "
+        "clipboard, and conversation downloads"
     )
     return 0
 
