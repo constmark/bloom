@@ -4,7 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
+import hmac
 import http.client
+import io
 import json
 import os
 import pathlib
@@ -12,12 +16,23 @@ import re
 import shlex
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import time
+import urllib.request
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PLAYWRIGHT_CLI_VERSION = "0.1.18"
+AXE_CORE_VERSION = "4.13.0"
+AXE_CORE_ARCHIVE_URL = (
+    f"https://registry.npmjs.org/axe-core/-/axe-core-{AXE_CORE_VERSION}.tgz"
+)
+AXE_CORE_ARCHIVE_INTEGRITY = (
+    "sha512-UzGt8zg7Ny8djbYMhxl2zuEevVa7r2gJjYY5Lwr1xM7+XU2nd6CkIWFTVcCIbAP63vSz71NaVyyuSk9lHKcy0A=="
+)
+MAX_AXE_CORE_ARCHIVE_BYTES = 4 * 1024 * 1024
+MAX_AXE_CORE_SCRIPT_BYTES = 2 * 1024 * 1024
 STARTUP_PATTERN = re.compile(r"server running on http://127\.0\.0\.1:(\d+)")
 ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -210,10 +225,58 @@ def run_cli(
     return completed.stdout
 
 
-def browser_test_source(base_url: str) -> str:
+def provision_axe_core(workdir: pathlib.Path) -> pathlib.Path:
+    override = os.environ.get("BLOOM_AXE_CORE_PATH")
+    if override:
+        path = pathlib.Path(override)
+        path = (path if path.is_absolute() else ROOT / path).resolve()
+        if not path.is_file():
+            raise AssertionError(f"axe-core script does not exist: {path}")
+        if path.stat().st_size > MAX_AXE_CORE_SCRIPT_BYTES:
+            raise AssertionError(f"axe-core script exceeds size limit: {path}")
+        return path
+
+    request = urllib.request.Request(
+        AXE_CORE_ARCHIVE_URL,
+        headers={"User-Agent": "Bloom embedded UI accessibility gate"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        content_length = response.headers.get("Content-Length")
+        if content_length is not None and int(content_length) > MAX_AXE_CORE_ARCHIVE_BYTES:
+            raise AssertionError("axe-core archive exceeds declared size limit")
+        archive = response.read(MAX_AXE_CORE_ARCHIVE_BYTES + 1)
+    if len(archive) > MAX_AXE_CORE_ARCHIVE_BYTES:
+        raise AssertionError("axe-core archive exceeds size limit")
+
+    algorithm, encoded_digest = AXE_CORE_ARCHIVE_INTEGRITY.split("-", 1)
+    if algorithm != "sha512":
+        raise AssertionError(f"unsupported axe-core integrity algorithm: {algorithm}")
+    expected_digest = base64.b64decode(encoded_digest, validate=True)
+    actual_digest = hashlib.sha512(archive).digest()
+    if not hmac.compare_digest(actual_digest, expected_digest):
+        raise AssertionError("axe-core archive failed pinned SHA-512 integrity verification")
+
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as package:
+        member = package.getmember("package/axe.min.js")
+        if not member.isfile() or member.size > MAX_AXE_CORE_SCRIPT_BYTES:
+            raise AssertionError("axe-core package contains an invalid browser script")
+        source_handle = package.extractfile(member)
+        if source_handle is None:
+            raise AssertionError("axe-core package browser script is unreadable")
+        source = source_handle.read(MAX_AXE_CORE_SCRIPT_BYTES + 1)
+    if not source or len(source) > MAX_AXE_CORE_SCRIPT_BYTES:
+        raise AssertionError("axe-core browser script is empty or exceeds its size limit")
+
+    path = workdir / f"axe-core-{AXE_CORE_VERSION}.min.js"
+    path.write_bytes(source)
+    return path.resolve()
+
+
+def browser_test_source(base_url: str, axe_core_path: pathlib.Path) -> str:
     source = r"""
 async (page) => {
   const baseUrl = __BASE_URL__;
+  const axeCorePath = __AXE_CORE_PATH__;
   const assert = (condition, message) => {
     if (!condition) throw new Error(message);
   };
@@ -247,6 +310,36 @@ async (page) => {
   assert(headers['permissions-policy']?.includes('microphone=()'), 'microphone permission is not disabled');
   assert(headers['permissions-policy']?.includes('geolocation=()'), 'geolocation permission is not disabled');
 
+  await page.addScriptTag({ path: axeCorePath });
+  const axeVersion = await page.evaluate(() => globalThis.axe?.version);
+  assert(axeVersion === __AXE_CORE_VERSION__,
+    `expected axe-core __AXE_CORE_VERSION__, found ${axeVersion || 'none'}`);
+  const accessibilityScans = [];
+  const scanAccessibility = async (contextSelector, label) => {
+    const results = await page.evaluate(async ({ contextSelector }) => {
+      const context = contextSelector ? document.querySelector(contextSelector) : document;
+      if (!context) throw new Error(`accessibility context is missing: ${contextSelector}`);
+      return await globalThis.axe.run(context, {
+        runOnly: {
+          type: 'tag',
+          values: ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'],
+        },
+      });
+    }, { contextSelector });
+    const violations = results.violations.map((violation) => ({
+      id: violation.id,
+      impact: violation.impact,
+      help: violation.help,
+      nodes: violation.nodes.slice(0, 3).map((node) => ({
+        target: node.target,
+        failure: node.failureSummary,
+      })),
+    }));
+    assert(violations.length === 0,
+      `${label} accessibility violations: ${JSON.stringify(violations)}`);
+    accessibilityScans.push({ label, passes: results.passes.length });
+  };
+
   const productHeading = page.getByRole('heading', { name: 'Bloom', level: 1, exact: true });
   await productHeading.waitFor({ timeout: 15_000 });
   assert(await page.title() === 'Bloom · Local multimodal inference', 'document title drifted');
@@ -259,6 +352,7 @@ async (page) => {
     'generation is enabled without a model');
   const favicon = await page.locator('link[rel~="icon"]').getAttribute('href');
   assert(favicon?.startsWith('data:image/svg+xml,'), 'favicon is missing or externally hosted');
+  await scanAccessibility(null, 'application shell');
 
   const focusableSelector = 'button:not([disabled]):not([tabindex="-1"]),a[href]:not([tabindex="-1"]),input:not([disabled]):not([tabindex="-1"]),select:not([disabled]):not([tabindex="-1"]),textarea:not([disabled]):not([tabindex="-1"]),[tabindex]:not([tabindex="-1"])';
   const visibleFocusableState = async (dialog) => dialog.evaluate((root, selector) => {
@@ -307,6 +401,7 @@ async (page) => {
   await modelsDialog.waitFor();
   await assertDialogContract(modelsDialog, 'Models');
   await assertFocusLoop(modelsDialog, 'Models');
+  await scanAccessibility('#model-manager-dialog', 'Models dialog');
   await page.keyboard.press('Escape');
   await modelsDialog.waitFor({ state: 'detached' });
   assert(await modelsButton.evaluate((button) => document.activeElement === button),
@@ -324,6 +419,7 @@ async (page) => {
   assert(await page.getByRole('checkbox', { name: 'Remember API key in this browser' }).count() === 1,
     'credential-persistence control has no accessible name');
   await assertFocusLoop(settingsDialog, 'Settings');
+  await scanAccessibility('#settings-dialog', 'Settings dialog');
 
   await page.emulateMedia({ reducedMotion: 'reduce' });
   const motion = await settingsDialog.evaluate((element) => {
@@ -368,6 +464,7 @@ async (page) => {
   const importDialog = page.getByRole('dialog', { name: 'Import conversations' });
   await importDialog.waitFor();
   await assertDialogContract(importDialog, 'Import conversations');
+  await scanAccessibility('#import-conversations-dialog', 'Import conversations dialog');
   await importDialog.getByRole('button', { name: 'Replace all', exact: true }).click();
   await importDialog.waitFor({ state: 'detached' });
 
@@ -435,16 +532,24 @@ async (page) => {
     title: await page.title(),
     dialogs: ['Models', 'Settings', 'Import conversations'],
     transfers: ['clipboard', 'conversation download'],
+    accessibility: { axeVersion, scans: accessibilityScans },
     expectedReadinessErrors: consoleErrors.length,
   };
 }
 """
-    return source.replace("__BASE_URL__", json.dumps(base_url))
+    return (
+        source.replace("__BASE_URL__", json.dumps(base_url))
+        .replace("__AXE_CORE_PATH__", json.dumps(str(axe_core_path)))
+        .replace("__AXE_CORE_VERSION__", json.dumps(AXE_CORE_VERSION))
+    )
 
 
 def run_browser_gate(base_url: str, workdir: pathlib.Path) -> None:
     command = playwright_command()
-    version = run_cli(command, ["--version"], workdir).strip()
+    axe_core_path = provision_axe_core(workdir)
+    version_output = run_cli(command, ["--version"], workdir)
+    version_match = re.search(r"(?m)^(\d+\.\d+\.\d+)\r?$", version_output)
+    version = version_match.group(1) if version_match else version_output.strip()
     if version != PLAYWRIGHT_CLI_VERSION:
         raise AssertionError(
             f"playwright-cli {PLAYWRIGHT_CLI_VERSION} is required, found {version}"
@@ -454,7 +559,12 @@ def run_browser_gate(base_url: str, workdir: pathlib.Path) -> None:
         run_cli(command, ["--session", session, "open", "about:blank"], workdir)
         run_cli(
             command,
-            ["--session", session, "run-code", browser_test_source(base_url)],
+            [
+                "--session",
+                session,
+                "run-code",
+                browser_test_source(base_url, axe_core_path),
+            ],
             workdir,
             timeout=90,
         )
@@ -495,8 +605,8 @@ def main() -> int:
                 stop_process(process)
     print(
         "OK: embedded Bloom UI Chromium shell, security headers, semantics, "
-        "focus loops, Escape dismissal, focus restoration, reduced motion, "
-        "clipboard, and conversation downloads"
+        f"axe-core {AXE_CORE_VERSION} WCAG scans, focus loops, Escape dismissal, "
+        "focus restoration, reduced motion, clipboard, and conversation downloads"
     )
     return 0
 

@@ -508,9 +508,13 @@ headers and empty state, and exercises Models/Settings focus entry, forward and
 reverse containment, Escape dismissal, opener restoration, accessible names,
 reduced motion, an imported message's real clipboard write, and a versioned
 conversation download whose filename and decoded contents are checked. CI runs
-that gate against the release-shaped container. Other browser engines,
-automated accessibility scanning, and target assistive technology remain
-release checks.
+that gate against the release-shaped container. Pinned axe-core 4.13.0 also
+scans the application shell and the Models, Settings, and conversation-import
+dialogs against WCAG 2.0, 2.1, and 2.2 A/AA rules. The test downloads the
+bounded npm archive with a pinned SHA-512 digest and verifies the browser-side
+scanner version; offline environments can set `BLOOM_AXE_CORE_PATH` to a
+pre-provisioned `axe.min.js` from that exact release. Other browser engines and
+target assistive technology remain release checks.
 
 ### Embedded in bloom_server
 

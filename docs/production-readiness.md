@@ -60,13 +60,16 @@ non-container macOS and Windows archive builders.
 
 ## High-priority gaps
 
-- Add cross-browser, automated accessibility-scanner, and target
-  assistive-technology validation. The current release-container gate covers
-  the real WASM application shell, security headers, empty-model admission,
-  document/landmark/control semantics, Models/Settings/import-dialog focus
-  behavior, bidirectional Tab containment, Escape dismissal, opener-focus
-  restoration, reduced motion, real clipboard writes, versioned conversation
-  downloads, request failures, page errors, and unexpected console errors.
+- Add cross-browser and target assistive-technology validation. The current
+  release-container gate covers the real WASM application shell, security
+  headers, empty-model admission, document/landmark/control semantics,
+  Models/Settings/import-dialog focus behavior, bidirectional Tab containment,
+  Escape dismissal, opener-focus restoration, reduced motion, real clipboard
+  writes, versioned conversation downloads, request failures, page errors, and
+  unexpected console errors. Pinned axe-core 4.13.0 scans the application shell
+  and all three exercised dialogs against WCAG 2.0, 2.1, and 2.2 A/AA rules;
+  the gate also enforces the scanner archive's npm SHA-512 integrity and exact
+  browser-side version.
 - Add dedicated target-hardware runners and published performance budgets for
   each claimed Metal or CUDA deployment. Feature compilation alone is not
   execution evidence.
