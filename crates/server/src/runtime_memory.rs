@@ -844,9 +844,12 @@ fn safe_mount_point(path: std::path::PathBuf) -> Result<std::path::PathBuf> {
     use std::path::Component;
 
     if !path.is_absolute()
-        || !path
-            .components()
-            .all(|component| matches!(component, Component::RootDir | Component::Normal(_)))
+        || !path.components().all(|component| {
+            matches!(
+                component,
+                Component::Prefix(_) | Component::RootDir | Component::Normal(_)
+            )
+        })
     {
         bail!("cgroup mount point contains an unsafe path");
     }
@@ -875,19 +878,22 @@ fn mapped_cgroup_roots(
 
 #[cfg(any(target_os = "linux", test))]
 fn safe_cgroup_path(path: &str) -> Result<std::path::PathBuf> {
-    use std::path::Component;
-
-    let absolute = std::path::Path::new(path);
-    if !absolute.is_absolute() {
+    // `/proc/self/cgroup` and mountinfo always use Linux hierarchy syntax,
+    // even when these pure parsers are exercised by cross-platform tests.
+    // Parsing through the host `Path` implementation would treat `/tenant`
+    // as relative on Windows and would interpret backslashes as separators.
+    if !path.starts_with('/') {
         bail!("cgroup hierarchy contains a non-absolute path");
     }
     let mut relative = std::path::PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            Component::RootDir => {}
-            Component::Normal(component) => relative.push(component),
-            _ => bail!("cgroup hierarchy contains an unsafe path"),
+    for component in path.split('/').filter(|component| !component.is_empty()) {
+        if matches!(component, "." | "..")
+            || component.contains('\\')
+            || component.chars().any(char::is_control)
+        {
+            bail!("cgroup hierarchy contains an unsafe path");
         }
+        relative.push(component);
     }
     Ok(relative)
 }
@@ -1569,6 +1575,9 @@ mod tests {
     #[test]
     fn cgroup_probe_rejects_unsafe_membership_paths() {
         assert!(strict_linux_cgroup_memory_from("0::/tenant/../escape\n", "").is_err());
+        assert!(strict_linux_cgroup_memory_from("0::tenant/service\n", "").is_err());
+        assert!(strict_linux_cgroup_memory_from("0::/tenant\\escape\n", "").is_err());
+        assert!(strict_linux_cgroup_memory_from("0::/tenant/\0escape\n", "").is_err());
     }
 
     #[test]

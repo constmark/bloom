@@ -95,6 +95,7 @@ mod model_provenance;
 mod model_storage;
 mod model_upgrade;
 mod ollama;
+mod openai_vision;
 mod readiness;
 mod response_store;
 mod runtime_loader;
@@ -127,6 +128,7 @@ use model_manager::ModelCatalog;
 use model_preflight::{ModelPreflightConfig, ModelPreflightManager};
 use model_storage::ModelStorageManager;
 use ollama::*;
+use openai_vision::*;
 use readiness::*;
 use response_store::ResponseStore;
 use runtime_loader::*;
@@ -177,6 +179,7 @@ const MAX_MULTIMODAL_BLOCKS: usize = 3;
 const MAX_MULTIMODAL_TEXT_CHARS: usize = 262_144;
 const MAX_MULTIMODAL_TEXT_BYTES: usize = 768 * 1024;
 const MAX_MULTIMODAL_IMAGE_BYTES: usize = 10 * MIB as usize;
+const MAX_OPENAI_VISION_BODY_BYTES: usize = 16 * MIB as usize;
 const MAX_MULTIMODAL_IMAGE_PIXELS: u64 = 16_777_216;
 const MAX_MULTIMODAL_IMAGE_DIMENSION: u32 = 16_384;
 const MAX_MULTIMODAL_IMAGE_ASPECT_RATIO: u32 = 200;
@@ -1630,7 +1633,11 @@ async fn run_server(args: Args, config_path: PathBuf) -> Result<()> {
         .route("/observability", get(handle_observability))
         .route("/models", get(handle_models))
         .route("/models/{model}", get(handle_model_retrieve))
-        .route("/chat/completions", post(handle_chat_completions))
+        .route(
+            "/chat/completions",
+            post(handle_chat_completions)
+                .layer(DefaultBodyLimit::max(MAX_OPENAI_VISION_BODY_BYTES)),
+        )
         .route("/responses", post(handle_responses))
         .route(
             "/responses/{response_id}",
@@ -3906,6 +3913,34 @@ mod tests {
             ))
             .unwrap();
         let response = app.clone().oneshot(admitted).await.unwrap();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        let admitted_image = axum::http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(
+                json!({
+                    "model": "default",
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe this."},
+                            {"type": "image_url", "image_url": {
+                                "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+                                "detail": "auto"
+                            }}
+                        ]
+                    }],
+                    "max_completion_tokens": 16
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(admitted_image).await.unwrap();
         assert_eq!(
             response.status(),
             axum::http::StatusCode::SERVICE_UNAVAILABLE

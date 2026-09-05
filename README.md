@@ -432,6 +432,34 @@ curl http://127.0.0.1:3000/v1/chat/completions \
   }'
 ```
 
+Vision-capable models also accept the standard OpenAI `image_url` part with one
+inline JPEG or PNG data URL. Both buffered and streamed Chat Completions are
+supported:
+
+```json
+{
+  "model": "default",
+  "messages": [{
+    "role": "user",
+    "content": [
+      {"type": "text", "text": "Describe this image."},
+      {"type": "image_url", "image_url": {
+        "url": "data:image/png;base64,BASE64_IMAGE_BYTES",
+        "detail": "auto"
+      }}
+    ]
+  }],
+  "stream": true
+}
+```
+
+This local-first path accepts one image and never fetches remote URLs. It uses
+the same 10 MiB decoded-image, signature, dimensions, pixels, context,
+cancellation, and exact-model checks as Bloom's native multimodal endpoints.
+Image input currently rejects history/system messages, low/high detail modes,
+active tools, stop sequences, structured output, and streamed token usage rather than
+ignoring them.
+
 The active runtime can be listed with `GET /v1/models` and retrieved with
 `GET /v1/models/{model}` using its exact ID or the `default` alias. The latter
 always returns the real runtime ID and never loads an inactive catalog entry.
@@ -449,8 +477,10 @@ accept at most 2,048 messages, 768 KiB of combined message content, 262,144
 characters in one user message, and 65,536 characters in one system message.
 Direct API clients may use `developer`, `system`, `user`, and `assistant` roles
 and send each `content` as a string or as one to 256 ordered OpenAI text parts;
-leading `developer` messages map explicitly to local system instructions, while
-late developer messages and non-text parts fail explicitly. The browser
+one single-user request may instead include one bounded inline JPEG/PNG
+`image_url` part. Leading `developer` messages map explicitly to local system
+instructions, while late developer messages and unsupported parts fail
+explicitly. The browser
 additionally caps the encoded chat JSON at 1 MiB. These are explicit errors,
 not truncation. Raising the server's general JSON body limit does not disable
 the semantic chat limits.

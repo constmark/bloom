@@ -503,6 +503,16 @@ called out in release notes.
 
 ### Server
 
+- Add bounded OpenAI Chat Completions vision input. A single user message may
+  contain one canonical inline JPEG/PNG `image_url` data URL plus optional text;
+  buffered and SSE responses reuse the native multimodal lifecycle and return
+  standard Chat Completion shapes. Remote URLs, multiple images, history,
+  non-auto detail, active tools, stop sequences, structured output, and unavailable
+  multimodal usage reporting fail closed.
+- Restore the Windows default-test baseline: Intel NPU path-list tests now use
+  `split_paths` directly instead of mutating process-wide environment variables,
+  and pure Linux cgroup fixtures parse hierarchy paths independently of the host
+  path syntax while retaining traversal, backslash, and control-byte rejection.
 - Add signed model-index schema v3 with a permanent, bounded exact
   `(id, sha256)` revocation ledger. Persist the canonical revocation set beside
   rollback watermarks and reject removal across refreshes and restarts. Block

@@ -24,19 +24,12 @@ impl IntelNpuBackend {
 
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn check_env_path(name: &str) -> bool {
-        if let Ok(paths) = env::var(name) {
-            #[cfg(target_os = "windows")]
-            let separator = ';';
-            #[cfg(not(target_os = "windows"))]
-            let separator = ':';
+        env::var_os(name).is_some_and(|paths| Self::path_list_contains_existing(&paths))
+    }
 
-            for path in paths.split(separator) {
-                if Path::new(path).exists() {
-                    return true;
-                }
-            }
-        }
-        false
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn path_list_contains_existing(paths: &std::ffi::OsStr) -> bool {
+        env::split_paths(paths).any(|path| path.exists())
     }
 
     #[cfg(target_os = "linux")]
@@ -464,12 +457,12 @@ mod tests {
 
     #[test]
     #[cfg(any(target_os = "linux", target_os = "windows"))]
-    fn test_check_env_path() {
-        std::env::set_var("TEST_BLOOM_PATH", env!("CARGO_MANIFEST_DIR"));
-        assert!(IntelNpuBackend::check_env_path("TEST_BLOOM_PATH"));
+    fn test_path_list_contains_existing() {
+        let existing = std::env::join_paths([env!("CARGO_MANIFEST_DIR")]).unwrap();
+        assert!(IntelNpuBackend::path_list_contains_existing(&existing));
 
-        std::env::set_var("TEST_BLOOM_PATH_INVALID", "non_existent_path_12345_xyz");
-        assert!(!IntelNpuBackend::check_env_path("TEST_BLOOM_PATH_INVALID"));
+        let missing = std::env::join_paths(["non_existent_path_12345_xyz"]).unwrap();
+        assert!(!IntelNpuBackend::path_list_contains_existing(&missing));
     }
 
     #[test]

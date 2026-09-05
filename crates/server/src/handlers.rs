@@ -2051,6 +2051,26 @@ async fn handle_chat_completions_inner(
             message,
         );
     }
+    let vision_request = match prepare_openai_vision_request(&payload) {
+        Ok(request) => request,
+        Err(message) => {
+            return error_response(
+                axum::http::StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                message,
+            );
+        }
+    };
+    if let Some(vision_request) = vision_request {
+        let stream = payload.stream;
+        let response = match exact_runtime {
+            Some(runtime) => {
+                run_multimodal_request_for_runtime(state, vision_request, runtime).await
+            }
+            None => run_multimodal_request(state, vision_request, payload.model.clone()).await,
+        };
+        return openai_chat_from_multimodal_response(response, stream).await;
+    }
     let stop_sequences = match normalize_stop_sequences(payload.stop.as_ref()) {
         Ok(sequences) => sequences,
         Err(message) => {
@@ -4693,7 +4713,7 @@ fn multipart_error_response(
     error_response(status, "invalid_request_error", message)
 }
 
-async fn run_multimodal_request(
+pub(crate) async fn run_multimodal_request(
     state: Arc<ServerState>,
     payload: InferenceRequest,
     requested_model: Option<String>,

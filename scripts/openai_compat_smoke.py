@@ -911,6 +911,43 @@ def request_openai_sdk_model_free(
     result["model_unavailable"] = "ok"
 
     try:
+        client.chat.completions.create(
+            model="default",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this."},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": (
+                                    "data:image/png;base64,"
+                                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwC"
+                                    "AAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+                                ),
+                                "detail": "auto",
+                            },
+                        },
+                    ],
+                }
+            ],
+            max_completion_tokens=1,
+        )
+    except APIStatusError as error:
+        body = error.body if isinstance(error.body, dict) else {}
+        if error.status_code != 503 or body.get("type") != "model_not_loaded":
+            raise AssertionError(
+                "official OpenAI client did not admit the bounded vision request "
+                f"before runtime availability: {error!r}"
+            ) from error
+    else:
+        raise AssertionError(
+            "official OpenAI client admitted vision chat without a loaded model"
+        )
+    result["vision_model_unavailable"] = "ok"
+
+    try:
         client.models.retrieve("bloom-smoke-missing")
     except APIStatusError as error:
         body = error.body if isinstance(error.body, dict) else {}

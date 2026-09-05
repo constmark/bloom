@@ -512,3 +512,36 @@ negative and replacement-digest recovery paths.
 This closes the local revocation mechanism gap. The remaining operational gap
 is evidence from a multi-host incident drill: bounded fleet refresh latency,
 alerting, durable state backup/restore, and verified replacement rollout.
+
+## 17. Core-Capability Reassessment (2026-09-05)
+
+Bloom's broad backend list is no longer the most important measure of product
+completeness. The largest user-facing discontinuity was across protocol
+surfaces: native multimodal execution, browser image chat, and Ollama image
+input existed, while the most common OpenAI Chat Completions entry point still
+rejected every image content part. A client therefore could not use Bloom as a
+drop-in local vision endpoint even when a compatible vision runtime was loaded.
+
+This iteration closes that discontinuity with a bounded `image_url` adapter for
+one inline JPEG or PNG in one user message. It reuses the native multimodal
+runtime, exact model lease, revocation and modality admission, image and context
+budgets, concurrency, cancellation, and metrics lifecycle. A separate bounded
+translator validates the internal SSE media type, framing, event count, bytes,
+stable identity, start/end markers, and supported text chunks before publishing
+buffered or streamed OpenAI Chat Completion shapes. Remote URLs, multi-image or
+history requests, non-auto detail, active tools, stop sequences, structured
+output, and unavailable usage accounting fail closed.
+
+The Windows baseline also exposed a Rust 2024 test-compilation blocker in Intel
+NPU path discovery. Its test no longer mutates the process environment and now
+exercises platform path-list parsing directly. The subsequent full workspace
+run exposed that pure Linux cgroup fixtures were incorrectly parsed through the
+Windows path implementation; hierarchy parsing is now host-independent while
+mount points remain native absolute paths, with traversal, backslash, and
+control-byte rejection retained.
+
+The remaining capability priorities are evidence-heavy rather than additional
+surface area: publish one stable deployment cell, add a pinned trained vision
+model protocol gate, extend the Responses API to bounded image content when its
+state/usage contract can be preserved, publish Metal/CUDA target measurements,
+and continue decomposing the oversized server, UI, and executor modules.

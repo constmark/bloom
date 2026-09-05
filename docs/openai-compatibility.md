@@ -71,6 +71,9 @@ local catalog removal API.
   `user`, or `assistant` roles; bounded paired `assistant.tool_calls` and
   `tool` result messages are accepted for function-call continuation; text
   parts are concatenated in order without a separator
+- one `image_url` part in a single `user` message, using a canonical padded
+  `data:image/png;base64,...` or `data:image/jpeg;base64,...` URL with optional
+  `detail: "auto"`; an optional text prompt may appear before or after it
 - `stream` and `stream_options.include_usage`
 - `max_tokens` or its current `max_completion_tokens` alias, plus `temperature`,
   `top_p`, and `seed`; if both token-limit fields are supplied, they must match
@@ -90,6 +93,26 @@ instruction. It may appear alongside other leading `developer` or `system`
 messages. Bloom rejects a `developer` message after the first `user` or
 `assistant` turn because applying it as ordinary conversation text would change
 its instruction semantics.
+
+### Image input
+
+Bloom maps the standard Chat Completions `image_url` content part onto its
+native multimodal lifecycle. Both buffered completion objects and streamed
+`chat.completion.chunk` events are supported. The loaded model must declare
+Vision input, and the request retains exact model selection, image signature,
+dimension, pixel, decoded-byte, visual-context, concurrency, cancellation, and
+stable stream-identity checks.
+
+This is deliberately a bounded local-image subset. One request accepts exactly
+one `user` message, one JPEG or PNG image of at most 10 MiB decoded, optional
+text within the existing 262,144-character and 768 KiB limits, and up to 32,768
+output tokens. Bloom does not fetch remote URLs, and it rejects multiple images,
+history/system messages, `detail: "low"` or `"high"`, active tools, stop sequences,
+structured response formats, and `stream_options.include_usage` instead of
+silently changing their semantics. Multimodal token usage is omitted because
+the native stream does not yet publish a truthful usage record. The request
+shape follows the
+[official Chat Completions image content contract](https://developers.openai.com/api/reference/resources/chat).
 
 ### Function tools
 
@@ -421,12 +444,12 @@ or control-bearing names.
 Multiple choices, token log probabilities, penalty/logit-bias sampling, custom
 tools, and deprecated function fields are
 therefore explicitly unsupported today. Message content arrays accept text
-parts only. Bloom rejects
-image, audio, file, refusal, malformed, empty, or over-limit part arrays with an
-HTTP 400 error; use Bloom's bounded multimodal endpoints for supported image and
-audio input. This behavior is intentionally different from silently ignoring a
-field, which could cause an agent or application to execute with assumptions
-Bloom did not honor.
+parts plus the bounded single-user `image_url` subset described above. Bloom
+rejects audio, file, refusal, malformed, empty, or over-limit part arrays with
+an HTTP 400 error; use Bloom's native multimodal endpoints for inline PCM and
+other supported programmatic input. This behavior is intentionally different
+from silently ignoring a field, which could cause an agent or application to
+execute with assumptions Bloom did not honor.
 
 ## Validation
 

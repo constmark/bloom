@@ -485,8 +485,11 @@ component.
   roles and semantic message limits even if its general JSON body limit is
   raised. Its OpenAI text-part normalizer admits one to 256 text parts per
   message, accounts concatenated bytes before allocating beyond the shared
-  budget, and rejects non-text semantics. Do not replace these failures with
-  silent history truncation.
+  budget, and rejects unsupported non-text semantics. A separate bounded vision
+  adapter admits exactly one inline JPEG/PNG `image_url` in one user message,
+  validates canonical base64 plus the decoded image before inference, and never
+  fetches remote URLs. Do not replace these failures with silent history
+  truncation or implicit network access.
 - Treat the configured generation endpoint as an untrusted streaming peer. The
   browser requires the SSE media type, limits total decoded transport bytes,
   individual frame bytes, error text, and accumulated output before updating
