@@ -1,8 +1,8 @@
 use std::collections::{HashMap, VecDeque};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bloomai_core::constants::GIB;
@@ -235,38 +235,79 @@ impl FileSystemRemoteCache {
         let root = root.into();
         std::fs::create_dir_all(&root)
             .with_context(|| format!("failed to create cachemesh L3 root '{}'", root.display()))?;
-        Ok(Self { root })
+        Ok(Self {
+            root: root.canonicalize()?,
+        })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    fn path_for(&self, key: &CacheMeshKey) -> PathBuf {
-        self.root
-            .join(sanitize_component(&key.namespace))
-            .join(format!("layer-{}", key.layer_idx))
-            .join(format!("{}.json", key.digest))
+    fn path_for(&self, key: &CacheMeshKey) -> Result<PathBuf> {
+        anyhow::ensure!(
+            key.digest.len() == 64 && key.digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "cachemesh digest must be a SHA-256 hex string"
+        );
+        // Sanitizing '/' into '_' aliases different model namespaces. Hash the
+        // entire namespace to preserve identity and prevent path traversal.
+        let namespace = hex_digest(Sha256::digest(key.namespace.as_bytes()).as_slice());
+        let parent = self
+            .root
+            .join(namespace)
+            .join(format!("layer-{}", key.layer_idx));
+        for directory in [parent.parent().unwrap_or(&self.root), parent.as_path()] {
+            match std::fs::symlink_metadata(directory) {
+                Ok(metadata) => anyhow::ensure!(
+                    metadata.is_dir() && !metadata.file_type().is_symlink(),
+                    "cachemesh directory must not be a symlink"
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(parent.join(format!("{}.json", key.digest)))
     }
 }
 
 impl RemoteCacheBackend for FileSystemRemoteCache {
     fn get(&self, key: &CacheMeshKey) -> Result<Option<CacheMeshBlock>> {
-        let path = self.path_for(key);
-        if !path.exists() {
-            return Ok(None);
-        }
-        let content = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read cachemesh block '{}'", path.display()))?;
+        let path = self.path_for(key)?;
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        anyhow::ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "cachemesh block must be a regular file"
+        );
+        const MAX_BLOCK_BYTES: u64 = 256 * 1024 * 1024;
+        anyhow::ensure!(
+            metadata.len() <= MAX_BLOCK_BYTES,
+            "cachemesh block exceeds the read limit"
+        );
+        let mut content = String::new();
+        std::fs::File::open(&path)?
+            .take(MAX_BLOCK_BYTES + 1)
+            .read_to_string(&mut content)?;
+        anyhow::ensure!(
+            content.len() as u64 <= MAX_BLOCK_BYTES,
+            "cachemesh block exceeds the read limit"
+        );
         let block: CacheMeshBlock = serde_json::from_str(&content)
             .with_context(|| format!("failed to parse cachemesh block '{}'", path.display()))?;
         block.validate()?;
+        anyhow::ensure!(
+            &block.key == key,
+            "cachemesh stored key does not match the requested identity"
+        );
         Ok(Some(block))
     }
 
     fn put(&self, block: CacheMeshBlock) -> Result<()> {
         block.validate()?;
-        let path = self.path_for(&block.key);
+        let path = self.path_for(&block.key)?;
         let parent = path
             .parent()
             .ok_or_else(|| anyhow!("cachemesh block path has no parent: {}", path.display()))?;
@@ -277,26 +318,23 @@ impl RemoteCacheBackend for FileSystemRemoteCache {
             )
         })?;
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or_default();
-        let tmp = path.with_extension(format!("json.tmp-{now}"));
-        let content = serde_json::to_vec(&block)?;
-        std::fs::write(&tmp, content)
-            .with_context(|| format!("failed to write cachemesh temp file '{}'", tmp.display()))?;
-        std::fs::rename(&tmp, &path).with_context(|| {
-            format!(
-                "failed to atomically install cachemesh block '{}' from '{}'",
-                path.display(),
-                tmp.display()
-            )
-        })?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        serde_json::to_writer(&mut temporary, &block)?;
+        temporary.flush()?;
+        temporary
+            .persist(&path)
+            .map_err(|error| error.error)
+            .with_context(|| {
+                format!(
+                    "failed to atomically install cachemesh block '{}'",
+                    path.display()
+                )
+            })?;
         Ok(())
     }
 
     fn remove(&self, key: &CacheMeshKey) -> Result<()> {
-        let path = self.path_for(key);
+        let path = self.path_for(key)?;
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -577,22 +615,6 @@ fn hex_digest(bytes: &[u8]) -> String {
     out
 }
 
-fn sanitize_component(value: &str) -> String {
-    let mut out = String::with_capacity(value.len().max(1));
-    for ch in value.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
-    if out.is_empty() {
-        "default".to_string()
-    } else {
-        out
-    }
-}
-
 fn count_files_with_extension(root: &Path, extension: &str) -> Result<usize> {
     let mut count = 0usize;
     if !root.exists() {
@@ -601,9 +623,15 @@ fn count_files_with_extension(root: &Path, extension: &str) -> Result<usize> {
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
-            count += count_files_with_extension(&path, extension)?;
-        } else if path.extension().and_then(|e| e.to_str()) == Some(extension) {
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            count = count.saturating_add(count_files_with_extension(&path, extension)?);
+        } else if file_type.is_file()
+            && path.extension().and_then(|e| e.to_str()) == Some(extension)
+        {
             count += 1;
         }
     }
@@ -618,10 +646,17 @@ fn sum_file_bytes_with_extension(root: &Path, extension: &str) -> Result<usize> 
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
-            bytes += sum_file_bytes_with_extension(&path, extension)?;
-        } else if path.extension().and_then(|e| e.to_str()) == Some(extension) {
-            bytes += entry.metadata()?.len() as usize;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            bytes = bytes.saturating_add(sum_file_bytes_with_extension(&path, extension)?);
+        } else if file_type.is_file()
+            && path.extension().and_then(|e| e.to_str()) == Some(extension)
+        {
+            bytes = bytes
+                .saturating_add(usize::try_from(entry.metadata()?.len()).unwrap_or(usize::MAX));
         }
     }
     Ok(bytes)
@@ -630,6 +665,46 @@ fn sum_file_bytes_with_extension(root: &Path, extension: &str) -> Result<usize> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filesystem_cache_preserves_namespace_and_stored_key_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileSystemRemoteCache::new(dir.path()).unwrap();
+        let first = CacheMeshKey::from_tokens("model/a", 0, &[1, 2]);
+        let second = CacheMeshKey::from_tokens("model_a", 0, &[1, 2]);
+        cache.put(block(first.clone(), 1.0)).unwrap();
+        cache.put(block(second.clone(), 2.0)).unwrap();
+        assert_eq!(cache.get(&first).unwrap().unwrap().keys[0], 1.0);
+        assert_eq!(cache.get(&second).unwrap().unwrap().keys[0], 2.0);
+        std::fs::copy(
+            cache.path_for(&first).unwrap(),
+            cache.path_for(&second).unwrap(),
+        )
+        .unwrap();
+        assert!(cache.get(&second).is_err());
+        let malicious = CacheMeshKey {
+            digest: "../../outside".into(),
+            ..first
+        };
+        assert!(cache.get(&malicious).is_err());
+        assert!(cache.put(block(malicious.clone(), 0.0)).is_err());
+        assert!(cache.remove(&malicious).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_cache_rejects_symlinks_and_does_not_recurse_into_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileSystemRemoteCache::new(dir.path()).unwrap();
+        let key = CacheMeshKey::from_tokens("model", 0, &[1]);
+        let path = cache.path_for(&key).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", &path).unwrap();
+        assert!(cache.get(&key).is_err());
+        std::os::unix::fs::symlink(dir.path(), dir.path().join("loop")).unwrap();
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.bytes(), Some(0));
+    }
 
     fn block(key: CacheMeshKey, fill: f32) -> CacheMeshBlock {
         CacheMeshBlock {

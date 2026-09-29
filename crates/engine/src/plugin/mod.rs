@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use bloomai_core::{BloomError, DeviceKind, Modality};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PluginMetadata {
@@ -195,6 +195,7 @@ impl PluginManager {
         manifest: &PluginManifest,
         base_dir: P,
     ) -> Result<()> {
+        Self::validate_manifest(manifest)?;
         if manifest.entry_point.entry_type != "native" {
             return Ok(());
         }
@@ -256,6 +257,7 @@ impl PluginManager {
         manifest: &PluginManifest,
         base_dir: P,
     ) -> Result<Box<dyn Engine>> {
+        Self::validate_manifest(manifest)?;
         if manifest.entry_point.entry_type != "native" {
             return Err(BloomError::Plugin(
                 "Only 'native' entry point type is supported for engine plugins".into(),
@@ -278,8 +280,9 @@ impl PluginManager {
             })?
         };
 
-        let mut c_engine = std::mem::MaybeUninit::<ffi::CBloomEngine>::uninit();
-        let res = unsafe { init_fn(c_engine.as_mut_ptr()) };
+        // A nullable wire table is valid even if a plugin forgets a callback.
+        let mut wire = ffi::NullableEngine::default();
+        let res = unsafe { init_fn((&mut wire as *mut ffi::NullableEngine).cast()) };
         if res != 0 {
             return Err(BloomError::Plugin(format!(
                 "bloom_plugin_init failed with error code {}",
@@ -287,11 +290,12 @@ impl PluginManager {
             ))
             .into());
         }
-        let c_engine = unsafe { c_engine.assume_init() };
+        let c_engine = wire.validate()?;
 
         Ok(Box::new(FfiPluginEngine {
             _lib: Some(lib),
             c_engine,
+            name: OnceLock::new(),
         }))
     }
 }
@@ -328,30 +332,101 @@ pub mod ffi {
         ) -> i32,
         pub free_string: extern "C" fn(s: *mut c_char),
     }
+    #[repr(C)]
+    #[derive(Default)]
+    pub(super) struct NullableEngine {
+        pub name: Option<extern "C" fn() -> *const c_char>,
+        pub supported_modalities:
+            Option<extern "C" fn(out_modalities: *mut i32, out_len: *mut usize) -> i32>,
+        pub supported_devices:
+            Option<extern "C" fn(out_devices: *mut i32, out_len: *mut usize) -> i32>,
+        pub load_model: Option<
+            extern "C" fn(
+                model_path: *const c_char,
+                device_kind: i32,
+                out_model: *mut *mut c_void,
+            ) -> i32,
+        >,
+        pub free_model: Option<extern "C" fn(model: *mut c_void)>,
+        pub model_metadata:
+            Option<extern "C" fn(model: *mut c_void, out_json: *mut *mut c_char) -> i32>,
+        pub model_infer: Option<
+            extern "C" fn(
+                model: *mut c_void,
+                input_json: *const c_char,
+                out_json: *mut *mut c_char,
+            ) -> i32,
+        >,
+        pub model_infer_stream: Option<
+            extern "C" fn(
+                model: *mut c_void,
+                input_json: *const c_char,
+                callback: CBloomStreamCallback,
+                user_data: *mut c_void,
+            ) -> i32,
+        >,
+        pub free_string: Option<extern "C" fn(s: *mut c_char)>,
+    }
+    impl NullableEngine {
+        pub(super) fn validate(self) -> anyhow::Result<CBloomEngine> {
+            Ok(CBloomEngine {
+                name: self
+                    .name
+                    .ok_or_else(|| anyhow::anyhow!("plugin callback name is missing"))?,
+                supported_modalities: self.supported_modalities.ok_or_else(|| {
+                    anyhow::anyhow!("plugin callback supported_modalities is missing")
+                })?,
+                supported_devices: self.supported_devices.ok_or_else(|| {
+                    anyhow::anyhow!("plugin callback supported_devices is missing")
+                })?,
+                load_model: self
+                    .load_model
+                    .ok_or_else(|| anyhow::anyhow!("plugin callback load_model is missing"))?,
+                free_model: self
+                    .free_model
+                    .ok_or_else(|| anyhow::anyhow!("plugin callback free_model is missing"))?,
+                model_metadata: self
+                    .model_metadata
+                    .ok_or_else(|| anyhow::anyhow!("plugin callback model_metadata is missing"))?,
+                model_infer: self
+                    .model_infer
+                    .ok_or_else(|| anyhow::anyhow!("plugin callback model_infer is missing"))?,
+                model_infer_stream: self.model_infer_stream.ok_or_else(|| {
+                    anyhow::anyhow!("plugin callback model_infer_stream is missing")
+                })?,
+                free_string: self
+                    .free_string
+                    .ok_or_else(|| anyhow::anyhow!("plugin callback free_string is missing"))?,
+            })
+        }
+    }
 }
 
 pub struct FfiPluginEngine {
     _lib: Option<Arc<libloading::Library>>,
     c_engine: ffi::CBloomEngine,
+    name: OnceLock<&'static str>,
 }
 
 impl Engine for FfiPluginEngine {
     fn name(&self) -> &'static str {
-        let ptr = (self.c_engine.name)();
-        if ptr.is_null() {
-            "unknown_plugin"
-        } else {
-            unsafe {
-                std::ffi::CStr::from_ptr(ptr)
-                    .to_str()
-                    .unwrap_or("invalid_utf8")
+        self.name.get_or_init(|| {
+            let ptr = (self.c_engine.name)();
+            if ptr.is_null() {
+                return "unknown_plugin";
             }
-        }
+            // Engine::name promises a static lifetime. Copy once so callers can
+            // retain the name even after this plugin library has been unloaded.
+            let name = unsafe { std::ffi::CStr::from_ptr(ptr) }
+                .to_string_lossy()
+                .into_owned();
+            Box::leak(name.into_boxed_str())
+        })
     }
 
     fn supported_modalities(&self) -> Vec<Modality> {
         let mut out_modalities = vec![0i32; 16];
-        let mut out_len = 0usize;
+        let mut out_len = 16usize;
         let res = (self.c_engine.supported_modalities)(out_modalities.as_mut_ptr(), &mut out_len);
         if res != 0 {
             return vec![];
@@ -370,7 +445,7 @@ impl Engine for FfiPluginEngine {
 
     fn supported_devices(&self) -> Vec<DeviceKind> {
         let mut out_devices = vec![0i32; 16];
-        let mut out_len = 0usize;
+        let mut out_len = 16usize;
         let res = (self.c_engine.supported_devices)(out_devices.as_mut_ptr(), &mut out_len);
         if res != 0 {
             return vec![];
@@ -397,6 +472,10 @@ impl Engine for FfiPluginEngine {
 
         let mut model_ptr = std::ptr::null_mut();
         let res = (self.c_engine.load_model)(path_str.as_ptr(), device_i32, &mut model_ptr);
+        let mut handle = PluginModelHandle {
+            ptr: model_ptr,
+            free: self.c_engine.free_model,
+        };
         if res != 0 || model_ptr.is_null() {
             return Err(BloomError::Plugin(format!(
                 "Failed to load model in dynamic plugin: error code {}",
@@ -408,17 +487,19 @@ impl Engine for FfiPluginEngine {
         // Get model metadata
         let mut metadata_json_ptr = std::ptr::null_mut();
         let res = (self.c_engine.model_metadata)(model_ptr, &mut metadata_json_ptr);
+        let metadata_json = PluginString {
+            ptr: metadata_json_ptr,
+            free: self.c_engine.free_string,
+        };
         if res != 0 || metadata_json_ptr.is_null() {
-            (self.c_engine.free_model)(model_ptr);
             return Err(BloomError::Plugin(format!(
                 "Failed to read metadata from plugin model: error code {}",
                 res
             ))
             .into());
         }
-        let metadata_str = unsafe { std::ffi::CStr::from_ptr(metadata_json_ptr).to_str()? };
-        let metadata: ModelMetadata = serde_json::from_str(metadata_str)?;
-        (self.c_engine.free_string)(metadata_json_ptr);
+        let metadata: ModelMetadata = serde_json::from_str(metadata_json.text()?)?;
+        handle.ptr = std::ptr::null_mut();
 
         Ok(Box::new(FfiPluginModel {
             _lib: self._lib.clone(),
@@ -429,7 +510,37 @@ impl Engine for FfiPluginEngine {
             model_infer_stream_fn: self.c_engine.model_infer_stream,
             free_string_fn: self.c_engine.free_string,
             metadata,
+            inference_gate: std::sync::Mutex::new(()),
         }))
+    }
+}
+
+struct PluginModelHandle {
+    ptr: *mut std::ffi::c_void,
+    free: extern "C" fn(*mut std::ffi::c_void),
+}
+impl Drop for PluginModelHandle {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            (self.free)(self.ptr);
+        }
+    }
+}
+struct PluginString {
+    ptr: *mut std::os::raw::c_char,
+    free: extern "C" fn(*mut std::os::raw::c_char),
+}
+impl PluginString {
+    fn text(&self) -> Result<&str> {
+        anyhow::ensure!(!self.ptr.is_null(), "plugin returned a null string");
+        Ok(unsafe { std::ffi::CStr::from_ptr(self.ptr) }.to_str()?)
+    }
+}
+impl Drop for PluginString {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            (self.free)(self.ptr);
+        }
     }
 }
 
@@ -451,8 +562,11 @@ pub struct FfiPluginModel {
     ) -> i32,
     free_string_fn: extern "C" fn(*mut std::os::raw::c_char),
     metadata: ModelMetadata,
+    inference_gate: std::sync::Mutex<()>,
 }
 
+// Calls on an opaque model are serialized; the plugin ABI requires its handle
+// to be movable between threads, but does not require concurrent inference.
 unsafe impl Send for FfiPluginModel {}
 unsafe impl Sync for FfiPluginModel {}
 
@@ -481,8 +595,16 @@ impl LoadedModel for FfiPluginModel {
         let payload_str = serde_json::to_string(&payload)?;
         let payload_c = std::ffi::CString::new(payload_str)?;
 
+        let _gate = self
+            .inference_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mut out_json_ptr = std::ptr::null_mut();
         let res = (self.model_infer_fn)(self.model_ptr, payload_c.as_ptr(), &mut out_json_ptr);
+        let output_json = PluginString {
+            ptr: out_json_ptr,
+            free: self.free_string_fn,
+        };
         if res != 0 || out_json_ptr.is_null() {
             return Err(BloomError::Plugin(format!(
                 "Inference failed in dynamic plugin: error code {}",
@@ -491,11 +613,7 @@ impl LoadedModel for FfiPluginModel {
             .into());
         }
 
-        let out_str = unsafe { std::ffi::CStr::from_ptr(out_json_ptr).to_str()? };
-        let output: ModelOutput = serde_json::from_str(out_str)?;
-        (self.free_string_fn)(out_json_ptr);
-
-        Ok(output)
+        Ok(serde_json::from_str(output_json.text()?)?)
     }
 
     fn infer_stream(
@@ -522,8 +640,15 @@ impl LoadedModel for FfiPluginModel {
             user_data: *mut std::ffi::c_void,
             chunk_json: *const std::os::raw::c_char,
         ) -> i32 {
+            if user_data.is_null() {
+                return -1;
+            }
             let state = unsafe { &mut *(user_data as *mut CallbackState) };
+            if state.err.is_some() {
+                return -1;
+            }
             if chunk_json.is_null() {
+                state.err = Some(anyhow::anyhow!("plugin emitted a null chunk"));
                 return -1;
             }
             let chunk_str = unsafe {
@@ -542,13 +667,25 @@ impl LoadedModel for FfiPluginModel {
                     return -3;
                 }
             };
-            if let Err(e) = state.sink.on_chunk(chunk) {
-                state.err = Some(e);
-                return -4;
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.sink.on_chunk(chunk)
+            })) {
+                Ok(Ok(())) => 0,
+                Ok(Err(error)) => {
+                    state.err = Some(error);
+                    -4
+                }
+                Err(_) => {
+                    state.err = Some(anyhow::anyhow!("plugin output sink panicked"));
+                    -5
+                }
             }
-            0
         }
 
+        let _gate = self
+            .inference_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mut state = CallbackState { sink, err: None };
         let res = (self.model_infer_stream_fn)(
             self.model_ptr,
@@ -842,6 +979,7 @@ mod tests {
         let engine = FfiPluginEngine {
             _lib: None,
             c_engine,
+            name: OnceLock::new(),
         };
 
         assert_eq!(engine.name(), "mock_ffi_engine");
@@ -872,5 +1010,197 @@ mod tests {
         assert_eq!(sink.chunks.len(), 2);
         assert!(matches!(&sink.chunks[0], OutputChunk::TextDelta(t) if t == "hello "));
         assert!(matches!(sink.chunks[1], OutputChunk::End));
+    }
+    thread_local! {
+        static FAILURE_MODE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+        static MODEL_FREES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static STRING_FREES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static DYNAMIC_NAME: std::cell::RefCell<Option<std::ffi::CString>> = const { std::cell::RefCell::new(None) };
+    }
+
+    fn failing_plugin(mode: u8) -> FfiPluginEngine {
+        FAILURE_MODE.set(mode);
+        MODEL_FREES.set(0);
+        STRING_FREES.set(0);
+        extern "C" fn name() -> *const std::os::raw::c_char {
+            DYNAMIC_NAME.with(|name| {
+                name.borrow()
+                    .as_ref()
+                    .map_or(c"failure-fixture".as_ptr(), |name| name.as_ptr())
+            })
+        }
+        extern "C" fn supported(_: *mut i32, len: *mut usize) -> i32 {
+            unsafe {
+                *len = 0;
+            }
+            0
+        }
+        extern "C" fn load(
+            _: *const std::os::raw::c_char,
+            _: i32,
+            out: *mut *mut std::ffi::c_void,
+        ) -> i32 {
+            unsafe {
+                *out = Box::into_raw(Box::new(0u8)).cast();
+            }
+            if FAILURE_MODE.get() == 4 { 1 } else { 0 }
+        }
+        extern "C" fn free_model(ptr: *mut std::ffi::c_void) {
+            unsafe {
+                drop(Box::from_raw(ptr.cast::<u8>()));
+            }
+            MODEL_FREES.set(MODEL_FREES.get() + 1);
+        }
+        extern "C" fn free_string(ptr: *mut std::os::raw::c_char) {
+            unsafe {
+                drop(std::ffi::CString::from_raw(ptr));
+            }
+            STRING_FREES.set(STRING_FREES.get() + 1);
+        }
+        fn write_string(out: *mut *mut std::os::raw::c_char, bytes: Vec<u8>) {
+            unsafe {
+                *out = std::ffi::CString::new(bytes).unwrap().into_raw();
+            }
+        }
+        extern "C" fn metadata(
+            _: *mut std::ffi::c_void,
+            out: *mut *mut std::os::raw::c_char,
+        ) -> i32 {
+            let bytes = match FAILURE_MODE.get() {
+                1 | 3 => b"invalid JSON".to_vec(),
+                2 => vec![0xff],
+                _ => serde_json::to_vec(&ModelMetadata {
+                    id: "fixture".into(),
+                    modality: Modality::Text,
+                    quantized: false,
+                    manifest: Default::default(),
+                })
+                .unwrap(),
+            };
+            write_string(out, bytes);
+            if FAILURE_MODE.get() == 3 { 1 } else { 0 }
+        }
+        extern "C" fn infer(
+            _: *mut std::ffi::c_void,
+            _: *const std::os::raw::c_char,
+            out: *mut *mut std::os::raw::c_char,
+        ) -> i32 {
+            write_string(
+                out,
+                if FAILURE_MODE.get() == 6 {
+                    vec![0xff]
+                } else {
+                    b"invalid JSON".to_vec()
+                },
+            );
+            if FAILURE_MODE.get() == 7 { 1 } else { 0 }
+        }
+        extern "C" fn stream(
+            _: *mut std::ffi::c_void,
+            _: *const std::os::raw::c_char,
+            callback: ffi::CBloomStreamCallback,
+            data: *mut std::ffi::c_void,
+        ) -> i32 {
+            let chunk = match FAILURE_MODE.get() {
+                8 => std::ptr::null(),
+                9 => c"invalid JSON".as_ptr(),
+                _ => c"\"End\"".as_ptr(),
+            };
+            let _ = callback(data, chunk);
+            // Deliberately ignore the failure to prove the host retains it.
+            let _ = callback(data, c"\"End\"".as_ptr());
+            0
+        }
+        FfiPluginEngine {
+            _lib: None,
+            name: OnceLock::new(),
+            c_engine: ffi::CBloomEngine {
+                name,
+                supported_modalities: supported,
+                supported_devices: supported,
+                load_model: load,
+                free_model,
+                model_metadata: metadata,
+                model_infer: infer,
+                model_infer_stream: stream,
+                free_string,
+            },
+        }
+    }
+
+    #[test]
+    fn plugin_failures_release_models_and_strings_exactly_once() {
+        for mode in 1..=4 {
+            let engine = failing_plugin(mode);
+            assert!(engine.load(Path::new("fixture"), DeviceKind::Cpu).is_err());
+            assert_eq!(MODEL_FREES.get(), 1);
+            assert_eq!(STRING_FREES.get(), usize::from(mode != 4));
+        }
+        for mode in 5..=7 {
+            let engine = failing_plugin(mode);
+            let model = engine.load(Path::new("fixture"), DeviceKind::Cpu).unwrap();
+            assert!(
+                model
+                    .infer(
+                        ModelInput::Text {
+                            prompt: "test".into()
+                        },
+                        &Default::default()
+                    )
+                    .is_err()
+            );
+            assert_eq!(STRING_FREES.get(), 2);
+            drop(model);
+            assert_eq!(MODEL_FREES.get(), 1);
+        }
+    }
+
+    #[test]
+    fn plugin_callback_retains_null_parse_sink_and_panic_failures() {
+        for mode in 8..=11 {
+            let engine = failing_plugin(mode);
+            let model = engine.load(Path::new("fixture"), DeviceKind::Cpu).unwrap();
+            let mut calls = 0;
+            let result = model.infer_stream(
+                ModelInput::Text {
+                    prompt: "test".into(),
+                },
+                &Default::default(),
+                &mut |_| {
+                    calls += 1;
+                    if mode == 11 {
+                        panic!("sink panic fixture");
+                    }
+                    anyhow::bail!("sink rejected output")
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(calls, usize::from(mode >= 10));
+        }
+    }
+
+    #[test]
+    fn plugin_name_outlives_the_library_owned_string() {
+        DYNAMIC_NAME.with(|name| {
+            *name.borrow_mut() = Some(std::ffi::CString::new("temporary-plugin-name").unwrap())
+        });
+        let engine = failing_plugin(0);
+        let name = engine.name();
+        DYNAMIC_NAME.with(|name| *name.borrow_mut() = None);
+        drop(engine);
+        assert_eq!(name, "temporary-plugin-name");
+    }
+
+    #[test]
+    fn plugin_wire_table_rejects_missing_callbacks_before_use() {
+        assert_eq!(
+            std::mem::size_of::<ffi::CBloomEngine>(),
+            std::mem::size_of::<ffi::NullableEngine>()
+        );
+        assert_eq!(
+            std::mem::align_of::<ffi::CBloomEngine>(),
+            std::mem::align_of::<ffi::NullableEngine>()
+        );
+        assert!(ffi::NullableEngine::default().validate().is_err());
     }
 }

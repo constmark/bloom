@@ -24,8 +24,11 @@ use std::time::Instant;
 
 use crate::io::DataBlock;
 
+#[cfg(feature = "candle-engine")]
 pub mod kv_hook;
+#[cfg(feature = "candle-engine")]
 pub mod paged_cache;
+pub mod policy;
 
 /// Return whether `requested` tokens fit without overflowing the counter.
 ///

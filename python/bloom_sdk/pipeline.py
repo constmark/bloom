@@ -2,11 +2,12 @@ import ctypes
 import json
 import math
 import os
-import queue
 import sys
 import threading
 from pathlib import Path
 from typing import Any, Dict, Generator, Optional, Union
+
+from ._stream import MAX_STREAM_BYTES, StreamBuffer
 
 
 class BloomError(Exception):
@@ -251,6 +252,9 @@ class BloomPipeline:
         context_size: int = 2048,
     ):
         self._call_lock = threading.RLock()
+        self._stream_lock = threading.Lock()
+        self._stream_cancellations = set()
+        self._closing = False
         self._pipeline = None
         if not isinstance(model_path, str) or not model_path:
             raise ValueError("model_path must be a non-empty string")
@@ -317,10 +321,17 @@ class BloomPipeline:
         self.close()
 
     def close(self):
-        """Free the pipeline resource."""
+        """Cancel streams and wait for native calls before freeing the handle."""
         call_lock = getattr(self, "_call_lock", None)
         if call_lock is None:
             return
+        with self._stream_lock:
+            self._closing = True
+            cancellations = tuple(self._stream_cancellations)
+        # Never wait for native completion while a callback is blocked on a
+        # consumer that has stopped reading (including context-manager exit).
+        for cancel in cancellations:
+            cancel()
         with call_lock:
             if self._pipeline:
                 self._lib.bloom_pipeline_free(self._pipeline)
@@ -405,7 +416,7 @@ class BloomPipeline:
         err_buf = ctypes.create_string_buffer(512)
 
         with self._call_lock:
-            if not self._pipeline:
+            if self._closing or not self._pipeline:
                 raise BloomError("Pipeline is closed")
             if self._uses_v2:
                 input_slice, input_owner = _bytes_slice(input_bytes)
@@ -487,10 +498,10 @@ class BloomPipeline:
         """
         Run streaming inference.
         
-        Yields parsed OutputChunk dicts progressively as they arrive from the engine.
+        Yields parsed OutputChunks progressively, with bounded backpressure.
         """
         input_bytes, params_bytes = self._prepare_input_params(prompt_or_input, max_tokens, temperature, top_p, seed)
-        q = queue.Queue()
+        buffer = StreamBuffer()
         err_buf = ctypes.create_string_buffer(512)
         token_lock = threading.Lock()
         token_holder = {"value": None}
@@ -517,31 +528,38 @@ class BloomPipeline:
                 if token:
                     self._lib.bloom_cancellation_token_free(token)
 
+        def stop_stream():
+            buffer.stop()
+            cancel_v2_stream()
+
+        def invalid_chunk(error):
+            buffer.finish(BloomInferenceError(f"Invalid streaming chunk: {error}"))
+            cancel_v2_stream()
+
         @BloomStreamCallback
         def py_callback(_user_data, chunk_json):
             try:
+                if buffer.stopped.is_set():
+                    return
                 if chunk_json is None:
                     raise BloomInferenceError("Streaming callback returned NULL data")
-                chunk_str = chunk_json.decode("utf-8")
-                q.put(("chunk", json.loads(chunk_str)))
+                buffer.put(chunk_json)
             except Exception as error:
-                q.put(("error", BloomInferenceError(
-                    f"Invalid streaming chunk: {error}"
-                )))
+                invalid_chunk(error)
 
         @BloomStreamCallbackV2
         def py_callback_v2(_user_data, chunk_json, chunk_json_len):
             try:
+                if buffer.stopped.is_set():
+                    return
                 if not chunk_json and chunk_json_len:
                     raise BloomInferenceError("Streaming callback returned NULL data")
+                if chunk_json_len > MAX_STREAM_BYTES:
+                    raise BloomInferenceError("Streaming chunk exceeds the 16 MiB limit")
                 chunk_bytes = ctypes.string_at(chunk_json, chunk_json_len)
-                chunk_str = chunk_bytes.decode("utf-8")
-                q.put(("chunk", json.loads(chunk_str)))
+                buffer.put(chunk_bytes)
             except Exception as error:
-                q.put(("error", BloomInferenceError(
-                    f"Invalid streaming chunk: {error}"
-                )))
-                cancel_v2_stream()
+                invalid_chunk(error)
         
         # Execute streaming FFI in a background thread to allow yielding on main thread
         def run_thread():
@@ -549,9 +567,10 @@ class BloomPipeline:
                 # Serialize calls on one native pipeline. This also prevents
                 # close() from freeing the handle while inference is active.
                 with self._call_lock:
-                    if not self._pipeline:
-                        q.put(("error", BloomError("Pipeline is closed")))
+                    if buffer.stopped.is_set():
                         return
+                    if self._closing or not self._pipeline:
+                        raise BloomError("Pipeline is closed")
                     if self._uses_v2:
                         input_slice, input_owner = _bytes_slice(input_bytes)
                         params_slice, params_owner = _bytes_slice(params_bytes)
@@ -579,38 +598,54 @@ class BloomPipeline:
                             len(err_buf)
                         )
                 if res == BLOOM_STATUS_CANCELLED:
-                    q.put(("cancelled", None))
+                    buffer.finish()
                 elif res != 0:
-                    q.put(("error", BloomInferenceError(
+                    buffer.finish(BloomInferenceError(
                         f"Streaming failed (code {res}): {_decode_error(err_buf)}"
-                    )))
+                    ))
                 else:
-                    q.put(("done", None))
+                    buffer.finish()
             except Exception as error:
-                q.put(("error", BloomInferenceError(
+                buffer.finish(BloomInferenceError(
                     f"Streaming native call failed: {error}"
-                )))
+                ))
             finally:
                 free_v2_token()
+                with self._stream_lock:
+                    self._stream_cancellations.discard(stop_stream)
 
-        thread = threading.Thread(target=run_thread)
-        thread.start()
+        with self._stream_lock:
+            if self._closing:
+                free_v2_token()
+                raise BloomError("Pipeline is closed")
+            self._stream_cancellations.add(stop_stream)
+        thread = threading.Thread(target=run_thread, name="bloom-stream")
+        try:
+            thread.start()
+        except BaseException:
+            with self._stream_lock:
+                self._stream_cancellations.discard(stop_stream)
+            free_v2_token()
+            raise
 
         try:
             while True:
-                status, value = q.get()
-                if status == "chunk":
-                    yield value
-                elif status == "error":
-                    raise value
-                elif status in ("done", "cancelled"):
+                chunk = buffer.receive()
+                if chunk is None:
                     thread.join()
                     break
+                try:
+                    value = json.loads(chunk.decode("utf-8"))
+                except (UnicodeDecodeError, ValueError, RecursionError) as error:
+                    raise BloomInferenceError(
+                        f"Invalid streaming chunk: {error}"
+                    ) from error
+                yield value
         finally:
+            stop_stream()
             if self._uses_v2:
                 # Closing or abandoning the generator now stops native decode
                 # cooperatively instead of leaving an orphaned worker.
-                cancel_v2_stream()
                 thread.join(timeout=1)
             elif not thread.is_alive():
                 # A revision 1 library cannot be cancelled. The worker retains

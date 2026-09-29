@@ -3,7 +3,6 @@ use super::*;
 
 pub(crate) const MAX_JSON_SCHEMA_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_JSON_SCHEMA_DEPTH: usize = 16;
-pub(crate) const MAX_REQUESTED_MODEL_ID_CHARS: usize = 256;
 pub(crate) const MAX_REQUEST_ID_CHARS: usize = 128;
 const MAX_JSON_SCHEMA_NODES: usize = 1_024;
 const MAX_JSON_SCHEMA_PROPERTIES: usize = 256;
@@ -11,50 +10,6 @@ const MAX_JSON_SCHEMA_ENUM_VALUES: usize = 256;
 const MAX_JSON_SCHEMA_ANNOTATION_CHARS: usize = 1_024;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RequestedModelError {
-    Invalid,
-    NotLoaded,
-    Revoked,
-}
-
-/// Bind an optional OpenAI-compatible model selector to the active runtime.
-///
-/// Omitting the field remains backward compatible, and `default` is an explicit
-/// alias for the one active model. Any other identifier must match exactly so a
-/// client can never request one model while Bloom silently executes another.
-pub(crate) fn validate_requested_model(
-    requested: Option<&str>,
-    active_model: &str,
-) -> std::result::Result<(), RequestedModelError> {
-    let Some(requested) = requested else {
-        return Ok(());
-    };
-    validate_model_selector(requested)?;
-    if requested == "default" || requested == active_model {
-        Ok(())
-    } else {
-        Err(RequestedModelError::NotLoaded)
-    }
-}
-
-pub(crate) fn validate_model_selector(
-    requested: &str,
-) -> std::result::Result<(), RequestedModelError> {
-    if requested.is_empty()
-        || requested.trim() != requested
-        || requested
-            .chars()
-            .take(MAX_REQUESTED_MODEL_ID_CHARS + 1)
-            .count()
-            > MAX_REQUESTED_MODEL_ID_CHARS
-        || requested.chars().any(char::is_control)
-    {
-        return Err(RequestedModelError::Invalid);
-    }
-    Ok(())
-}
 
 pub(crate) fn requested_model_error_response(
     error: RequestedModelError,
@@ -3090,11 +3045,12 @@ pub(crate) fn record_stream_tokens(
     if let Ok(mut last_time) = last_token_time.lock() {
         if !first_token_seen.swap(true, Ordering::Relaxed) {
             state
+                .app
                 .metrics
                 .record_first_token_latency(request_start.elapsed().as_secs_f64() * 1000.0);
         } else if let Some(prev) = *last_time {
             let delta = now.duration_since(prev).as_secs_f64();
-            state.metrics.record_inter_token_latency(delta);
+            state.app.metrics.record_inter_token_latency(delta);
         }
         *last_time = Some(now);
     }
@@ -3129,4 +3085,27 @@ pub(crate) fn validate_request_id(request_id: &str) -> Result<(), &'static str> 
 pub(crate) fn next_request_id_from_counter(counter: &AtomicU64, prefix: &str) -> String {
     let seq = counter.fetch_add(1, Ordering::Relaxed) + 1;
     format!("{}-{}-{}", prefix, unix_seconds(), seq)
+}
+
+/// Common transport mapping; runtime services return only the typed outcome.
+pub(crate) fn model_unload_error_details(
+    error: ModelUnloadError,
+) -> (axum::http::StatusCode, &'static str, &'static str) {
+    match error {
+        ModelUnloadError::LifecycleBusy => (
+            axum::http::StatusCode::CONFLICT,
+            "model_load_in_progress",
+            "Another model lifecycle operation is already in progress.",
+        ),
+        ModelUnloadError::RequestsInFlight => (
+            axum::http::StatusCode::CONFLICT,
+            "requests_in_flight",
+            "The selected runtime still has requests in flight.",
+        ),
+        ModelUnloadError::NotLoaded => (
+            axum::http::StatusCode::NOT_FOUND,
+            "model_not_loaded",
+            "The selected runtime generation is no longer loaded.",
+        ),
+    }
 }

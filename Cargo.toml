@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "crates/app",
   "crates/backend",
   "crates/core",
   "crates/engine",
@@ -37,4 +38,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bloomai-core = { version = "0.1.0", path = "crates/core" }
 bloomai-backend = { version = "0.1.0", path = "crates/backend" }
 bloomai-tilelang = { version = "0.1.0", path = "crates/tilelang" }
-bloomai-engine = { version = "0.1.0", path = "crates/engine" }
+bloomai-engine = { version = "0.1.0", path = "crates/engine", default-features = false }
+bloomai-app = { version = "0.1.0", path = "crates/app", default-features = false }

@@ -43,6 +43,12 @@ quantization, backend, device, operating system, and client set, then publish:
 Promotion should apply only to that measured cell. It must not implicitly
 promote other model families, accelerators, or external-runtime adapters.
 
+The pinned Qwen2 Q4_0 Candle CPU profile is the first candidate. Its short
+CI workload records identity, concurrent streaming latency, disconnect
+recovery, and host RSS using the [HTTP workload procedure](http-workload.md).
+Multi-hour target-host evidence and the failure-injection drills above are
+still required before `stable` classification.
+
 ### P0: complete the chosen deployment artifact
 
 Release archives have provenance, while the Dockerfile is CI-built and receives
@@ -76,8 +82,11 @@ non-container macOS and Windows archive builders.
 - Continue stabilizing and package the C ABI and Python SDK. Revision 2 now
   provides version negotiation, bounded length-delimited buffers, explicit
   ownership/status contracts, cooperative stream cancellation, and revision 1
-  fallback tests; binary wheels, a declared compatibility window, and packaged
-  cross-version ABI tests remain before production support.
+  fallback tests. Python streaming now has bounded byte/chunk backpressure and
+  close-safe cancellation; a self-contained sdist-to-wheel gate verifies clean
+  installation and native ABI v2 interoperation. Platform binary wheels, a
+  declared compatibility window, packaged cross-version ABI tests, and the
+  complete supported Python/platform matrix remain before production support.
 - Exercise signed-index v3 urgent revocation through a multi-host deployment
   drill, including forced refresh latency, operator alerting, state backup, and
   replacement-digest recovery evidence. The protocol and local fail-closed
@@ -106,3 +115,8 @@ or failover.
 Review this register together with the [support matrix](support-matrix.md),
 [production checklist](production.md), [security guide](security.md), and
 [release checklist](../RELEASE.md) before promoting a deployment.
+
+The [September project assessment](project-assessment-2026-09.md) records the
+latest repository-wide review, reproduced failures, and follow-up acceptance
+criteria. Performance-budget checks now reject missing or invalid evidence
+instead of treating skipped metrics as a passing result.

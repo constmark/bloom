@@ -513,6 +513,20 @@ where
     read_streaming_http_json_events(stream, on_event)
 }
 
+const MAX_HTTP_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
+const MAX_STREAM_EVENT_BYTES: usize = 1024 * 1024;
+
+fn bounded_line(reader: &mut impl BufRead, limit: usize) -> Result<String> {
+    let mut line = String::new();
+    Read::take(reader, limit as u64 + 1).read_line(&mut line)?;
+    anyhow::ensure!(
+        line.len() <= limit && line.ends_with('\n'),
+        "oversized or truncated llama-server protocol line"
+    );
+    Ok(line)
+}
+
 fn request(
     addr: SocketAddr,
     method: &str,
@@ -537,7 +551,13 @@ fn request(
     stream.write_all(request.as_bytes())?;
 
     let mut raw = Vec::new();
-    stream.read_to_end(&mut raw)?;
+    stream
+        .take(MAX_HTTP_RESPONSE_BYTES as u64 + 1)
+        .read_to_end(&mut raw)?;
+    anyhow::ensure!(
+        raw.len() <= MAX_HTTP_RESPONSE_BYTES,
+        "llama-server response exceeds the byte limit"
+    );
     parse_http_json(&raw)
 }
 
@@ -546,67 +566,93 @@ where
     F: FnMut(&serde_json::Value) -> Result<()>,
 {
     let mut reader = BufReader::new(stream);
-    let mut status = String::new();
-    reader.read_line(&mut status)?;
-    if !status.contains(" 200 ") {
-        let mut body = String::new();
-        let _ = reader.read_to_string(&mut body);
-        bail!("llama-server returned {}: {}", status.trim(), body);
+    let status = bounded_line(&mut reader, MAX_HTTP_HEADER_BYTES)?;
+    if status.split_whitespace().nth(1) != Some("200") {
+        bail!("llama-server returned {}", status.trim());
     }
-
     let mut transfer_encoding = String::new();
+    let mut header_bytes = status.len();
     loop {
-        let mut header = String::new();
-        let bytes = reader.read_line(&mut header)?;
-        if bytes == 0 || header == "\r\n" || header == "\n" {
+        let header = bounded_line(
+            &mut reader,
+            MAX_HTTP_HEADER_BYTES.saturating_sub(header_bytes),
+        )?;
+        header_bytes += header.len();
+        if header == "\r\n" || header == "\n" {
             break;
         }
-        if header
-            .to_ascii_lowercase()
-            .starts_with("transfer-encoding:")
+        if let Some((name, value)) = header.split_once(':')
+            && name.eq_ignore_ascii_case("transfer-encoding")
         {
-            transfer_encoding = header;
+            transfer_encoding = value.trim().to_ascii_lowercase();
         }
     }
-
+    anyhow::ensure!(
+        transfer_encoding.is_empty() || transfer_encoding == "chunked",
+        "unsupported llama-server transfer encoding"
+    );
     let mut parser = StreamJsonEventParser::default();
-    if transfer_encoding.to_ascii_lowercase().contains("chunked") {
+    let mut total_bytes = 0usize;
+    let mut buffer = [0u8; 8192];
+    if transfer_encoding == "chunked" {
         loop {
-            let mut size_line = String::new();
-            if reader.read_line(&mut size_line)? == 0 {
-                break;
-            }
+            let size_line = bounded_line(&mut reader, MAX_HTTP_HEADER_BYTES)?;
             let size_hex = size_line.split(';').next().unwrap_or("").trim();
-            if size_hex.is_empty() {
-                continue;
-            }
             let size = usize::from_str_radix(size_hex, 16)?;
+            anyhow::ensure!(
+                size <= MAX_HTTP_RESPONSE_BYTES.saturating_sub(total_bytes),
+                "llama-server stream exceeds the byte limit"
+            );
             if size == 0 {
                 break;
             }
-            let mut chunk = vec![0u8; size];
-            reader.read_exact(&mut chunk)?;
+            total_bytes += size;
+            let mut remaining = size;
+            while remaining > 0 {
+                let length = remaining.min(buffer.len());
+                reader.read_exact(&mut buffer[..length])?;
+                parser.push_bytes(&buffer[..length], &mut on_event)?;
+                remaining -= length;
+            }
             let mut crlf = [0u8; 2];
             reader.read_exact(&mut crlf)?;
-            parser.push_bytes(&chunk, &mut on_event)?;
+            anyhow::ensure!(crlf == *b"\r\n", "invalid llama-server chunk terminator");
         }
     } else {
-        let mut body = Vec::new();
-        reader.read_to_end(&mut body)?;
-        parser.push_bytes(&body, &mut on_event)?;
+        // Connection-close streams must deliver deltas before EOF too.
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            total_bytes += read;
+            anyhow::ensure!(
+                total_bytes <= MAX_HTTP_RESPONSE_BYTES,
+                "llama-server stream exceeds the byte limit"
+            );
+            parser.push_bytes(&buffer[..read], &mut on_event)?;
+        }
     }
     parser.finish(&mut on_event)
 }
 
 fn parse_http_json(raw: &[u8]) -> Result<serde_json::Value> {
+    anyhow::ensure!(
+        raw.len() <= MAX_HTTP_RESPONSE_BYTES,
+        "llama-server response exceeds the byte limit"
+    );
     let header_end = raw
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
         .ok_or_else(|| anyhow!("invalid HTTP response from llama-server"))?;
+    anyhow::ensure!(
+        header_end <= MAX_HTTP_HEADER_BYTES,
+        "llama-server headers exceed the byte limit"
+    );
     let headers = String::from_utf8_lossy(&raw[..header_end]);
     let body_bytes = &raw[header_end + 4..];
     let status = headers.lines().next().unwrap_or_default();
-    if !status.contains(" 200 ") {
+    if status.split_whitespace().nth(1) != Some("200") {
         bail!(
             "llama-server returned {status}: {}",
             String::from_utf8_lossy(body_bytes)
@@ -643,10 +689,20 @@ fn decode_chunked_body(mut body: &[u8]) -> Result<Vec<u8>> {
             break;
         }
         let chunk_start = line_end + 2;
-        let chunk_end = chunk_start + size;
-        if body.len() < chunk_end + 2 {
+        let chunk_end = chunk_start
+            .checked_add(size)
+            .ok_or_else(|| anyhow!("llama-server chunk size overflow"))?;
+        if chunk_end > body.len() || body.len() - chunk_end < 2 {
             bail!("truncated chunked response from llama-server");
         }
+        anyhow::ensure!(
+            decoded.len().saturating_add(size) <= MAX_HTTP_RESPONSE_BYTES,
+            "llama-server response exceeds the byte limit"
+        );
+        anyhow::ensure!(
+            &body[chunk_end..chunk_end + 2] == b"\r\n",
+            "invalid llama-server chunk terminator"
+        );
         decoded.extend_from_slice(&body[chunk_start..chunk_end]);
         body = &body[chunk_end + 2..];
     }
@@ -668,6 +724,7 @@ fn speculative_types_include(value: &serde_json::Value, expected: &str) -> bool 
 struct StreamJsonEventParser {
     pending: Vec<u8>,
     sse_data_lines: Vec<String>,
+    sse_data_bytes: usize,
 }
 
 impl StreamJsonEventParser {
@@ -675,6 +732,10 @@ impl StreamJsonEventParser {
     where
         F: FnMut(&serde_json::Value) -> Result<()>,
     {
+        anyhow::ensure!(
+            self.pending.len().saturating_add(bytes.len()) <= MAX_STREAM_EVENT_BYTES,
+            "llama-server stream line exceeds the byte limit"
+        );
         self.pending.extend_from_slice(bytes);
         while let Some(line_end) = self.pending.iter().position(|&b| b == b'\n') {
             let mut line = self.pending.drain(..=line_end).collect::<Vec<_>>();
@@ -713,6 +774,14 @@ impl StreamJsonEventParser {
         }
         if let Some(data) = trimmed.strip_prefix(b"data:") {
             let data = trim_ascii(data);
+            self.sse_data_bytes = self
+                .sse_data_bytes
+                .saturating_add(data.len())
+                .saturating_add(1);
+            anyhow::ensure!(
+                self.sse_data_bytes <= MAX_STREAM_EVENT_BYTES,
+                "llama-server SSE event exceeds the byte limit"
+            );
             self.sse_data_lines
                 .push(std::str::from_utf8(data)?.to_string());
             return Ok(());
@@ -733,6 +802,7 @@ impl StreamJsonEventParser {
         }
         let payload = self.sse_data_lines.join("\n");
         self.sse_data_lines.clear();
+        self.sse_data_bytes = 0;
         let payload = payload.trim();
         if payload.is_empty() || payload == "[DONE]" {
             return Ok(());
@@ -758,6 +828,47 @@ fn trim_ascii(bytes: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_overflowing_chunks_bad_terminators_and_oversized_events() {
+        let body = format!("{:x}\r\n", usize::MAX);
+        assert!(decode_chunked_body(body.as_bytes()).is_err());
+        assert!(decode_chunked_body(b"1\r\nxXX0\r\n\r\n").is_err());
+        let mut parser = StreamJsonEventParser::default();
+        assert!(
+            parser
+                .push_bytes(&vec![b'x'; MAX_STREAM_EVENT_BYTES + 1], &mut |_| Ok(()))
+                .is_err()
+        );
+        let mut parser = StreamJsonEventParser::default();
+        for _ in 0..MAX_STREAM_EVENT_BYTES / 2 {
+            if parser.push_bytes(b"data: x\n", &mut |_| Ok(())).is_err() {
+                return;
+            }
+        }
+        assert!(parser.push_bytes(b"data: x\n", &mut |_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn connection_close_stream_delivers_before_the_peer_closes() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        server.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: {\"content\":\"hello\"}\n\n").unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let mut received = false;
+        assert!(
+            read_streaming_http_json_events(client, |_| {
+                received = true;
+                bail!("stop after first event")
+            })
+            .is_err()
+        );
+        assert!(received, "event was buffered until connection close");
+    }
 
     #[test]
     fn maps_speculative_modes() {

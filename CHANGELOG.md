@@ -8,8 +8,50 @@ called out in release notes.
 
 ## Unreleased
 
+### Reliability and distribution
+
+- Bound Python streaming handoff to 64 chunks and 16 MiB, apply backpressure to
+  slow consumers, reject oversized revision 2 callbacks before copying their
+  memory, and release blocked callbacks on stream/pipeline close. Pipeline
+  close now cancels registered streams before waiting for native calls. Native
+  handle and token ownership remain valid through worker completion, including
+  legacy ABI fallback and worker-start failures.
+- Fix Python package builds by including package-local README/license files.
+  Add CI for sdist-to-wheel builds and clean installation with real native ABI
+  v2 buffered/streaming mock inference. Wheels still require a separately
+  supplied native library.
+- Reject missing, negative, non-finite and malformed benchmark evidence with
+  exit code 4; reserve exit code 3 for valid measurements with unclassified
+  hardware. Fix timing fallback precedence and the inclusive 5% WARN boundary.
+  Emit CPU architecture in benchmark metadata and stop classifying ARM CPU or
+  OpenVINO CPU execution as x86 or NPU evidence. Correct documented memory units
+  to match the unchanged MiB thresholds.
+- Create Unix TileLang executable-cache directories with explicit owner-only
+  permissions at creation, fixing the private-cache regression under a normal
+  umask. Normalize formatting of the existing Rust reliability changes.
+
 ### Breaking
 
+- Replace Candle-specific `LoadedModel` extensions (`candle_device`, tensor
+  `forward`, `create_wrapper`, `tokenizer`, and batching vocabulary/KV getters)
+  with backend-neutral `batch_model` and `tokenize` capabilities. Implement
+  `bloomai_engine::batching::BatchModel` for batch-capable adapters. Candle
+  execution stays behind a typed private adapter; `ServerKvHook` is renamed
+  `CandleKvHook`. The general `Engine::load` signature is unchanged.
+- Separate server runtime services, loading, scheduling, cancellation and
+  memory admission into `application` modules with resolved configuration.
+  HTTP state owns protocol concerns and references the runtime service explicitly.
+  Model unload and Ollama expiry share a typed service transaction. HTTP routes,
+  status codes, payloads and configuration formats remain unchanged.
+- Move process configuration APIs (`BloomConfig`, `ServerConfig`, `InferConfig`,
+  `BenchConfig`, and config-file helpers) from `bloomai_engine` to `bloomai_app`.
+  Native CLI binaries now belong to the `bloomai-app` package; binary names,
+  CLI arguments, environment variables, and config JSON remain unchanged.
+  HTTP batch assembly now uses an engine-owned executor factory, and disabling
+  `candle-engine` no longer pulls Candle through inherited dependency defaults.
+  The native IFB path also normalizes per-model logits into one vocabulary row
+  per request and preserves that row during prefill, fixing rank errors and
+  cross-request concatenation. The tiny-model gate now exercises this path.
 - Add `BLOOM_OPERATOR_API_KEY`/`--operator-api-key` and enforce a separate
   operator scope for `/v1/model-management/*`, Ollama pull/delete, inactive
   model activation, empty-prompt load/unload, and explicit `keep_alive`.

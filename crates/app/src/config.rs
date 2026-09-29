@@ -198,7 +198,7 @@ fn example_config() -> BloomConfig {
             temperature: Some(0.7),
             top_p: Some(0.9),
             context_size: Some(2048),
-            memory_utilization: Some(crate::core::memory::default_memory_utilization()),
+            memory_utilization: Some(bloomai_engine::default_memory_utilization()),
             disable_memory_prealloc: Some(false),
             batch_size: Some(1),
             speculative: Some("none".to_string()),
@@ -217,7 +217,7 @@ fn example_config() -> BloomConfig {
             max_concurrent: Some(4),
             max_loaded_models: Some(1),
             context_size: Some(2048),
-            memory_utilization: Some(crate::core::memory::default_memory_utilization()),
+            memory_utilization: Some(bloomai_engine::default_memory_utilization()),
             disable_memory_prealloc: Some(false),
             max_num_tokens: Some(4096),
             max_upload_bytes: Some(12 * MIB as usize),
@@ -330,6 +330,29 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_config_preserves_all_sections_and_refuses_to_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/config.json");
+        write_default_config(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let mut document: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        assert!(document["infer"].is_object());
+        assert!(document["server"].is_object());
+        assert!(document["bench"].is_object());
+        assert!(write_default_config(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+
+        document["infer"]["max_tokens"] = serde_json::json!(17);
+        document["server"]["port"] = serde_json::json!(8123);
+        document["bench"]["repetitions"] = serde_json::json!(7);
+        std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let loaded = load_config(&path).unwrap();
+        assert_eq!(loaded.infer.max_tokens, Some(17));
+        assert_eq!(loaded.server.port, Some(8123));
+        assert_eq!(loaded.bench.repetitions, Some(7));
+    }
 
     #[test]
     fn loads_missing_config_as_default() {

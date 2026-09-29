@@ -886,6 +886,8 @@ def main() -> int:
             "120",
             "--max-body-bytes",
             "65536",
+            "--max-ollama-body-bytes",
+            "65536",
         ]
         if has_model and not args.catalog_only:
             command.extend(["--model", str(model)])

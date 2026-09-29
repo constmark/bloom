@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "bloom-sdk"
 version = "0.1.0"
 description = "Python SDK for the Bloom standalone multimodal inference engine (ctypes binding to the bloomai-ffi library)."
-readme = "../README.md"
+readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Bloom Contributors" }]
@@ -35,3 +35,4 @@ Changelog = "https://github.com/constmark/bloom/blob/main/CHANGELOG.md"
 #   cargo build --release -p bloomai-ffi
 [tool.setuptools]
 packages = ["bloom_sdk"]
+license-files = ["LICENSE"]

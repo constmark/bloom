@@ -7,7 +7,7 @@ use anyhow::{Result, anyhow, bail};
 use bloomai_core::{DeviceKind, MemoryTopology, ModelManifest};
 use bloomai_engine::{MemoryEstimate, estimate_memory_for_device};
 
-use crate::cli::Args;
+use super::config::RuntimeConfig;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct RuntimeMemoryFootprint {
@@ -258,7 +258,7 @@ pub(crate) struct RuntimeMemoryPlanner {
 }
 
 impl RuntimeMemoryPlanner {
-    pub(crate) fn new(args: &Args, device: DeviceKind) -> Result<Self> {
+    pub(crate) fn new(args: &RuntimeConfig, device: DeviceKind) -> Result<Self> {
         if matches!(
             args.speculative.trim().to_ascii_lowercase().as_str(),
             "draft" | "draft_model" | "draft-model"
@@ -1057,15 +1057,7 @@ fn strict_gpu_memory_probe() -> Result<StrictMemoryProbe> {
 
 #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
 fn strict_gpu_memory_probe() -> Result<StrictMemoryProbe> {
-    use candle_core::cuda_backend::cudarc::driver::{CudaContext, result};
-
-    let context = CudaContext::new(0)
-        .map_err(|error| anyhow!("failed to initialize CUDA logical device 0: {error}"))?;
-    context
-        .bind_to_thread()
-        .map_err(|error| anyhow!("failed to bind CUDA logical device 0: {error}"))?;
-    let (available_bytes, total_bytes) = result::mem_get_info()
-        .map_err(|error| anyhow!("failed to query CUDA logical device 0 memory: {error}"))?;
+    let (available_bytes, total_bytes) = bloomai_engine::core::memory::cuda_memory_info(0)?;
     validate_probe(
         StrictMemoryProbe {
             topology: MemoryTopology::Discrete,

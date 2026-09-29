@@ -15,7 +15,8 @@ flowchart TD
     Web["Bloom UI (standalone Dioxus crate)"] -->|HTTP/SSE| Server["bloomai-server (application + HTTP)"]
     Client["OpenAI / Ollama clients"] -->|HTTP| Server
     Server --> Engine["bloomai-engine (pipeline + scheduling)"]
-    CLI["bloom_infer / bloom_bench"] --> Engine
+    App["bloomai-app (process configuration + CLI)"] --> Engine
+    Server --> App
     FFI["bloomai-ffi"] --> Engine
     Engine --> Core["bloomai-core (contracts)"]
     Engine --> Backend["bloomai-backend (devices)"]
@@ -23,7 +24,8 @@ flowchart TD
     Backend --> Core
 ```
 
-`bloomai-server` is the composition root: it owns process configuration,
+`bloomai-app` owns process configuration and the native CLI entry points.
+`bloomai-server` is the HTTP composition root: it owns configuration application,
 runtime lifecycle, model catalog services, protocol adapters, routing, and
 middleware. The Dioxus UI consumes only versioned HTTP contracts. It can be
 hosted independently, or its static build can be embedded in the server by the
@@ -47,15 +49,111 @@ path.
 
 | Crate | Responsibility |
 | --- | --- |
-| `bloomai-core` | Public data types, manifests, resource contracts, scheduling configuration, and errors |
+| `bloomai-core` | Public data types, manifests, resource contracts, reusable scheduling/resource policies, and errors |
 | `bloomai-backend` | Device capabilities, hardware probing, reservation, and backend registry |
-| `bloomai-engine` | Model loading, processors, executors, inference pipeline, scheduler, and native CLI tools |
+| `bloomai-engine` | Model loading, processors, executors, inference pipeline, and scheduler |
+| `bloomai-app` | Process configuration files and `bloom_infer`, `bloom_bench`, `bloom_quantize`, and `inspect_gguf` entry points |
 | `bloomai-server` | Application assembly, model lifecycle, HTTP protocols, operations, and optional embedded UI adapter |
 | `bloomai-tilelang` | Dynamic kernel compilation and loading |
 | `bloomai-ffi` | Pre-1.0 C ABI used by native and Python consumers |
 
 The standalone `ui/` crate intentionally remains outside the native workspace
 because it targets WebAssembly and has its own toolchain and lockfile.
+
+### Enforced boundaries and current limits
+
+The September 2026 layering review found a valid crate dependency graph but
+three implementation leaks: server configuration and CLI dependencies lived
+inside the engine, HTTP scheduler assembly downcast Candle model wrappers and
+constructed tensor callbacks, and disabling `candle-engine` did not compile.
+The configuration and CLI code now belongs to `bloomai-app`. Configuration JSON,
+environment variables, and binary names are unchanged; Rust imports of the
+process configuration API move from `bloomai_engine` to `bloomai_app`, and
+package-qualified CLI commands use `-p bloomai-app`.
+
+The engine's `build_batch_executor` accepts a pipeline, a KV pool, optional
+CacheMesh, and a typed layout, returning `Arc<dyn EngineExecutor>`. It validates
+the layout and physical device before dispatching through the loaded model's
+optional `batching::BatchModel` capability. The returned executor retains the
+pipeline and its backend lease until execution resources finish teardown.
+Candle device identity, tensor callbacks, per-request model wrappers, tokenizers,
+and KV hooks belong to `executor/candle/batching.rs`. The server retains
+application admission, memory permits, scheduler worker lifetime, and shutdown.
+CUDA driver memory queries also stay behind an engine function. No Candle
+dependency is required in the HTTP crate.
+
+`LoadedModel` contains backend-neutral contracts. Exact tokenization returns
+token IDs or an error; only an absent capability falls back to processors and
+then approximate counts. The Candle-specific tensor forward port used by draft
+decoding is private to the engine and uses the draft model's own device.
+There are no tensor types, concrete tokenizer handles, or wrapper downcasts in
+the general model/pipeline/batch capability contracts.
+
+The factory normalizes each native model's `[1, vocab]` or
+`[1, sequence, vocab]` output into one final-token vocabulary vector and stacks
+those vectors into `[batch, vocab]`. Prefill and decode preserve the vocabulary
+axis when selecting a request. A real tiny-Qwen2 IFB gate and separate multi-row
+tests guard this contract; concatenating rows or sampling a scalar is invalid.
+
+Long-context policy remains available without Candle; tensor-backed paged
+caches and hooks compile only with `candle-engine`. Application and FFI
+dependencies disable inherited engine defaults and explicitly forward their
+features. `cargo check --workspace --all-targets --no-default-features --locked`
+checks this build independently. It supports external adapters and inspection
+within their declared capabilities; native Candle inference and IFB still
+require Candle. The GGUF inspection and quantization binaries explicitly
+require that feature.
+
+`python3 scripts/check_architecture.py` checks the Cargo dependency graph,
+including renamed, optional, development and target-specific dependencies,
+and selected source-level application/engine boundaries. CI and
+`just architecture-check` also run its regression tests and the feature-free
+build. New crates require an explicit update to the layer map.
+
+### Server application boundary
+
+The server keeps runtime services in `src/application/`. `server_state.rs`
+contains the HTTP-specific state and an explicit `Arc<RuntimeService>`; it does
+not forward field access through `Deref`. This application module is distinct
+from the `bloomai-app` crate, which owns process configuration and CLI binaries.
+
+```mermaid
+flowchart TD
+    Bootstrap["CLI / HTTP bootstrap"] --> Config["RuntimeConfig"]
+    HTTP["HTTP adapters + ServerState"] --> Service["RuntimeService"]
+    HTTP --> Lifecycle["CancellationRegistry + InferenceLifecycle"]
+    Loader["application::loader"] --> Service
+    Loader --> Scheduling["application::scheduling"]
+    Loader --> Registry["backend_registry"]
+    Service --> Memory["Memory planner + runtime pool + catalog services"]
+    Config --> Loader
+    Config --> Scheduling
+    Scheduling --> Port["Engine batch capability"]
+    Lifecycle --> Lease["RuntimeRequestLease"]
+```
+
+| Owner | Responsibility |
+| --- | --- |
+| `application/runtime_service.rs` | Load admission, publication, retirement, atomic idle unload, typed availability/unload outcomes, private lifecycle/draining/catalog state |
+| `application/runtime.rs`, `pool.rs`, `memory.rs` | Exact runtime generations, request leases, bounded residency and memory accounting |
+| `application/inference.rs` | Private cancellation registry, scheduler cancellation and client/worker resource settlement |
+| `application/loader.rs`, `scheduling.rs`, `backend_registry.rs` | Backend selection, verified loading and worker construction from resolved options |
+| `server_state.rs` and protocol adapters | Credentials, request IDs, body limits, Responses storage, Ollama residency policy and HTTP error mapping |
+
+Application services use explicit imports and cannot depend on HTTP state,
+Axum response types, CLI arguments, or root wildcard imports. The architecture
+gate enforces these source boundaries as well as the crate graph. Both HTTP
+unload requests and Ollama expiry timers call the same typed unload transaction;
+the timer never invokes an HTTP handler. Cancellation handlers do not own or
+lock the registration map. Request leases, memory permits and scheduler shutdown
+retain their original ordering, including draining after client disconnect.
+
+These boundaries are now enforced inside the existing server crate. Protocol
+DTOs, handlers and response helpers are still large and some use root wildcard
+imports within the HTTP layer. Model-management infrastructure remains in the
+server crate, and core still includes executable resource/scheduling policies.
+Further decomposition can follow protocol or infrastructure reuse needs;
+there is no claim that all modules are small or that core is a DTO-only crate.
 
 ## Deployment profiles
 
@@ -126,9 +224,11 @@ chunking, batching, KV allocation, and cache eviction. A higher-level runtime
 or orchestrator may handle cross-model routing, device placement, residency,
 and fleet-level policy.
 
-The server's model-management API can transactionally replace that single
-active runtime. It is lifecycle control, not concurrent cross-model routing:
-new inference admission closes and in-flight work drains before replacement.
+The server's model-management API controls a bounded pool of resident runtimes
+(one by default). It resolves an explicit model to an admitted runtime and
+retains that generation while requests drain during replacement or eviction.
+Each runtime owns its own engine scheduler; the pool is application lifecycle
+and residency management, not fleet-level orchestration.
 
 Process shutdown has a separate, bounded lifecycle. `Ctrl-C` on supported
 hosts and `SIGTERM` on Unix feed one shutdown notification. The signal owner

@@ -17,6 +17,8 @@ else
     BUILD_SERVER=1
 fi
 REQUIRE_OFFICIAL_CLIENTS="${BLOOM_TINY_RUNTIME_REQUIRE_OFFICIAL_CLIENTS:-0}"
+# Optional argument arrays use the guarded expansion below because macOS Bash
+# 3.2 treats an empty array as unset under `set -u`.
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -136,6 +138,20 @@ if [[ ! -x "$SERVER_BIN" ]]; then
     exit 1
 fi
 
+echo "Running bounded HTTP concurrency and disconnect workload..."
+HTTP_WORKLOAD_OUTPUT="${BLOOM_HTTP_WORKLOAD_OUTPUT:-${TINY_RUNTIME_DIR}/http-workload.json}"
+python3 scripts/http_workload.py \
+    --server-bin "$SERVER_BIN" \
+    --model "$MODEL_DIR" \
+    --output "$HTTP_WORKLOAD_OUTPUT" \
+    --concurrency 1,2,4 \
+    --duration-seconds 0 \
+    --max-requests 7 \
+    --max-tokens 3 \
+    --warmup 1 \
+    --disconnects 1
+cat "$HTTP_WORKLOAD_OUTPUT"
+
 echo "Running OpenAI-compatible native-model smoke..."
 python3 scripts/openai_compat_smoke.py \
     --server-bin "$SERVER_BIN" \
@@ -143,7 +159,7 @@ python3 scripts/openai_compat_smoke.py \
     --require-model \
     --max-tokens 3 \
     --api-key bloom-tiny-runtime \
-    "${OPENAI_SDK_ARGS[@]}"
+    ${OPENAI_SDK_ARGS[@]+"${OPENAI_SDK_ARGS[@]}"}
 
 echo "Running Ollama-compatible native-model smoke..."
 python3 scripts/ollama_compat_smoke.py \
@@ -153,7 +169,17 @@ python3 scripts/ollama_compat_smoke.py \
     --catalog-only \
     --max-tokens 3 \
     --api-key bloom-tiny-runtime \
-    "${OLLAMA_SDK_ARGS[@]}"
+    ${OLLAMA_SDK_ARGS[@]+"${OLLAMA_SDK_ARGS[@]}"}
+
+echo "Running OpenAI-compatible native batch-executor smoke..."
+python3 scripts/openai_compat_smoke.py \
+    --server-bin "$SERVER_BIN" \
+    --model "$MODEL_DIR" \
+    --require-model \
+    --enable-ifb \
+    --max-tokens 3 \
+    --api-key bloom-tiny-runtime \
+    ${OPENAI_SDK_ARGS[@]+"${OPENAI_SDK_ARGS[@]}"}
 
 echo "Running OpenAI-compatible sharded native-model smoke..."
 python3 scripts/openai_compat_smoke.py \
@@ -162,7 +188,7 @@ python3 scripts/openai_compat_smoke.py \
     --require-model \
     --max-tokens 3 \
     --api-key bloom-tiny-runtime \
-    "${OPENAI_SDK_ARGS[@]}"
+    ${OPENAI_SDK_ARGS[@]+"${OPENAI_SDK_ARGS[@]}"}
 
 echo "Running Ollama-compatible sharded native-model smoke..."
 python3 scripts/ollama_compat_smoke.py \
@@ -172,7 +198,7 @@ python3 scripts/ollama_compat_smoke.py \
     --catalog-only \
     --max-tokens 3 \
     --api-key bloom-tiny-runtime \
-    "${OLLAMA_SDK_ARGS[@]}"
+    ${OLLAMA_SDK_ARGS[@]+"${OLLAMA_SDK_ARGS[@]}"}
 
 echo "Running OpenAI-compatible native embedding and rerank smoke..."
 python3 scripts/openai_compat_smoke.py \
@@ -181,7 +207,7 @@ python3 scripts/openai_compat_smoke.py \
     --require-model \
     --embedding-only \
     --api-key bloom-tiny-runtime \
-    "${OPENAI_SDK_ARGS[@]}"
+    ${OPENAI_SDK_ARGS[@]+"${OPENAI_SDK_ARGS[@]}"}
 
 echo "Running Ollama-compatible native embedding smoke..."
 python3 scripts/ollama_compat_smoke.py \
@@ -190,7 +216,7 @@ python3 scripts/ollama_compat_smoke.py \
     --require-model \
     --catalog-only \
     --api-key bloom-tiny-runtime \
-    "${OLLAMA_SDK_ARGS[@]}"
+    ${OLLAMA_SDK_ARGS[@]+"${OLLAMA_SDK_ARGS[@]}"}
 
 echo "Running OpenAI-compatible native structured-output smoke..."
 python3 scripts/openai_compat_smoke.py \
@@ -200,7 +226,7 @@ python3 scripts/openai_compat_smoke.py \
     --structured-only \
     --max-tokens 8 \
     --api-key bloom-tiny-runtime \
-    "${OPENAI_SDK_ARGS[@]}"
+    ${OPENAI_SDK_ARGS[@]+"${OPENAI_SDK_ARGS[@]}"}
 
 echo "Running Ollama-compatible native structured-output smoke..."
 python3 scripts/ollama_compat_smoke.py \
@@ -211,7 +237,7 @@ python3 scripts/ollama_compat_smoke.py \
     --structured-only \
     --max-tokens 8 \
     --api-key bloom-tiny-runtime \
-    "${OLLAMA_SDK_ARGS[@]}"
+    ${OLLAMA_SDK_ARGS[@]+"${OLLAMA_SDK_ARGS[@]}"}
 
 echo "Running OpenAI-compatible native function-call smoke..."
 python3 scripts/openai_compat_smoke.py \
@@ -221,7 +247,7 @@ python3 scripts/openai_compat_smoke.py \
     --tool-only \
     --max-tokens 64 \
     --api-key bloom-tiny-runtime \
-    "${OPENAI_SDK_ARGS[@]}"
+    ${OPENAI_SDK_ARGS[@]+"${OPENAI_SDK_ARGS[@]}"}
 
 echo "Running Ollama-compatible native function-call smoke..."
 python3 scripts/ollama_compat_smoke.py \
@@ -232,6 +258,6 @@ python3 scripts/ollama_compat_smoke.py \
     --tool-only \
     --max-tokens 64 \
     --api-key bloom-tiny-runtime \
-    "${OLLAMA_SDK_ARGS[@]}"
+    ${OLLAMA_SDK_ARGS[@]+"${OLLAMA_SDK_ARGS[@]}"}
 
-echo "OK: deterministic Qwen2 fixtures passed native CPU single-file/sharded text, embedding, rerank, structured-output, and function-call runtime smokes"
+echo "OK: deterministic Qwen2 fixtures passed native CPU single-file/sharded text, IFB, embedding, rerank, structured-output, and function-call runtime smokes"

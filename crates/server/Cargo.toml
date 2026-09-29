@@ -24,9 +24,9 @@ path = "src/main.rs"
 [features]
 default = ["candle-engine"]
 candle-engine = ["bloomai-engine/candle-engine"]
-cuda = ["bloomai-engine/cuda", "candle-core/cuda"]
-metal = ["bloomai-engine/metal", "candle-core/metal"]
-flash-attn = ["bloomai-engine/flash-attn"]
+cuda = ["candle-engine", "bloomai-engine/cuda"]
+metal = ["candle-engine", "bloomai-engine/metal"]
+flash-attn = ["candle-engine", "bloomai-engine/flash-attn"]
 hardware-tests = ["bloomai-engine/hardware-tests"]
 # The default build is an API-only service. This feature embeds the Dioxus
 # assets and adds browser routes without changing the application/core layers.
@@ -43,7 +43,7 @@ thiserror.workspace = true
 bloomai-core.workspace = true
 bloomai-backend.workspace = true
 bloomai-engine.workspace = true
-candle-core = "0.10"
+bloomai-app.workspace = true
 axum = { version = "0.8.9", features = ["multipart"] }
 tokio = { version = "1.52.3", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }

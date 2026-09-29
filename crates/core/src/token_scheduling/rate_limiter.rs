@@ -68,9 +68,18 @@ pub struct TokenBucket {
 impl TokenBucket {
     fn new(config: &TokenBucketConfig) -> Self {
         Self {
-            tokens: config.burst as f64,
+            tokens: if config.rate_per_second.is_finite() && config.rate_per_second >= 0.0 {
+                config.burst as f64
+            } else {
+                0.0
+            },
             capacity: config.burst as f64,
-            rate_per_second: config.rate_per_second,
+            rate_per_second: if config.rate_per_second.is_finite() && config.rate_per_second >= 0.0
+            {
+                config.rate_per_second
+            } else {
+                0.0
+            },
             last_refill: Instant::now(),
         }
     }
@@ -102,11 +111,14 @@ impl TokenBucket {
 
     /// Return the wait required for `tokens` to become available.
     pub fn wait_time_for(&self, tokens: usize) -> Duration {
+        if tokens as f64 > self.capacity {
+            return Duration::MAX;
+        }
         let deficit = tokens as f64 - self.tokens;
         if deficit <= 0.0 {
             Duration::ZERO
         } else {
-            Duration::from_secs_f64(deficit / self.rate_per_second)
+            Duration::try_from_secs_f64(deficit / self.rate_per_second).unwrap_or(Duration::MAX)
         }
     }
 }
@@ -169,7 +181,7 @@ impl TokenBucketRateLimiter {
 
     /// Try to consume `tokens` from a model's bucket.
     pub fn try_acquire(&mut self, model_id: &str, tokens: usize) -> RateLimitDecision {
-        self.total_requests += 1;
+        self.total_requests = self.total_requests.saturating_add(1);
 
         if !self.config.enabled {
             return RateLimitDecision::Allowed;
@@ -192,7 +204,7 @@ impl TokenBucketRateLimiter {
             RateLimitDecision::Allowed
         } else {
             let wait = bucket.wait_time_for(tokens);
-            self.total_throttled += 1;
+            self.total_throttled = self.total_throttled.saturating_add(1);
             RateLimitDecision::Throttled { wait }
         }
     }
@@ -233,6 +245,25 @@ impl TokenBucketRateLimiter {
 mod tests {
     use super::*;
     use std::thread;
+
+    #[test]
+    fn zero_invalid_and_impossible_rates_never_panic_or_refill() {
+        for rate in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::MIN_POSITIVE] {
+            let mut bucket = TokenBucket::new(&TokenBucketConfig {
+                burst: 1,
+                rate_per_second: rate,
+            });
+            bucket.tokens = 0.0;
+            assert_eq!(bucket.wait_time_for(1), Duration::MAX);
+            assert_eq!(bucket.wait_time_for(2), Duration::MAX);
+            assert!(!bucket.try_consume(1, Instant::now()));
+        }
+        let bucket = TokenBucket::new(&TokenBucketConfig {
+            burst: 10,
+            rate_per_second: 1.0,
+        });
+        assert_eq!(bucket.wait_time_for(11), Duration::MAX);
+    }
 
     #[test]
     fn rate_limiter_disabled_always_allows() {

@@ -19,3 +19,4 @@ hardware-tests = []
 [dependencies]
 anyhow.workspace = true
 libloading.workspace = true
+tempfile = "3"

@@ -3,6 +3,7 @@
 #![cfg_attr(not(test), warn(clippy::unwrap_used))]
 //! Model abstraction for multimodal inference.
 
+pub mod batching;
 pub mod cachemesh;
 pub mod core;
 pub mod executor;
@@ -28,10 +29,6 @@ pub use crate::executor as engines;
 pub use crate::cachemesh::{
     CacheMesh, CacheMeshBlock, CacheMeshConfig, CacheMeshKey, CacheMeshMetrics, CacheMeshSnapshot,
     CacheMeshTier, FileSystemRemoteCache, InMemoryRemoteCache, RemoteCacheBackend, TierMetrics,
-};
-pub use crate::core::config::{
-    BenchConfig, BloomConfig, InferConfig, ServerConfig, default_config_dir, default_config_path,
-    load_config, resolve_config_path, write_default_config,
 };
 pub use crate::core::engine::{
     BackendMaturity, Engine, EngineCapability, EngineRegistry, EngineRouter, RoutingDecision,
@@ -70,6 +67,7 @@ pub use crate::executor::npu_tts::NpuTtsEngine;
 pub use crate::executor::onnx::OnnxRuntimeEngine;
 pub use crate::executor::vulkan::VulkanEngine;
 
+pub use crate::batching::{BatchExecutorConfig, build_batch_executor};
 #[allow(deprecated)]
 pub use crate::executor::speculative::{
     DraftModelStrategy, NGramStrategy, SpeculativeMode, SpeculativeResult, SpeculativeStrategy,
@@ -81,10 +79,11 @@ pub use crate::processor::{
     AudioProcessor, AudioProcessorConfig, IdentityProcessor, ImageProcessor, ImageProcessorConfig,
     Processor, ProcessorRegistry, TokenizerProcessor,
 };
+#[cfg(feature = "candle-engine")]
 pub use crate::scheduler::kv_hook::KvHook;
-pub use crate::scheduler::paged_cache::{
-    BlockKvData, LongContextPolicy, PagedAttentionCache, PagedCacheConfig,
-};
+#[cfg(feature = "candle-engine")]
+pub use crate::scheduler::paged_cache::{BlockKvData, PagedAttentionCache, PagedCacheConfig};
+pub use crate::scheduler::policy::LongContextPolicy;
 pub use crate::scheduler::{
     BatchResult, BloomKvCachePool, BloomScheduler, EngineExecutor, EnvironmentConstraints,
     ExecutionBatch, ExecutionGuard, ExecutionPhase, FairnessStrategy, InferenceScheduler,

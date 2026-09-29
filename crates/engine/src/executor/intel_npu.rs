@@ -9,7 +9,6 @@
 //! The engine re-uses the `openvino_llm_infer.py` script for execution and
 //! adds NPU-specific probing, auto-export, and device selection on top.
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -311,9 +310,9 @@ impl Engine for IntelNpuEngine {
             supported_modalities: vec![Modality::Text],
             supports_streaming: true,
             supports_quantized_models: true,
-            supports_embeddings: true,
-            supports_rerank: true,
-            supports_structured_output: true,
+            supports_embeddings: false,
+            supports_rerank: false,
+            supports_structured_output: false,
             max_context_tokens: None,
             supported_quant_methods: vec![
                 crate::core::quantization::QuantMethod::Int8,
@@ -508,46 +507,7 @@ impl LoadedModel for IntelNpuModel {
             command.arg("--seed").arg(seed.to_string());
         }
 
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::inherit());
-
-        tracing::info!(
-            "Starting Intel NPU inference on device={} model={}",
-            self.device,
-            self.model_path.display()
-        );
-
-        let mut child = command
-            .spawn()
-            .map_err(|e| anyhow!("failed to spawn Intel NPU inference process: {}", e))?;
-
-        // Stream stdout in real-time
-        if let Some(mut stdout) = child.stdout.take() {
-            let mut buffer = Vec::new();
-            let mut byte = [0u8; 1];
-
-            while stdout.read_exact(&mut byte).is_ok() {
-                buffer.push(byte[0]);
-                if let Ok(text) = std::str::from_utf8(&buffer) {
-                    sink.on_chunk(crate::io::OutputChunk::TextDelta(text.to_string()))?;
-                    buffer.clear();
-                }
-            }
-        }
-
-        let status = child
-            .wait()
-            .map_err(|e| anyhow!("failed to wait on Intel NPU inference process: {}", e))?;
-
-        sink.on_chunk(crate::io::OutputChunk::End)?;
-
-        if !status.success() {
-            return Err(anyhow!(
-                "Intel NPU inference process exited with error status"
-            ));
-        }
-
-        Ok(())
+        crate::core::process::stream_text_process(&mut command, sink)
     }
 }
 

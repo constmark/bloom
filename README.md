@@ -890,7 +890,8 @@ Public JSON schemas and examples live under `examples/`. Validate them with:
 | --- | --- |
 | `crates/core` | Shared types, manifests, scheduling, memory, world-state, and plugin contracts |
 | `crates/backend` | Device probing, backend traits, and backend registry helpers |
-| `crates/engine` | Model loading, inference engines, pipelines, native CLI tools, and CacheMesh |
+| `crates/engine` | Model loading, inference engines, pipelines, scheduling, and CacheMesh |
+| `crates/app` | Shared process configuration and native CLI tools |
 | `crates/server` | HTTP application layer, model lifecycle, protocol adapters, and optional UI embedding |
 | `crates/tilelang` | TileLang kernel compilation and loading |
 | `crates/ffi` | Pre-1.0 C ABI for native consumers |

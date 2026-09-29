@@ -1,4 +1,3 @@
-pub mod config;
 pub mod engine;
 pub mod io;
 pub mod manifest;
@@ -6,6 +5,7 @@ pub mod memory;
 pub mod model;
 pub mod parallelism;
 pub mod pipeline;
+pub(crate) mod process;
 pub mod quantization;
 pub mod security;
 pub mod telemetry;

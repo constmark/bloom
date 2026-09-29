@@ -8,7 +8,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bloomai_core::{
@@ -49,12 +48,15 @@ impl std::fmt::Display for LongCatProbeReport {
 }
 
 #[derive(Debug, Clone)]
+// Without Candle only package classification is available.
+#[cfg_attr(not(feature = "candle-engine"), allow(dead_code))]
 enum LongCatPackage {
     DiffusersSafetensors { weight_files: Vec<PathBuf> },
     GgufQuantized { weight_files: Vec<PathBuf> },
 }
 
 impl LongCatPackage {
+    #[cfg(any(feature = "candle-engine", test))]
     fn weight_files(&self) -> &[PathBuf] {
         match self {
             Self::DiffusersSafetensors { weight_files } | Self::GgufQuantized { weight_files } => {
@@ -63,6 +65,7 @@ impl LongCatPackage {
         }
     }
 
+    #[cfg(feature = "candle-engine")]
     fn format_label(&self) -> &'static str {
         match self {
             Self::DiffusersSafetensors { .. } => "diffusers-safetensors",
@@ -202,8 +205,8 @@ impl LongCatImageEditModel {
         ensure_safe_native_run(&self.model_path)?;
 
         let run_dir = make_run_dir()?;
-        let input_path = run_dir.join("input.png");
-        let output_path = run_dir.join("output.png");
+        let input_path = run_dir.path().join("input.png");
+        let output_path = run_dir.path().join("output.png");
         fs::write(&input_path, image).context("failed to write temporary LongCat input image")?;
 
         crate::core::security::validate_runner(runner)?;
@@ -751,19 +754,24 @@ fn candle_device_label(device: &candle_core::Device) -> String {
     }
 }
 
-fn make_run_dir() -> Result<PathBuf> {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let dir = std::env::temp_dir().join(format!("bloom-longcat-{stamp}"));
-    fs::create_dir_all(&dir)?;
-    Ok(dir)
+fn make_run_dir() -> Result<tempfile::TempDir> {
+    tempfile::Builder::new()
+        .prefix("bloom-longcat-")
+        .tempdir()
+        .context("failed to create private LongCat work directory")
 }
 
+#[cfg(feature = "candle-engine")]
 fn probe_tilelang_fallback() -> String {
-    set_gpu_tilelang_backend_if_unset();
-    let compiler = match bloomai_tilelang::TileLangCompiler::new() {
+    let backend = std::env::var("TILELANG_BACKEND").unwrap_or_else(|_| {
+        if cfg!(target_os = "macos") {
+            "mlx"
+        } else {
+            "cuda"
+        }
+        .to_string()
+    });
+    let compiler = match bloomai_tilelang::TileLangCompiler::with_backend(&backend) {
         Ok(c) => c,
         Err(e) => return format!("unavailable ({e})"),
     };
@@ -795,19 +803,6 @@ fn probe_tilelang_fallback() -> String {
             ok.join(", "),
             missing.join("; ")
         )
-    }
-}
-
-fn set_gpu_tilelang_backend_if_unset() {
-    if std::env::var_os("TILELANG_BACKEND").is_some() {
-        return;
-    }
-    if cfg!(target_os = "macos") {
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("TILELANG_BACKEND", "mlx") };
-    } else {
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("TILELANG_BACKEND", "cuda") };
     }
 }
 

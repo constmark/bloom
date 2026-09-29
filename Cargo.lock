@@ -237,6 +237,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloomai-app"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bloomai-core",
+ "bloomai-engine",
+ "candle-core",
+ "clap",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "bloomai-backend"
 version = "0.1.0"
 dependencies = [
@@ -286,7 +303,6 @@ dependencies = [
  "tokenizers 0.23.1",
  "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -309,10 +325,10 @@ dependencies = [
  "anyhow",
  "axum",
  "base64 0.22.1",
+ "bloomai-app",
  "bloomai-backend",
  "bloomai-core",
  "bloomai-engine",
- "candle-core",
  "clap",
  "ed25519-dalek",
  "futures",
@@ -342,6 +358,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "libloading 0.8.9",
+ "tempfile",
 ]
 
 [[package]]

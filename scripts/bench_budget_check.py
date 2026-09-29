@@ -19,7 +19,8 @@ Exit codes:
     0 = all metrics within budget (PASS)
     1 = at least one metric WARNed (within 5% over budget)
     2 = at least one metric FAILed (more than 5% over budget)
-    3 = could not classify hardware / missing fields / invalid JSON
+    3 = valid metrics, but hardware could not be classified
+    4 = missing or invalid benchmark data (always a CI failure)
 
 This script depends only on the Python standard library so it can run
 in CI without `pip install`.
@@ -28,7 +29,7 @@ in CI without `pip install`.
 from __future__ import annotations
 
 import json
-import re
+import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -75,28 +76,29 @@ def classify_hardware(hardware: dict[str, Any] | None) -> str | None:
     device = str(hardware.get("device", "")).lower()
     backend = str(hardware.get("backend", "")).lower()
     os_ = str(hardware.get("os", "")).lower()
+    arch = str(hardware.get("arch", "")).lower()
+
+    # Runtime selection takes precedence over a backend's possible devices.
+    # In particular, OpenVINO on CPU is not evidence of NPU execution, and
+    # an ARM CPU must never inherit x86 latency thresholds.
+    if device == "cpu":
+        if arch in {"x86", "x86_64", "amd64", "i686"}:
+            return "x86_cpu"
+        return None
 
     # Apple Silicon: macOS + metal/gpu
     if "macos" in os_ or "darwin" in os_:
-        if "metal" in backend or "gpu" in device or "metal" in device:
+        if arch in {"aarch64", "arm64"} and (
+            "metal" in backend or "gpu" in device or "metal" in device
+        ):
             return "apple_silicon"
-        elif "cpu" in device:
-            return "x86_cpu"
 
     # NVIDIA RTX: linux + cuda
     if "cuda" in backend or "nvidia" in device or "rtx" in device:
         return "nvidia_rtx"
 
     # Intel NPU: explicit npu device or openvino backend
-    if "npu" in device or "openvino" in backend or "intel-npu" in device:
-        return "intel_npu"
-
-    # x86 CPU fallback: linux + cpu
-    if "linux" in os_ and ("cpu" in device or "candle-cpu" in backend):
-        return "x86_cpu"
-
-    # Windows NPU
-    if "windows" in os_ and ("npu" in device or "openvino" in backend):
+    if "npu" in device:
         return "intel_npu"
 
     return None
@@ -130,12 +132,10 @@ def check_metric(
         PASS  — actual is within budget
         WARN  — actual exceeds budget by ≤ tolerance (5%)
         FAIL  — actual exceeds budget by > tolerance (5%)
-        SKIP  — actual or budget is missing
+        Invalid or missing measurements raise ValueError.
     """
-    if actual is None or budget is None:
-        return "SKIP", f"{name}: no data (actual={actual}, budget={budget})"
-    if not isinstance(actual, (int, float)) or not isinstance(budget, (int, float)):
-        return "SKIP", f"{name}: non-numeric (actual={actual!r}, budget={budget!r})"
+    validate_number(name, actual)
+    validate_number(f"{name} budget", budget, positive=True)
 
     if is_lower_better:
         ratio = actual / budget if budget > 0 else float("inf")
@@ -145,7 +145,13 @@ def check_metric(
     if ratio <= 1.0:
         return "PASS", f"{name}: {fmt_value(name, actual)} <= {fmt_value(name, budget)} budget"
     over = (ratio - 1.0) * 100
-    if over <= REGRESSION_TOLERANCE * 100:
+    # Compare values directly: ratio subtraction rounds exact 5% boundaries
+    # just above 5 for common integer budgets.
+    within_tolerance = (
+        actual <= budget * (1 + REGRESSION_TOLERANCE)
+        if is_lower_better else budget <= actual * (1 + REGRESSION_TOLERANCE)
+    )
+    if within_tolerance:
         return (
             "WARN",
             f"{name}: {fmt_value(name, actual)} > {fmt_value(name, budget)} budget "
@@ -168,58 +174,84 @@ def fmt_value(name: str, value: float | int | None) -> str:
     return str(value)
 
 
-def extract_metrics(bench: dict[str, Any]) -> dict[str, float | int | None]:
+def validate_number(name: str, value: Any, *, positive: bool = False) -> None:
+    try:
+        valid = (
+            not isinstance(value, bool)
+            and isinstance(value, (int, float))
+            and math.isfinite(value)
+            and (value > 0 if positive else value >= 0)
+        )
+    except OverflowError:
+        valid = False
+    if not valid:
+        bound = "positive" if positive else "non-negative"
+        raise ValueError(f"{name} must be a finite {bound} number")
+
+
+def extract_metrics(bench: dict[str, Any]) -> dict[str, float | int]:
     """Pull TTFT / TBT / Peak Memory out of a bloom_bench JSON object."""
-    ttft = bench.get("ttft_ms")
-    if ttft is None:
-        ttft = bench.get("avg_ttft_ms")
-        if isinstance(ttft, dict):
-            ttft = ttft.get("avg_ttft_ms")
-        elif bench.get("timing_breakdown"):
-            ttft = bench["timing_breakdown"].get("avg_ttft_ms")
-
-    tbt = bench.get("tbt_ms")
-    if tbt is None:
-        tbt = bench.get("avg_tbt_ms")
-        if isinstance(tbt, dict):
-            tbt = tbt.get("avg_tbt_ms")
-        elif bench.get("timing_breakdown"):
-            tbt = bench["timing_breakdown"].get("avg_tbt_ms")
-
+    timing = bench.get("timing_breakdown")
+    if timing is not None and not isinstance(timing, dict):
+        raise ValueError("timing_breakdown must be an object")
+    timing = timing or {}
+    metrics = {}
+    for name, average in (("ttft_ms", "avg_ttft_ms"), ("tbt_ms", "avg_tbt_ms")):
+        value = bench.get(name)
+        if value is None:
+            value = bench.get(average)
+        if value is None:
+            value = timing.get(average)
+        validate_number(name, value)
+        metrics[name] = value
     peak = bench.get("peak_memory_bytes")
-    if peak is None and bench.get("memory_breakdown"):
-        peak = bench["memory_breakdown"].get("total_bytes")
+    validate_number("peak_memory_bytes", peak, positive=True)
+    if not isinstance(peak, int):
+        raise ValueError("peak_memory_bytes must be an integer byte count")
+    metrics["peak_memory_bytes"] = peak
+    return metrics
 
-    # Coerce to numeric or None.
-    def _num(x: Any) -> float | int | None:
-        if isinstance(x, bool):
-            return None
-        if isinstance(x, (int, float)):
-            return x
-        return None
 
-    return {
-        "ttft_ms": _num(ttft),
-        "tbt_ms": _num(tbt),
-        "peak_memory_bytes": _num(peak),
-    }
+def validate_metadata(bench: Any) -> None:
+    if not isinstance(bench, dict):
+        raise ValueError("benchmark must be an object")
+    hardware = bench.get("hardware")
+    if not isinstance(hardware, dict):
+        raise ValueError("hardware must be an object")
+    for name in ("device", "backend", "os"):
+        if not isinstance(hardware.get(name), str) or not hardware[name].strip():
+            raise ValueError(f"hardware.{name} must be a non-empty string")
+    if "arch" in hardware and (
+        not isinstance(hardware["arch"], str) or not hardware["arch"].strip()
+    ):
+        raise ValueError("hardware.arch must be a non-empty string")
+    cache = bench.get("cache_metrics", {})
+    if not isinstance(cache, dict):
+        raise ValueError("cache_metrics must be an object")
+    if not isinstance(cache.get("enabled", False), bool):
+        raise ValueError("cache_metrics.enabled must be a boolean")
+    for name in ("hits", "misses", "evictions", "reuses"):
+        value = cache.get(name, 0)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"cache_metrics.{name} must be a non-negative integer")
+
+
+def reject_constant(value: str):
+    raise ValueError(f"non-finite JSON constant: {value}")
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) < 2 or argv[1] == "-":
-        raw = sys.stdin.read()
-    else:
-        path = Path(argv[1])
-        if not path.exists():
-            print(f"error: {path} does not exist", file=sys.stderr)
-            return 3
-        raw = path.read_text(encoding="utf-8")
-
     try:
-        bench = json.loads(raw)
-    except json.JSONDecodeError as e:
-        print(f"error: invalid JSON: {e}", file=sys.stderr)
-        return 3
+        if len(argv) < 2 or argv[1] == "-":
+            raw = sys.stdin.read()
+        else:
+            raw = Path(argv[1]).read_text(encoding="utf-8")
+        bench = json.loads(raw, parse_constant=reject_constant)
+        validate_metadata(bench)
+        metrics = extract_metrics(bench)
+    except (OSError, ValueError, RecursionError) as error:
+        print(f"error: invalid benchmark data: {error}", file=sys.stderr)
+        return 4
 
     tier = classify_hardware(bench.get("hardware"))
     if tier is None:
@@ -233,7 +265,6 @@ def main(argv: list[str]) -> int:
         return 3
 
     budget = BUDGETS[tier]
-    metrics = extract_metrics(bench)
 
     print(f"Hardware tier: {tier}")
     print(f"Budget: TTFT<={fmt_ms(budget['ttft_ms'])}, "

@@ -25,6 +25,7 @@ jobs:
           cache-dependency-path: |
             requirements/compat-smoke.txt
             requirements/schema-validation.txt
+            requirements/python-package.txt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install pinned official compatibility clients
         run: python -m pip install --disable-pip-version-check -r requirements/compat-smoke.txt
@@ -79,6 +80,12 @@ jobs:
           python3 scripts/test_generate_sbom.py
       - name: Check
         run: cargo check --workspace --all-targets --locked
+      - name: Check architecture boundaries
+        run: |
+          python3 scripts/check_architecture.py
+          python3 scripts/test_architecture.py
+          cargo check --workspace --all-targets --no-default-features --locked
+          cargo test -p bloomai-engine --no-default-features --lib batching::tests --locked
       - name: Clippy
         # -D warnings keeps CI strict; -A missing_docs opts out of the
         # documentation lint so it does not block PRs while docs catch up.
@@ -89,6 +96,14 @@ jobs:
         run: |
           cargo build -p bloomai-ffi --locked
           BLOOM_TEST_NATIVE_FFI=1 python3 -m unittest discover -s python/tests -v
+      - name: Test Python SDK distribution
+        run: |
+          python -m pip install --disable-pip-version-check -r requirements/python-package.txt
+          python scripts/test_python_package.py
+      - name: Test benchmark evidence gate
+        run: python3 scripts/test_bench_budget_check.py
+      - name: Test HTTP workload evidence collector
+        run: python3 scripts/test_http_workload.py
       - name: Check C and C++ header compatibility
         run: |
           cc -std=c11 -Wall -Wextra -Werror -fsyntax-only crates/ffi/tests/header_smoke.c
@@ -109,7 +124,17 @@ jobs:
       - name: Test pinned trained Qwen2 CPU runtime
         # Verifies immutable model and license hashes before real quantized
         # instruction following, benchmarking, and both HTTP adapters.
+        env:
+          BLOOM_TRAINED_HTTP_WORKLOAD_OUTPUT: ${{ runner.temp }}/bloom-qwen2-http-workload.json
         run: ./scripts/test_trained_qwen2_runtime.sh
+      - name: Upload pinned Qwen2 HTTP workload evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bloom-qwen2-http-workload
+          path: ${{ runner.temp }}/bloom-qwen2-http-workload.json
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Cache pinned trained Qwen3 model
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:

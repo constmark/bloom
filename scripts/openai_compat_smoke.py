@@ -1761,6 +1761,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--build", action="store_true", help="Build bloom_server before running.")
     parser.add_argument("--backend", default="candle")
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--enable-ifb", action="store_true", help="Exercise the engine-owned batch executor.")
     parser.add_argument("--max-tokens", type=int, default=8)
     parser.add_argument(
         "--semantic-system",
@@ -1875,6 +1876,8 @@ def main() -> int:
     ]
     if has_model:
         cmd.extend(["--model", str(model)])
+    if args.enable_ifb:
+        cmd.append("--enable-ifb")
     env = os.environ.copy()
     if args.api_key:
         env["BLOOM_API_KEY"] = args.api_key

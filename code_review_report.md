@@ -6,8 +6,9 @@
 > technical-debt indicators.
 >
 > **Current status:** Sections 1–5 preserve the original assessment. Sections
-> 6–8 record subsequent remediation; Section 8 is the current 2026-08-15
-> reassessment and remaining-risk list.
+> 6 onward record subsequent remediation. The latest review is the
+> [2026-09-29 project assessment](docs/project-assessment-2026-09.md), which
+> records current gaps, reproduced failures, fixes and verification limits.
 
 ## Executive Summary
 
@@ -545,3 +546,106 @@ surface area: publish one stable deployment cell, add a pinned trained vision
 model protocol gate, extend the Responses API to bounded image content when its
 state/usage contract can be preserved, publish Metal/CUDA target measurements,
 and continue decomposing the oversized server, UI, and executor modules.
+
+## 18. Layering Reassessment (2026-09-05)
+
+The crate graph was acyclic, but that alone did not establish complete layering.
+The engine still owned HTTP process configuration and all native CLI entry
+points, the server assembled Candle tensor callbacks and downcast model
+wrappers, and `--no-default-features` failed because tensor-backed scheduler
+modules were unconditional. FFI and server dependencies also inherited the
+engine's default feature, concealing that broken minimal build.
+
+Process configuration and the four CLI binaries now live in `bloomai-app`, above
+the engine and alongside the HTTP application. The engine owns batch executor
+assembly, per-request wrappers, device identity, KV hooks, and CUDA memory
+queries. HTTP owns admission and worker lifetime through typed engine contracts.
+Long-context policy is independent of the optional tensor implementation, and
+application/FFI feature forwarding is explicit. Configuration JSON and binary
+names are preserved; the Rust configuration import and package-qualified CLI
+paths change as recorded in the changelog.
+
+An architecture gate now checks every workspace crate, including the standalone
+UI, for dependency direction, implicit engine defaults, misplaced transport or
+CLI dependencies, and selected source-level tensor/configuration leaks. CI also
+compiles the entire native workspace without default features. The native tiny
+Qwen2 gate includes the IFB factory path in addition to buffered execution.
+That real-model gate exposed a pre-existing logits-shape mismatch: the HTTP
+assembly concatenated request rows, while prefill could treat a vocabulary
+vector as a sequence and sample a scalar. The engine factory now normalizes and
+stacks one vocabulary row per request, and prefill preserves its vocabulary
+axis. Regression tests cover both native output layouts and separate request
+rows during prefill and decode.
+
+The remaining decomposition work is inside existing layers: server application
+services and HTTP handlers still share root state, `LoadedModel` has optional
+Candle extension methods, and core includes executable resource/scheduling
+policies. These are explicit limits to the claim of a completely separated
+architecture. The current change closes concrete cross-layer ownership and
+build failures without adding a new runtime abstraction around every module.
+
+Validation passed: 913 native workspace tests, seven architecture regression
+tests, strict workspace Clippy, all-target builds without default features and
+with the server's embedded-UI feature, the no-Candle factory rejection test,
+tiny-Qwen2 CPU protocol tests including IFB, live HTTP and shutdown boundaries,
+and compilation of all seven exact crate archives. The runtime gate also fixes
+macOS Bash 3.2 empty-array expansion and explicitly configures Ollama's separate
+body limit before testing its 413 response. CUDA/Metal hardware execution was
+not exercised in this review.
+
+
+## 19. Runtime Application and Model Capability Separation (2026-09-06)
+
+This follow-up closes the two ownership seams recorded in section 18. The
+server now has an explicit `application` module for runtime admission, loading,
+publication, retirement, memory planning, cancellation and scheduler workers.
+Its imports point to engine contracts and model infrastructure. `RuntimeConfig`
+contains resolved values; CLI parsing and environment/config merging stay in
+entry points. Backend registration and selection are shared by loader and
+preflight without importing the composition root.
+
+`ServerState` is a 50-line transport module holding credentials, protocol limits,
+request IDs, Responses storage, Ollama residency policy and an explicit
+`Arc<RuntimeService>`. The runtime service privately owns its lifecycle,
+draining-generation registry and catalog cache. A constructor initializes this
+state consistently. Model unload is one typed transaction used by HTTP requests
+and Ollama expiry timers; timers no longer invoke handlers or decode HTTP
+responses. `CancellationRegistry` privately owns request registration and
+scheduler cancellation. Existing request leases, late-worker draining,
+exact-generation identity and memory/shutdown ordering are preserved.
+
+The general `LoadedModel`, pipeline and batch factory contain no Candle types,
+tokenizer handles or erased model-wrapper downcasts. A model optionally exposes the neutral
+`batching::BatchModel` capability and exact tokenization. An encoding failure
+propagates instead of using approximate counts. The factory validates cache
+layout and physical device, dispatches to the adapter, and retains the pipeline
+and its backend lease until executor teardown. Candle wrapper construction,
+vocabulary, device identity and KV hooks live under `executor/candle`. Draft
+decoding uses a private typed Candle forward port and the model's device instead
+of opening another GPU device for each proposal. These Rust API changes are
+recorded in the changelog; the general `Engine::load` signature is preserved.
+
+The architecture gate now rejects HTTP/CLI/root dependencies inside application
+services and backend implementation details in the generic model contracts.
+It still checks all workspace crates and explicit feature ownership.
+
+Validation: 915 workspace tests, 10 architecture regression tests, strict
+workspace Clippy, all-target no-default-features and embedded-UI builds, four
+no-Candle batch capability tests, the live HTTP/shutdown boundaries and all
+seven exact crate archives passed. The capability tests also exercise a portable
+adapter, exact tokenizer error propagation, rejected unknown/mismatched devices,
+and pipeline lifetime through batch executor teardown. The existing
+client-disconnect/worker-drain integration test was rerun after final cleanup.
+
+The CPU fixture gate passed with required OpenAI and Ollama client checks.
+The available package indexes did not provide the repository-pinned
+`openai==2.52.0`; the isolated verification environment uses OpenAI 2.48.0 and
+Ollama 0.6.2, without changing repository requirements. The exact OpenAI 2.52.0
+cell and GPU hardware execution remain unverified.
+
+Remaining work is within the established layers: the HTTP DTOs, handlers and
+response helpers remain large, with some root wildcard imports; model-management
+infrastructure still lives in the server crate. Runtime-pool queries and metrics
+are shared with protocol adapters. These are opportunities for narrower APIs and
+protocol-specific modules, not a reason to recreate process or backend
+dependencies in the extracted services.

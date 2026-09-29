@@ -156,7 +156,7 @@ async fn execute_embedding_batch_inner(
     truncate_inputs: bool,
     projection: EmbeddingProjection,
 ) -> std::result::Result<EmbeddingBatchResult, EmbeddingExecutionError> {
-    if !state.ready.load(Ordering::Acquire) {
+    if !state.app.ready.load(Ordering::Acquire) {
         let (error_type, message) = state.model_unavailable().await;
         return Err(EmbeddingExecutionError::new(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -166,14 +166,14 @@ async fn execute_embedding_batch_inner(
     }
 
     let runtime_lease = match exact_runtime {
-        Some(runtime) if state.runtime_is_revoked(&runtime) => {
+        Some(runtime) if state.app.runtime_is_revoked(&runtime) => {
             return Err(EmbeddingExecutionError::new(
                 axum::http::StatusCode::GONE,
                 "model_version_revoked",
                 "The loaded signed-index model version has been permanently revoked. Install a replacement with a different digest before retrying.",
             ));
         }
-        Some(runtime) => match state.lease_exact_runtime(&runtime).await {
+        Some(runtime) => match state.app.lease_exact_runtime(&runtime).await {
             Some(runtime_lease) => runtime_lease,
             None => {
                 return Err(EmbeddingExecutionError::new(
@@ -183,7 +183,7 @@ async fn execute_embedding_batch_inner(
                 ));
             }
         },
-        None => match state.lease_runtime(requested_model.as_deref()).await {
+        None => match state.app.lease_runtime(requested_model.as_deref()).await {
             Ok(Some(runtime_lease)) => runtime_lease,
             Ok(None) => {
                 let (error_type, message) = state.model_unavailable().await;
@@ -236,7 +236,7 @@ async fn execute_embedding_batch_inner(
                 message,
             )
         })?;
-    let permit = Arc::clone(&state.semaphore)
+    let permit = Arc::clone(&state.app.semaphore)
         .try_acquire_owned()
         .map_err(|_| {
             EmbeddingExecutionError::new(
@@ -246,11 +246,11 @@ async fn execute_embedding_batch_inner(
             )
         })?;
 
-    state.metrics.record_request_start();
+    state.app.metrics.record_request_start();
     let request_start = Instant::now();
     let request_id = next_request_id(&state, "embed");
-    let Some(cancel_guard) = CancelTokenGuard::register(&state, request_id, None) else {
-        state.metrics.record_request_end(
+    let Some(cancel_guard) = state.app.cancellations.register(request_id, None) else {
+        state.app.metrics.record_request_end(
             false,
             request_start.elapsed().as_secs_f64(),
             0,
@@ -266,7 +266,7 @@ async fn execute_embedding_batch_inner(
     let lifecycle = InferenceLifecycle::new(
         cancel_guard,
         InferenceLifecycleResources {
-            metrics: Arc::clone(&state.metrics),
+            metrics: Arc::clone(&state.app.metrics),
             request_start,
             generated_tokens: Arc::new(AtomicU64::new(0)),
             prompt_tokens: u64::try_from(prompt_tokens).unwrap_or(u64::MAX),
@@ -351,6 +351,7 @@ async fn execute_embedding_batch_inner(
     })
     .await;
     state
+        .app
         .metrics
         .record_inference_latency(inference_started.elapsed().as_secs_f64());
 

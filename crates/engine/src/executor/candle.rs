@@ -1,3 +1,5 @@
+mod batching;
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -390,6 +392,24 @@ impl Engine for CandleEngine {
     }
 
     fn load(&self, model_path: &Path, device_kind: DeviceKind) -> Result<Box<dyn LoadedModel>> {
+        Ok(Box::new(self.load_text_model(model_path, device_kind)?))
+    }
+}
+
+impl CandleEngine {
+    pub(crate) fn load_draft_model(
+        &self,
+        model_path: &Path,
+        device_kind: DeviceKind,
+    ) -> Result<Box<dyn CandleForwardModel>> {
+        Ok(Box::new(self.load_text_model(model_path, device_kind)?))
+    }
+
+    fn load_text_model(
+        &self,
+        model_path: &Path,
+        device_kind: DeviceKind,
+    ) -> Result<CandleTextModel> {
         // If model_path is a single GGUF file, use its parent directory.
         let mut gguf_file_path = None;
         let model_path_buf;
@@ -649,7 +669,7 @@ impl Engine for CandleEngine {
         finalize_loading_verification(&model.model, verification)?;
         tracing::info!("Model loading verification passed (dummy forward pass OK)");
 
-        Ok(Box::new(model))
+        Ok(model)
     }
 }
 
@@ -1905,19 +1925,21 @@ impl CandleTextModel {
     }
 }
 
-impl LoadedModel for CandleTextModel {
-    fn actual_device(&self) -> Option<DeviceKind> {
-        Some(if self.device.is_cpu() {
-            DeviceKind::Cpu
-        } else {
-            DeviceKind::Gpu
-        })
-    }
+/// Candle-only forward port used by speculative decoding. It deliberately does
+/// not extend the general loaded-model contract with tensors or device handles.
+pub(crate) trait CandleForwardModel: Send + Sync {
+    fn device(&self) -> &Device;
+    fn clear_kv_cache(&self);
+    fn forward(&self, input_ids: &Tensor, start_pos: usize) -> Result<Tensor>;
+}
 
-    fn candle_device(&self) -> Option<Device> {
-        Some(self.device.clone())
+impl CandleForwardModel for CandleTextModel {
+    fn device(&self) -> &Device {
+        &self.device
     }
-
+    fn clear_kv_cache(&self) {
+        LoadedModel::clear_kv_cache(self);
+    }
     fn forward(
         &self,
         input_ids: &candle_core::Tensor,
@@ -1933,10 +1955,31 @@ impl LoadedModel for CandleTextModel {
             .ok_or_else(|| anyhow!("model reload produced no model"))?;
         model.forward(input_ids, start_pos)
     }
+}
 
-    fn create_wrapper(&self) -> Result<Box<dyn std::any::Any + Send + Sync>> {
-        let wrapper = self.reload()?;
-        Ok(Box::new(wrapper))
+impl crate::batching::BatchModel for CandleTextModel {
+    fn build_executor(
+        self: Arc<Self>,
+        kv_pool: Arc<crate::BloomKvCachePool>,
+        cachemesh: Option<Arc<crate::CacheMesh>>,
+        config: crate::batching::BatchExecutorConfig,
+    ) -> Result<Arc<dyn crate::EngineExecutor>> {
+        config.validate(&kv_pool)?;
+        batching::build(self, kv_pool, cachemesh, config)
+    }
+}
+
+impl LoadedModel for CandleTextModel {
+    fn actual_device(&self) -> Option<DeviceKind> {
+        Some(if self.device.is_cpu() {
+            DeviceKind::Cpu
+        } else {
+            DeviceKind::Gpu
+        })
+    }
+
+    fn batch_model(self: Arc<Self>) -> Option<Arc<dyn crate::batching::BatchModel>> {
+        Some(self)
     }
 
     fn release_idle_weights(&self) {
@@ -1975,18 +2018,6 @@ impl LoadedModel for CandleTextModel {
         }
     }
 
-    fn supports_paged_kv(&self) -> bool {
-        self.uses_streaming_variant()
-    }
-
-    fn vocab_strings(&self) -> &[String] {
-        &self.vocab_strings
-    }
-
-    fn eos_token_ids(&self) -> &[u32] {
-        &self.eos_token_ids
-    }
-
     fn metadata(&self) -> &ModelMetadata {
         &self.metadata
     }
@@ -2003,9 +2034,13 @@ impl LoadedModel for CandleTextModel {
         Some(&self.processors)
     }
 
-    #[cfg(feature = "candle-engine")]
-    fn tokenizer(&self) -> Option<&tokenizers::Tokenizer> {
-        Some(&self.tokenizer)
+    fn tokenize(&self, text: &str) -> Option<Result<Vec<u32>>> {
+        Some(
+            self.tokenizer
+                .encode(text, self.model_type == ModelType::Bert)
+                .map(|encoding| encoding.get_ids().to_vec())
+                .map_err(|error| anyhow!("failed to tokenize input: {error}")),
+        )
     }
 
     fn infer(&self, input: ModelInput, params: &GenerationParams) -> Result<ModelOutput> {
@@ -3242,7 +3277,7 @@ pub(crate) fn filter_logits_by_grammar(
         .map_err(Into::into)
 }
 
-pub struct ServerKvHook {
+pub struct CandleKvHook {
     request_models: Arc<Mutex<std::collections::HashMap<usize, Arc<Mutex<QwenModelWrapper>>>>>,
     num_layers: usize,
     num_kv_heads: usize,
@@ -3250,7 +3285,7 @@ pub struct ServerKvHook {
     kv_dim: usize,
 }
 
-impl ServerKvHook {
+impl CandleKvHook {
     pub fn new(
         request_models: Arc<Mutex<std::collections::HashMap<usize, Arc<Mutex<QwenModelWrapper>>>>>,
         num_layers: usize,
@@ -3267,7 +3302,7 @@ impl ServerKvHook {
     }
 }
 
-impl crate::scheduler::kv_hook::KvHook for ServerKvHook {
+impl crate::scheduler::kv_hook::KvHook for CandleKvHook {
     fn num_layers(&self) -> usize {
         self.num_layers
     }

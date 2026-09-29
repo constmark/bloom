@@ -697,6 +697,7 @@ fn classify_chat_template(template: &str) -> Option<&'static str> {
 /// not a model-level quantization signal, so use the dtype covering the most
 /// transformer weight elements and keep deterministic fallbacks for unusual
 /// layouts.
+#[cfg(any(feature = "candle-engine", test))]
 pub(crate) fn select_primary_gguf_dtype<'a>(
     tensors: impl IntoIterator<Item = (&'a str, String, usize)>,
 ) -> String {
@@ -912,11 +913,11 @@ pub fn load_manifest(model_path: &Path) -> Result<ModelManifest> {
         let content = fs::read_to_string(model_path.join("config.json"))?;
         let config: serde_json::Value = serde_json::from_str(&content)?;
         infer_from_hf_config(model_path, config)?
-    } else if let Some(gguf) = find_gguf_in_dir(model_path)? {
+    } else if let Some(_gguf) = find_gguf_in_dir(model_path)? {
         // GGUF-only directory (no config.json / bloom.json).
         #[cfg(feature = "candle-engine")]
         {
-            infer_from_gguf(model_path, &gguf)?
+            infer_from_gguf(model_path, &_gguf)?
         }
         #[cfg(not(feature = "candle-engine"))]
         {
@@ -1408,11 +1409,11 @@ fn infer_from_hf_config(model_path: &Path, config: serde_json::Value) -> Result<
     // weight artifact; never leave the manifest with zero accounted files or
     // trust config.json's unquantized torch_dtype instead.
     if manifest.files.is_empty()
-        && let Some(gguf_path) = find_gguf_in_dir(model_path)?
+        && let Some(_gguf_path) = find_gguf_in_dir(model_path)?
     {
         #[cfg(feature = "candle-engine")]
         {
-            let gguf_manifest = infer_from_gguf(model_path, &gguf_path)?;
+            let gguf_manifest = infer_from_gguf(model_path, &_gguf_path)?;
             manifest.family = gguf_manifest.family;
             manifest.primary_dtype = gguf_manifest.primary_dtype;
             manifest.quantization = gguf_manifest.quantization;
@@ -4087,6 +4088,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "candle-engine")]
     fn test_infer_from_gguf_unsupported_arch() {
         let dir = tempfile::tempdir().unwrap();
         let gguf_path = dir.path().join("unsupported_arch.gguf");
@@ -4109,6 +4111,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "candle-engine")]
     fn test_infer_from_gguf_unsupported_quant() {
         let dir = tempfile::tempdir().unwrap();
         let gguf_path = dir.path().join("unsupported_quant.gguf");
@@ -4128,6 +4131,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "candle-engine")]
     fn test_infer_from_gguf_accepts_candle_supported_q4_1() {
         let dir = tempfile::tempdir().unwrap();
         let gguf_path = dir.path().join("supported-q4_1.gguf");
@@ -4142,6 +4146,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "candle-engine")]
     fn create_mock_gguf_bytes(arch: &str, _quant_name: &str, ggml_dtype_id: u32) -> Vec<u8> {
         let mut buf = Vec::new();
         // Magic
@@ -4184,18 +4189,21 @@ mod tests {
         buf
     }
 
+    #[cfg(feature = "candle-engine")]
     fn write_string(buf: &mut Vec<u8>, s: &str) {
         let len = s.len() as u64;
         buf.extend_from_slice(&len.to_le_bytes());
         buf.extend_from_slice(s.as_bytes());
     }
 
+    #[cfg(feature = "candle-engine")]
     fn write_kv_string(buf: &mut Vec<u8>, key: &str, val: &str) {
         write_string(buf, key);
         buf.extend_from_slice(&8u32.to_le_bytes());
         write_string(buf, val);
     }
 
+    #[cfg(feature = "candle-engine")]
     fn write_kv_u64(buf: &mut Vec<u8>, key: &str, val: u64) {
         write_string(buf, key);
         buf.extend_from_slice(&10u32.to_le_bytes());

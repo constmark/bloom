@@ -309,6 +309,27 @@ python3 "${WORKSPACE_DIR}/scripts/ollama_compat_smoke.py" \
     --require-model \
     > "$OLLAMA_JSON"
 
+# Qwen2 Q4_0 is the first candidate CPU deployment cell. Keep this short CI
+# workload separate from the multi-hour operator soak required for promotion.
+if [ "$MODEL_PROFILE" = "qwen2" ]; then
+    HTTP_WORKLOAD_JSON="${BLOOM_TRAINED_HTTP_WORKLOAD_OUTPUT:-${RUN_DIR}/http-workload.json}"
+    echo "Running pinned Qwen2 HTTP concurrency and disconnect workload..." >&2
+    python3 "${WORKSPACE_DIR}/scripts/http_workload.py" \
+        --server-bin "$SERVER_BIN" \
+        --model "$MODEL_PATH" \
+        --expected-model-sha256 "$MODEL_SHA256" \
+        --output "$HTTP_WORKLOAD_JSON" \
+        --concurrency 1,2,4 \
+        --duration-seconds 0 \
+        --max-requests 7 \
+        --max-tokens "$MAX_TOKENS" \
+        --warmup 1 \
+        --disconnects 1 \
+        --startup-timeout 180 \
+        --request-timeout 180
+    cat "$HTTP_WORKLOAD_JSON"
+fi
+
 python3 - "$BENCHMARK_JSON" "$OPENAI_JSON" "$OLLAMA_JSON" \
     "$MODEL_REPOSITORY" "$MODEL_REVISION" "$MODEL_FILENAME" "$MODEL_SHA256" \
     "$MODEL_LICENSE" "$SEMANTIC_EXPECTED" "$EXPECTED_DTYPE" "$MODEL_LAYOUT" \

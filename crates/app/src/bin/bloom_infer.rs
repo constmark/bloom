@@ -19,6 +19,7 @@ use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 use tracing_subscriber::EnvFilter;
 
+#[cfg(feature = "candle-engine")]
 use bloomai_engine::executor::candle::CandleEngine;
 use bloomai_engine::executor::coreml::CoreMlEngine;
 use bloomai_engine::executor::funasr::FunASREngine;
@@ -31,6 +32,7 @@ use bloomai_engine::executor::onnx::OnnxRuntimeEngine;
 use bloomai_engine::executor::openvino::OpenVINOEngine;
 use bloomai_engine::executor::vulkan::VulkanEngine;
 
+#[cfg(feature = "candle-engine")]
 use bloomai_engine::executor::qwen3_vl::Qwen3VLEngine;
 #[cfg(feature = "candle-engine")]
 use bloomai_engine::executor::wan::WanEngine;
@@ -319,7 +321,7 @@ fn parse_args() -> Result<(Args, ArgMatches)> {
     Ok((args, matches))
 }
 
-fn apply_config(args: &mut Args, matches: &ArgMatches, config: &bloomai_engine::InferConfig) {
+fn apply_config(args: &mut Args, matches: &ArgMatches, config: &bloomai_app::InferConfig) {
     apply_config_option!(args, matches, config, model);
     apply_config_value!(args, matches, config, prompt);
     apply_config_option!(args, matches, config, prompt_file);
@@ -654,9 +656,11 @@ fn resolve_model_path_arg(model: &std::path::Path) -> Result<PathBuf> {
 
 fn build_engine_registry() -> EngineRegistry {
     let mut registry = EngineRegistry::default();
+    #[cfg(feature = "candle-engine")]
     registry.register("candle", Box::new(CandleEngine));
     registry.register("openvino", Box::new(OpenVINOEngine));
     registry.register("funasr", Box::new(FunASREngine));
+    #[cfg(feature = "candle-engine")]
     registry.register("qwen3_vl", Box::new(Qwen3VLEngine));
     registry.register("longcat", Box::new(LongCatImageEditEngine));
     registry.register("intel-npu", Box::new(IntelNpuEngine));
@@ -717,13 +721,13 @@ fn main() -> Result<()> {
         .init();
 
     let (mut args, matches) = parse_args()?;
-    let config_path = bloomai_engine::resolve_config_path(args.config.as_deref())?;
+    let config_path = bloomai_app::resolve_config_path(args.config.as_deref())?;
     if args.init_config {
-        bloomai_engine::write_default_config(&config_path)?;
+        bloomai_app::write_default_config(&config_path)?;
         println!("Wrote Bloom config to {}", config_path.display());
         return Ok(());
     }
-    let config = bloomai_engine::load_config(&config_path)?;
+    let config = bloomai_app::load_config(&config_path)?;
     apply_config(&mut args, &matches, &config.infer);
     configure_process_environment(&args);
 

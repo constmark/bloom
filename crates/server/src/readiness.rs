@@ -40,16 +40,16 @@ struct ReadinessSnapshot<'a> {
 pub(crate) async fn handle_ready(
     State(state): State<Arc<ServerState>>,
 ) -> axum::response::Response {
-    let in_flight = state.metrics.in_flight_requests.load(Ordering::Relaxed);
-    let available_permits = state.semaphore.available_permits();
+    let in_flight = state.app.metrics.in_flight_requests.load(Ordering::Relaxed);
+    let available_permits = state.app.semaphore.available_permits();
     let mut memory = bloomai_engine::MemoryTelemetry::new();
     memory.refresh_ram();
     let memory_pressure_high = memory.is_high_pressure();
-    let runtime = state.runtime_pool.read().await.default_runtime();
-    let ready = state.ready.load(Ordering::Acquire)
+    let runtime = state.app.runtime_pool.read().await.default_runtime();
+    let ready = state.app.ready.load(Ordering::Acquire)
         && runtime
             .as_ref()
-            .is_none_or(|runtime| !state.runtime_is_revoked(runtime))
+            .is_none_or(|runtime| !state.app.runtime_is_revoked(runtime))
         && available_permits > 0
         && !memory_pressure_high;
     let model = runtime
@@ -73,7 +73,7 @@ pub(crate) async fn handle_ready(
     let context_window = runtime
         .as_ref()
         .map(|runtime| runtime.pipeline.context_size() as u64);
-    let load_failed = state.load_error.read().await.is_some();
+    let load_failed = state.app.load_error.read().await.is_some();
     let body = ReadinessSnapshot {
         schema_version: READINESS_SCHEMA_VERSION,
         object: READINESS_OBJECT,
@@ -82,9 +82,9 @@ pub(crate) async fn handle_ready(
         maximum_ui_protocol_version: MAXIMUM_UI_PROTOCOL_VERSION,
         server_version: env!("CARGO_PKG_VERSION"),
         status: if ready { "ready" } else { "not_ready" },
-        progress: state.load_progress.load(Ordering::Relaxed),
+        progress: state.app.load_progress.load(Ordering::Relaxed),
         model,
-        loading: state.load_in_progress.load(Ordering::Relaxed),
+        loading: state.app.load_in_progress.load(Ordering::Relaxed),
         load_error: load_failed.then_some(
             "Model load failed. See the authenticated model-management endpoint for details.",
         ),

@@ -461,7 +461,8 @@ impl LoadedModel for NpuTtsModel {
         command.arg("--speed").arg(speed.to_string());
 
         // Use a temporary output file to get PCM samples back
-        let temp_wav = std::env::temp_dir().join(format!("bloom_tts_{}.wav", std::process::id()));
+        let work_dir = tempfile::Builder::new().prefix("bloom-tts-").tempdir()?;
+        let temp_wav = work_dir.path().join("output.wav");
         command.arg("--output").arg(&temp_wav);
 
         command.stdout(Stdio::piped());
@@ -480,16 +481,11 @@ impl LoadedModel for NpuTtsModel {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            // Clean up temp file
-            let _ = std::fs::remove_file(&temp_wav);
             return Err(anyhow!("TTS inference failed: {}", stderr));
         }
 
         // Read the WAV output and convert to PCM float samples
         let (samples, sample_rate) = read_wav_to_pcm(&temp_wav)?;
-
-        // Clean up temp file
-        let _ = std::fs::remove_file(&temp_wav);
 
         if samples.is_empty() {
             return Err(anyhow!("TTS inference produced no audio output"));
@@ -524,10 +520,14 @@ impl LoadedModel for NpuTtsModel {
             sink.on_chunk(crate::io::OutputChunk::TextDelta(text))?;
         }
 
-        if let Some((samples, _sample_rate)) = output.audio {
-            // Emit audio in chunks of ~1000 samples for efficiency
-            for chunk in samples.chunks(1000) {
-                sink.on_chunk(crate::io::OutputChunk::AudioDelta(chunk.to_vec()))?;
+        if let Some((samples, sample_rate)) = output.audio {
+            let mut chunks = samples.chunks(1000).peekable();
+            while let Some(chunk) = chunks.next() {
+                sink.on_chunk(crate::io::OutputChunk::TtsAudioChunk {
+                    samples: chunk.to_vec(),
+                    sample_rate,
+                    is_final: chunks.peek().is_none(),
+                })?;
             }
         }
 
@@ -542,88 +542,126 @@ impl LoadedModel for NpuTtsModel {
 
 /// Read a WAV file and return PCM float samples and sample rate.
 fn read_wav_to_pcm(path: &Path) -> Result<(Vec<f32>, u32)> {
-    if !path.exists() {
-        return Ok((Vec::new(), 22050));
-    }
+    use std::io::Read;
+    const MAX_WAV_BYTES: u64 = 64 * 1024 * 1024;
+    let mut data = Vec::new();
+    std::fs::File::open(path)?
+        .take(MAX_WAV_BYTES + 1)
+        .read_to_end(&mut data)?;
+    anyhow::ensure!(
+        data.len() as u64 <= MAX_WAV_BYTES,
+        "TTS WAV output exceeds 64 MiB"
+    );
+    decode_wav(&data)
+}
 
-    let data = std::fs::read(path)
-        .map_err(|e| anyhow!("failed to read WAV file {}: {}", path.display(), e))?;
-
-    if data.len() < 44 {
-        return Err(anyhow!("WAV file too small: {} bytes", data.len()));
-    }
-
-    // Parse WAV header
-    let num_channels = u16::from_le_bytes([data[22], data[23]]) as usize;
-    let sample_rate = u32::from_le_bytes([data[24], data[25], data[26], data[27]]);
-    let bits_per_sample = u16::from_le_bytes([data[34], data[35]]) as usize;
-
-    // Find data chunk
-    let mut pos = 12;
-    let mut data_start = 0;
-    let mut data_size = 0;
-
-    while pos + 8 <= data.len() {
-        let chunk_id = &data[pos..pos + 4];
-        let chunk_size =
-            u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
-                as usize;
-
-        if chunk_id == b"data" {
-            data_start = pos + 8;
-            data_size = chunk_size;
-            break;
-        }
-
-        pos += 8 + chunk_size;
-        // Chunks are 2-byte aligned
-        if !chunk_size.is_multiple_of(2) {
-            pos += 1;
-        }
-    }
-
-    if data_start == 0 || data_start + data_size > data.len() {
-        return Err(anyhow!("invalid WAV file structure"));
-    }
-
-    let bytes_per_sample = bits_per_sample / 8;
-    let total_samples = data_size / bytes_per_sample;
-    let mut samples = Vec::with_capacity(total_samples / num_channels.max(1));
-
-    match bits_per_sample {
-        16 => {
-            for i in (0..data_size).step_by(2 * num_channels) {
-                if i + 1 < data_size {
-                    let sample =
-                        i16::from_le_bytes([data[data_start + i], data[data_start + i + 1]]);
-                    samples.push(sample as f32 / 32768.0);
-                }
+fn decode_wav(data: &[u8]) -> Result<(Vec<f32>, u32)> {
+    anyhow::ensure!(
+        data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WAVE",
+        "invalid RIFF/WAVE header"
+    );
+    let u16_at =
+        |bytes: &[u8], offset: usize| u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
+    let u32_at = |bytes: &[u8], offset: usize| {
+        u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ])
+    };
+    let end = (u32_at(data, 4) as usize)
+        .checked_add(8)
+        .ok_or_else(|| anyhow!("WAV RIFF size overflow"))?;
+    anyhow::ensure!(
+        end >= 12 && end <= data.len(),
+        "truncated WAV RIFF container"
+    );
+    let mut format = None;
+    let mut pcm = None;
+    let mut pos = 12usize;
+    while pos < end {
+        anyhow::ensure!(end - pos >= 8, "truncated WAV chunk header");
+        let size = u32_at(data, pos + 4) as usize;
+        let start = pos + 8;
+        let chunk_end = start
+            .checked_add(size)
+            .ok_or_else(|| anyhow!("WAV chunk size overflow"))?;
+        anyhow::ensure!(chunk_end <= end, "truncated WAV chunk");
+        let chunk = &data[start..chunk_end];
+        match &data[pos..pos + 4] {
+            b"fmt " => {
+                anyhow::ensure!(
+                    format.is_none() && size >= 16,
+                    "invalid or duplicate WAV format"
+                );
+                format = Some((
+                    u16_at(chunk, 0),
+                    u16_at(chunk, 2) as usize,
+                    u32_at(chunk, 4),
+                    u32_at(chunk, 8),
+                    u16_at(chunk, 12) as usize,
+                    u16_at(chunk, 14),
+                ));
             }
-        }
-        32 => {
-            for i in (0..data_size).step_by(4 * num_channels) {
-                if i + 3 < data_size {
-                    let sample = f32::from_le_bytes([
-                        data[data_start + i],
-                        data[data_start + i + 1],
-                        data[data_start + i + 2],
-                        data[data_start + i + 3],
-                    ]);
-                    samples.push(sample);
-                }
+            b"data" => {
+                anyhow::ensure!(pcm.is_none(), "duplicate WAV data chunk");
+                pcm = Some(chunk);
             }
+            _ => {}
         }
-        8 => {
-            for i in (0..data_size).step_by(num_channels) {
-                if data_start + i < data.len() {
-                    let sample = (data[data_start + i] as f32 - 128.0) / 128.0;
-                    samples.push(sample);
-                }
-            }
-        }
-        _ => return Err(anyhow!("unsupported WAV bit depth: {}", bits_per_sample)),
+        pos = chunk_end
+            .checked_add(size % 2)
+            .ok_or_else(|| anyhow!("WAV padding overflow"))?;
+        anyhow::ensure!(pos <= end, "missing WAV chunk padding");
     }
-
+    let (encoding, channels, sample_rate, byte_rate, block_align, bits) =
+        format.ok_or_else(|| anyhow!("WAV format chunk is missing"))?;
+    anyhow::ensure!(
+        channels > 0 && sample_rate > 0,
+        "WAV channels and sample rate must be positive"
+    );
+    anyhow::ensure!(
+        matches!((encoding, bits), (1, 8 | 16 | 24 | 32) | (3, 32)),
+        "unsupported WAV encoding {encoding}/{bits}"
+    );
+    let bytes_per_sample = bits as usize / 8;
+    let frame_bytes = channels
+        .checked_mul(bytes_per_sample)
+        .ok_or_else(|| anyhow!("WAV frame size overflow"))?;
+    anyhow::ensure!(
+        block_align == frame_bytes
+            && u64::from(byte_rate) == u64::from(sample_rate) * frame_bytes as u64,
+        "inconsistent WAV frame or byte rate"
+    );
+    let pcm = pcm.ok_or_else(|| anyhow!("WAV data chunk is missing"))?;
+    anyhow::ensure!(
+        pcm.len().is_multiple_of(frame_bytes),
+        "incomplete WAV sample frame"
+    );
+    let mut samples = Vec::with_capacity(pcm.len() / frame_bytes);
+    for frame in pcm.chunks_exact(frame_bytes) {
+        let mut sum = 0.0f64;
+        for sample in frame.chunks_exact(bytes_per_sample) {
+            let value = match (encoding, bits) {
+                (1, 8) => (sample[0] as f64 - 128.0) / 128.0,
+                (1, 16) => i16::from_le_bytes([sample[0], sample[1]]) as f64 / 32768.0,
+                (1, 24) => {
+                    ((i32::from_le_bytes([sample[0], sample[1], sample[2], 0]) << 8) >> 8) as f64
+                        / 8388608.0
+                }
+                (1, 32) => {
+                    i32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]) as f64
+                        / 2147483648.0
+                }
+                (3, 32) => f32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]) as f64,
+                _ => unreachable!("encoding validated above"),
+            };
+            anyhow::ensure!(value.is_finite(), "WAV contains non-finite samples");
+            sum += value;
+        }
+        samples.push((sum / channels as f64) as f32);
+    }
     Ok((samples, sample_rate))
 }
 
@@ -705,9 +743,8 @@ mod tests {
 
     #[test]
     fn test_read_wav_to_pcm_nonexistent() {
-        let (samples, sr) = read_wav_to_pcm(Path::new("/tmp/nonexistent.wav")).unwrap();
-        assert!(samples.is_empty());
-        assert_eq!(sr, 22050);
+        let dir = tempdir().unwrap();
+        assert!(read_wav_to_pcm(&dir.path().join("missing.wav")).is_err());
     }
 
     #[test]
@@ -746,13 +783,39 @@ mod tests {
             wav_data.extend_from_slice(&s.to_le_bytes());
         }
 
-        std::fs::write(&wav_path, wav_data).unwrap();
+        std::fs::write(&wav_path, &wav_data).unwrap();
 
         let (pcm, sr) = read_wav_to_pcm(&wav_path).unwrap();
         assert_eq!(sr, 22050);
         assert_eq!(pcm.len(), 5);
         assert!((pcm[1] - 1000.0 / 32768.0).abs() < 0.001);
         assert!((pcm[3] - 1.0).abs() < 0.001);
+        for (offset, value) in [
+            (0, 0),
+            (20, 0),
+            (22, 0),
+            (24, 0),
+            (32, 0),
+            (34, 0),
+            (34, 7),
+            (40, 255),
+        ] {
+            let mut malformed = wav_data.clone();
+            malformed[offset] = value;
+            assert!(
+                decode_wav(&malformed).is_err(),
+                "accepted malformed header at {offset}"
+            );
+        }
+        for length in 0..wav_data.len() {
+            assert!(decode_wav(&wav_data[..length]).is_err());
+        }
+        // A padded ancillary chunk before fmt must not change header offsets.
+        let mut extended = wav_data.clone();
+        extended.splice(12..12, *b"JUNK\x01\x00\x00\x00x\x00");
+        let len = (extended.len() - 8) as u32;
+        extended[4..8].copy_from_slice(&len.to_le_bytes());
+        assert_eq!(decode_wav(&extended).unwrap(), (pcm, sr));
     }
 
     #[test]

@@ -122,7 +122,7 @@ impl ServerMetrics {
         kv_cache_metrics: &bloomai_engine::KvCacheMetrics,
         cachemesh_metrics: Option<&bloomai_engine::CacheMeshMetrics>,
         queue_stats: (usize, usize, usize),
-        runtime_memory: crate::runtime_memory::RuntimeMemoryBudgetSnapshot,
+        runtime_memory: crate::application::memory::RuntimeMemoryBudgetSnapshot,
     ) -> String {
         self.render_prometheus_inner(
             kv_cache_metrics,
@@ -137,7 +137,7 @@ impl ServerMetrics {
         kv_cache_metrics: &bloomai_engine::KvCacheMetrics,
         cachemesh_metrics: Option<&bloomai_engine::CacheMeshMetrics>,
         queue_stats: (usize, usize, usize),
-        runtime_memory: Option<crate::runtime_memory::RuntimeMemoryBudgetSnapshot>,
+        runtime_memory: Option<crate::application::memory::RuntimeMemoryBudgetSnapshot>,
     ) -> String {
         let mut out = String::new();
         let uptime = self.start_time.elapsed().as_secs_f64();
@@ -574,7 +574,7 @@ mod tests {
             &KvCacheMetrics::default(),
             None,
             (0, 0, 0),
-            crate::runtime_memory::RuntimeMemoryBudgetSnapshot {
+            crate::application::memory::RuntimeMemoryBudgetSnapshot {
                 host_limit_bytes: 100,
                 host_used_bytes: 40,
                 device_limit_bytes: 80,

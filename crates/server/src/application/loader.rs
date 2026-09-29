@@ -1,29 +1,29 @@
 //! Model loading, backend admission, and runtime publication lifecycle.
 
-use super::*;
+use super::backend_registry::{
+    engine_registry, select_backend_name, validate_ifb_backend, validate_strict_runtime_backend,
+};
+use super::config::RuntimeConfig;
+use super::memory::RuntimeMemoryPermit;
+use super::model_selector::{model_path_label, validate_model_selector};
+use super::runtime::{LoadedRuntime, SignedModelVersion};
+use super::runtime_service::{ModelLoadOutcome, ModelLoadRequest, RuntimeService};
+use super::scheduling::{SchedulingRuntimeBuildContext, build_scheduling_runtime};
+use crate::model_manager::{self, ModelCatalog};
+use anyhow::{Result, anyhow};
+use bloomai_core::DeviceKind;
+use bloomai_engine::InferencePipeline;
+use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::{sync::mpsc, task};
 
-pub(crate) fn engine_registry() -> EngineRegistry {
-    let mut registry = EngineRegistry::default();
-    registry.register("candle", Box::new(CandleEngine));
-    registry.register("openvino", Box::new(OpenVINOEngine));
-    registry.register("funasr", Box::new(FunASREngine));
-    registry.register("qwen3_vl", Box::new(Qwen3VLEngine));
-    registry.register("intel-npu", Box::new(IntelNpuEngine));
-    registry.register("npu-tts", Box::new(NpuTtsEngine));
-    registry.register("onnxruntime", Box::new(OnnxRuntimeEngine));
-    registry.register("coreml", Box::new(CoreMlEngine));
-    registry.register("mlx", Box::new(MlxEngine));
-    registry.register("vulkan", Box::new(VulkanEngine));
-    registry.register("llamacpp", Box::new(LlamaCppEngine));
-    registry.register("longcat", Box::new(LongCatImageEditEngine));
-    #[cfg(feature = "candle-engine")]
-    registry.register("wan", Box::new(WanEngine));
-    registry
-}
-
-pub(super) async fn model_loader_loop(
-    state: Arc<ServerState>,
-    args: Args,
+pub(crate) async fn model_loader_loop(
+    state: Arc<RuntimeService>,
+    args: RuntimeConfig,
     device_kind: DeviceKind,
     mut requests: mpsc::Receiver<ModelLoadRequest>,
 ) {
@@ -115,14 +115,6 @@ pub(super) async fn model_loader_loop(
     tracing::error!("Model loader stopped because its request channel was closed");
 }
 
-pub(super) fn model_path_label(path: &std::path::Path) -> String {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or("external model")
-        .to_string()
-}
-
 pub(super) fn validate_loaded_runtime_model_id(model_id: &str) -> Result<()> {
     if model_id == "default" {
         return Err(anyhow!(
@@ -167,8 +159,8 @@ fn signed_model_version_from_catalog(
 }
 
 async fn prepare_loaded_runtime(
-    state: Arc<ServerState>,
-    args: &Args,
+    state: Arc<RuntimeService>,
+    args: &RuntimeConfig,
     device_kind: DeviceKind,
     model_path: PathBuf,
     catalog_id: Option<String>,
@@ -373,7 +365,10 @@ async fn prepare_loaded_runtime(
         scheduler: scheduling.scheduler,
         _memory_reservation: scheduling.memory_reservation,
         scheduler_shutdown: scheduling.shutdown,
-        published_at: unix_seconds(),
+        published_at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
         source_path: model_path,
         catalog_id,
         signed_model_version,
@@ -382,27 +377,11 @@ async fn prepare_loaded_runtime(
     })
 }
 
-pub(crate) fn validate_ifb_backend(enable_ifb: bool, backend_name: &str) -> Result<()> {
-    if enable_ifb && backend_name != "candle" {
-        return Err(anyhow!(
-            "in-flight batching requires the verified Candle batch backend; selected backend '{backend_name}' cannot be published with IFB enabled"
-        ));
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_strict_runtime_backend(backend_name: &str) -> Result<()> {
-    if !matches!(backend_name, "candle" | "qwen3_vl") {
-        return Err(anyhow!(
-            "strict aggregate memory admission requires a backend that reports its verified physical device; selected backend '{backend_name}' does not yet provide that contract"
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::backend_registry::{validate_ifb_backend, validate_strict_runtime_backend};
     use super::*;
+    use crate::model_provenance;
 
     #[test]
     fn loaded_runtime_model_ids_exclude_the_reserved_default_alias() {

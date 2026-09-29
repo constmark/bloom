@@ -390,6 +390,7 @@ async fn arm_ollama_residency_expiry(
             return;
         };
         if !state
+            .app
             .runtime_pool
             .read()
             .await
@@ -399,24 +400,17 @@ async fn arm_ollama_residency_expiry(
             return;
         }
 
-        let response =
-            handle_model_unload_exact_if_idle(Arc::clone(&state), expected_runtime).await;
-        if response.status().is_success() {
-            residency.clear_if_current(&runtime, revision);
-            tracing::info!("Ollama keep_alive deadline unloaded its resident model");
-            return;
-        }
-        if response.status() == axum::http::StatusCode::NOT_FOUND {
-            residency.clear_if_current(&runtime, revision);
-            return;
-        }
-        if response.status() != axum::http::StatusCode::CONFLICT {
-            residency.clear_if_current(&runtime, revision);
-            tracing::warn!(
-                status = %response.status(),
-                "Ollama keep_alive deadline could not unload its resident model"
-            );
-            return;
+        match state.app.unload_runtime(Some(expected_runtime), true).await {
+            Ok(()) => {
+                residency.clear_if_current(&runtime, revision);
+                tracing::info!("Ollama keep_alive deadline unloaded its resident model");
+                return;
+            }
+            Err(ModelUnloadError::NotLoaded) => {
+                residency.clear_if_current(&runtime, revision);
+                return;
+            }
+            Err(ModelUnloadError::LifecycleBusy | ModelUnloadError::RequestsInFlight) => {}
         }
         drop(residency);
         tokio::select! {
@@ -456,7 +450,7 @@ pub(crate) async fn handle_ollama_version() -> axum::response::Response {
 pub(crate) async fn handle_ollama_tags(
     State(state): State<Arc<ServerState>>,
 ) -> axum::response::Response {
-    let (catalog, _) = match state.model_catalog_snapshot().await {
+    let (catalog, _) = match state.app.model_catalog_snapshot().await {
         Ok(snapshot) => snapshot,
         Err(_) => {
             return ollama_error_response(
@@ -465,7 +459,7 @@ pub(crate) async fn handle_ollama_tags(
             );
         }
     };
-    let resident = state.runtime_pool.read().await.snapshot();
+    let resident = state.app.runtime_pool.read().await.snapshot();
     let mut models = catalog
         .models
         .iter()
@@ -495,7 +489,7 @@ pub(crate) async fn handle_ollama_tags(
 pub(crate) async fn handle_ollama_ps(
     State(state): State<Arc<ServerState>>,
 ) -> axum::response::Response {
-    let (catalog, _) = match state.model_catalog_snapshot().await {
+    let (catalog, _) = match state.app.model_catalog_snapshot().await {
         Ok(snapshot) => snapshot,
         Err(_) => {
             return ollama_error_response(
@@ -504,7 +498,7 @@ pub(crate) async fn handle_ollama_ps(
             );
         }
     };
-    let resident = state.runtime_pool.read().await.snapshot();
+    let resident = state.app.runtime_pool.read().await.snapshot();
     let default = resident.default_runtime();
     let mut runtimes = Vec::with_capacity(resident.entries().len());
     if let Some(runtime) = default.as_ref() {
@@ -576,7 +570,7 @@ pub(crate) async fn handle_ollama_show(
     if validate_ollama_model_selector(requested).is_err() {
         return ollama_bad_request("model selector is invalid");
     }
-    let (catalog, _) = match state.model_catalog_snapshot().await {
+    let (catalog, _) = match state.app.model_catalog_snapshot().await {
         Ok(snapshot) => snapshot,
         Err(_) => {
             return ollama_error_response(
@@ -585,7 +579,7 @@ pub(crate) async fn handle_ollama_show(
             );
         }
     };
-    let resident = state.runtime_pool.read().await.snapshot();
+    let resident = state.app.runtime_pool.read().await.snapshot();
     let (entry, matching_runtime) = if requested == "default" {
         let Some(runtime) = resident.default_runtime() else {
             return ollama_error_response(
@@ -708,7 +702,7 @@ pub(crate) async fn handle_ollama_delete(
         return ollama_bad_request("model selector is invalid");
     }
 
-    let (catalog, _) = match state.fresh_model_catalog_snapshot().await {
+    let (catalog, _) = match state.app.fresh_model_catalog_snapshot().await {
         Ok(snapshot) => snapshot,
         Err(_) => {
             return ollama_error_response(
@@ -766,13 +760,13 @@ pub(crate) async fn handle_ollama_pull(
         return ollama_bad_request("model must be an exact Bloom signed-index ID");
     }
     let stream = payload.stream.unwrap_or(true);
-    let Some(downloads) = state.model_downloads.as_ref().cloned() else {
+    let Some(downloads) = state.app.model_downloads.as_ref().cloned() else {
         return ollama_error_response(
             axum::http::StatusCode::FORBIDDEN,
             "verified model downloads are disabled",
         );
     };
-    let Some(index) = state.model_index.as_ref() else {
+    let Some(index) = state.app.model_index.as_ref() else {
         return ollama_error_response(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "a trusted signed model index is not configured",
@@ -853,13 +847,17 @@ async fn admit_ollama_pull(
     downloads: &Arc<ModelDownloadManager>,
     entry: &ModelIndexEntry,
 ) -> std::result::Result<OllamaPullAdmission, OllamaPullError> {
-    let _storage_guard = state.model_storage.serial().await;
-    let (catalog, _) = state.fresh_model_catalog_snapshot().await.map_err(|_| {
-        OllamaPullError::new(
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "the local model catalog could not be inspected",
-        )
-    })?;
+    let _storage_guard = state.app.model_storage.serial().await;
+    let (catalog, _) = state
+        .app
+        .fresh_model_catalog_snapshot()
+        .await
+        .map_err(|_| {
+            OllamaPullError::new(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "the local model catalog could not be inspected",
+            )
+        })?;
     let replacement = match model_index_installation_state(&catalog, entry) {
         InstalledPullState::Verified => return Ok(OllamaPullAdmission::Complete),
         InstalledPullState::Conflict => {
@@ -886,13 +884,13 @@ async fn admit_ollama_pull(
                     "unload or switch away from the installed model before pulling its upgrade",
                 ));
             }
-            if state.load_in_progress.load(Ordering::Acquire) {
+            if state.app.load_in_progress.load(Ordering::Acquire) {
                 return Err(OllamaPullError::new(
                     axum::http::StatusCode::CONFLICT,
                     "wait for the current model lifecycle operation before pulling an upgrade",
                 ));
             }
-            if state.model_integrity.is_active(&source.id).await {
+            if state.app.model_integrity.is_active(&source.id).await {
                 return Err(OllamaPullError::new(
                     axum::http::StatusCode::CONFLICT,
                     "finish or cancel the installed model integrity check before pulling an upgrade",
@@ -1030,12 +1028,16 @@ async fn installed_pull_state(
     state: &Arc<ServerState>,
     entry: &ModelIndexEntry,
 ) -> std::result::Result<InstalledPullState, OllamaPullError> {
-    let (catalog, _) = state.fresh_model_catalog_snapshot().await.map_err(|_| {
-        OllamaPullError::new(
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "the local model catalog could not be inspected",
-        )
-    })?;
+    let (catalog, _) = state
+        .app
+        .fresh_model_catalog_snapshot()
+        .await
+        .map_err(|_| {
+            OllamaPullError::new(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "the local model catalog could not be inspected",
+            )
+        })?;
     Ok(model_index_installation_state(&catalog, entry))
 }
 
@@ -1269,7 +1271,7 @@ fn admit_ollama_runtime(
     state: &ServerState,
     runtime: Arc<LoadedRuntime>,
 ) -> std::result::Result<Arc<LoadedRuntime>, OllamaActivationError> {
-    if state.runtime_is_revoked(&runtime) {
+    if state.app.runtime_is_revoked(&runtime) {
         Err(OllamaActivationError::new(
             axum::http::StatusCode::GONE,
             "the verified signed-index model version has been permanently revoked; install a replacement with a different digest",
@@ -1301,14 +1303,18 @@ async fn activate_ollama_model_with_permission(
         ));
     }
 
-    let _storage_guard = state.model_storage.serial().await;
-    let (catalog, _) = state.fresh_model_catalog_snapshot().await.map_err(|_| {
-        OllamaActivationError::new(
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "the local model catalog could not be inspected",
-        )
-    })?;
-    let resident = state.runtime_pool.read().await.snapshot();
+    let _storage_guard = state.app.model_storage.serial().await;
+    let (catalog, _) = state
+        .app
+        .fresh_model_catalog_snapshot()
+        .await
+        .map_err(|_| {
+            OllamaActivationError::new(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "the local model catalog could not be inspected",
+            )
+        })?;
+    let resident = state.app.runtime_pool.read().await.snapshot();
 
     if requested == "default" {
         let runtime = resident.default_runtime().ok_or_else(|| {
@@ -1340,7 +1346,7 @@ async fn activate_ollama_model_with_permission(
                 )
             })?;
     if let Some(runtime) = resident_match {
-        if allow_lifecycle_change && !state.runtime_pool.write().await.promote_exact(&runtime) {
+        if allow_lifecycle_change && !state.app.runtime_pool.write().await.promote_exact(&runtime) {
             return Err(OllamaActivationError::new(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 "the selected model was unloaded before inference admission",
@@ -1357,7 +1363,7 @@ async fn activate_ollama_model_with_permission(
 
     if candidates.is_empty()
         && validate_index_id(requested).is_ok()
-        && let Some(index) = state.model_index.as_ref()
+        && let Some(index) = state.app.model_index.as_ref()
     {
         let snapshot = index.snapshot(false).await.map_err(|_| {
             OllamaActivationError::new(
@@ -1396,7 +1402,7 @@ async fn activate_ollama_model_with_permission(
             )
         })?;
     if let Some(runtime) = resident_match {
-        if !state.runtime_pool.write().await.promote_exact(&runtime) {
+        if !state.app.runtime_pool.write().await.promote_exact(&runtime) {
             return Err(OllamaActivationError::new(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 "the selected model was unloaded before inference admission",
@@ -1410,6 +1416,7 @@ async fn activate_ollama_model_with_permission(
         .await
         .map_err(|error| OllamaActivationError::new(error.status, error.message))?;
     let admission = state
+        .app
         .admit_model_load(path, Some(catalog_id), true)
         .await
         .map_err(|error| match error {
@@ -1606,7 +1613,7 @@ async fn handle_ollama_lifecycle(
                 Err(error) => return ollama_error_response(error.status, error.message),
             };
             let mut residency = state.ollama_residency.lock().await;
-            if !state.runtime_pool.read().await.contains_exact(&runtime) {
+            if !state.app.runtime_pool.read().await.contains_exact(&runtime) {
                 return ollama_error_response(
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,
                     "the selected model was unloaded before its residency policy could be committed",
@@ -1636,13 +1643,13 @@ async fn handle_ollama_lifecycle(
             "load"
         }
         OllamaLifecycleAction::Unload => {
-            if state.load_in_progress.load(Ordering::Acquire) {
+            if state.app.load_in_progress.load(Ordering::Acquire) {
                 return ollama_error_response(
                     axum::http::StatusCode::CONFLICT,
                     "another model lifecycle operation is already in progress",
                 );
             }
-            let (catalog, _) = match state.fresh_model_catalog_snapshot().await {
+            let (catalog, _) = match state.app.fresh_model_catalog_snapshot().await {
                 Ok(snapshot) => snapshot,
                 Err(_) => {
                     return ollama_error_response(
@@ -1651,7 +1658,7 @@ async fn handle_ollama_lifecycle(
                     );
                 }
             };
-            let resident = state.runtime_pool.read().await.snapshot();
+            let resident = state.app.runtime_pool.read().await.snapshot();
             let runtime = if model == "default" {
                 resident.default_runtime()
             } else {
@@ -1692,9 +1699,13 @@ async fn handle_ollama_lifecycle(
                 );
             };
             let mut residency = state.ollama_residency.lock().await;
-            let response = handle_model_unload_exact(Arc::clone(state), Arc::clone(&runtime)).await;
-            if !response.status().is_success() {
-                return adapt_ollama_error_response(response).await;
+            if let Err(error) = state
+                .app
+                .unload_runtime(Some(Arc::clone(&runtime)), false)
+                .await
+            {
+                let (status, _, message) = model_unload_error_details(error);
+                return ollama_error_response(status, message);
             }
             residency.cancel_runtime(&runtime);
             drop(residency);
@@ -1742,7 +1753,7 @@ async fn activate_ollama_model_for_request(
     }
 
     let mut residency = state.ollama_residency.lock().await;
-    if !state.runtime_pool.read().await.contains_exact(&runtime) {
+    if !state.app.runtime_pool.read().await.contains_exact(&runtime) {
         return Err(OllamaActivationError::new(
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             "the selected model was unloaded before its residency policy could be committed",
@@ -4094,7 +4105,7 @@ fn runtime_digest(entry: Option<&model_manager::ModelCatalogEntry>) -> String {
 
 fn resolve_resident_runtime(
     catalog: &model_manager::ModelCatalog,
-    resident: &crate::runtime_pool::RuntimePoolSnapshot<LoadedRuntime>,
+    resident: &crate::application::pool::RuntimePoolSnapshot<LoadedRuntime>,
     selector: &str,
     catalog_entry: Option<&model_manager::ModelCatalogEntry>,
 ) -> std::result::Result<Option<Arc<LoadedRuntime>>, ()> {

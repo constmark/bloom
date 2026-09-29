@@ -14,8 +14,10 @@ use serde::Serialize;
 use tokio::sync::Semaphore;
 
 use super::model_manager::ModelCatalog;
-use super::runtime_memory::{RuntimeMemoryFootprint, RuntimeMemoryPlanner};
-use super::{engine_registry, select_backend_name, validate_strict_runtime_backend};
+use crate::application::backend_registry::{
+    engine_registry, select_backend_name, validate_strict_runtime_backend,
+};
+use crate::application::memory::{RuntimeMemoryFootprint, RuntimeMemoryPlanner};
 
 const MAX_PREFLIGHT_ID_CHARS: usize = 256;
 const MAX_PREFLIGHT_METADATA_CHARS: usize = 4_096;
@@ -430,7 +432,7 @@ fn fallback_footprint(
     runtime_memory: &RuntimeMemoryPlanner,
     manifest: &ModelManifest,
     estimate: &bloomai_engine::MemoryEstimate,
-    budget: &super::runtime_memory::RuntimeMemoryBudgetSnapshot,
+    budget: &crate::application::memory::RuntimeMemoryBudgetSnapshot,
 ) -> RuntimeMemoryFootprint {
     runtime_memory.footprint(manifest, estimate).unwrap_or({
         if budget.device_limit_bytes > 0 {

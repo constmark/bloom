@@ -10,6 +10,7 @@ request.
 - [Release manifest](release-manifest.md)
 - [GGUF models](gguf.md)
 - [Pinned trained-model validation](trained-model-validation.md)
+- [HTTP workload evidence](http-workload.md)
 - [Model manifests](manifest.md)
 - [Signed model discovery index](model-index.md)
 - [Model catalog contract](model-catalog.md)
@@ -26,6 +27,7 @@ request.
 - [Intel NPU setup](npu.md)
 - [Production checklist](production.md)
 - [Production readiness gap register](production-readiness.md)
+- [September 2026 project assessment](project-assessment-2026-09.md)
 
 ## Understand and extend Bloom
 

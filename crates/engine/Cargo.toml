@@ -13,9 +13,9 @@ documentation.workspace = true
 [features]
 default = ["candle-engine"]
 candle-engine = ["candle-core", "candle-nn", "candle-transformers", "tokenizers"]
-cuda = ["bloomai-backend/cuda", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
-metal = ["bloomai-backend/metal", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal", "dep:metal", "dep:objc2-metal", "dep:candle-metal-kernels"]
-flash-attn = ["candle-flash-attn"]
+cuda = ["candle-engine", "bloomai-backend/cuda", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+metal = ["candle-engine", "bloomai-backend/metal", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal", "dep:metal", "dep:objc2-metal", "dep:candle-metal-kernels"]
+flash-attn = ["candle-engine", "candle-flash-attn"]
 # Opt-in tests that need real hardware or external toolchains (GPU/NPU/Metal,
 # the TileLang Python JIT, etc.). Excluded from default CI; enable with
 # `cargo test --workspace --features hardware-tests`.
@@ -25,9 +25,7 @@ hardware-tests = []
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-clap.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 thiserror.workspace = true
 bloomai-core = { workspace = true }
 bloomai-backend = { workspace = true }
@@ -45,6 +43,11 @@ image = { version = "0.24", default-features = false, features = ["png", "jpeg"]
 libloading = { workspace = true }
 libc = "0.2"
 sha2 = "0.10"
+tempfile = "3"
+
+[[example]]
+name = "generate_tiny_qwen2_fixture"
+required-features = ["candle-engine"]
 
 [dev-dependencies]
-tempfile = "3"
+clap.workspace = true

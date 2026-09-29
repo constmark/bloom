@@ -15,10 +15,6 @@ use crate::{
     model::{LoadedModel, ModelMetadata},
 };
 
-thread_local! {
-    static FORCE_SPAWN_DAEMON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 pub struct FunASREngine;
 
 #[derive(Debug, Clone, Copy)]
@@ -191,7 +187,8 @@ impl Engine for FunASREngine {
         )));
 
         // Spawning Python ASR Daemon
-        let mut command = Command::new(default_python());
+        let python = default_python();
+        let mut command = Command::new(&python);
         command.env("PYTORCH_ENABLE_MPS_FALLBACK", "1");
         command.env("PYTHONIOENCODING", "utf-8");
 
@@ -228,11 +225,8 @@ impl Engine for FunASREngine {
             }
         };
 
-        let force_spawn = FORCE_SPAWN_DAEMON.with(|f| f.get());
-        let skip_daemon = !force_spawn
-            && (!script.exists()
-                || std::env::var_os("BLOOM_TEST_MOCK_ASR").is_some()
-                || std::env::var_os("CARGO_MANIFEST_DIR").is_some());
+        // Only the unit-test build may construct a simulated ASR runtime.
+        let skip_daemon = cfg!(test);
 
         if skip_daemon {
             return Ok(Box::new(FunASRModel {
@@ -247,67 +241,15 @@ impl Engine for FunASREngine {
             }));
         }
 
+        crate::core::security::validate_runner(&python)?;
         crate::core::security::validate_external_script(&script)?;
         command.arg(script).args(args);
         command.stdin(std::process::Stdio::piped());
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
 
-        let mut child = command
-            .spawn()
-            .map_err(|e| anyhow!("failed to spawn ASR daemon: {}", e))?;
-        let mut stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow!("no stderr handle for ASR daemon"))?;
-
-        // Handshake: wait for READY signal on stderr
-        let mut ready_buf = [0u8; 32];
-        let mut read_bytes = 0;
-        loop {
-            let mut byte = [0u8; 1];
-            match stderr.read(&mut byte) {
-                Ok(0) => break,
-                Ok(1) => {
-                    if byte[0] == b'\n' {
-                        break;
-                    }
-                    if read_bytes < ready_buf.len() {
-                        ready_buf[read_bytes] = byte[0];
-                        read_bytes += 1;
-                    }
-                }
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e.into()),
-            }
-        }
-        let ready_str = String::from_utf8_lossy(&ready_buf[..read_bytes]);
-        if !ready_str.contains("READY") {
-            return Err(anyhow!(
-                "ASR daemon failed to start ready signal. Output: {}",
-                ready_str
-            ));
-        }
-
-        // Consume remaining stderr asynchronously
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 1024];
-            while let Ok(n) = stderr.read(&mut buf) {
-                if n == 0 {
-                    break;
-                }
-            }
-        });
-
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("no stdin handle for ASR daemon"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow!("no stdout handle for ASR daemon"))?;
+        let (child, stdin, stdout) =
+            spawn_asr_daemon(&mut command, std::time::Duration::from_secs(120))?;
 
         Ok(Box::new(FunASRModel {
             _model_path: model_path.to_path_buf(),
@@ -317,20 +259,51 @@ impl Engine for FunASREngine {
             processors,
             child: Some(Arc::new(Mutex::new(child))),
             stdin: Some(Arc::new(Mutex::new(stdin))),
-            stdout: Some(Arc::new(Mutex::new(BufReader::new(stdout)))),
+            stdout: Some(Arc::new(Mutex::new(stdout))),
         }))
     }
 }
 
-#[allow(dead_code)]
-struct TempWavGuard {
-    path: PathBuf,
-}
+type AsrDaemon = (
+    crate::core::process::ChildGuard,
+    std::process::ChildStdin,
+    BufReader<std::process::ChildStdout>,
+);
 
-impl Drop for TempWavGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
+fn spawn_asr_daemon(command: &mut Command, timeout: std::time::Duration) -> Result<AsrDaemon> {
+    let mut child = crate::core::process::ChildGuard::spawn(command)?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("no ASR stderr"))?;
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut stderr = BufReader::new(stderr);
+        loop {
+            let mut line = String::new();
+            match Read::take(&mut stderr, 4097).read_line(&mut line) {
+                Ok(0) | Err(_) => return,
+                Ok(_) if line.trim() == "READY" => {
+                    let _ = sender.send(());
+                    // Drain diagnostics even after readiness so the daemon can
+                    // never block on its stderr pipe while serving a request.
+                    let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+                    return;
+                }
+                Ok(_) if line.len() > 4096 => return,
+                Ok(_) => {}
+            }
+        }
+    });
+    receiver
+        .recv_timeout(timeout)
+        .map_err(|error| anyhow!("ASR daemon failed to become READY: {error}"))?;
+    let stdin = child.stdin.take().ok_or_else(|| anyhow!("no ASR stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("no ASR stdout"))?;
+    Ok((child, stdin, BufReader::new(stdout)))
 }
 
 struct FunASRModel {
@@ -339,19 +312,9 @@ struct FunASRModel {
     _runtime: AsrRuntime,
     metadata: ModelMetadata,
     processors: crate::processor::ProcessorRegistry,
-    child: Option<Arc<Mutex<std::process::Child>>>,
+    child: Option<Arc<Mutex<crate::core::process::ChildGuard>>>,
     stdin: Option<Arc<Mutex<std::process::ChildStdin>>>,
     stdout: Option<Arc<Mutex<BufReader<std::process::ChildStdout>>>>,
-}
-
-impl Drop for FunASRModel {
-    fn drop(&mut self) {
-        if let Some(ref child_mutex) = self.child
-            && let Ok(mut child) = child_mutex.lock()
-        {
-            let _ = child.kill();
-        }
-    }
 }
 
 impl LoadedModel for FunASRModel {
@@ -409,18 +372,11 @@ impl LoadedModel for FunASRModel {
                 samples,
                 sample_rate,
             } => {
-                static COUNTER: std::sync::atomic::AtomicUsize =
-                    std::sync::atomic::AtomicUsize::new(0);
-                let counter = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let temp_dir = std::env::temp_dir();
-                let path = temp_dir.join(format!(
-                    "bloom_asr_temp_{}_{}.wav",
-                    std::process::id(),
-                    counter
-                ));
+                let directory = tempfile::Builder::new().prefix("bloom-asr-").tempdir()?;
+                let path = directory.path().join("input.wav");
                 crate::processor::write_wav_file(&path, &samples, sample_rate)?;
                 let path_str = path.to_string_lossy().to_string();
-                _temp_guard = Some(TempWavGuard { path });
+                _temp_guard = Some(directory);
                 (path_str, "auto".to_string())
             }
             ModelInput::Text { prompt } => (prompt, "auto".to_string()),
@@ -435,22 +391,37 @@ impl LoadedModel for FunASRModel {
 
         let (Some(stdin_mutex), Some(stdout_mutex)) = (self.stdin.as_ref(), self.stdout.as_ref())
         else {
-            // Fallback mock mode (e.g. in tests)
+            anyhow::ensure!(cfg!(test), "ASR daemon is unavailable");
             sink.on_chunk(crate::io::OutputChunk::TextDelta("mocked text".to_string()))?;
             sink.on_chunk(crate::io::OutputChunk::End)?;
             return Ok(());
         };
 
-        {
-            let mut stdin = stdin_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        // Hold stdin until the corresponding response has been read. Separate
+        // write/read locks permit concurrent callers to consume each other's text.
+        let mut stdin = stdin_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stdout = stdout_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        let response = (|| -> Result<String> {
             writeln!(stdin, "{}", request_json)?;
             stdin.flush()?;
+            let mut line = String::new();
+            Read::take(&mut *stdout, 1024 * 1024 + 1).read_line(&mut line)?;
+            anyhow::ensure!(
+                line.len() <= 1024 * 1024 && line.ends_with('\n'),
+                "ASR response is oversized or incomplete"
+            );
+            Ok(line)
+        })();
+        if response.is_err()
+            && let Some(child) = &self.child
+        {
+            let mut child = child.lock().unwrap_or_else(|error| error.into_inner());
+            let _ = child.kill();
+            let _ = child.wait();
         }
-
-        // Read response from daemon's stdout
-        let mut stdout = stdout_mutex.lock().unwrap_or_else(|e| e.into_inner());
-        let mut line = String::new();
-        stdout.read_line(&mut line)?;
+        let line = response?;
+        drop(stdout);
+        drop(stdin);
 
         let response: serde_json::Value = serde_json::from_str(&line)?;
         if response["status"] == "ok" {
@@ -589,27 +560,19 @@ mod tests {
         assert_eq!(decoded, input_str);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn test_funasr_infer_audio_input() {
-        let dir_holder = tempfile::tempdir().unwrap();
-        let dir = dir_holder.path();
-        fs::write(dir.join("config.yaml"), "{}").unwrap();
-        fs::write(dir.join("model.pt"), "").unwrap();
-
-        let engine = FunASREngine;
-
-        // Use thread-local cell to force real daemon spawn attempt
-        FORCE_SPAWN_DAEMON.with(|f| f.set(true));
-
-        // Set invalid script path. Loading the model should fail during daemon spawning.
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("BLOOM_FUN_ASR_SCRIPT", "/tmp/nonexistent_script_bloom.py") };
-        let res = engine.load(dir, DeviceKind::Cpu);
-        assert!(res.is_err());
-
-        // Restore state
-        FORCE_SPAWN_DAEMON.with(|f| f.set(false));
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::remove_var("BLOOM_FUN_ASR_SCRIPT") };
+    fn daemon_startup_requires_exact_ready_and_has_a_deadline() {
+        for script in ["printf NOT_READY >&2", "exec sleep 30"] {
+            let mut command = Command::new("sh");
+            command
+                .args(["-c", script])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            let start = std::time::Instant::now();
+            assert!(spawn_asr_daemon(&mut command, std::time::Duration::from_millis(100)).is_err());
+            assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        }
     }
 }

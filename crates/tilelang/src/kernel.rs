@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use libloading::Library;
 use std::path::Path;
 
@@ -23,7 +23,7 @@ type MropeFn = unsafe extern "C" fn(
 
 pub struct TileLangKernel {
     #[allow(dead_code)]
-    lib: Library,
+    lib: Option<Library>,
     vector_add_fn: Option<VectorAddFn>,
     matmul_fn: Option<MatmulFn>,
     softmax_fn: Option<SoftmaxFn>,
@@ -62,7 +62,7 @@ impl TileLangKernel {
                 { lib.get::<MropeFn>(b"mrope_launch").ok().map(|s| *s) };
 
             Ok(Self {
-                lib,
+                lib: Some(lib),
                 vector_add_fn,
                 matmul_fn,
                 softmax_fn,
@@ -76,9 +76,11 @@ impl TileLangKernel {
         let fn_ptr = self
             .vector_add_fn
             .ok_or_else(|| anyhow::anyhow!("vector_add not supported by this kernel"))?;
-        assert_eq!(a.len(), b.len());
-        assert_eq!(a.len(), c.len());
-        let n = a.len() as i32;
+        ensure!(
+            a.len() == b.len() && a.len() == c.len(),
+            "vector_add buffer lengths must match"
+        );
+        let n = checked_elements(&[a.len()])? as i32;
         let ret = unsafe { (fn_ptr)(a.as_ptr(), b.as_ptr(), c.as_mut_ptr(), n) };
         Ok(ret)
     }
@@ -95,9 +97,18 @@ impl TileLangKernel {
         let fn_ptr = self
             .matmul_fn
             .ok_or_else(|| anyhow::anyhow!("matmul not supported by this kernel"))?;
-        assert_eq!(a.len(), m * k);
-        assert_eq!(b.len(), k * n);
-        assert_eq!(c.len(), m * n);
+        ensure!(
+            a.len() == checked_elements(&[m, k])?,
+            "matmul A shape mismatch"
+        );
+        ensure!(
+            b.len() == checked_elements(&[k, n])?,
+            "matmul B shape mismatch"
+        );
+        ensure!(
+            c.len() == checked_elements(&[m, n])?,
+            "matmul output shape mismatch"
+        );
         let ret = unsafe {
             (fn_ptr)(
                 a.as_ptr(),
@@ -116,8 +127,11 @@ impl TileLangKernel {
         let fn_ptr = self
             .softmax_fn
             .ok_or_else(|| anyhow::anyhow!("softmax not supported by this kernel"))?;
-        assert_eq!(input.len(), output.len());
-        let n = input.len() as i32;
+        ensure!(
+            input.len() == output.len(),
+            "softmax buffer lengths must match"
+        );
+        let n = checked_elements(&[input.len()])? as i32;
         let ret = unsafe { (fn_ptr)(input.as_ptr(), output.as_mut_ptr(), n) };
         Ok(ret)
     }
@@ -135,10 +149,13 @@ impl TileLangKernel {
         let fn_ptr = self
             .attention_fn
             .ok_or_else(|| anyhow::anyhow!("attention not supported by this kernel"))?;
-        assert_eq!(q.len(), seq_len * head_dim);
-        assert_eq!(k.len(), seq_len * head_dim);
-        assert_eq!(v.len(), seq_len * head_dim);
-        assert_eq!(output.len(), seq_len * head_dim);
+        let elements = checked_elements(&[seq_len, head_dim])?;
+        ensure!(
+            [q.len(), k.len(), v.len(), output.len()]
+                .iter()
+                .all(|&len| len == elements),
+            "attention buffer shape mismatch"
+        );
         let ret = unsafe {
             (fn_ptr)(
                 q.as_ptr(),
@@ -170,12 +187,24 @@ impl TileLangKernel {
         let fn_ptr = self
             .mrope_fn
             .ok_or_else(|| anyhow::anyhow!("mrope not supported by this kernel"))?;
-        assert_eq!(q.len(), bs * num_heads * seq_len * head_dim);
-        assert_eq!(k.len(), bs * num_kv_heads * seq_len * head_dim);
-        assert_eq!(cos.len(), 3 * bs * seq_len * head_dim);
-        assert_eq!(sin.len(), 3 * bs * seq_len * head_dim);
-        assert_eq!(q_out.len(), bs * num_heads * seq_len * head_dim);
-        assert_eq!(k_out.len(), bs * num_kv_heads * seq_len * head_dim);
+        // The generated Qwen MRoPE kernel uses fixed 64-element rotation
+        // partners and [24, 20, 20] sections. Other head sizes would read OOB.
+        ensure!(head_dim == 128, "mrope requires head_dim=128");
+        let q_elements = checked_elements(&[bs, num_heads, seq_len, head_dim])?;
+        let k_elements = checked_elements(&[bs, num_kv_heads, seq_len, head_dim])?;
+        let rotation_elements = checked_elements(&[3, bs, seq_len, head_dim])?;
+        ensure!(
+            q.len() == q_elements && q_out.len() == q_elements,
+            "mrope Q shape mismatch"
+        );
+        ensure!(
+            k.len() == k_elements && k_out.len() == k_elements,
+            "mrope K shape mismatch"
+        );
+        ensure!(
+            cos.len() == rotation_elements && sin.len() == rotation_elements,
+            "mrope rotation shape mismatch"
+        );
         let ret = unsafe {
             (fn_ptr)(
                 q.as_ptr(),
@@ -192,5 +221,118 @@ impl TileLangKernel {
             )
         };
         Ok(ret)
+    }
+}
+
+// Generated kernels use signed 32-bit indices for both dimensions and products.
+pub(crate) fn checked_elements(shape: &[usize]) -> Result<usize> {
+    shape.iter().try_fold(1usize, |elements, &dimension| {
+        ensure!(dimension > 0, "kernel dimensions must be positive");
+        let elements = elements
+            .checked_mul(dimension)
+            .ok_or_else(|| anyhow::anyhow!("kernel shape overflows usize"))?;
+        ensure!(
+            elements <= i32::MAX as usize,
+            "kernel shape exceeds the signed 32-bit ABI"
+        );
+        Ok(elements)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    unsafe extern "C" fn unreachable_vector(
+        _: *const f32,
+        _: *const f32,
+        _: *mut f32,
+        _: i32,
+    ) -> i32 {
+        panic!("invalid vector reached native code")
+    }
+    unsafe extern "C" fn unreachable_softmax(_: *const f32, _: *mut f32, _: i32) -> i32 {
+        panic!("invalid softmax reached native code")
+    }
+    unsafe extern "C" fn unreachable_matmul(
+        _: *const f32,
+        _: *const f32,
+        _: *mut f32,
+        _: i32,
+        _: i32,
+        _: i32,
+    ) -> i32 {
+        panic!("invalid matmul reached native code")
+    }
+    unsafe extern "C" fn unreachable_attention(
+        _: *const f32,
+        _: *const f32,
+        _: *const f32,
+        _: *mut f32,
+        _: i32,
+        _: i32,
+    ) -> i32 {
+        panic!("invalid attention reached native code")
+    }
+    unsafe extern "C" fn unreachable_mrope(
+        _: *const f32,
+        _: *const f32,
+        _: *const f32,
+        _: *const f32,
+        _: *mut f32,
+        _: *mut f32,
+        _: i32,
+        _: i32,
+        _: i32,
+        _: i32,
+        _: i32,
+    ) -> i32 {
+        panic!("invalid mrope reached native code")
+    }
+
+    #[test]
+    fn malformed_shapes_never_enter_native_code() {
+        let kernel = TileLangKernel {
+            lib: None,
+            vector_add_fn: Some(unreachable_vector),
+            matmul_fn: Some(unreachable_matmul),
+            softmax_fn: Some(unreachable_softmax),
+            attention_fn: Some(unreachable_attention),
+            mrope_fn: Some(unreachable_mrope),
+        };
+        assert!(kernel.vector_add(&[1.0], &[], &mut []).is_err());
+        assert!(kernel.softmax(&[], &mut []).is_err());
+        assert!(kernel.softmax(&[1.0], &mut []).is_err());
+        assert!(kernel.matmul(&[], &[], &mut [], usize::MAX, 2, 2).is_err());
+        assert!(kernel.attention(&[], &[], &[], &mut [], 1, 1).is_err());
+        assert!(
+            kernel
+                .mrope(
+                    &[0.0; 64],
+                    &[0.0; 64],
+                    &[0.0; 192],
+                    &[0.0; 192],
+                    &mut [0.0; 64],
+                    &mut [0.0; 64],
+                    1,
+                    1,
+                    1,
+                    1,
+                    64
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_zero_overflow_and_signed_index_overflow() {
+        for shape in [
+            &[0][..],
+            &[usize::MAX],
+            &[65536, 65536],
+            &[i32::MAX as usize, 2],
+        ] {
+            assert!(checked_elements(shape).is_err());
+        }
+        assert_eq!(checked_elements(&[2, 3, 128]).unwrap(), 768);
     }
 }

@@ -184,6 +184,10 @@ case "$BUDGET_EXIT" in
         fi
         echo "SKIP: Hardware tier not in budget table (set BLOOM_REQUIRE_BUDGET=1 to enforce)"
         ;;
+    4)
+        echo "FAIL: Benchmark data is missing or invalid"
+        exit 1
+        ;;
     *)
         echo "FAIL: bench_budget_check.py exited with $BUDGET_EXIT"
         exit 1

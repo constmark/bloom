@@ -25,6 +25,7 @@ use bloomai_engine::executor::mlx::MlxEngine;
 use bloomai_engine::executor::npu_tts::NpuTtsEngine;
 use bloomai_engine::executor::onnx::OnnxRuntimeEngine;
 use bloomai_engine::executor::openvino::OpenVINOEngine;
+#[cfg(feature = "candle-engine")]
 use bloomai_engine::executor::qwen3_vl::Qwen3VLEngine;
 use bloomai_engine::executor::vulkan::VulkanEngine;
 #[cfg(feature = "candle-engine")]
@@ -210,6 +211,7 @@ static ENGINE_REGISTRY: once_cell::sync::Lazy<EngineRegistry> = once_cell::sync:
     registry.register("candle", Box::new(CandleEngine));
     registry.register("openvino", Box::new(OpenVINOEngine));
     registry.register("funasr", Box::new(FunASREngine));
+    #[cfg(feature = "candle-engine")]
     registry.register("qwen3_vl", Box::new(Qwen3VLEngine));
     registry.register("longcat", Box::new(LongCatImageEditEngine));
     registry.register("intel-npu", Box::new(IntelNpuEngine));

@@ -5,6 +5,11 @@ support rather than fixed release dates.
 
 ## Current priorities
 
+- Complete the first candidate deployment cell: pinned Qwen2 0.5B Instruct
+  Q4_0 GGUF on Candle CPU through OpenAI streaming. A short concurrent HTTP
+  workload now runs in CI and a 30-second local release run has been recorded;
+  repeated multi-hour target-host runs, failure injection, measured budgets,
+  and upgrade/rollback evidence are still required before stable support.
 - Broaden pinned, license-reviewed trained-model evidence beyond the maintained
   official Qwen2 0.5B Instruct Q4_0, Qwen3 0.6B Q8_0, SmolLM2 360M
   Instruct Q8_0 GGUF and BF16 Safetensors, and MiniLM sentence-embedding CPU
@@ -24,9 +29,9 @@ support rather than fixed release dates.
 - Publish measured CPU, Metal, and CUDA results using the benchmark schema.
 - Keep the README, support matrix, and runtime capability reports consistent.
 - Split the largest CLI, server, scheduler, and executor modules.
-- Evaluate an operator-controlled signed-index revocation and recovery format
-  after the bounded overlap rotation and persistent watermark protocols gain
-  deployment feedback.
+- Exercise the implemented signed-index v3 revocation and replacement-digest
+  recovery protocol in a multi-host incident drill, including refresh latency,
+  alerting and durable state recovery.
 
 ## Next
 
@@ -35,7 +40,8 @@ support rather than fixed release dates.
 - Expand trained embedding evidence beyond MiniLM and add a native
   cross-encoder reranking path; current reranking is normalized bi-encoder
   cosine similarity.
-- Harden the C ABI and Python SDK before declaring a stable API.
+- Extend the bounded C ABI/Python SDK and isolated sdist/wheel gate to platform
+  binary wheels, cross-version ABI tests, and a declared compatibility window.
 
 ## Later
 

@@ -85,6 +85,8 @@ pub struct BatchableModel {
     /// forward function as a boxed closure to decouple from the candle model types.
     pub forward_fn: Box<dyn Fn(&Tensor, usize, Option<usize>) -> Result<Tensor> + Send + Sync>,
     /// Optional batched forward function for packed prefill and stacked decode.
+    /// Returns [batch, vocab], [batch, sequence, vocab], or packed
+    /// [total_tokens, vocab] logits; the vocabulary axis must remain intact.
     pub forward_batch_fn:
         Option<Box<dyn Fn(&Tensor, &[usize], &[usize], &[usize]) -> Result<Tensor> + Send + Sync>>,
     /// Whether this is a streaming (layer-wise) model.
@@ -245,8 +247,12 @@ impl CandleBatchExecutor {
                 let req_logits = if logits.rank() >= 2 {
                     if logits.dim(0)? == batch_size {
                         let b_logits = logits.get(i)?;
-                        let last_idx = b_logits.dim(0)? - 1;
-                        b_logits.get(last_idx)?
+                        if b_logits.rank() >= 2 {
+                            let last_idx = b_logits.dim(0)? - 1;
+                            b_logits.get(last_idx)?
+                        } else {
+                            b_logits
+                        }
                     } else {
                         logits.get(last_token_idx)?
                     }
@@ -1027,6 +1033,49 @@ mod tests {
     use crate::scheduler::kv_hook::{InMemoryKvHook, KvHook};
     use crate::scheduler::paged_cache::{LongContextPolicy, PagedCacheConfig};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn batch_vocabulary_rows_remain_separate_during_prefill_and_decode() {
+        let executor = CandleBatchExecutor::new(
+            Box::new(|_, _, _| unreachable!("batch callback must be used")),
+            Device::Cpu,
+            4,
+            32,
+        )
+        .with_forward_batch_fn(Box::new(|_, _, _, _| {
+            Tensor::new(&[[0f32, 9., 1.], [0., 1., 9.]], &Device::Cpu).map_err(Into::into)
+        }));
+        for phase in [ExecutionPhase::Prefill, ExecutionPhase::Decode] {
+            let prefill = matches!(phase, ExecutionPhase::Prefill);
+            let result = executor
+                .execute(ExecutionBatch {
+                    phase,
+                    request_ids: vec!["first".into(), "second".into()],
+                    tokens: if prefill {
+                        vec![1, 2, 3, 4, 5]
+                    } else {
+                        vec![1, 2]
+                    },
+                    cu_seqlens: if prefill {
+                        vec![0, 2, 5]
+                    } else {
+                        vec![0, 1, 2]
+                    },
+                    kv_handles: vec![1, 2],
+                    start_positions: if prefill { vec![0, 0] } else { vec![2, 3] },
+                    params: vec![
+                        GenerationParams {
+                            temperature: 0.,
+                            ..Default::default()
+                        };
+                        2
+                    ],
+                    generated_tokens: vec![vec![], vec![]],
+                })
+                .unwrap();
+            assert_eq!(result.next_tokens, vec![1, 2]);
+        }
+    }
 
     #[test]
     fn test_token_budget() {

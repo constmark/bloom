@@ -41,9 +41,16 @@ with BloomPipeline("/path/to/model.gguf", context_size=2048) as pipeline:
         print(chunk)
 ```
 
-Calls on one Python pipeline are serialized. `close()` is idempotent and waits
-for an active native call before freeing the handle, preventing a concurrent
-stream from using freed memory. With an ABI revision 2 native library, closing
+Calls on one Python pipeline are serialized; consume or close a stream before
+starting another inference on that pipeline. Stream handoff is bounded to 64
+serialized chunks and 16 MiB of queued bytes. A slow consumer backpressures the
+native callback; an individual chunk above 16 MiB raises `BloomInferenceError`
+(revision 2 checks its length before copying native memory). These limits bound
+the handoff queue, not model memory or objects retained by the application.
+
+`close()` is idempotent. It stops registered streams, releases blocked
+callbacks, and waits for active native calls before freeing the handle,
+preventing a concurrent stream from using freed memory. With an ABI revision 2 native library, closing
 the generator cooperatively cancels native decoding at the next output
 boundary. Explicitly close a partially consumed stream instead of retaining it:
 
@@ -58,6 +65,34 @@ finally:
 The wrapper detects `bloom_abi_version()` at runtime. Revision 2 is preferred;
 libraries that expose only the original symbols continue to work, without
 stream cancellation or length-delimited buffers.
+
+Revision 1 callbacks stop queueing output after close, but their native call
+must still finish before the pipeline can be freed. For either revision, a
+backend stuck in prefill or external I/O may delay `pipeline.close()`; the SDK
+does not forcibly terminate threads or release a live native handle.
+
+## Python distribution gate
+
+The SDK has a self-contained source distribution and pure-Python wheel,
+including its own README and Apache-2.0 license. Neither package contains the
+native library. Supply `BLOOM_FFI_LIB` for an installed package as shown above;
+platform binary wheels and a stable cross-version ABI window remain future
+work.
+
+The packaging gate builds an sdist, rebuilds the wheel from it, checks package
+metadata and license contents, installs into a clean temporary environment,
+imports with no native library, then exercises buffered and streamed inference
+through the installed wrapper and the real ABI v2 mock engine:
+
+```bash
+python3 -m pip install -r requirements/python-package.txt
+cargo build -p bloomai-ffi --locked
+python3 scripts/test_python_package.py
+```
+
+Pass `--native-library /absolute/path/to/library` to validate another build.
+This proves package isolation and native interoperation, not trained-model
+quality or compatibility with every supported Python/platform combination.
 
 ## ABI revision 2
 

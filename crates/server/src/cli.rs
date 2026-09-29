@@ -342,7 +342,7 @@ pub(crate) fn parse_args() -> Result<(Args, ArgMatches)> {
 pub(crate) fn apply_config(
     args: &mut Args,
     matches: &ArgMatches,
-    config: &bloomai_engine::ServerConfig,
+    config: &bloomai_app::ServerConfig,
 ) {
     apply_config_option!(args, matches, config, model);
     apply_config_option!(args, matches, config, models_dir);
@@ -395,70 +395,6 @@ pub(crate) fn apply_config(
     apply_config_value!(args, matches, config, compact_free_blocks);
 }
 
-pub(crate) fn select_backend_name(
-    backend: &str,
-    speculative: &str,
-    manifest: &bloomai_core::ModelManifest,
-) -> String {
-    if backend == "candle" {
-        let has_format = |format| manifest.files.iter().any(|file| file.format == format);
-        let is_qwen_vl = manifest.family == bloomai_core::ModelFamily::Qwen
-            && (manifest.id.to_lowercase().contains("vl")
-                || manifest
-                    .parameters
-                    .get("model_type")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.contains("vl"))
-                    .unwrap_or(false));
-        if speculative_mode_is_mtp(speculative) {
-            "llamacpp".to_string()
-        } else if has_format(bloomai_core::ModelFormat::Onnx) {
-            "onnxruntime".to_string()
-        } else if has_format(bloomai_core::ModelFormat::OpenVinoIr) {
-            "openvino".to_string()
-        } else if has_format(bloomai_core::ModelFormat::CoreMl) {
-            "coreml".to_string()
-        } else if has_format(bloomai_core::ModelFormat::Mlx) {
-            "mlx".to_string()
-        } else if has_format(bloomai_core::ModelFormat::VulkanSpirv) {
-            "vulkan".to_string()
-        } else if is_qwen_vl {
-            "qwen3_vl".to_string()
-        } else if matches!(&manifest.family, bloomai_core::ModelFamily::Custom(c) if c == "longcat-image-edit")
-        {
-            "longcat".to_string()
-        } else if manifest.family == bloomai_core::ModelFamily::FunAsr {
-            "funasr".to_string()
-        } else if matches!(&manifest.family, bloomai_core::ModelFamily::Custom(c) if c == "wan") {
-            "wan".to_string()
-        } else {
-            "candle".to_string()
-        }
-    } else {
-        backend.to_string()
-    }
-}
-
-pub(crate) fn manifest_param_usize(
-    manifest: &bloomai_core::ModelManifest,
-    names: &[&str],
-    default_value: usize,
-) -> usize {
-    names
-        .iter()
-        .find_map(|name| manifest.parameters.get(*name))
-        .and_then(|value| value.as_u64())
-        .map(|value| value as usize)
-        .unwrap_or(default_value)
-}
-
-pub(crate) fn div_ceil_usize(numerator: usize, denominator: usize) -> usize {
-    if denominator == 0 {
-        return 0;
-    }
-    numerator.saturating_add(denominator - 1) / denominator
-}
-
 pub(crate) fn build_long_context_policy(args: &Args) -> Result<bloomai_engine::LongContextPolicy> {
     match args.long_context_policy.trim().to_lowercase().as_str() {
         "full" => Ok(bloomai_engine::LongContextPolicy::Full),
@@ -482,5 +418,29 @@ pub(crate) fn build_long_context_policy(args: &Args) -> Result<bloomai_engine::L
             "unsupported --long-context-policy '{}'; expected full, sliding-window, context-shift, or compact-inactive",
             other
         )),
+    }
+}
+
+impl Args {
+    pub(crate) fn runtime_config(&self) -> Result<crate::application::config::RuntimeConfig> {
+        Ok(crate::application::config::RuntimeConfig {
+            backend: self.backend.clone(),
+            cachemesh_l2_capacity_bytes: self.cachemesh_l2_capacity_bytes,
+            cachemesh_l3_path: self.cachemesh_l3_path.clone(),
+            cachemesh_write_through_l3: self.cachemesh_write_through_l3,
+            context_size: self.context_size,
+            disable_memory_prealloc: self.disable_memory_prealloc,
+            enable_cachemesh: self.enable_cachemesh,
+            enable_cachemesh_l3: self.enable_cachemesh_l3,
+            enable_chunked_prefill: self.enable_chunked_prefill,
+            enable_ifb: self.enable_ifb,
+            max_concurrent: self.max_concurrent,
+            max_num_tokens: self.max_num_tokens,
+            memory_utilization: self.memory_utilization,
+            prefill_chunk_size: self.prefill_chunk_size,
+            reserve_memory_bytes: self.reserve_memory_bytes,
+            speculative: self.speculative.clone(),
+            long_context_policy: build_long_context_policy(self)?,
+        })
     }
 }

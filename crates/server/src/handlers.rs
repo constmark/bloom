@@ -22,14 +22,16 @@ fn embedding_model_generation_response(model_id: &str) -> axum::response::Respon
 
 pub(crate) async fn handle_health(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
     let in_flight = state
+        .app
         .metrics
         .in_flight_requests
         .load(std::sync::atomic::Ordering::Relaxed);
     let requests_total = state
+        .app
         .metrics
         .requests_total
         .load(std::sync::atomic::Ordering::Relaxed);
-    let runtime = state.runtime_pool.read().await.default_runtime();
+    let runtime = state.app.runtime_pool.read().await.default_runtime();
     let model_id = runtime
         .as_ref()
         .map(|runtime| runtime.model_id.as_str())
@@ -39,14 +41,14 @@ pub(crate) async fn handle_health(State(state): State<Arc<ServerState>>) -> impl
         "model": model_id,
         "in_flight_requests": in_flight,
         "requests_total": requests_total,
-        "speculative_mode": state.speculative_mode,
+        "speculative_mode": state.app.speculative_mode,
     }))
 }
 
 // ─── /metrics ──────────────────────────────────────────────────────────────
 
 pub(crate) async fn handle_metrics(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
-    let runtime = state.runtime_pool.read().await.default_runtime();
+    let runtime = state.app.runtime_pool.read().await.default_runtime();
     let kv_metrics = {
         if let Some(pool) = runtime
             .as_ref()
@@ -73,8 +75,8 @@ pub(crate) async fn handle_metrics(State(state): State<Arc<ServerState>>) -> imp
             .and_then(|runtime| runtime.cachemesh.as_ref())
             .map(|mesh| mesh.metrics())
     };
-    let runtime_memory = state.runtime_memory.snapshot();
-    let body = state.metrics.render_prometheus_with_runtime_memory(
+    let runtime_memory = state.app.runtime_memory.snapshot();
+    let body = state.app.metrics.render_prometheus_with_runtime_memory(
         &kv_metrics,
         cachemesh_metrics.as_ref(),
         queue_stats,
@@ -95,8 +97,8 @@ pub(crate) async fn handle_observability(
     State(state): State<Arc<ServerState>>,
 ) -> impl IntoResponse {
     let (runtime, resident_generations, draining_generations, draining_request_leases) = {
-        let runtime_pool = state.runtime_pool.read().await;
-        let (draining_generations, draining_request_leases) = state.draining_runtime_stats();
+        let runtime_pool = state.app.runtime_pool.read().await;
+        let (draining_generations, draining_request_leases) = state.app.draining_runtime_stats();
         (
             runtime_pool.default_runtime(),
             runtime_pool.len(),
@@ -143,12 +145,12 @@ pub(crate) async fn handle_observability(
         .as_ref()
         .and_then(|runtime| runtime.cachemesh.as_ref())
         .map(|mesh| mesh.metrics());
-    let loading = state.load_in_progress.load(Ordering::Relaxed);
-    let ready = state.ready.load(Ordering::Acquire)
+    let loading = state.app.load_in_progress.load(Ordering::Relaxed);
+    let ready = state.app.ready.load(Ordering::Acquire)
         && runtime
             .as_ref()
-            .is_none_or(|runtime| !state.runtime_is_revoked(runtime));
-    let load_failed = state.load_error.read().await.is_some();
+            .is_none_or(|runtime| !state.app.runtime_is_revoked(runtime));
+    let load_failed = state.app.load_error.read().await.is_some();
     let load_phase = if loading {
         "loading"
     } else if load_failed {
@@ -158,8 +160,8 @@ pub(crate) async fn handle_observability(
     } else {
         "idle"
     };
-    let requested_model = state.requested_model.read().await.clone();
-    let runtime_memory = state.runtime_memory.snapshot();
+    let requested_model = state.app.requested_model.read().await.clone();
+    let runtime_memory = state.app.runtime_memory.snapshot();
 
     (
         [(axum::http::header::CACHE_CONTROL, "no-store")],
@@ -169,7 +171,7 @@ pub(crate) async fn handle_observability(
             "created": unix_seconds(),
             "server": {
                 "version": env!("CARGO_PKG_VERSION"),
-                "uptime_seconds": state.metrics.uptime_seconds(),
+                "uptime_seconds": state.app.metrics.uptime_seconds(),
             },
             "model": model_id,
             "ready": ready,
@@ -187,23 +189,23 @@ pub(crate) async fn handle_observability(
             },
             "load": {
                 "phase": load_phase,
-                "progress": state.load_progress.load(Ordering::Relaxed),
+                "progress": state.app.load_progress.load(Ordering::Relaxed),
                 "requested_model": requested_model,
                 "failure_present": load_phase == "failed",
             },
-            "speculative_mode": state.speculative_mode,
+            "speculative_mode": state.app.speculative_mode,
             "requests": {
-                "total": state.metrics.requests_total.load(Ordering::Relaxed),
-                "completed": state.metrics.requests_completed.load(Ordering::Relaxed),
-                "failed": state.metrics.requests_failed.load(Ordering::Relaxed),
-                "in_flight": state.metrics.in_flight_requests.load(Ordering::Relaxed)
+                "total": state.app.metrics.requests_total.load(Ordering::Relaxed),
+                "completed": state.app.metrics.requests_completed.load(Ordering::Relaxed),
+                "failed": state.app.metrics.requests_failed.load(Ordering::Relaxed),
+                "in_flight": state.app.metrics.in_flight_requests.load(Ordering::Relaxed)
             },
             "tokens": {
-                "prompt_total": state.metrics.prompt_tokens_total.load(Ordering::Relaxed),
-                "generated_total": state.metrics.tokens_generated_total.load(Ordering::Relaxed)
+                "prompt_total": state.app.metrics.prompt_tokens_total.load(Ordering::Relaxed),
+                "generated_total": state.app.metrics.tokens_generated_total.load(Ordering::Relaxed)
             },
             "scheduler": {
-                "ifb_enabled": state.enable_ifb,
+                "ifb_enabled": state.app.enable_ifb,
                 "prefill_queue": queue_stats.0,
                 "decoding_queue": queue_stats.1,
                 "active_requests": queue_stats.2
@@ -231,7 +233,7 @@ pub(crate) async fn handle_observability(
 pub(crate) async fn handle_kv_cache_stats(
     State(state): State<Arc<ServerState>>,
 ) -> impl IntoResponse {
-    let runtime = state.runtime_pool.read().await.default_runtime();
+    let runtime = state.app.runtime_pool.read().await.default_runtime();
     let kv_metrics = {
         if let Some(pool) = runtime
             .as_ref()
@@ -283,10 +285,10 @@ fn openai_model_resource(runtime: &LoadedRuntime) -> serde_json::Value {
 }
 
 pub(crate) async fn handle_models(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
-    let snapshot = state.runtime_pool.read().await.snapshot();
+    let snapshot = state.app.runtime_pool.read().await.snapshot();
     let default = snapshot
         .default_runtime()
-        .filter(|runtime| !state.runtime_is_revoked(runtime));
+        .filter(|runtime| !state.app.runtime_is_revoked(runtime));
     let mut models = Vec::with_capacity(snapshot.entries().len());
     if let Some(runtime) = default.as_ref() {
         models.push(openai_model_resource(runtime));
@@ -297,7 +299,7 @@ pub(crate) async fn handle_models(State(state): State<Arc<ServerState>>) -> impl
             .iter()
             .map(|(_, runtime)| runtime)
             .filter(|runtime| {
-                !state.runtime_is_revoked(runtime)
+                !state.app.runtime_is_revoked(runtime)
                     && default
                         .as_ref()
                         .is_none_or(|default| !Arc::ptr_eq(runtime, default))
@@ -339,12 +341,12 @@ pub(crate) async fn handle_model_retrieve(
         return requested_model_error_response(error);
     }
 
-    let runtime = match state.runtime_pool.read().await.resolve(Some(&model)) {
+    let runtime = match state.app.runtime_pool.read().await.resolve(Some(&model)) {
         Ok(Some(runtime)) => runtime,
         Ok(None) => return requested_model_error_response(RequestedModelError::NotLoaded),
         Err(error) => return requested_model_error_response(error),
     };
-    if state.runtime_is_revoked(&runtime) {
+    if state.app.runtime_is_revoked(&runtime) {
         return requested_model_error_response(RequestedModelError::Revoked);
     }
     Json(openai_model_resource(&runtime)).into_response()
@@ -427,18 +429,18 @@ pub(crate) struct ModelDownloadControlRequest {
 pub(crate) async fn handle_model_catalog(
     State(state): State<Arc<ServerState>>,
 ) -> axum::response::Response {
-    let (catalog, runtime) = match state.model_catalog_snapshot().await {
+    let (catalog, runtime) = match state.app.model_catalog_snapshot().await {
         Ok(snapshot) => snapshot,
         Err(error) => return api_error(ApiError::InternalError, error),
     };
 
-    let loading = state.load_in_progress.load(Ordering::Acquire);
-    let ready = state.ready.load(Ordering::Acquire)
+    let loading = state.app.load_in_progress.load(Ordering::Acquire);
+    let ready = state.app.ready.load(Ordering::Acquire)
         && runtime
             .as_ref()
-            .is_none_or(|runtime| !state.runtime_is_revoked(runtime));
-    let error = state.load_error.read().await.clone();
-    let requested_model = state.requested_model.read().await.clone();
+            .is_none_or(|runtime| !state.app.runtime_is_revoked(runtime));
+    let error = state.app.load_error.read().await.clone();
+    let requested_model = state.app.requested_model.read().await.clone();
     let phase = if loading {
         "loading"
     } else if ready {
@@ -456,7 +458,7 @@ pub(crate) async fn handle_model_catalog(
             "input_modalities": runtime.input_modalities
         })
     });
-    let download_status = match state.model_downloads.as_ref() {
+    let download_status = match state.app.model_downloads.as_ref() {
         Some(manager) => {
             let (status, staged) = tokio::join!(manager.status(), manager.staged());
             json!({
@@ -473,7 +475,7 @@ pub(crate) async fn handle_model_catalog(
             "staged": []
         }),
     };
-    let import_status = match state.model_imports.as_ref() {
+    let import_status = match state.app.model_imports.as_ref() {
         Some(manager) => {
             let (status, staged) = tokio::join!(manager.status(), manager.staged());
             json!({
@@ -494,18 +496,18 @@ pub(crate) async fn handle_model_catalog(
             "staged": []
         }),
     };
-    let storage_status = match state.model_storage.snapshot().await {
+    let storage_status = match state.app.model_storage.snapshot().await {
         Ok(status) => status,
         Err(error) => return api_error(ApiError::InternalError, error),
     };
-    let integrity_status = state.model_integrity.status().await;
+    let integrity_status = state.app.model_integrity.status().await;
     let index_status = json!({
-        "enabled": state.model_index.is_some(),
-        "key_id": state.model_index.as_ref().and_then(|manager| manager.single_key_id()),
-        "trust_id": state.model_index.as_ref().map(|manager| manager.trust_id()),
-        "trusted_key_count": state.model_index.as_ref().map_or(0, |manager| manager.trusted_key_count()),
-        "refresh_seconds": state.model_index.as_ref().map_or(0, |manager| manager.refresh_seconds()),
-        "persistent_rollback_protection": state.model_index.as_ref().is_some_and(|manager| manager.persistent_rollback_protection()),
+        "enabled": state.app.model_index.is_some(),
+        "key_id": state.app.model_index.as_ref().and_then(|manager| manager.single_key_id()),
+        "trust_id": state.app.model_index.as_ref().map(|manager| manager.trust_id()),
+        "trusted_key_count": state.app.model_index.as_ref().map_or(0, |manager| manager.trusted_key_count()),
+        "refresh_seconds": state.app.model_index.as_ref().map_or(0, |manager| manager.refresh_seconds()),
+        "persistent_rollback_protection": state.app.model_index.as_ref().is_some_and(|manager| manager.persistent_rollback_protection()),
     });
 
     Json(json!({
@@ -522,7 +524,7 @@ pub(crate) async fn handle_model_catalog(
         "integrity": integrity_status,
         "load": {
             "phase": phase,
-            "progress": state.load_progress.load(Ordering::Acquire),
+            "progress": state.app.load_progress.load(Ordering::Acquire),
             "requested_model": requested_model,
             "error": error
         }
@@ -546,7 +548,7 @@ async fn model_index_response(
     state: &ServerState,
     force_refresh: bool,
 ) -> axum::response::Response {
-    let Some(manager) = state.model_index.as_ref() else {
+    let Some(manager) = state.app.model_index.as_ref() else {
         return error_response(
             axum::http::StatusCode::NOT_FOUND,
             "model_index_not_configured",
@@ -676,14 +678,14 @@ pub(crate) async fn handle_model_index_download(
             "The model index ID is invalid.",
         );
     }
-    let Some(downloads) = state.model_downloads.as_ref() else {
+    let Some(downloads) = state.app.model_downloads.as_ref() else {
         return error_response(
             axum::http::StatusCode::FORBIDDEN,
             "model_downloads_disabled",
             "Model downloads are disabled. Start bloom_server with --enable-model-downloads to enable signed acquisitions.",
         );
     };
-    let Some(index) = state.model_index.as_ref() else {
+    let Some(index) = state.app.model_index.as_ref() else {
         return error_response(
             axum::http::StatusCode::NOT_FOUND,
             "model_index_not_configured",
@@ -729,8 +731,8 @@ pub(crate) async fn handle_model_index_download(
         );
     }
 
-    let _storage_guard = state.model_storage.serial().await;
-    let (catalog, _) = match state.fresh_model_catalog_snapshot().await {
+    let _storage_guard = state.app.model_storage.serial().await;
+    let (catalog, _) = match state.app.fresh_model_catalog_snapshot().await {
         Ok(snapshot) => snapshot,
         Err(error) => return api_error(ApiError::InternalError, error),
     };
@@ -754,12 +756,12 @@ pub(crate) async fn handle_model_index_download(
                     "Unload or switch away from the installed model before upgrading it.",
                 );
             }
-            if state.load_in_progress.load(Ordering::Acquire) {
+            if state.app.load_in_progress.load(Ordering::Acquire) {
                 return blocked_model_index_upgrade_response(
                     "Wait for the current model lifecycle operation before upgrading.",
                 );
             }
-            if state.model_integrity.is_active(&source.id).await {
+            if state.app.model_integrity.is_active(&source.id).await {
                 return blocked_model_index_upgrade_response(
                     "Cancel or finish the installed model integrity check before upgrading.",
                 );
@@ -858,7 +860,7 @@ pub(crate) async fn handle_model_index_download(
             },
         ),
         Err(error @ ModelDownloadStartError::Conflict(_)) => {
-            let (catalog, _) = match state.fresh_model_catalog_snapshot().await {
+            let (catalog, _) = match state.app.fresh_model_catalog_snapshot().await {
                 Ok(snapshot) => snapshot,
                 Err(scan_error) => return api_error(ApiError::InternalError, scan_error),
             };
@@ -909,7 +911,7 @@ pub(crate) async fn handle_model_index_download(
 pub(crate) async fn handle_model_inventory(
     State(state): State<Arc<ServerState>>,
 ) -> axum::response::Response {
-    let (catalog, _) = match state.fresh_model_catalog_snapshot().await {
+    let (catalog, _) = match state.app.fresh_model_catalog_snapshot().await {
         Ok(snapshot) => snapshot,
         Err(error) => return api_error(ApiError::InternalError, error),
     };
@@ -931,7 +933,7 @@ pub(crate) async fn handle_model_inventory_reconcile(
     State(state): State<Arc<ServerState>>,
     Json(expected): Json<model_inventory::ModelInventory>,
 ) -> axum::response::Response {
-    let (catalog, _) = match state.fresh_model_catalog_snapshot().await {
+    let (catalog, _) = match state.app.fresh_model_catalog_snapshot().await {
         Ok(snapshot) => snapshot,
         Err(error) => return api_error(ApiError::InternalError, error),
     };
@@ -955,14 +957,14 @@ pub(crate) async fn handle_model_inventory_restore(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(expected): Json<model_inventory::ModelInventory>,
 ) -> axum::response::Response {
-    let Some(manager) = state.model_downloads.as_ref() else {
+    let Some(manager) = state.app.model_downloads.as_ref() else {
         return error_response(
             axum::http::StatusCode::FORBIDDEN,
             "model_downloads_disabled",
             "Inventory restore requires verified model downloads. Start bloom_server with --enable-model-downloads.",
         );
     };
-    let (catalog, _) = match state.fresh_model_catalog_snapshot().await {
+    let (catalog, _) = match state.app.fresh_model_catalog_snapshot().await {
         Ok(snapshot) => snapshot,
         Err(error) => return api_error(ApiError::InternalError, error),
     };
@@ -1047,7 +1049,7 @@ pub(crate) async fn handle_model_preflight(
     State(state): State<Arc<ServerState>>,
     Json(payload): Json<ModelPreflightRequest>,
 ) -> axum::response::Response {
-    match state.model_preflight.inspect(&payload.id).await {
+    match state.app.model_preflight.inspect(&payload.id).await {
         Ok(report) => Json(json!({
             "schema_version": model_preflight::MODEL_PREFLIGHT_SCHEMA_VERSION,
             "object": model_preflight::MODEL_PREFLIGHT_OBJECT,
@@ -1069,7 +1071,7 @@ pub(crate) async fn handle_model_download_start(
     State(state): State<Arc<ServerState>>,
     Json(payload): Json<ModelDownloadRequest>,
 ) -> axum::response::Response {
-    let Some(manager) = state.model_downloads.as_ref() else {
+    let Some(manager) = state.app.model_downloads.as_ref() else {
         return error_response(
             axum::http::StatusCode::FORBIDDEN,
             "model_downloads_disabled",
@@ -1094,7 +1096,7 @@ pub(crate) async fn handle_model_download_source_inspect(
     State(state): State<Arc<ServerState>>,
     Json(payload): Json<ModelDownloadSourceRequest>,
 ) -> axum::response::Response {
-    let Some(manager) = state.model_downloads.as_ref() else {
+    let Some(manager) = state.app.model_downloads.as_ref() else {
         return error_response(
             axum::http::StatusCode::FORBIDDEN,
             "model_downloads_disabled",
@@ -1138,7 +1140,7 @@ pub(crate) async fn handle_model_download_resume(
     State(state): State<Arc<ServerState>>,
     Json(payload): Json<ModelDownloadControlRequest>,
 ) -> axum::response::Response {
-    let Some(manager) = state.model_downloads.as_ref() else {
+    let Some(manager) = state.app.model_downloads.as_ref() else {
         return error_response(
             axum::http::StatusCode::FORBIDDEN,
             "model_downloads_disabled",
@@ -1167,7 +1169,7 @@ pub(crate) async fn handle_model_download_discard(
     State(state): State<Arc<ServerState>>,
     Json(payload): Json<ModelDownloadControlRequest>,
 ) -> axum::response::Response {
-    let Some(manager) = state.model_downloads.as_ref() else {
+    let Some(manager) = state.app.model_downloads.as_ref() else {
         return error_response(
             axum::http::StatusCode::FORBIDDEN,
             "model_downloads_disabled",
@@ -1215,7 +1217,7 @@ pub(crate) async fn handle_model_import_begin(
     State(state): State<Arc<ServerState>>,
     Json(payload): Json<ModelImportRequest>,
 ) -> axum::response::Response {
-    let Some(manager) = state.model_imports.as_ref() else {
+    let Some(manager) = state.app.model_imports.as_ref() else {
         return model_imports_disabled_response();
     };
     match manager.begin(payload).await {
@@ -1234,7 +1236,7 @@ pub(crate) async fn handle_model_import_chunk(
     headers: axum::http::HeaderMap,
     bytes: axum::body::Bytes,
 ) -> axum::response::Response {
-    let Some(manager) = state.model_imports.as_ref() else {
+    let Some(manager) = state.app.model_imports.as_ref() else {
         return model_imports_disabled_response();
     };
     let offset = match headers
@@ -1265,7 +1267,7 @@ pub(crate) async fn handle_model_import_complete(
     State(state): State<Arc<ServerState>>,
     axum::extract::Path(filename): axum::extract::Path<String>,
 ) -> axum::response::Response {
-    let Some(manager) = state.model_imports.as_ref() else {
+    let Some(manager) = state.app.model_imports.as_ref() else {
         return model_imports_disabled_response();
     };
     match manager.complete(&filename).await {
@@ -1283,7 +1285,7 @@ pub(crate) async fn handle_model_import_discard(
     State(state): State<Arc<ServerState>>,
     axum::extract::Path(filename): axum::extract::Path<String>,
 ) -> axum::response::Response {
-    let Some(manager) = state.model_imports.as_ref() else {
+    let Some(manager) = state.app.model_imports.as_ref() else {
         return model_imports_disabled_response();
     };
     match manager.discard(&filename).await {
@@ -1344,7 +1346,7 @@ fn model_import_error_response(error: ModelImportError) -> axum::response::Respo
 pub(crate) async fn handle_model_download_cancel(
     State(state): State<Arc<ServerState>>,
 ) -> axum::response::Response {
-    let Some(manager) = state.model_downloads.as_ref() else {
+    let Some(manager) = state.app.model_downloads.as_ref() else {
         return error_response(
             axum::http::StatusCode::FORBIDDEN,
             "model_downloads_disabled",
@@ -1374,7 +1376,7 @@ pub(crate) async fn prepare_catalog_model_load(
     state: &Arc<ServerState>,
     model_id: &str,
 ) -> std::result::Result<PathBuf, ModelActivationError> {
-    if let Some(downloads) = state.model_downloads.as_ref()
+    if let Some(downloads) = state.app.model_downloads.as_ref()
         && downloads.upgrade_source_active(model_id).await
     {
         return Err(ModelActivationError::new(
@@ -1383,8 +1385,9 @@ pub(crate) async fn prepare_catalog_model_load(
             "Wait for the signed-model upgrade to finish before loading this model.",
         ));
     }
-    if let Some(index) = state.model_index.as_ref() {
+    if let Some(index) = state.app.model_index.as_ref() {
         let (catalog, _) = state
+            .app
             .fresh_model_catalog_snapshot()
             .await
             .map_err(|error| {
@@ -1414,14 +1417,14 @@ pub(crate) async fn prepare_catalog_model_load(
             ));
         }
     }
-    if state.model_integrity.is_active(model_id).await {
+    if state.app.model_integrity.is_active(model_id).await {
         return Err(ModelActivationError::new(
             axum::http::StatusCode::CONFLICT,
             "model_integrity_in_progress",
             "Wait for the model integrity verification to finish before loading this model.",
         ));
     }
-    let integrity = state.model_integrity.status().await;
+    let integrity = state.app.model_integrity.status().await;
     if integrity.model_id.as_deref() == Some(model_id) && integrity.matches_expected == Some(false)
     {
         return Err(ModelActivationError::new(
@@ -1430,7 +1433,7 @@ pub(crate) async fn prepare_catalog_model_load(
             "The model does not match its verified acquisition checksum and cannot be loaded.",
         ));
     }
-    let root = state.models_root.clone();
+    let root = state.app.models_root.clone();
     let resolve_id = model_id.to_string();
     let (path, recorded_mismatch) = match task::spawn_blocking(move || -> anyhow::Result<_> {
         let path = ModelCatalog::resolve(&root, &resolve_id)?;
@@ -1470,13 +1473,13 @@ pub(crate) async fn prepare_catalog_model_load(
     }
 
     let already_resident = {
-        let runtime_pool = state.runtime_pool.read().await;
+        let runtime_pool = state.app.runtime_pool.read().await;
         runtime_pool.contains_source(&path)
     };
     let preflight_result = if already_resident {
-        state.model_preflight.inspect_resident(model_id).await
+        state.app.model_preflight.inspect_resident(model_id).await
     } else {
-        state.model_preflight.inspect(model_id).await
+        state.app.model_preflight.inspect(model_id).await
     };
     let preflight = match preflight_result {
         Ok(report) => report,
@@ -1511,7 +1514,7 @@ pub(crate) async fn handle_model_switch(
     State(state): State<Arc<ServerState>>,
     Json(payload): Json<ModelSwitchRequest>,
 ) -> axum::response::Response {
-    let _storage_guard = state.model_storage.serial().await;
+    let _storage_guard = state.app.model_storage.serial().await;
     let model_id = payload.id.trim().to_string();
     let path = match prepare_catalog_model_load(&state, &model_id).await {
         Ok(path) => path,
@@ -1519,6 +1522,7 @@ pub(crate) async fn handle_model_switch(
     };
 
     match state
+        .app
         .admit_model_load(path, Some(model_id.clone()), false)
         .await
     {
@@ -1601,8 +1605,8 @@ pub(crate) async fn remove_catalog_model(
     }
 
     let id = requested_id.to_string();
-    let _storage_guard = state.model_storage.serial().await;
-    if let Some(downloads) = state.model_downloads.as_ref()
+    let _storage_guard = state.app.model_storage.serial().await;
+    if let Some(downloads) = state.app.model_downloads.as_ref()
         && downloads.upgrade_source_active(&id).await
     {
         return Err(ModelRemovalError::Conflict {
@@ -1611,7 +1615,7 @@ pub(crate) async fn remove_catalog_model(
                 .to_string(),
         });
     }
-    if state.load_in_progress.load(Ordering::Acquire) {
+    if state.app.load_in_progress.load(Ordering::Acquire) {
         return Err(ModelRemovalError::Conflict {
             code: "model_load_in_progress",
             message: "Models cannot be removed while a lifecycle operation is in progress."
@@ -1619,7 +1623,7 @@ pub(crate) async fn remove_catalog_model(
         });
     }
 
-    if state.model_integrity.is_active(&id).await {
+    if state.app.model_integrity.is_active(&id).await {
         return Err(ModelRemovalError::Conflict {
             code: "model_integrity_in_progress",
             message: "Cancel the active integrity verification before removing this model."
@@ -1628,6 +1632,7 @@ pub(crate) async fn remove_catalog_model(
     }
 
     let (catalog, _) = state
+        .app
         .fresh_model_catalog_snapshot()
         .await
         .map_err(|error| {
@@ -1650,7 +1655,7 @@ pub(crate) async fn remove_catalog_model(
         });
     }
 
-    let root = state.models_root.clone();
+    let root = state.app.models_root.clone();
     let resolve_id = id.clone();
     let resolved =
         match task::spawn_blocking(move || ModelCatalog::resolve(&root, &resolve_id)).await {
@@ -1670,18 +1675,18 @@ pub(crate) async fn remove_catalog_model(
                 ));
             }
         };
-    if state.source_is_resident_or_draining(&resolved).await {
+    if state.app.source_is_resident_or_draining(&resolved).await {
         return Err(ModelRemovalError::Conflict {
             code: "model_is_active",
             message: "Unload or switch away from the active model before removing it.".to_string(),
         });
     }
 
-    let root = state.models_root.clone();
+    let root = state.app.models_root.clone();
     let remove_id = id.clone();
     match task::spawn_blocking(move || ModelCatalog::remove(&root, &remove_id, &resolved)).await {
         Ok(Ok(())) => {
-            *state.model_catalog_cache.write().await = None;
+            state.app.invalidate_catalog_cache().await;
             Ok(id)
         }
         Ok(Err(error)) => {
@@ -1705,8 +1710,8 @@ pub(crate) async fn handle_model_integrity_start(
     State(state): State<Arc<ServerState>>,
     Json(payload): Json<ModelIntegrityRequest>,
 ) -> axum::response::Response {
-    let _storage_guard = state.model_storage.serial().await;
-    if state.load_in_progress.load(Ordering::Acquire) {
+    let _storage_guard = state.app.model_storage.serial().await;
+    if state.app.load_in_progress.load(Ordering::Acquire) {
         return error_response(
             axum::http::StatusCode::CONFLICT,
             "model_load_in_progress",
@@ -1714,7 +1719,7 @@ pub(crate) async fn handle_model_integrity_start(
         );
     }
     let model_id = payload.id.trim().to_string();
-    if let Some(downloads) = state.model_downloads.as_ref()
+    if let Some(downloads) = state.app.model_downloads.as_ref()
         && downloads.upgrade_source_active(&model_id).await
     {
         return error_response(
@@ -1723,7 +1728,7 @@ pub(crate) async fn handle_model_integrity_start(
             "Wait for the signed-model upgrade to finish before verifying this model.",
         );
     }
-    let root = state.models_root.clone();
+    let root = state.app.models_root.clone();
     let resolve_id = model_id.clone();
     let resolved =
         match task::spawn_blocking(move || ModelCatalog::resolve(&root, &resolve_id)).await {
@@ -1736,14 +1741,14 @@ pub(crate) async fn handle_model_integrity_start(
                 );
             }
         };
-    if state.source_is_resident_or_draining(&resolved).await {
+    if state.app.source_is_resident_or_draining(&resolved).await {
         return error_response(
             axum::http::StatusCode::CONFLICT,
             "model_is_active",
             "Unload or switch away from the active model before verifying its on-disk integrity.",
         );
     }
-    match state.model_integrity.start(&model_id).await {
+    match state.app.model_integrity.start(&model_id).await {
         Ok(status) => (
             axum::http::StatusCode::ACCEPTED,
             Json(json!({
@@ -1760,7 +1765,7 @@ pub(crate) async fn handle_model_integrity_start(
 pub(crate) async fn handle_model_integrity_cancel(
     State(state): State<Arc<ServerState>>,
 ) -> axum::response::Response {
-    if state.model_integrity.cancel().await {
+    if state.app.model_integrity.cancel().await {
         (
             axum::http::StatusCode::ACCEPTED,
             Json(json!({
@@ -1801,92 +1806,10 @@ fn model_integrity_error_response(error: ModelIntegrityError) -> axum::response:
 pub(crate) async fn handle_model_unload(
     State(state): State<Arc<ServerState>>,
 ) -> axum::response::Response {
-    unload_model_runtime(state, None, false).await
-}
-
-pub(crate) async fn handle_model_unload_exact(
-    state: Arc<ServerState>,
-    expected: Arc<LoadedRuntime>,
-) -> axum::response::Response {
-    unload_model_runtime(state, Some(expected), false).await
-}
-
-pub(crate) async fn handle_model_unload_exact_if_idle(
-    state: Arc<ServerState>,
-    expected: Arc<LoadedRuntime>,
-) -> axum::response::Response {
-    unload_model_runtime(state, Some(expected), true).await
-}
-
-async fn unload_model_runtime(
-    state: Arc<ServerState>,
-    expected: Option<Arc<LoadedRuntime>>,
-    only_if_idle: bool,
-) -> axum::response::Response {
-    let _lifecycle_guard = state.model_lifecycle.lock().await;
-    if state.load_in_progress.swap(true, Ordering::AcqRel) {
-        return error_response(
-            axum::http::StatusCode::CONFLICT,
-            "model_load_in_progress",
-            "Another model lifecycle operation is already in progress.",
-        );
+    if let Err(error) = state.app.unload_runtime(None, false).await {
+        let (status, code, message) = model_unload_error_details(error);
+        return error_response(status, code, message);
     }
-
-    let (removed, fallback, busy) = {
-        let mut runtime_pool = state.runtime_pool.write().await;
-        // Request leases are acquired while holding the pool read lock. This
-        // write-side check therefore makes timer-driven idle eviction atomic
-        // with new inference admission.
-        let busy = only_if_idle
-            && expected.as_ref().is_some_and(|expected| {
-                runtime_pool.contains_exact(expected)
-                    && expected.active_request_leases.load(Ordering::Acquire) > 0
-            });
-        let removed = if busy {
-            None
-        } else {
-            match expected.as_ref() {
-                Some(expected) => runtime_pool.remove_exact(expected),
-                None => runtime_pool.remove_default(),
-            }
-        };
-        if let Some(runtime) = removed.as_ref() {
-            state.track_draining_runtimes(std::slice::from_ref(runtime));
-        }
-        let fallback = runtime_pool.default_runtime();
-        if !busy {
-            state.ready.store(fallback.is_some(), Ordering::Release);
-        }
-        (removed, fallback, busy)
-    };
-    if busy {
-        state.load_in_progress.store(false, Ordering::Release);
-        return error_response(
-            axum::http::StatusCode::CONFLICT,
-            "requests_in_flight",
-            "The selected runtime still has requests in flight.",
-        );
-    }
-    if expected.is_some() && removed.is_none() {
-        state.load_in_progress.store(false, Ordering::Release);
-        return error_response(
-            axum::http::StatusCode::NOT_FOUND,
-            "model_not_loaded",
-            "The selected runtime generation is no longer loaded.",
-        );
-    }
-    drop(removed);
-    *state.requested_model.write().await = fallback.as_ref().map(|runtime| {
-        runtime
-            .catalog_id
-            .clone()
-            .unwrap_or_else(|| runtime.model_id.clone())
-    });
-    *state.load_error.write().await = None;
-    state
-        .load_progress
-        .store(if fallback.is_some() { 100 } else { 0 }, Ordering::Release);
-    state.load_in_progress.store(false, Ordering::Release);
 
     Json(json!({
         "object": "bloom.model_unload",
@@ -2153,15 +2076,15 @@ async fn handle_chat_completions_inner(
             message,
         );
     }
-    if !state.ready.load(Ordering::Acquire) {
+    if !state.app.ready.load(Ordering::Acquire) {
         return model_unavailable_response(&state).await;
     }
 
     let runtime_lease = match exact_runtime {
-        Some(runtime) if state.runtime_is_revoked(&runtime) => {
+        Some(runtime) if state.app.runtime_is_revoked(&runtime) => {
             return requested_model_error_response(RequestedModelError::Revoked);
         }
-        Some(runtime) => match state.lease_exact_runtime(&runtime).await {
+        Some(runtime) => match state.app.lease_exact_runtime(&runtime).await {
             Some(lease) => lease,
             None => {
                 return error_response(
@@ -2171,7 +2094,7 @@ async fn handle_chat_completions_inner(
                 );
             }
         },
-        None => match state.lease_runtime(payload.model.as_deref()).await {
+        None => match state.app.lease_runtime(payload.model.as_deref()).await {
             Ok(Some(lease)) => lease,
             Ok(None) => return model_unavailable_response(&state).await,
             Err(error) => return requested_model_error_response(error),
@@ -2192,7 +2115,7 @@ async fn handle_chat_completions_inner(
         .as_ref()
         .is_some_and(|options| options.include_usage);
 
-    let permit = match Arc::clone(&state.semaphore).try_acquire_owned() {
+    let permit = match Arc::clone(&state.app.semaphore).try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
             return error_response(
@@ -2203,7 +2126,7 @@ async fn handle_chat_completions_inner(
         }
     };
 
-    state.metrics.record_request_start();
+    state.app.metrics.record_request_start();
     let request_start = std::time::Instant::now();
     let params = GenerationParams {
         max_tokens,
@@ -2239,9 +2162,12 @@ async fn handle_chat_completions_inner(
     let prompt_tokens_vec = match pipeline.tokenize(&prompt) {
         Ok(tokens) => tokens,
         Err(error) => {
-            state
-                .metrics
-                .record_request_end(false, request_start.elapsed().as_secs_f64(), 0, 0);
+            state.app.metrics.record_request_end(
+                false,
+                request_start.elapsed().as_secs_f64(),
+                0,
+                0,
+            );
             return error_response(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "tokenization_error",
@@ -2253,7 +2179,7 @@ async fn handle_chat_completions_inner(
     if let Err(message) =
         validate_context_budget(prompt_tokens, params.max_tokens, pipeline.context_size())
     {
-        state.metrics.record_request_end(
+        state.app.metrics.record_request_end(
             false,
             request_start.elapsed().as_secs_f64(),
             0,
@@ -2269,7 +2195,7 @@ async fn handle_chat_completions_inner(
     let request_id = match payload.internal_request_id.clone() {
         Some(request_id) if validate_request_id(&request_id).is_ok() => request_id,
         Some(_) => {
-            state.metrics.record_request_end(
+            state.app.metrics.record_request_end(
                 false,
                 request_start.elapsed().as_secs_f64(),
                 0,
@@ -2284,15 +2210,17 @@ async fn handle_chat_completions_inner(
         None => next_request_id(&state, "chatcmpl"),
     };
     let created = unix_seconds();
-    let cancel_scheduler = if state.enable_ifb {
+    let cancel_scheduler = if state.app.enable_ifb {
         scheduler_opt.clone()
     } else {
         None
     };
-    let Some(cancel_guard) =
-        CancelTokenGuard::register(&state, request_id.clone(), cancel_scheduler)
+    let Some(cancel_guard) = state
+        .app
+        .cancellations
+        .register(request_id.clone(), cancel_scheduler)
     else {
-        state.metrics.record_request_end(
+        state.app.metrics.record_request_end(
             false,
             request_start.elapsed().as_secs_f64(),
             0,
@@ -2306,9 +2234,9 @@ async fn handle_chat_completions_inner(
     };
     let cancel_token = cancel_guard.token();
 
-    if state.enable_ifb {
+    if state.app.enable_ifb {
         let Some(scheduler) = scheduler_opt else {
-            state.metrics.record_request_end(
+            state.app.metrics.record_request_end(
                 false,
                 request_start.elapsed().as_secs_f64(),
                 0,
@@ -2346,7 +2274,7 @@ async fn handle_chat_completions_inner(
 
         if let Err(e) = scheduler.submit_with_execution_guard(req, runtime_lease.execution_guard())
         {
-            state.metrics.record_request_end(
+            state.app.metrics.record_request_end(
                 false,
                 request_start.elapsed().as_secs_f64(),
                 0,
@@ -2363,7 +2291,7 @@ async fn handle_chat_completions_inner(
         // successful cancellation can never leave a newly queued orphan.
         if cancel_token.is_cancelled() {
             scheduler.cancel_request(&request_id);
-            state.metrics.record_request_end(
+            state.app.metrics.record_request_end(
                 false,
                 request_start.elapsed().as_secs_f64(),
                 0,
@@ -2381,7 +2309,7 @@ async fn handle_chat_completions_inner(
             let lifecycle = InferenceLifecycle::new(
                 cancel_guard,
                 InferenceLifecycleResources {
-                    metrics: Arc::clone(&state.metrics),
+                    metrics: Arc::clone(&state.app.metrics),
                     request_start,
                     generated_tokens: Arc::clone(&generated_count),
                     prompt_tokens: prompt_tokens as u64,
@@ -2619,7 +2547,7 @@ async fn handle_chat_completions_inner(
         let lifecycle = InferenceLifecycle::new(
             cancel_guard,
             InferenceLifecycleResources {
-                metrics: Arc::clone(&state.metrics),
+                metrics: Arc::clone(&state.app.metrics),
                 request_start,
                 generated_tokens: Arc::clone(&generated_count),
                 prompt_tokens: prompt_tokens as u64,
@@ -2706,7 +2634,7 @@ async fn handle_chat_completions_inner(
         let lifecycle = InferenceLifecycle::new(
             cancel_guard,
             InferenceLifecycleResources {
-                metrics: Arc::clone(&state.metrics),
+                metrics: Arc::clone(&state.app.metrics),
                 request_start,
                 generated_tokens: Arc::clone(&generated_count),
                 prompt_tokens: prompt_tokens as u64,
@@ -2733,6 +2661,7 @@ async fn handle_chat_completions_inner(
         })
         .await;
         state
+            .app
             .metrics
             .record_inference_latency(inference_start.elapsed().as_secs_f64());
 
@@ -2821,7 +2750,7 @@ async fn handle_chat_completions_inner(
     let lifecycle = InferenceLifecycle::new(
         cancel_guard,
         InferenceLifecycleResources {
-            metrics: Arc::clone(&state.metrics),
+            metrics: Arc::clone(&state.app.metrics),
             request_start,
             generated_tokens: Arc::clone(&generated_count),
             prompt_tokens: prompt_tokens as u64,
@@ -3697,11 +3626,11 @@ pub(crate) async fn handle_completions(
             );
         }
     };
-    if !state.ready.load(Ordering::Acquire) {
+    if !state.app.ready.load(Ordering::Acquire) {
         return model_unavailable_response(&state).await;
     }
 
-    let runtime_lease = match state.lease_runtime(payload.model.as_deref()).await {
+    let runtime_lease = match state.app.lease_runtime(payload.model.as_deref()).await {
         Ok(Some(lease)) => lease,
         Ok(None) => return model_unavailable_response(&state).await,
         Err(error) => return requested_model_error_response(error),
@@ -3714,7 +3643,7 @@ pub(crate) async fn handle_completions(
     let pipeline = Arc::clone(&runtime.pipeline);
     let scheduler_opt = runtime.scheduler.clone();
 
-    let permit = match Arc::clone(&state.semaphore).try_acquire_owned() {
+    let permit = match Arc::clone(&state.app.semaphore).try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
             return error_response(
@@ -3725,7 +3654,7 @@ pub(crate) async fn handle_completions(
         }
     };
 
-    state.metrics.record_request_start();
+    state.app.metrics.record_request_start();
     let request_start = std::time::Instant::now();
 
     let core_response_format = match &response_format {
@@ -3752,9 +3681,12 @@ pub(crate) async fn handle_completions(
     let prompt_tokens_vec = match pipeline.tokenize(&prompt) {
         Ok(tokens) => tokens,
         Err(error) => {
-            state
-                .metrics
-                .record_request_end(false, request_start.elapsed().as_secs_f64(), 0, 0);
+            state.app.metrics.record_request_end(
+                false,
+                request_start.elapsed().as_secs_f64(),
+                0,
+                0,
+            );
             return error_response(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "tokenization_error",
@@ -3766,7 +3698,7 @@ pub(crate) async fn handle_completions(
     if let Err(message) =
         validate_context_budget(prompt_tokens, params.max_tokens, pipeline.context_size())
     {
-        state.metrics.record_request_end(
+        state.app.metrics.record_request_end(
             false,
             request_start.elapsed().as_secs_f64(),
             0,
@@ -3780,15 +3712,17 @@ pub(crate) async fn handle_completions(
     }
     let input = ModelInput::Text { prompt };
     let request_id = next_request_id(&state, "cmpl");
-    let cancel_scheduler = if state.enable_ifb {
+    let cancel_scheduler = if state.app.enable_ifb {
         scheduler_opt.clone()
     } else {
         None
     };
-    let Some(cancel_guard) =
-        CancelTokenGuard::register(&state, request_id.clone(), cancel_scheduler)
+    let Some(cancel_guard) = state
+        .app
+        .cancellations
+        .register(request_id.clone(), cancel_scheduler)
     else {
-        state.metrics.record_request_end(
+        state.app.metrics.record_request_end(
             false,
             request_start.elapsed().as_secs_f64(),
             0,
@@ -3802,9 +3736,9 @@ pub(crate) async fn handle_completions(
     };
     let cancel_token = cancel_guard.token();
 
-    if state.enable_ifb {
+    if state.app.enable_ifb {
         let Some(scheduler) = scheduler_opt else {
-            state.metrics.record_request_end(
+            state.app.metrics.record_request_end(
                 false,
                 request_start.elapsed().as_secs_f64(),
                 0,
@@ -3842,7 +3776,7 @@ pub(crate) async fn handle_completions(
 
         if let Err(e) = scheduler.submit_with_execution_guard(req, runtime_lease.execution_guard())
         {
-            state.metrics.record_request_end(
+            state.app.metrics.record_request_end(
                 false,
                 request_start.elapsed().as_secs_f64(),
                 0,
@@ -3858,7 +3792,7 @@ pub(crate) async fn handle_completions(
         // scheduler has a queue entry to remove.
         if cancel_token.is_cancelled() {
             scheduler.cancel_request(&request_id);
-            state.metrics.record_request_end(
+            state.app.metrics.record_request_end(
                 false,
                 request_start.elapsed().as_secs_f64(),
                 0,
@@ -3876,7 +3810,7 @@ pub(crate) async fn handle_completions(
             let lifecycle = InferenceLifecycle::new(
                 cancel_guard,
                 InferenceLifecycleResources {
-                    metrics: Arc::clone(&state.metrics),
+                    metrics: Arc::clone(&state.app.metrics),
                     request_start,
                     generated_tokens: Arc::clone(&generated_count),
                     prompt_tokens: prompt_tokens as u64,
@@ -4078,7 +4012,7 @@ pub(crate) async fn handle_completions(
         let lifecycle = InferenceLifecycle::new(
             cancel_guard,
             InferenceLifecycleResources {
-                metrics: Arc::clone(&state.metrics),
+                metrics: Arc::clone(&state.app.metrics),
                 request_start,
                 generated_tokens: Arc::clone(&generated_count),
                 prompt_tokens: prompt_tokens as u64,
@@ -4147,7 +4081,7 @@ pub(crate) async fn handle_completions(
         let lifecycle = InferenceLifecycle::new(
             cancel_guard,
             InferenceLifecycleResources {
-                metrics: Arc::clone(&state.metrics),
+                metrics: Arc::clone(&state.app.metrics),
                 request_start,
                 generated_tokens: Arc::clone(&generated_count),
                 prompt_tokens: prompt_tokens as u64,
@@ -4174,6 +4108,7 @@ pub(crate) async fn handle_completions(
         })
         .await;
         state
+            .app
             .metrics
             .record_inference_latency(inference_start.elapsed().as_secs_f64());
 
@@ -4253,7 +4188,7 @@ pub(crate) async fn handle_completions(
     let lifecycle = InferenceLifecycle::new(
         cancel_guard,
         InferenceLifecycleResources {
-            metrics: Arc::clone(&state.metrics),
+            metrics: Arc::clone(&state.app.metrics),
             request_start,
             generated_tokens: Arc::clone(&generated_count),
             prompt_tokens: prompt_tokens as u64,
@@ -4746,15 +4681,15 @@ async fn run_multimodal_request_inner(
             message,
         );
     }
-    if !state.ready.load(Ordering::Acquire) {
+    if !state.app.ready.load(Ordering::Acquire) {
         return model_unavailable_response(&state).await;
     }
 
     let runtime_lease = match exact_runtime {
-        Some(runtime) if state.runtime_is_revoked(&runtime) => {
+        Some(runtime) if state.app.runtime_is_revoked(&runtime) => {
             return requested_model_error_response(RequestedModelError::Revoked);
         }
-        Some(runtime) => match state.lease_exact_runtime(&runtime).await {
+        Some(runtime) => match state.app.lease_exact_runtime(&runtime).await {
             Some(lease) => lease,
             None => {
                 return error_response(
@@ -4764,7 +4699,7 @@ async fn run_multimodal_request_inner(
                 );
             }
         },
-        None => match state.lease_runtime(requested_model.as_deref()).await {
+        None => match state.app.lease_runtime(requested_model.as_deref()).await {
             Ok(Some(lease)) => lease,
             Ok(None) => return model_unavailable_response(&state).await,
             Err(error) => return requested_model_error_response(error),
@@ -4803,7 +4738,7 @@ async fn run_multimodal_request_inner(
         );
     }
 
-    let permit = match Arc::clone(&state.semaphore).try_acquire_owned() {
+    let permit = match Arc::clone(&state.app.semaphore).try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
             return error_response(
@@ -4814,11 +4749,11 @@ async fn run_multimodal_request_inner(
         }
     };
 
-    state.metrics.record_request_start();
+    state.app.metrics.record_request_start();
     let request_start = std::time::Instant::now();
     let request_id = next_request_id(&state, "mms");
-    let Some(cancel_guard) = CancelTokenGuard::register(&state, request_id.clone(), None) else {
-        state.metrics.record_request_end(
+    let Some(cancel_guard) = state.app.cancellations.register(request_id.clone(), None) else {
+        state.app.metrics.record_request_end(
             false,
             request_start.elapsed().as_secs_f64(),
             0,
@@ -4839,7 +4774,7 @@ async fn run_multimodal_request_inner(
     let lifecycle = InferenceLifecycle::new(
         cancel_guard,
         InferenceLifecycleResources {
-            metrics: Arc::clone(&state.metrics),
+            metrics: Arc::clone(&state.app.metrics),
             request_start,
             generated_tokens: generated_count,
             prompt_tokens: u64::try_from(prompt_tokens).unwrap_or(u64::MAX),
@@ -5281,41 +5216,7 @@ pub(crate) async fn handle_cancel(
             message,
         );
     }
-    let (registration, cancelled) = {
-        let registrations = state
-            .cancel_tokens
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some(registration) = registrations.get(&request_id).cloned() {
-            if registration
-                .cancelling
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                registration.token.cancel();
-                (Some(registration), true)
-            } else {
-                (None, true)
-            }
-        } else {
-            (None, false)
-        }
-    };
-    if let Some(registration) = registration {
-        if let Some(scheduler) = &registration.scheduler {
-            scheduler.cancel_request(&request_id);
-        }
-        let mut registrations = state
-            .cancel_tokens
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if registrations
-            .get(&request_id)
-            .is_some_and(|active| Arc::ptr_eq(active, &registration))
-        {
-            registrations.remove(&request_id);
-        }
-    }
+    let cancelled = state.app.cancellations.cancel(&request_id);
 
     if cancelled {
         Json(json!({
@@ -5338,7 +5239,7 @@ pub(crate) async fn handle_cancel(
 // ─── /v1/backends ───────────────────────────────────────────────────────────
 
 pub(crate) async fn handle_backends(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
-    let runtime = state.runtime_pool.read().await.default_runtime();
+    let runtime = state.app.runtime_pool.read().await.default_runtime();
     let model_id = runtime
         .as_ref()
         .map(|runtime| runtime.model_id.clone())

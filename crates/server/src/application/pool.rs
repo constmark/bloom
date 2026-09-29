@@ -11,9 +11,9 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::helpers::{RequestedModelError, validate_model_selector};
+use super::model_selector::{RequestedModelError, validate_model_selector};
 
-use super::LoadedRuntime;
+use super::runtime::LoadedRuntime;
 
 pub(crate) const DEFAULT_RUNTIME_POOL_CAPACITY: usize = 1;
 

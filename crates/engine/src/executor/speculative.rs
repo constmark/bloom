@@ -189,8 +189,10 @@ pub struct DraftModelStrategy {
     /// Whether the draft model is loaded.
     is_loaded: Mutex<bool>,
     /// The loaded draft model instance.
-    draft_model: Mutex<Option<Box<dyn crate::core::model::LoadedModel>>>,
+    #[cfg(feature = "candle-engine")]
+    draft_model: Mutex<Option<Box<dyn crate::executor::candle::CandleForwardModel>>>,
     /// Device kind to load the draft model on.
+    #[cfg(feature = "candle-engine")]
     device_kind: DeviceKind,
     /// Exponential moving average of acceptance rate (0.0 to 1.0).
     acceptance_rate_ema: Mutex<f32>,
@@ -200,11 +202,15 @@ pub struct DraftModelStrategy {
 
 impl DraftModelStrategy {
     pub fn new(draft_model_path: String, num_speculative: usize, device_kind: DeviceKind) -> Self {
+        #[cfg(not(feature = "candle-engine"))]
+        let _ = device_kind;
         Self {
             num_speculative,
             draft_model_path,
             is_loaded: Mutex::new(false),
+            #[cfg(feature = "candle-engine")]
             draft_model: Mutex::new(None),
+            #[cfg(feature = "candle-engine")]
             device_kind,
             acceptance_rate_ema: Mutex::new(0.8),
             dynamic_limit: Mutex::new(num_speculative),
@@ -229,32 +235,6 @@ impl DraftModelStrategy {
     /// Number of speculative tokens per step.
     pub fn num_speculative(&self) -> usize {
         self.num_speculative
-    }
-}
-
-#[cfg(feature = "candle-engine")]
-fn get_candle_device(kind: DeviceKind) -> Result<candle_core::Device> {
-    match kind {
-        DeviceKind::Cpu => Ok(candle_core::Device::Cpu),
-        DeviceKind::Gpu => {
-            #[cfg(feature = "cuda")]
-            {
-                candle_core::Device::new_cuda(0)
-                    .map_err(|e| anyhow!("failed to initialize CUDA device: {}", e))
-            }
-            #[cfg(feature = "metal")]
-            {
-                candle_core::Device::new_metal(0)
-                    .map_err(|e| anyhow!("failed to initialize Metal device: {}", e))
-            }
-            #[cfg(not(any(feature = "cuda", feature = "metal")))]
-            {
-                Err(anyhow!(
-                    "GPU backend (CUDA/Metal) not compiled; please rebuild with features"
-                ))
-            }
-        }
-        _ => Err(anyhow!("unsupported device kind for Candle draft model")),
     }
 }
 
@@ -356,46 +336,37 @@ impl SpeculativeStrategy for DraftModelStrategy {
         }
 
         // Lazy load the model on first call
+        #[cfg(feature = "candle-engine")]
         {
             let mut model_guard = self.draft_model.lock().unwrap_or_else(|e| e.into_inner());
             if model_guard.is_none() {
-                #[cfg(feature = "candle-engine")]
-                {
-                    use crate::engine::Engine;
-                    use crate::executor::candle::CandleEngine;
-                    use std::path::Path;
-                    let engine = CandleEngine;
-                    let loaded =
-                        engine.load(Path::new(&self.draft_model_path), self.device_kind)?;
-                    *model_guard = Some(loaded);
-                    *self.is_loaded.lock().unwrap_or_else(|e| e.into_inner()) = true;
-                }
-                #[cfg(not(feature = "candle-engine"))]
-                {
-                    bail!(
-                        "Candle engine feature is not enabled; draft model loading is unsupported."
-                    );
-                }
+                use crate::executor::candle::CandleEngine;
+                use std::path::Path;
+                let engine = CandleEngine;
+                let loaded =
+                    engine.load_draft_model(Path::new(&self.draft_model_path), self.device_kind)?;
+                *model_guard = Some(loaded);
+                *self.is_loaded.lock().unwrap_or_else(|e| e.into_inner()) = true;
             }
         }
 
         #[cfg(feature = "candle-engine")]
         {
             use candle_core::Tensor;
-            let device = get_candle_device(self.device_kind)?;
             let model_guard = self.draft_model.lock().unwrap_or_else(|e| e.into_inner());
             let draft_model = model_guard
                 .as_ref()
                 .ok_or_else(|| anyhow!("draft model not loaded"))?;
 
             // Clear KV cache for a fresh proposal step
+            let device = draft_model.device();
             draft_model.clear_kv_cache();
 
             let mut proposed_tokens = Vec::with_capacity(n);
             let mut current_pos = 0;
 
             // Step 0: Prefill the context
-            let input_ids = Tensor::new(context, &device)?.unsqueeze(0)?;
+            let input_ids = Tensor::new(context, device)?.unsqueeze(0)?;
             let logits = draft_model.forward(&input_ids, current_pos)?;
             let mut last_token = get_greedy_token(&logits)?;
             proposed_tokens.push(last_token);
@@ -403,7 +374,7 @@ impl SpeculativeStrategy for DraftModelStrategy {
 
             // Step 1 to n-1: Autoregressive decoding
             for _ in 1..n {
-                let input_ids = Tensor::new(&[[last_token]], &device)?;
+                let input_ids = Tensor::new(&[[last_token]], device)?;
                 let logits = draft_model.forward(&input_ids, current_pos)?;
                 last_token = get_greedy_token(&logits)?;
                 proposed_tokens.push(last_token);
@@ -414,6 +385,7 @@ impl SpeculativeStrategy for DraftModelStrategy {
         }
         #[cfg(not(feature = "candle-engine"))]
         {
+            let _ = context;
             bail!(
                 "Candle engine feature is not enabled; draft model speculative decoding is unsupported."
             );
@@ -477,45 +449,36 @@ impl SpeculativeStrategy for DraftModelStrategy {
         }
 
         // Lazy load the model on first call (mirrors `propose`).
+        #[cfg(feature = "candle-engine")]
         {
             let mut model_guard = self.draft_model.lock().unwrap_or_else(|e| e.into_inner());
             if model_guard.is_none() {
-                #[cfg(feature = "candle-engine")]
-                {
-                    use crate::engine::Engine;
-                    use crate::executor::candle::CandleEngine;
-                    use std::path::Path;
-                    let engine = CandleEngine;
-                    let loaded =
-                        engine.load(Path::new(&self.draft_model_path), self.device_kind)?;
-                    *model_guard = Some(loaded);
-                    *self.is_loaded.lock().unwrap_or_else(|e| e.into_inner()) = true;
-                }
-                #[cfg(not(feature = "candle-engine"))]
-                {
-                    bail!(
-                        "Candle engine feature is not enabled; draft model loading is unsupported."
-                    );
-                }
+                use crate::executor::candle::CandleEngine;
+                use std::path::Path;
+                let engine = CandleEngine;
+                let loaded =
+                    engine.load_draft_model(Path::new(&self.draft_model_path), self.device_kind)?;
+                *model_guard = Some(loaded);
+                *self.is_loaded.lock().unwrap_or_else(|e| e.into_inner()) = true;
             }
         }
 
         #[cfg(feature = "candle-engine")]
         {
             use candle_core::Tensor;
-            let device = get_candle_device(self.device_kind)?;
             let model_guard = self.draft_model.lock().unwrap_or_else(|e| e.into_inner());
             let draft_model = model_guard
                 .as_ref()
                 .ok_or_else(|| anyhow!("draft model not loaded"))?;
 
+            let device = draft_model.device();
             draft_model.clear_kv_cache();
 
             let mut proposed: Vec<(u32, Vec<f32>)> = Vec::with_capacity(n);
             let mut current_pos = 0;
 
             // Step 0: Prefill the context.
-            let input_ids = Tensor::new(context, &device)?.unsqueeze(0)?;
+            let input_ids = Tensor::new(context, device)?.unsqueeze(0)?;
             let logits = draft_model.forward(&input_ids, current_pos)?;
             let logits_vec = get_last_logits_vec(&logits)?;
             let mut last_token = argmax(&logits_vec);
@@ -524,7 +487,7 @@ impl SpeculativeStrategy for DraftModelStrategy {
 
             // Steps 1..n-1: autoregressive decoding, keeping full logits.
             for _ in 1..n {
-                let input_ids = Tensor::new(&[[last_token]], &device)?;
+                let input_ids = Tensor::new(&[[last_token]], device)?;
                 let logits = draft_model.forward(&input_ids, current_pos)?;
                 let logits_vec = get_last_logits_vec(&logits)?;
                 last_token = argmax(&logits_vec);
@@ -536,6 +499,7 @@ impl SpeculativeStrategy for DraftModelStrategy {
         }
         #[cfg(not(feature = "candle-engine"))]
         {
+            let _ = context;
             bail!(
                 "Candle engine feature is not enabled; draft model speculative decoding is unsupported."
             );
@@ -1011,19 +975,20 @@ mod tests {
     #[test]
     #[cfg(feature = "candle-engine")]
     fn test_draft_model_strategy_propose() {
-        use crate::core::model::{LoadedModel, ModelMetadata};
-        use crate::io::{ModelInput, ModelOutput};
-        use bloomai_core::{GenerationParams, Modality, ModelManifest};
+        use crate::executor::candle::CandleForwardModel;
         use std::sync::Arc;
         use std::sync::atomic::AtomicUsize;
 
         struct MockLoadedModel {
             clear_calls: Arc<AtomicUsize>,
             forward_result: Mutex<Vec<u32>>,
-            metadata: ModelMetadata,
+            device: candle_core::Device,
         }
 
-        impl LoadedModel for MockLoadedModel {
+        impl CandleForwardModel for MockLoadedModel {
+            fn device(&self) -> &candle_core::Device {
+                &self.device
+            }
             fn forward(
                 &self,
                 _input_ids: &candle_core::Tensor,
@@ -1047,34 +1012,13 @@ mod tests {
                 self.clear_calls
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
-
-            fn metadata(&self) -> &ModelMetadata {
-                &self.metadata
-            }
-
-            fn infer(&self, _input: ModelInput, _params: &GenerationParams) -> Result<ModelOutput> {
-                Ok(ModelOutput {
-                    text: None,
-                    logits: None,
-                    image: None,
-                    audio: None,
-                    video: None,
-                })
-            }
         }
-
-        let metadata = ModelMetadata {
-            id: "mock".to_string(),
-            modality: Modality::Text,
-            quantized: false,
-            manifest: ModelManifest::default(),
-        };
 
         let clear_calls = Arc::new(AtomicUsize::new(0));
         let mock_model = Box::new(MockLoadedModel {
             clear_calls: clear_calls.clone(),
             forward_result: Mutex::new(vec![42, 43, 44]),
-            metadata,
+            device: candle_core::Device::Cpu,
         });
 
         let strategy = DraftModelStrategy::new("dummy_path".to_string(), 3, DeviceKind::Cpu);

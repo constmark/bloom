@@ -1,0 +1,42 @@
+[package]
+name = "bloomai-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Process configuration and native command-line applications for Bloom."
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+
+[features]
+default = ["candle-engine"]
+candle-engine = ["bloomai-engine/candle-engine", "dep:candle-core"]
+cuda = ["candle-engine", "bloomai-engine/cuda", "candle-core/cuda"]
+metal = ["candle-engine", "bloomai-engine/metal", "candle-core/metal"]
+flash-attn = ["candle-engine", "bloomai-engine/flash-attn"]
+hardware-tests = ["bloomai-engine/hardware-tests"]
+
+[[bin]]
+name = "bloom_quantize"
+required-features = ["candle-engine"]
+
+[[bin]]
+name = "inspect_gguf"
+required-features = ["candle-engine"]
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+bloomai-core.workspace = true
+bloomai-engine.workspace = true
+candle-core = { version = "0.10", optional = true }
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

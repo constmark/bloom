@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Result;
 use bloomai_backend::Backend;
@@ -30,7 +31,7 @@ fn model_context_limit(manifest: &bloomai_core::ModelManifest) -> Option<usize> 
 }
 
 pub struct InferencePipeline {
-    model: Box<dyn LoadedModel>,
+    model: Arc<dyn LoadedModel>,
     /// Held lease (if any) for the resources used by this pipeline.
     #[allow(dead_code)]
     lease: Option<BackendLease>,
@@ -297,7 +298,7 @@ impl InferencePipeline {
         });
 
         Ok(Self {
-            model,
+            model: model.into(),
             lease: None,
             memory_estimate: post_estimate.or(final_pre_estimate),
             context_size: current_context_size,
@@ -324,7 +325,7 @@ impl InferencePipeline {
         backend.warmup()?;
         tracing::info!("model loaded successfully");
         Ok(Self {
-            model,
+            model: model.into(),
             lease: None,
             memory_estimate: None,
             context_size,
@@ -364,7 +365,7 @@ impl InferencePipeline {
             });
         tracing::info!("model loaded with ticket");
         Ok(Self {
-            model,
+            model: model.into(),
             lease: Some(lease),
             memory_estimate: None,
             context_size,
@@ -412,6 +413,10 @@ impl InferencePipeline {
         self.model.as_ref()
     }
 
+    pub(crate) fn shared_model(&self) -> Arc<dyn LoadedModel> {
+        Arc::clone(&self.model)
+    }
+
     /// Drop a verified idle wrapper before handing execution ownership to a
     /// scheduler that creates separately accounted per-request wrappers.
     pub fn release_idle_weights(&self) {
@@ -435,16 +440,8 @@ impl InferencePipeline {
     /// Processor-based tokenizers remain supported for non-Candle backends;
     /// the final approximation is only for engines that expose neither.
     pub fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
-        #[cfg(feature = "candle-engine")]
-        if let Some(tokenizer) = self.model.tokenizer() {
-            let add_special_tokens =
-                self.model.metadata().manifest.family == bloomai_core::ModelFamily::Bert;
-            let encoding = tokenizer
-                .encode(text, add_special_tokens)
-                .map_err(|error| {
-                    BloomError::Engine(format!("failed to tokenize benchmark input: {error}"))
-                })?;
-            return Ok(encoding.get_ids().to_vec());
+        if let Some(tokens) = self.model.tokenize(text) {
+            return tokens;
         }
 
         if let Some(registry) = self.model.processors() {

@@ -77,8 +77,15 @@ The repository is a standalone workspace. All crates are published under the
 - `crates/tilelang` (`bloomai-tilelang`): TileLang kernel compilation and
   dynamic loading helpers.
 - `crates/engine` (`bloomai-engine`): model loading, concrete inference engines,
-  CLI binaries, OpenAI-compatible server, plugins, processors, CacheMesh, and
-  engine-internal scheduling.
+  plugins, processors, CacheMesh, and engine-internal scheduling.
+- `crates/app` (`bloomai-app`): shared process configuration and native CLI binaries.
+- `crates/server` (`bloomai-server`): HTTP adapters, application lifecycle,
+  operations, and optional UI embedding.
+- `crates/ffi` (`bloomai-ffi`): the native C ABI, depending directly on the engine.
+
+Run `just architecture-check` when changing boundaries or Cargo features. The
+engine must not depend on process configuration, CLI parsing, HTTP or browser
+code; HTTP must not construct model wrappers or manipulate backend tensors.
 
 Do not reintroduce dependencies on files outside this repository without an
 explicit design note and CI coverage.

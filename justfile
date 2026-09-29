@@ -40,8 +40,15 @@ infer-sync model_path prompt="Hello!":
 # ===== Checks =====
 
 # Run a fast type check for the Rust workspace and UI.
-check: ui-check
+check: ui-check architecture-check
     cargo check --workspace --locked
+
+# Enforce layer boundaries and build without optional inference backends.
+architecture-check:
+    python3 scripts/check_architecture.py
+    python3 scripts/test_architecture.py
+    cargo check --workspace --all-targets --no-default-features --locked
+    cargo test -p bloomai-engine --no-default-features --lib batching::tests --locked
 
 # Inspect the effective server deployment without loading a model or binding a port.
 doctor:
@@ -125,6 +132,15 @@ lint: fmt-check clippy ui-fmt-check ui-clippy
 # Package and compile the exact publishable crate archive set.
 crate-package-test:
     ./scripts/test_crate_packages.sh
+
+# Build and install the SDK from its sdist; install requirements/python-package.txt first.
+python-package-test:
+    cargo build -p bloomai-ffi --locked
+    python3 scripts/test_python_package.py
+
+# Validate benchmark measurements and budget boundary handling without a model.
+bench-budget-test:
+    python3 scripts/test_bench_budget_check.py
 
 # ===== Documentation =====
 

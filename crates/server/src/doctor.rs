@@ -15,12 +15,14 @@ use super::cli::{Args, DoctorFormat, MAX_LOADED_MODELS};
 use super::model_index::validate_configuration as validate_model_index_configuration;
 use super::model_index_state::inspect_model_index_watermark_directory;
 use super::model_license::ModelLicensePolicy;
-use super::runtime_memory::RuntimeMemoryPlanner;
 use super::{
     BrowserOriginPolicy, MAX_OLLAMA_ADAPTER_BODY_BYTES, MAX_SHUTDOWN_TIMEOUT_SECONDS, ModelCatalog,
-    engine_registry, parse_browser_origin_policy, select_backend_name, validate_ifb_backend,
-    validate_strict_runtime_backend,
+    parse_browser_origin_policy,
 };
+use crate::application::backend_registry::{
+    engine_registry, select_backend_name, validate_ifb_backend, validate_strict_runtime_backend,
+};
+use crate::application::memory::RuntimeMemoryPlanner;
 
 const DOCTOR_SCHEMA_VERSION: u32 = 1;
 
@@ -722,7 +724,10 @@ fn startup_model_check(
             "Correct --device and run the doctor again.",
         );
     };
-    let memory_planner = match RuntimeMemoryPlanner::new(args, device_kind) {
+    let memory_planner = match args
+        .runtime_config()
+        .and_then(|config| RuntimeMemoryPlanner::new(&config, device_kind))
+    {
         Ok(planner) => planner,
         Err(_) => {
             return DoctorCheck::fail(
@@ -1392,7 +1397,7 @@ mod tests {
 
     #[test]
     fn chunked_prefill_size_config_respects_cli_precedence_and_validation() {
-        let config = bloomai_engine::ServerConfig {
+        let config = bloomai_app::ServerConfig {
             enable_ifb: Some(true),
             enable_chunked_prefill: Some(true),
             prefill_chunk_size: Some(0),
@@ -1434,7 +1439,7 @@ mod tests {
 
     #[test]
     fn maximum_concurrency_config_respects_cli_precedence_and_validation() {
-        let config = bloomai_engine::ServerConfig {
+        let config = bloomai_app::ServerConfig {
             max_concurrent: Some(Semaphore::MAX_PERMITS + 1),
             ..Default::default()
         };
@@ -1470,7 +1475,7 @@ mod tests {
                 .contains("Maximum loaded models")
         );
 
-        let config = bloomai_engine::ServerConfig {
+        let config = bloomai_app::ServerConfig {
             max_loaded_models: Some(MAX_LOADED_MODELS + 1),
             ..Default::default()
         };
@@ -1511,7 +1516,7 @@ mod tests {
 
     #[test]
     fn shutdown_timeout_config_respects_cli_precedence() {
-        let config = bloomai_engine::ServerConfig {
+        let config = bloomai_app::ServerConfig {
             shutdown_timeout_seconds: Some(45),
             ..Default::default()
         };

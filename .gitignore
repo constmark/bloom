@@ -84,13 +84,17 @@ nano-vllm/
 *.qdstrm
 *.sqlite
 output.gif
-output/playwright/
+output/
 
 # Temporary tests and mock scripts
 test_*.py
 test_*.rs
+!scripts/test_architecture.py
+!scripts/test_bench_budget_check.py
+!scripts/test_python_package.py
 !scripts/test_server_http_boundary.py
 !scripts/test_server_shutdown.py
+!scripts/test_http_workload.py
 !scripts/test_create_release_archive.py
 !scripts/test_community_metadata.py
 !scripts/test_release_workflow_security.py

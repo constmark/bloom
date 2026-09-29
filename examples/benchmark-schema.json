@@ -68,7 +68,8 @@
       "properties": {
         "device": { "type": "string" },
         "backend": { "type": "string" },
-        "os": { "type": "string" }
+        "os": { "type": "string" },
+        "arch": { "type": "string", "minLength": 1 }
       }
     },
     "timing_breakdown": {

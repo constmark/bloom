@@ -49,26 +49,12 @@ pub trait LoadedModel: Send + Sync {
         None
     }
 
-    /// Exact Candle device identity used by model weights. Continuous batching
-    /// must clone this handle rather than constructing another device for the
-    /// same ordinal, because Candle device identity is instance-specific.
-    #[cfg(feature = "candle-engine")]
-    fn candle_device(&self) -> Option<candle_core::Device> {
+    /// Optional continuous-batching capability. Ownership is explicit so an
+    /// executor can retain its model without downcasting a backend wrapper.
+    fn batch_model(
+        self: std::sync::Arc<Self>,
+    ) -> Option<std::sync::Arc<dyn crate::batching::BatchModel>> {
         None
-    }
-
-    #[cfg(feature = "candle-engine")]
-    fn forward(
-        &self,
-        _input_ids: &candle_core::Tensor,
-        _start_pos: usize,
-    ) -> Result<candle_core::Tensor> {
-        Err(BloomError::Engine("forward not supported for this model".into()).into())
-    }
-
-    #[cfg(feature = "candle-engine")]
-    fn create_wrapper(&self) -> Result<Box<dyn std::any::Any + Send + Sync>> {
-        Err(BloomError::Engine("create_wrapper not supported for this model".into()).into())
     }
 
     /// Release the verified idle wrapper when another runtime component owns
@@ -77,35 +63,6 @@ pub trait LoadedModel: Send + Sync {
     fn release_idle_weights(&self) {}
 
     fn clear_kv_cache(&self) {}
-
-    /// Whether this model's KV cache can be bridged into the paged
-    /// attention cache via a `KvHook`.
-    ///
-    /// Returns `false` by default. Engines that expose a streaming variant
-    /// with a hookable KV cache (e.g. Candle's `QwenStreamingModelForCausalLM`)
-    /// should override this to return `true` so the server can attach a
-    /// `KvHook` to the batch executor, turning the paged KV cache from
-    /// metadata-only into real cross-request KV reuse.
-    fn supports_paged_kv(&self) -> bool {
-        false
-    }
-
-    /// Decoded vocabulary strings indexed by token id, used for token-level
-    /// grammar constraints (e.g. JSON schema filtering) on the IFB hot path.
-    ///
-    /// Returns an empty slice by default. Engines that can supply a vocab
-    /// (e.g. Candle's `CandleTextModel`) should override this so the batch
-    /// executor can apply `filter_logits_by_grammar` before sampling.
-    fn vocab_strings(&self) -> &[String] {
-        &[]
-    }
-
-    /// End-of-sequence token ids for the loaded model, used by grammar
-    /// filtering to decide when a structured response is allowed to
-    /// terminate. Returns an empty slice by default.
-    fn eos_token_ids(&self) -> &[u32] {
-        &[]
-    }
 
     fn metadata(&self) -> &ModelMetadata;
     fn infer(&self, input: ModelInput, params: &GenerationParams) -> Result<ModelOutput>;
@@ -202,8 +159,9 @@ pub trait LoadedModel: Send + Sync {
         None
     }
 
-    #[cfg(feature = "candle-engine")]
-    fn tokenizer(&self) -> Option<&tokenizers::Tokenizer> {
+    /// Exact text encoding when supported by the adapter. `None` delegates to
+    /// the processor registry; an encoding error must never use approximation.
+    fn tokenize(&self, _text: &str) -> Option<Result<Vec<u32>>> {
         None
     }
 

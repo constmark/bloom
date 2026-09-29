@@ -248,10 +248,10 @@ all protocol errors while leaving static UI paths outside the dynamic policy.
 
 ## Publishing to crates.io
 
-The workspace publishes six crates under the `bloomai-*` namespace. Publish
+The workspace publishes seven crates under the `bloomai-*` namespace. Publish
 them in dependency order so each crate's path dependencies already exist on
-the registry. The server and FFI crates can be published in either order after
-the engine because neither depends on the other:
+the registry. Publish the application crate after the engine and before the
+server; the FFI crate depends directly on the engine:
 
 ```bash
 cargo login                          # one-time, needs a crates.io API token
@@ -259,6 +259,7 @@ cargo publish -p bloomai-core
 cargo publish -p bloomai-backend
 cargo publish -p bloomai-tilelang
 cargo publish -p bloomai-engine
+cargo publish -p bloomai-app
 cargo publish -p bloomai-ffi
 cargo publish -p bloomai-server
 ```
@@ -266,7 +267,7 @@ cargo publish -p bloomai-server
 > **Namespace:** crates are published as `bloomai-*` because the bare
 > `bloom-core` name was already taken on crates.io by an unrelated project.
 > The original five library names were verified free on 2026-07-21; verify the
-> newer `bloomai-server` name again immediately before its first publication.
+> newer `bloomai-server` and `bloomai-app` names before their first publication.
 > The FFI dynamic
 > library keeps the file name `bloom_ffi` (`libbloom_ffi.{so,dylib,dll}`) so
 > the Python SDK and downstream loaders are unaffected by the crate rename.

@@ -5,6 +5,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -257,6 +258,9 @@ class BloomPipelineTests(unittest.TestCase):
             pipeline_module._configure_lib(partial_lib)
 
     def test_close_waits_for_active_stream_before_freeing_pipeline(self):
+        # Legacy workers cannot be interrupted, but close must still wait for
+        # the native call before releasing its handle.
+        self.fake_lib._bloom_uses_v2 = False
         self.fake_lib.block_stream = True
         pipeline = pipeline_module.BloomPipeline(".", engine="mock")
         stream = pipeline.generate_stream("hello")
@@ -299,6 +303,131 @@ class BloomPipelineTests(unittest.TestCase):
         self.assertGreaterEqual(self.fake_lib.cancel_calls, 1)
         self.assertEqual(self.fake_lib.freed_tokens, 1)
         pipeline.close()
+
+    def _install_burst(self, count, *, legacy=False, status=0):
+        self.burst_blocked = threading.Event()
+        self.burst_finished = threading.Event()
+        self.burst_progress = []
+
+        def emit(callback, v2):
+            try:
+                for index in range(count):
+                    if index == 65:
+                        self.burst_blocked.set()
+                    value = ('{"TextDelta":"%d"}' % index).encode()
+                    if v2:
+                        chunk = ctypes.create_string_buffer(value)
+                        callback(None, ctypes.cast(
+                            chunk, ctypes.POINTER(ctypes.c_uint8)
+                        ), len(value))
+                    else:
+                        callback(None, value)
+                    self.burst_progress.append(index)
+                    if v2 and self.fake_lib.stream_cancelled.is_set():
+                        return pipeline_module.BLOOM_STATUS_CANCELLED
+                return status
+            finally:
+                self.burst_finished.set()
+
+        if legacy:
+            self.fake_lib._bloom_uses_v2 = False
+            self.fake_lib.bloom_pipeline_run_stream = FakeFunction(
+                lambda _p, _i, _a, cb, *_rest: emit(cb, False)
+            )
+        else:
+            self.fake_lib.bloom_pipeline_run_stream_v2 = FakeFunction(
+                lambda _p, _i, _a, cb, *_rest: emit(cb, True)
+            )
+
+    def test_slow_stream_consumer_backpressures_without_losing_output(self):
+        self._install_burst(200)
+        pipeline = pipeline_module.BloomPipeline(".", engine="mock")
+        stream = pipeline.generate_stream("hello")
+        try:
+            self.assertEqual(next(stream), {"TextDelta": "0"})
+            self.assertTrue(self.burst_blocked.wait(timeout=1))
+            self.assertFalse(self.burst_finished.wait(timeout=0.05))
+            self.assertLessEqual(len(self.burst_progress), 65)
+            self.assertEqual(list(stream), [
+                {"TextDelta": str(index)} for index in range(1, 200)
+            ])
+        finally:
+            stream.close()
+            pipeline.close()
+        self.assertEqual(self.fake_lib.freed_tokens, 1)
+
+    def test_close_releases_backpressure_for_both_abi_revisions(self):
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                self._install_burst(200, legacy=legacy)
+                pipeline = pipeline_module.BloomPipeline(".", engine="mock")
+                stream = pipeline.generate_stream("hello")
+                self.assertEqual(next(stream), {"TextDelta": "0"})
+                self.assertTrue(self.burst_blocked.wait(timeout=1))
+                closer = threading.Thread(target=pipeline.close)
+                closer.start()
+                try:
+                    closer.join(timeout=2)
+                    self.assertFalse(closer.is_alive())
+                    self.assertTrue(self.burst_finished.is_set())
+                    self.assertEqual(list(stream), [])
+                finally:
+                    stream.close()
+                    closer.join(timeout=2)
+                self.assertFalse(pipeline._stream_cancellations)
+
+    def test_full_stream_delivers_terminal_native_error_after_buffered_chunks(self):
+        self._install_burst(100, status=-4)
+        with pipeline_module.BloomPipeline(".", engine="mock") as pipeline:
+            stream = pipeline.generate_stream("hello")
+            for index in range(100):
+                self.assertEqual(next(stream), {"TextDelta": str(index)})
+            with self.assertRaisesRegex(pipeline_module.BloomInferenceError, "code -4"):
+                next(stream)
+        self.assertEqual(self.fake_lib.freed_tokens, 1)
+
+    def test_v2_oversized_chunk_is_rejected_before_copying_native_memory(self):
+        def oversized(_p, _i, _a, callback, *_rest):
+            byte = ctypes.c_uint8(1)
+            callback(None, ctypes.pointer(byte), pipeline_module.MAX_STREAM_BYTES + 1)
+            return 0
+
+        self.fake_lib.bloom_pipeline_run_stream_v2 = FakeFunction(oversized)
+        with pipeline_module.BloomPipeline(".", engine="mock") as pipeline:
+            with mock.patch.object(ctypes, "string_at", side_effect=AssertionError("unsafe read")):
+                with self.assertRaisesRegex(pipeline_module.BloomInferenceError, "16 MiB"):
+                    list(pipeline.generate_stream("hello"))
+        self.assertEqual(self.fake_lib.freed_tokens, 1)
+
+    def test_invalid_stream_encoding_or_json_cancels_native_worker(self):
+        for value in (b"\xff", b"not-json"):
+            with self.subTest(value=value):
+                def invalid(_p, _i, _a, callback, *_rest):
+                    chunk = ctypes.create_string_buffer(value)
+                    callback(None, ctypes.cast(chunk, ctypes.POINTER(ctypes.c_uint8)), len(value))
+                    self.fake_lib.stream_cancelled.wait(timeout=2)
+                    return pipeline_module.BLOOM_STATUS_CANCELLED
+
+                self.fake_lib.bloom_pipeline_run_stream_v2 = FakeFunction(invalid)
+                with pipeline_module.BloomPipeline(".", engine="mock") as pipeline:
+                    with self.assertRaisesRegex(pipeline_module.BloomInferenceError, "Invalid streaming chunk"):
+                        list(pipeline.generate_stream("hello"))
+                self.assertTrue(self.fake_lib.stream_cancelled.is_set())
+
+    def test_worker_start_failure_releases_token_and_registration(self):
+        with pipeline_module.BloomPipeline(".", engine="mock") as pipeline:
+            with mock.patch.object(threading.Thread, "start", side_effect=RuntimeError("no thread")):
+                with self.assertRaisesRegex(RuntimeError, "no thread"):
+                    next(pipeline.generate_stream("hello"))
+            self.assertFalse(pipeline._stream_cancellations)
+        self.assertEqual(self.fake_lib.freed_tokens, 1)
+
+    def test_stream_after_pipeline_close_releases_token(self):
+        pipeline = pipeline_module.BloomPipeline(".", engine="mock")
+        pipeline.close()
+        with self.assertRaisesRegex(pipeline_module.BloomError, "closed"):
+            next(pipeline.generate_stream("hello"))
+        self.assertEqual(self.fake_lib.freed_tokens, 1)
 
 
 @unittest.skipUnless(

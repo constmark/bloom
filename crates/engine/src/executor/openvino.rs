@@ -1,6 +1,5 @@
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use anyhow::{Result, anyhow};
 use bloomai_core::{DeviceClass, DeviceKind, GenerationParams, Modality, ModelFamily, ModelFormat};
@@ -143,9 +142,9 @@ impl Engine for OpenVINOEngine {
             supported_modalities: vec![Modality::Text],
             supports_streaming: true,
             supports_quantized_models: true, // INT4/INT8 IR
-            supports_embeddings: true,
-            supports_rerank: true,
-            supports_structured_output: true,
+            supports_embeddings: false,
+            supports_rerank: false,
+            supports_structured_output: false,
             max_context_tokens: None,
             supported_quant_methods: vec![
                 crate::core::quantization::QuantMethod::Int8,
@@ -304,40 +303,7 @@ impl LoadedModel for OpenVINOModel {
             command.arg("--seed").arg(seed.to_string());
         }
 
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::inherit());
-
-        let mut child = command
-            .spawn()
-            .map_err(|e| anyhow!("failed to spawn OpenVINO inference process: {}", e))?;
-
-        // Stream stdout in real-time
-        if let Some(mut stdout) = child.stdout.take() {
-            let mut buffer = Vec::new();
-            let mut byte = [0u8; 1];
-
-            while stdout.read_exact(&mut byte).is_ok() {
-                buffer.push(byte[0]);
-                if let Ok(text) = std::str::from_utf8(&buffer) {
-                    sink.on_chunk(crate::io::OutputChunk::TextDelta(text.to_string()))?;
-                    buffer.clear();
-                }
-            }
-        }
-
-        let status = child
-            .wait()
-            .map_err(|e| anyhow!("failed to wait on OpenVINO inference process: {}", e))?;
-
-        sink.on_chunk(crate::io::OutputChunk::End)?;
-
-        if !status.success() {
-            return Err(anyhow!(
-                "OpenVINO inference process exited with error status"
-            ));
-        }
-
-        Ok(())
+        crate::core::process::stream_text_process(&mut command, sink)
     }
 }
 

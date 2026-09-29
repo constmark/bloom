@@ -11,6 +11,21 @@ const MAX_MEMORY_UTILIZATION: f64 = 0.95;
 const DEFAULT_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 const PAGE_BYTES: usize = 4096;
 
+/// Query free and total bytes for a CUDA logical device (respecting CUDA visibility).
+/// Driver initialization and thread binding stay inside the engine adapter.
+#[cfg(feature = "cuda")]
+pub fn cuda_memory_info(ordinal: usize) -> Result<(usize, usize)> {
+    use candle_core::cuda_backend::cudarc::driver::{CudaContext, result};
+
+    let context = CudaContext::new(ordinal)
+        .map_err(|error| anyhow!("failed to initialize CUDA logical device {ordinal}: {error}"))?;
+    context
+        .bind_to_thread()
+        .map_err(|error| anyhow!("failed to bind CUDA logical device {ordinal}: {error}"))?;
+    result::mem_get_info()
+        .map_err(|error| anyhow!("failed to query CUDA logical device {ordinal} memory: {error}"))
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct MemoryPreallocationConfig {
     pub enabled: bool,
