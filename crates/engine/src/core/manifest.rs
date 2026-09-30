@@ -909,6 +909,8 @@ pub fn load_manifest(model_path: &Path) -> Result<ModelManifest> {
     let mut manifest = if explicit_manifest {
         let content = fs::read_to_string(model_path.join("bloom.json"))?;
         serde_json::from_str(&content)?
+    } else if is_laya_model_layout(model_path) {
+        infer_from_laya_config(model_path)?
     } else if model_path.join("config.json").exists() {
         let content = fs::read_to_string(model_path.join("config.json"))?;
         let config: serde_json::Value = serde_json::from_str(&content)?;
@@ -940,6 +942,58 @@ pub fn load_manifest(model_path: &Path) -> Result<ModelManifest> {
         validate_explicit_manifest_artifact_coverage(&manifest, model_path)?;
     }
     validate_manifest(&mut manifest, model_path)?;
+    Ok(manifest)
+}
+
+fn is_laya_model_layout(model_path: &Path) -> bool {
+    model_path.join("rl_agent_config.json").is_file()
+        && model_path.join("encoder/config.json").is_file()
+        && model_path.join("tokenizer/tokenizer.json").is_file()
+        && model_path.join("model.safetensors").is_file()
+}
+
+fn infer_from_laya_config(model_path: &Path) -> Result<ModelManifest> {
+    let encoder_config: serde_json::Value =
+        serde_json::from_slice(&fs::read(model_path.join("encoder/config.json"))?)?;
+    let laya_config: serde_json::Value =
+        serde_json::from_slice(&fs::read(model_path.join("rl_agent_config.json"))?)?;
+    let mut manifest = infer_from_hf_config(model_path, encoder_config)?;
+    manifest.id = model_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    manifest.family = ModelFamily::Custom("laya".to_string());
+    manifest.io_schema = ModelIoSchema {
+        inputs: vec![Modality::Text],
+        outputs: vec![Modality::Text],
+    };
+    manifest.parameters.insert(
+        "bloom_task".to_string(),
+        serde_json::Value::String("decision".to_string()),
+    );
+    manifest.parameters.insert(
+        "laya_max_len".to_string(),
+        laya_config
+            .get("max_len")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!(512)),
+    );
+    manifest.parameters.insert(
+        "laya_head_max_len".to_string(),
+        laya_config
+            .get("head_max_len")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!(192)),
+    );
+    manifest.runtime_hints.preferred_backends = vec!["laya".to_string()];
+    manifest.runtime_hints.supports_mmap = true;
+    infer_hf_safetensors_files(model_path, &mut manifest)?;
+    if manifest.files.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Laya checkpoint is missing model.safetensors"
+        ));
+    }
     Ok(manifest)
 }
 

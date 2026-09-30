@@ -197,7 +197,7 @@ async fn prepare_loaded_runtime(
     validate_strict_runtime_backend(&backend_name)?;
     engine_registry().get(&backend_name).map_err(|error| {
         anyhow!(
-            "{}. Supported engines are: candle, openvino, funasr, qwen3_vl, longcat, intel-npu, npu-tts, onnxruntime, coreml, mlx, vulkan, llamacpp, wan.",
+            "{}. Supported engines are: candle, laya, openvino, funasr, qwen3_vl, longcat, intel-npu, npu-tts, onnxruntime, coreml, mlx, vulkan, llamacpp, wan.",
             error
         )
     })?;

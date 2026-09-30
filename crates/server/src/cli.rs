@@ -59,7 +59,7 @@ pub(crate) struct Args {
     #[arg(short, long, default_value_t = 3000)]
     pub port: u16,
 
-    /// Selection of backend engine: candle, openvino, funasr, qwen3_vl.
+    /// Selection of backend engine: candle, laya, openvino, funasr, qwen3_vl.
     #[arg(long, default_value = "candle")]
     pub backend: String,
 

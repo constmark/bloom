@@ -22,6 +22,7 @@ use bloomai_engine::executor::candle::CandleEngine;
 use bloomai_engine::executor::coreml::CoreMlEngine;
 use bloomai_engine::executor::funasr::FunASREngine;
 use bloomai_engine::executor::intel_npu::IntelNpuEngine;
+use bloomai_engine::executor::laya::LayaEngine;
 use bloomai_engine::executor::llamacpp::LlamaCppEngine;
 use bloomai_engine::executor::longcat_image_edit::LongCatImageEditEngine;
 use bloomai_engine::executor::mlx::MlxEngine;
@@ -134,7 +135,7 @@ struct Args {
     )]
     prompt: String,
 
-    /// Selection of backend engine: candle, openvino, funasr, qwen3_vl.
+    /// Selection of backend engine: candle, laya, openvino, funasr, qwen3_vl.
     #[arg(long, default_value = "candle")]
     backend: String,
 
@@ -301,6 +302,7 @@ fn main() -> Result<()> {
     registry.register("candle", Box::new(CandleEngine));
     registry.register("openvino", Box::new(OpenVINOEngine));
     registry.register("funasr", Box::new(FunASREngine));
+    registry.register("laya", Box::new(LayaEngine));
     #[cfg(feature = "candle-engine")]
     registry.register("qwen3_vl", Box::new(Qwen3VLEngine));
     registry.register("intel-npu", Box::new(IntelNpuEngine));
@@ -331,6 +333,8 @@ fn main() -> Result<()> {
             "longcat"
         } else if manifest.family == bloomai_core::ModelFamily::FunAsr {
             "funasr"
+        } else if matches!(&manifest.family, bloomai_core::ModelFamily::Custom(c) if c == "laya") {
+            "laya"
         } else if matches!(&manifest.family, bloomai_core::ModelFamily::Custom(c) if c == "wan") {
             "wan"
         } else {
@@ -342,7 +346,7 @@ fn main() -> Result<()> {
 
     let engine = registry.get(backend_name).map_err(|e| {
         anyhow!(
-            "{}. Supported engines are: candle, openvino, funasr, qwen3_vl, longcat, intel-npu, npu-tts, onnxruntime, coreml, mlx, llamacpp, wan.",
+            "{}. Supported engines are: candle, laya, openvino, funasr, qwen3_vl, longcat, intel-npu, npu-tts, onnxruntime, coreml, mlx, llamacpp, wan.",
             e
         )
     })?;

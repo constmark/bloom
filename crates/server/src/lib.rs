@@ -499,7 +499,7 @@ async fn run_server(args: Args, config_path: PathBuf) -> Result<()> {
     let registry = engine_registry();
     registry.get(&args.backend).map_err(|e| {
         anyhow!(
-            "{}. Supported engines are: candle, openvino, funasr, qwen3_vl, longcat, intel-npu, npu-tts, onnxruntime, coreml, mlx, vulkan, llamacpp, wan.",
+            "{}. Supported engines are: candle, laya, openvino, funasr, qwen3_vl, longcat, intel-npu, npu-tts, onnxruntime, coreml, mlx, vulkan, llamacpp, wan.",
             e
         )
     })?;

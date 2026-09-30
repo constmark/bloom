@@ -24,6 +24,7 @@ use bloomai_engine::executor::candle::CandleEngine;
 use bloomai_engine::executor::coreml::CoreMlEngine;
 use bloomai_engine::executor::funasr::FunASREngine;
 use bloomai_engine::executor::intel_npu::IntelNpuEngine;
+use bloomai_engine::executor::laya::LayaEngine;
 use bloomai_engine::executor::llamacpp::LlamaCppEngine;
 use bloomai_engine::executor::longcat_image_edit::LongCatImageEditEngine;
 use bloomai_engine::executor::mlx::MlxEngine;
@@ -138,7 +139,7 @@ struct Args {
     #[arg(long, default_value = "cpu")]
     device: String,
 
-    /// Selection of backend engine: candle, openvino, funasr, qwen3_vl, longcat.
+    /// Selection of backend engine: candle, laya, openvino, funasr, qwen3_vl, longcat.
     #[arg(long, default_value = "candle")]
     backend: String,
 
@@ -389,6 +390,8 @@ fn select_backend_name(
             "longcat".to_string()
         } else if manifest.family == bloomai_core::ModelFamily::FunAsr {
             "funasr".to_string()
+        } else if matches!(&manifest.family, bloomai_core::ModelFamily::Custom(c) if c == "laya") {
+            "laya".to_string()
         } else if matches!(&manifest.family, bloomai_core::ModelFamily::Custom(c) if c == "wan") {
             "wan".to_string()
         } else {
@@ -609,6 +612,22 @@ fn resolve_and_parse_input(args: &Args, template: CliChatTemplate) -> Result<Res
     let trimmed = raw_input.trim();
 
     if trimmed.starts_with('{') {
+        // Structured decision engines such as Laya consume the request JSON
+        // verbatim. Do this before the chat-oriented PromptJson parser, whose
+        // optional fields would otherwise turn {state, questions} into an
+        // empty prompt.
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed)
+            && value.get("state").is_some()
+            && value.get("questions").is_some()
+        {
+            return Ok(ResolvedInput {
+                prompt: trimmed.to_string(),
+                max_tokens: args.max_tokens,
+                temperature: args.temperature,
+                top_p: args.top_p,
+                seed: args.seed,
+            });
+        }
         if let Ok(json_obj) = serde_json::from_str::<PromptJson>(trimmed) {
             let prompt = if let Some(messages) = json_obj.messages {
                 chat_prompt_for_model(&messages, template)
@@ -660,6 +679,7 @@ fn build_engine_registry() -> EngineRegistry {
     registry.register("candle", Box::new(CandleEngine));
     registry.register("openvino", Box::new(OpenVINOEngine));
     registry.register("funasr", Box::new(FunASREngine));
+    registry.register("laya", Box::new(LayaEngine));
     #[cfg(feature = "candle-engine")]
     registry.register("qwen3_vl", Box::new(Qwen3VLEngine));
     registry.register("longcat", Box::new(LongCatImageEditEngine));
@@ -759,7 +779,7 @@ fn main() -> Result<()> {
 
     let engine = registry
         .get(&backend_name)
-        .map_err(|e| anyhow!("{}. Supported engines are: candle, openvino, funasr, qwen3_vl, longcat, intel-npu, npu-tts, onnxruntime, llamacpp, wan.", e))?;
+        .map_err(|e| anyhow!("{}. Supported engines are: candle, laya, openvino, funasr, qwen3_vl, longcat, intel-npu, npu-tts, onnxruntime, llamacpp, wan.", e))?;
 
     if args.inspect {
         return print_inspect(
@@ -1982,5 +2002,22 @@ mod tests {
             select_backend_name(None, "candle", "none", &manifest),
             "wan"
         );
+
+        manifest.family = bloomai_core::ModelFamily::Custom("laya".to_string());
+        assert_eq!(
+            select_backend_name(None, "candle", "none", &manifest),
+            "laya"
+        );
+    }
+
+    #[test]
+    fn structured_laya_prompt_is_preserved_verbatim() {
+        let args = Args::parse_from([
+            "bloom_infer",
+            "--prompt",
+            r#"{"state":"hello","questions":{"q":{"type":"noul","instructions":"is it safe?"}}}"#,
+        ]);
+        let resolved = resolve_and_parse_input(&args, CliChatTemplate::Legacy).unwrap();
+        assert_eq!(resolved.prompt, args.prompt);
     }
 }

@@ -11,6 +11,7 @@ pub mod gemma4;
 #[cfg(feature = "candle-engine")]
 pub mod gemma4_streaming;
 pub mod intel_npu;
+pub mod laya;
 pub mod llamacpp;
 pub mod longcat_image_edit;
 #[cfg(feature = "candle-engine")]

@@ -5,6 +5,7 @@ use bloomai_engine::executor::candle::CandleEngine;
 use bloomai_engine::executor::coreml::CoreMlEngine;
 use bloomai_engine::executor::funasr::FunASREngine;
 use bloomai_engine::executor::intel_npu::IntelNpuEngine;
+use bloomai_engine::executor::laya::LayaEngine;
 use bloomai_engine::executor::llamacpp::LlamaCppEngine;
 use bloomai_engine::executor::longcat_image_edit::LongCatImageEditEngine;
 use bloomai_engine::executor::mlx::MlxEngine;
@@ -24,6 +25,7 @@ pub(crate) fn engine_registry() -> EngineRegistry {
     registry.register("candle", Box::new(CandleEngine));
     registry.register("openvino", Box::new(OpenVINOEngine));
     registry.register("funasr", Box::new(FunASREngine));
+    registry.register("laya", Box::new(LayaEngine));
     #[cfg(feature = "candle-engine")]
     registry.register("qwen3_vl", Box::new(Qwen3VLEngine));
     registry.register("intel-npu", Box::new(IntelNpuEngine));
@@ -73,6 +75,8 @@ pub(crate) fn select_backend_name(
             "longcat".to_string()
         } else if manifest.family == bloomai_core::ModelFamily::FunAsr {
             "funasr".to_string()
+        } else if matches!(&manifest.family, bloomai_core::ModelFamily::Custom(c) if c == "laya") {
+            "laya".to_string()
         } else if matches!(&manifest.family, bloomai_core::ModelFamily::Custom(c) if c == "wan") {
             "wan".to_string()
         } else {
@@ -113,7 +117,7 @@ pub(crate) fn validate_ifb_backend(enable_ifb: bool, backend_name: &str) -> Resu
 }
 
 pub(crate) fn validate_strict_runtime_backend(backend_name: &str) -> Result<()> {
-    if !matches!(backend_name, "candle" | "qwen3_vl") {
+    if !matches!(backend_name, "candle" | "qwen3_vl" | "laya") {
         return Err(anyhow!(
             "strict aggregate memory admission requires a backend that reports its verified physical device; selected backend '{backend_name}' does not yet provide that contract"
         ));

@@ -802,6 +802,7 @@ paths. The current source of truth is the
 | Candle on Metal | Experimental | Build with `--features metal` |
 | Candle on CUDA | Experimental | Build with `--features cuda` |
 | OpenVINO and ASR bridges | External runtime | Require additional runtimes or Python packages |
+| Laya decision models | Experimental native runtime | Use a Laya checkpoint directory and JSON `{state, questions}` input; returns typed answers rather than generated text |
 | ONNX Runtime | Skeleton | Inspection and capability diagnostics only |
 
 Do not infer production readiness from the presence of an engine adapter. A
