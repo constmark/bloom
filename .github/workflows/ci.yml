@@ -90,11 +90,6 @@ jobs:
         # -D warnings keeps CI strict; -A missing_docs opts out of the
         # documentation lint so it does not block PRs while docs catch up.
         run: cargo clippy --workspace --all-targets --locked -- -D warnings -A missing_docs
-      - name: Diagnose CPU preflight
-        timeout-minutes: 5
-        env:
-          RUST_BACKTRACE: "1"
-        run: cargo test -p bloomai-server --lib model_preflight::tests::supported_cpu_manifest_is_loadable --locked -- --exact --nocapture
       - name: Test
         # Fail visibly and preserve job logs if a test blocks indefinitely.
         timeout-minutes: 20
