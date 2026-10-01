@@ -66,7 +66,9 @@ unsafe extern "C" fn cancel_from_stream_callback_v2(
     assert!(!user_data.is_null());
     let callback_context = unsafe { &*(user_data.cast::<ActiveCallbackContext>()) };
     unsafe { test_stream_callback_v2(std::ptr::null_mut(), chunk_json, chunk_json_len) };
-    callback_context.callback_count.fetch_add(1, Ordering::Relaxed);
+    callback_context
+        .callback_count
+        .fetch_add(1, Ordering::Relaxed);
     assert_eq!(
         unsafe { bloom_cancellation_token_cancel(callback_context.token) },
         BLOOM_STATUS_OK
