@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import pathlib
 import sys
 import unittest
@@ -87,6 +88,28 @@ def ui_metadata() -> dict[str, object]:
 
 
 class SbomContractTests(unittest.TestCase):
+    def test_repository_policy_preserves_option_ext_license(self) -> None:
+        policy_path = pathlib.Path(__file__).resolve().parents[1] / "config/dependency-policy.json"
+        repository_policy = json.loads(policy_path.read_text(encoding="utf-8"))
+        changed = metadata()
+        option_ext_id = f"{REGISTRY}#option-ext@0.2.0"
+        changed["packages"][1].update(
+            id=option_ext_id, name="option-ext", version="0.2.0", license="MPL-2.0"
+        )
+        changed["resolve"]["nodes"][0]["deps"][0]["pkg"] = option_ext_id
+        changed["resolve"]["nodes"][1]["id"] = option_ext_id
+        sbom = build_sbom(
+            changed, repository_policy, "x86_64-unknown-linux-gnu", False
+        )
+        component = next(item for item in sbom["components"] if item["name"] == "option-ext")
+        self.assertEqual(component["licenses"], [{"expression": "MPL-2.0"}])
+        validate_sbom_document(
+            sbom, repository_policy, "0.1.0", "x86_64-unknown-linux-gnu", False
+        )
+        changed["packages"][1]["license"] = "GPL-3.0-only"
+        with self.assertRaisesRegex(SbomError, "unreviewed license"):
+            build_sbom(changed, repository_policy, "x86_64-unknown-linux-gnu", False)
+
     def test_build_is_deterministic_and_self_validating(self) -> None:
         first = build_sbom(metadata(), policy(), "x86_64-unknown-linux-gnu", False)
         second = build_sbom(metadata(), policy(), "x86_64-unknown-linux-gnu", False)

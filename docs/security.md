@@ -28,6 +28,19 @@ metadata and an allowlist are not legal
 advice or proof of license compliance; release owners still review notices and
 distribution obligations.
 
+The `MPL-2.0` expression is recorded for the existing `option-ext` 0.2.0
+transitive dependency of `dirs-sys` 0.5.0. Its published
+[manifest](https://docs.rs/crate/option-ext/0.2.0/source/Cargo.toml.orig) declares
+that expression and its
+[license file](https://docs.rs/crate/option-ext/0.2.0/source/LICENSE.txt) contains
+the Mozilla Public License 2.0. The crate's published VCS metadata identifies
+the corresponding
+[source revision](https://github.com/soc/option-ext/tree/272f22fc9ea1ac6b08f01704af52c4ac338df4e2).
+Bloom does not modify that dependency. This is an inspection of upstream
+metadata and license text, not a legal compliance determination. Redistributors
+must preserve the applicable notices and make the covered source available
+under MPL-2.0; Bloom's Apache-2.0 license does not replace those terms.
+
 ## Model files
 
 - Load models only from controlled directories.
