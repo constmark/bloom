@@ -16,7 +16,11 @@ use bloom_ffi::{
 };
 
 static CALLBACK_DATA: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
-static V2_CALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+struct ActiveCallbackContext {
+    token: *mut BloomCancellationToken,
+    callback_count: AtomicUsize,
+}
 
 fn bloom_slice(bytes: &[u8]) -> BloomSlice {
     BloomSlice {
@@ -41,14 +45,17 @@ unsafe extern "C" fn test_stream_callback(
 }
 
 unsafe extern "C" fn test_stream_callback_v2(
-    _user_data: *mut std::ffi::c_void,
+    user_data: *mut std::ffi::c_void,
     chunk_json: *const u8,
     chunk_json_len: usize,
 ) {
     assert!(!chunk_json.is_null());
     let chunk = unsafe { std::slice::from_raw_parts(chunk_json, chunk_json_len) };
     assert!(serde_json::from_slice::<serde_json::Value>(chunk).is_ok());
-    V2_CALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+    if !user_data.is_null() {
+        let callback_count = unsafe { &*(user_data.cast::<AtomicUsize>()) };
+        callback_count.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 unsafe extern "C" fn cancel_from_stream_callback_v2(
@@ -56,10 +63,12 @@ unsafe extern "C" fn cancel_from_stream_callback_v2(
     chunk_json: *const u8,
     chunk_json_len: usize,
 ) {
+    assert!(!user_data.is_null());
+    let callback_context = unsafe { &*(user_data.cast::<ActiveCallbackContext>()) };
     unsafe { test_stream_callback_v2(std::ptr::null_mut(), chunk_json, chunk_json_len) };
-    let token = user_data.cast::<BloomCancellationToken>();
+    callback_context.callback_count.fetch_add(1, Ordering::Relaxed);
     assert_eq!(
-        unsafe { bloom_cancellation_token_cancel(token) },
+        unsafe { bloom_cancellation_token_cancel(callback_context.token) },
         BLOOM_STATUS_OK
     );
 }
@@ -210,20 +219,20 @@ fn test_v2_stream_cancellation_is_distinct_and_suppresses_callbacks() {
         let token = bloom_cancellation_token_new();
         assert!(!token.is_null());
         assert_eq!(bloom_cancellation_token_cancel(token), BLOOM_STATUS_OK);
-        V2_CALLBACK_COUNT.store(0, Ordering::Relaxed);
+        let callback_count = AtomicUsize::new(0);
 
         let status = bloom_pipeline_run_stream_v2(
             pipeline,
             bloom_slice(br#"{"Text":{"prompt":"Hello"}}"#),
             bloom_slice(br#"{"max_tokens":10,"temperature":0.7,"top_p":0.9,"seed":null}"#),
             Some(test_stream_callback_v2),
-            std::ptr::null_mut(),
+            (&callback_count as *const AtomicUsize).cast_mut().cast(),
             token,
             err_buf.as_mut_ptr(),
             err_buf.len(),
         );
         assert_eq!(status, BLOOM_STATUS_CANCELLED);
-        assert_eq!(V2_CALLBACK_COUNT.load(Ordering::Relaxed), 0);
+        assert_eq!(callback_count.load(Ordering::Relaxed), 0);
         assert!(
             CStr::from_ptr(err_buf.as_ptr())
                 .to_string_lossy()
@@ -250,20 +259,23 @@ fn test_v2_stream_observes_cancellation_from_an_active_callback() {
         assert!(!pipeline.is_null());
         let token = bloom_cancellation_token_new();
         assert!(!token.is_null());
-        V2_CALLBACK_COUNT.store(0, Ordering::Relaxed);
+        let mut callback_context = ActiveCallbackContext {
+            token,
+            callback_count: AtomicUsize::new(0),
+        };
 
         let status = bloom_pipeline_run_stream_v2(
             pipeline,
             bloom_slice(br#"{"Text":{"prompt":"Hello"}}"#),
             bloom_slice(br#"{"max_tokens":10,"temperature":0.7,"top_p":0.9,"seed":null}"#),
             Some(cancel_from_stream_callback_v2),
-            token.cast(),
+            (&mut callback_context as *mut ActiveCallbackContext).cast(),
             token,
             err_buf.as_mut_ptr(),
             err_buf.len(),
         );
         assert_eq!(status, BLOOM_STATUS_CANCELLED);
-        assert_eq!(V2_CALLBACK_COUNT.load(Ordering::Relaxed), 1);
+        assert_eq!(callback_context.callback_count.load(Ordering::Relaxed), 1);
 
         bloom_cancellation_token_free(token);
         bloom_pipeline_free(pipeline);
