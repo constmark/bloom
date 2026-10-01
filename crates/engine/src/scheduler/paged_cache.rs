@@ -520,10 +520,11 @@ impl PagedAttentionCache {
 
         for layer_map in layer_data.iter() {
             for block in layer_map.values() {
-                if self.config.kv_dtype.needs_dequant() {
-                    if let (Some(qk), Some(qv)) = (&block.quantized_keys, &block.quantized_values) {
-                        total += qk.memory_bytes() + qv.memory_bytes();
-                    }
+                if self.config.kv_dtype.needs_dequant()
+                    && let (Some(qk), Some(qv)) =
+                        (&block.quantized_keys, &block.quantized_values)
+                {
+                    total += qk.memory_bytes() + qv.memory_bytes();
                 } else {
                     total += (block.keys.len() + block.values.len()) * element_size;
                 }
