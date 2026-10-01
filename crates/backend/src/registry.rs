@@ -29,7 +29,14 @@ impl Default for BackendRegistry {
         registry.register("metal", Box::<MetalBackend>::default());
         registry.register("mlx", Box::<MlxBackend>::default());
         registry.register("cuda", Box::<CudaBackend>::default());
-        registry.register("gpu", Box::<CudaBackend>::default());
+        // Keep the generic `gpu` name useful on Apple Silicon.  CUDA is the
+        // natural default on Linux/Windows, while Metal is the only native
+        // GPU backend exposed by this crate on macOS.
+        if cfg!(target_os = "macos") {
+            registry.register("gpu", Box::<MetalBackend>::default());
+        } else {
+            registry.register("gpu", Box::<CudaBackend>::default());
+        }
         registry.register("intel-npu", Box::<IntelNpuBackend>::default());
         registry
     }
@@ -238,6 +245,18 @@ mod tests {
             names,
             vec!["cpu", "cuda", "gpu", "intel-npu", "metal", "mlx"]
         );
+    }
+
+    #[test]
+    fn generic_gpu_alias_uses_native_backend() {
+        let registry = BackendRegistry::default();
+        let backend = registry
+            .get("gpu")
+            .expect("generic GPU alias is registered");
+        #[cfg(target_os = "macos")]
+        assert_eq!(backend.info().name, "metal");
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(backend.info().name, "cuda");
     }
 
     struct DummyBackend;

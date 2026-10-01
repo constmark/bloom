@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import http.server
 import json
+import os
 import pathlib
 import sys
 import tempfile
@@ -64,6 +65,17 @@ class WorkloadTests(unittest.TestCase):
             "count": 4, "p50": 2.5, "p95": 3.85, "p99": 3.97, "max": 4,
         })
         self.assertIsNone(workload.distribution([])["p95"])
+
+    def test_rss_sampler_uses_a_platform_source(self) -> None:
+        # Keep this probe process-local so the regression remains independent
+        # of a running Bloom server or a model fixture.  Windows uses the
+        # locale-independent PSAPI path; POSIX hosts use /proc or ps.
+        self.assertGreater(workload.read_rss_bytes(os.getpid()), 0)
+        source = workload.rss_source()
+        if os.name == "nt":
+            self.assertEqual(source, "Windows PSAPI WorkingSetSize")
+        else:
+            self.assertIn(source, {"/proc/<pid>/status VmRSS", "ps RSS"})
 
     def request(self, handler: type[FakeChat]) -> dict:
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)

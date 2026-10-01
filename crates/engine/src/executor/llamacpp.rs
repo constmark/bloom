@@ -363,7 +363,7 @@ fn resolve_llama_server_binary() -> Result<PathBuf> {
     }
 
     let mut candidates = Vec::new();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = user_home_dir() {
         candidates.push(home.join(".docker/bin/inference/llama-server"));
     }
     candidates.push(PathBuf::from("llama-server"));
@@ -379,6 +379,24 @@ fn resolve_llama_server_binary() -> Result<PathBuf> {
     bail!(
         "llama-server not found. Set BLOOM_LLAMA_CPP_SERVER to a recent llama.cpp llama-server binary"
     )
+}
+
+fn user_home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+        .or_else(|| {
+            let drive = std::env::var_os("HOMEDRIVE").filter(|value| !value.is_empty())?;
+            let path = std::env::var_os("HOMEPATH").filter(|value| !value.is_empty())?;
+            let mut home = PathBuf::from(drive);
+            home.push(path);
+            Some(home)
+        })
 }
 
 fn command_exists(binary: &Path) -> bool {

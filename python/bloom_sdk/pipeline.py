@@ -5,7 +5,7 @@ import os
 import sys
 import threading
 from pathlib import Path
-from typing import Any, Dict, Generator, Optional, Union
+from typing import Any, Dict, Generator, Mapping, Optional, Union
 
 from ._stream import MAX_STREAM_BYTES, StreamBuffer
 
@@ -104,6 +104,114 @@ BloomStreamCallbackV2 = ctypes.CFUNCTYPE(
 )
 
 BLOOM_STATUS_CANCELLED = -8
+
+# Keep the Python boundary's diagnostic vocabulary stable while allowing
+# applications to present messages in their own UI language.  Native errors
+# are retained verbatim after the localized prefix so no diagnostic context is
+# lost.  Locale selection is deliberately small and deterministic: callers
+# can pass either a BCP-47 language tag or set BLOOM_LOCALE in the process
+# environment.  Unknown tags fall back to English rather than failing a model
+# load because of a presentation preference.
+_LOCALE_ALIASES = {
+    "en": "en",
+    "en-us": "en",
+    "en-gb": "en",
+    "zh": "zh-CN",
+    "zh-cn": "zh-CN",
+    "zh-sg": "zh-CN",
+    "zh-tw": "zh-TW",
+    "zh-hk": "zh-TW",
+}
+_LOCALIZED_LABELS = {
+    "en": {
+        "load_failed": "Native pipeline loading failed",
+        "model_load_failed": "Failed to load model pipeline",
+        "inference_failed": "Inference failed",
+        "stream_failed": "Streaming failed",
+        "stream_native_failed": "Streaming native call failed",
+        "pipeline_closed": "Pipeline is closed",
+        "invalid_json": "Inference returned invalid JSON",
+        "invalid_chunk": "Invalid streaming chunk",
+    },
+    "zh-CN": {
+        "load_failed": "原生推理管道加载失败",
+        "model_load_failed": "模型推理管道加载失败",
+        "inference_failed": "推理失败",
+        "stream_failed": "流式推理失败",
+        "stream_native_failed": "原生流式调用失败",
+        "pipeline_closed": "推理管道已关闭",
+        "invalid_json": "推理返回了无效 JSON",
+        "invalid_chunk": "无效的流式数据块",
+    },
+    "zh-TW": {
+        "load_failed": "原生推理管線載入失敗",
+        "model_load_failed": "模型推理管線載入失敗",
+        "inference_failed": "推理失敗",
+        "stream_failed": "串流推理失敗",
+        "stream_native_failed": "原生串流呼叫失敗",
+        "pipeline_closed": "推理管線已關閉",
+        "invalid_json": "推理回傳了無效 JSON",
+        "invalid_chunk": "無效的串流資料塊",
+    },
+}
+
+
+def _normalize_locale(locale: Optional[str]) -> str:
+    """Return the SDK's display locale for a BCP-47-ish language tag."""
+    selected = locale if locale is not None else os.environ.get("BLOOM_LOCALE", "en")
+    if not isinstance(selected, str):
+        raise TypeError("locale must be a string or None")
+    normalized = selected.strip().replace("_", "-").lower()
+    if not normalized:
+        return "en"
+    return _LOCALE_ALIASES.get(normalized, "en")
+
+
+def _label(locale: str, key: str) -> str:
+    labels = _LOCALIZED_LABELS.get(locale, _LOCALIZED_LABELS["en"])
+    return labels.get(key, _LOCALIZED_LABELS["en"].get(key, key))
+
+
+def _normalize_response_format(
+    response_format: Optional[Union[str, Mapping[str, Any]]],
+) -> Optional[Dict[str, Any]]:
+    """Convert OpenAI-style response formats to the native enum encoding.
+
+    The C ABI deserializes ``GenerationParams`` directly. Its tagged enum uses
+    ``{"type": "json_object"}`` and
+    ``{"type": "json_schema", "json_schema": schema}``, while SDK callers
+    commonly use the same OpenAI-style mapping. Accept strings as a convenient
+    shorthand and normalize both forms to the exact Rust representation.
+    """
+    if response_format is None:
+        return None
+    if isinstance(response_format, str):
+        if response_format in {"text", "json_object"}:
+            return {"type": response_format}
+        raise ValueError(
+            "response_format string must be 'text' or 'json_object'"
+        )
+    if not isinstance(response_format, Mapping):
+        raise TypeError("response_format must be a mapping, string, or None")
+
+    format_type = response_format.get("type")
+    if format_type is None and set(response_format) == {"json_schema"}:
+        schema = response_format["json_schema"]
+    elif format_type == "text":
+        return {"type": "text"}
+    elif format_type == "json_object":
+        return {"type": "json_object"}
+    elif format_type == "json_schema":
+        schema = response_format.get("json_schema")
+        if isinstance(schema, Mapping) and "schema" in schema:
+            schema = schema["schema"]
+    else:
+        raise ValueError(
+            "response_format.type must be 'text', 'json_object', or 'json_schema'"
+        )
+    if not isinstance(schema, Mapping):
+        raise ValueError("response_format json_schema must contain a schema object")
+    return {"type": "json_schema", "json_schema": dict(schema)}
 
 
 def _bytes_slice(value: bytes):
@@ -246,16 +354,31 @@ class BloomPipeline:
     """
     def __init__(
         self,
-        model_path: str,
+        model_path: Union[str, os.PathLike],
         engine: str = "candle",
         device: str = "cpu",
         context_size: int = 2048,
+        locale: Optional[str] = None,
     ):
+        self.locale = _normalize_locale(locale)
         self._call_lock = threading.RLock()
         self._stream_lock = threading.Lock()
         self._stream_cancellations = set()
         self._closing = False
         self._pipeline = None
+        # pathlib.Path and other os.PathLike implementations are common in
+        # cross-platform applications.  Convert them once, while rejecting
+        # arbitrary filesystem bytes that cannot be represented by the UTF-8
+        # C ABI.  This keeps Unicode model paths lossless on all platforms.
+        try:
+            model_path = os.fspath(model_path)
+        except TypeError as error:
+            raise TypeError("model_path must be a string or os.PathLike") from error
+        if isinstance(model_path, bytes):
+            try:
+                model_path = model_path.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise ValueError("model_path bytes must be valid UTF-8") from error
         if not isinstance(model_path, str) or not model_path:
             raise ValueError("model_path must be a non-empty string")
         if not isinstance(engine, str) or not engine:
@@ -280,7 +403,9 @@ class BloomPipeline:
         try:
             self._lib = _get_lib()
         except (OSError, RuntimeError) as error:
-            raise BloomLoadError(f"Could not load the Bloom native library: {error}") from error
+            raise BloomLoadError(
+                f"{_label(self.locale, 'load_failed')}: {error}"
+            ) from error
         self._uses_v2 = bool(getattr(self._lib, "_bloom_uses_v2", False))
         err_buf = ctypes.create_string_buffer(512)
         try:
@@ -308,10 +433,12 @@ class BloomPipeline:
                     len(err_buf)
                 )
         except Exception as error:
-            raise BloomLoadError(f"Native pipeline loading failed: {error}") from error
+            raise BloomLoadError(
+                f"{_label(self.locale, 'load_failed')}: {error}"
+            ) from error
         if not self._pipeline:
             raise BloomLoadError(
-                f"Failed to load model pipeline: {_decode_error(err_buf)}"
+                f"{_label(self.locale, 'model_load_failed')}: {_decode_error(err_buf)}"
             )
 
     def __enter__(self):
@@ -351,6 +478,7 @@ class BloomPipeline:
         temperature: float,
         top_p: float,
         seed: Optional[int],
+        response_format: Optional[Union[str, Mapping[str, Any]]] = None,
     ):
         if isinstance(prompt_or_input, str):
             input_data = {"Text": {"prompt": prompt_or_input}}
@@ -386,17 +514,36 @@ class BloomPipeline:
             )
         ):
             raise ValueError("seed must be None or an unsigned 64-bit integer")
+        native_response_format = _normalize_response_format(response_format)
 
         params_data = {
             "max_tokens": max_tokens,
             "temperature": temperature,
             "top_p": top_p,
-            "seed": seed
+            "seed": seed,
+            # The native GenerationParams type supports text, json_object and
+            # json_schema response formats.  Passing this through here keeps
+            # the Python SDK feature-compatible with the HTTP adapters while
+            # remaining backwards-compatible when omitted.
+            "response_format": native_response_format,
         }
-        return (
-            json.dumps(input_data, allow_nan=False).encode("utf-8"),
-            json.dumps(params_data, allow_nan=False).encode("utf-8"),
-        )
+        try:
+            # Avoid ASCII-only escaping so multilingual prompts and schema
+            # descriptions remain inspectable in traces and examples.  The
+            # native ABI consumes UTF-8 and receives the same JSON semantics.
+            return (
+                json.dumps(
+                    input_data, ensure_ascii=False, allow_nan=False
+                ).encode("utf-8"),
+                json.dumps(
+                    params_data, ensure_ascii=False, allow_nan=False
+                ).encode("utf-8"),
+            )
+        except (TypeError, ValueError, UnicodeError) as error:
+            raise ValueError(
+                "input and generation parameters must be JSON serializable: "
+                f"{error}"
+            ) from error
 
     def generate(
         self,
@@ -405,19 +552,25 @@ class BloomPipeline:
         temperature: float = 0.7,
         top_p: float = 0.9,
         seed: Optional[int] = None,
+        response_format: Optional[Union[str, Mapping[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
         Run full non-streaming inference.
         
         :param prompt_or_input: Prompt string or dict representation of ModelInput.
+        :param response_format: Optional response format string or OpenAI-style
+            mapping, for example ``"json_object"`` or
+            ``{"type": "json_schema", "json_schema": {"schema": {...}}}``.
         :return: Decoded ModelOutput dict.
         """
-        input_bytes, params_bytes = self._prepare_input_params(prompt_or_input, max_tokens, temperature, top_p, seed)
+        input_bytes, params_bytes = self._prepare_input_params(
+            prompt_or_input, max_tokens, temperature, top_p, seed, response_format
+        )
         err_buf = ctypes.create_string_buffer(512)
 
         with self._call_lock:
             if self._closing or not self._pipeline:
-                raise BloomError("Pipeline is closed")
+                raise BloomError(_label(self.locale, "pipeline_closed"))
             if self._uses_v2:
                 input_slice, input_owner = _bytes_slice(input_bytes)
                 params_slice, params_owner = _bytes_slice(params_bytes)
@@ -438,7 +591,8 @@ class BloomPipeline:
                     ) from error
                 if status != 0:
                     raise BloomInferenceError(
-                        f"Inference failed (code {status}): {_decode_error(err_buf)}"
+                        f"{_label(self.locale, 'inference_failed')} "
+                        f"(code {status}): {_decode_error(err_buf)}"
                     )
                 try:
                     if not output.data and output.len:
@@ -468,7 +622,7 @@ class BloomPipeline:
                     ) from error
                 if not res_ptr:
                     raise BloomInferenceError(
-                        f"Inference failed: {_decode_error(err_buf)}"
+                        f"{_label(self.locale, 'inference_failed')}: {_decode_error(err_buf)}"
                     )
                 try:
                     result_bytes = ctypes.cast(res_ptr, ctypes.c_char_p).value
@@ -483,9 +637,14 @@ class BloomPipeline:
                     self._lib.bloom_string_free(res_ptr)
 
         try:
-            return json.loads(result_text)
+            result = json.loads(result_text)
         except json.JSONDecodeError as error:
-            raise BloomInferenceError("Inference returned invalid JSON") from error
+            raise BloomInferenceError(_label(self.locale, "invalid_json")) from error
+        if not isinstance(result, dict):
+            raise BloomInferenceError(
+                f"{_label(self.locale, 'invalid_json')}: expected a JSON object"
+            )
+        return result
 
     def generate_stream(
         self,
@@ -494,13 +653,16 @@ class BloomPipeline:
         temperature: float = 0.7,
         top_p: float = 0.9,
         seed: Optional[int] = None,
+        response_format: Optional[Union[str, Mapping[str, Any]]] = None,
     ) -> Generator[Dict[str, Any], None, None]:
         """
         Run streaming inference.
         
         Yields parsed OutputChunks progressively, with bounded backpressure.
         """
-        input_bytes, params_bytes = self._prepare_input_params(prompt_or_input, max_tokens, temperature, top_p, seed)
+        input_bytes, params_bytes = self._prepare_input_params(
+            prompt_or_input, max_tokens, temperature, top_p, seed, response_format
+        )
         buffer = StreamBuffer()
         err_buf = ctypes.create_string_buffer(512)
         token_lock = threading.Lock()
@@ -533,7 +695,9 @@ class BloomPipeline:
             cancel_v2_stream()
 
         def invalid_chunk(error):
-            buffer.finish(BloomInferenceError(f"Invalid streaming chunk: {error}"))
+            buffer.finish(BloomInferenceError(
+                f"{_label(self.locale, 'invalid_chunk')}: {error}"
+            ))
             cancel_v2_stream()
 
         @BloomStreamCallback
@@ -570,7 +734,7 @@ class BloomPipeline:
                     if buffer.stopped.is_set():
                         return
                     if self._closing or not self._pipeline:
-                        raise BloomError("Pipeline is closed")
+                        raise BloomError(_label(self.locale, "pipeline_closed"))
                     if self._uses_v2:
                         input_slice, input_owner = _bytes_slice(input_bytes)
                         params_slice, params_owner = _bytes_slice(params_bytes)
@@ -601,13 +765,14 @@ class BloomPipeline:
                     buffer.finish()
                 elif res != 0:
                     buffer.finish(BloomInferenceError(
-                        f"Streaming failed (code {res}): {_decode_error(err_buf)}"
+                        f"{_label(self.locale, 'stream_failed')} "
+                        f"(code {res}): {_decode_error(err_buf)}"
                     ))
                 else:
                     buffer.finish()
             except Exception as error:
                 buffer.finish(BloomInferenceError(
-                    f"Streaming native call failed: {error}"
+                    f"{_label(self.locale, 'stream_native_failed')}: {error}"
                 ))
             finally:
                 free_v2_token()
@@ -617,7 +782,7 @@ class BloomPipeline:
         with self._stream_lock:
             if self._closing:
                 free_v2_token()
-                raise BloomError("Pipeline is closed")
+                raise BloomError(_label(self.locale, "pipeline_closed"))
             self._stream_cancellations.add(stop_stream)
         thread = threading.Thread(target=run_thread, name="bloom-stream")
         try:
@@ -638,7 +803,7 @@ class BloomPipeline:
                     value = json.loads(chunk.decode("utf-8"))
                 except (UnicodeDecodeError, ValueError, RecursionError) as error:
                     raise BloomInferenceError(
-                        f"Invalid streaming chunk: {error}"
+                        f"{_label(self.locale, 'invalid_chunk')}: {error}"
                     ) from error
                 yield value
         finally:

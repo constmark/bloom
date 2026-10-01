@@ -31,6 +31,30 @@ with BloomPipeline("/path/to/model.gguf", context_size=2048) as pipeline:
         stream.close()
 ```
 
+`model_path` accepts either a string or `pathlib.Path`. Text and JSON values
+are encoded as UTF-8, so multilingual prompts can be passed directly:
+
+```python
+from pathlib import Path
+from bloom_sdk import BloomPipeline
+
+with BloomPipeline(Path("模型/问答.gguf"), locale="zh-CN") as pipeline:
+    print(pipeline.generate("请用中文解释端侧推理。"))
+```
+
+`locale` controls SDK-generated diagnostic prefixes and defaults to
+`BLOOM_LOCALE` or English. `en`, `zh-CN`/`zh`, and `zh-TW` are recognised;
+unknown tags safely fall back to English. Native diagnostic details remain
+unchanged. Structured output can be requested with the native response-format
+mapping (or the shorthand string `"json_object"`):
+
+```python
+pipeline.generate(
+    "Return a JSON object",
+    response_format={"type": "json_object"},
+)
+```
+
 Streaming buffers at most 64 serialized chunks and 16 MiB of queued bytes.
 Slow consumers apply backpressure to native callbacks. Individual chunks over
 16 MiB fail with `BloomInferenceError`. Close partially consumed generators to

@@ -6,10 +6,22 @@ This script:
 2. Loads a model on NPU (falls back to CPU if NPU unavailable)
 3. Runs real inference and reports device used
 """
+import argparse
+import os
 import sys
 import time
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--model",
+        default=os.environ.get("BLOOM_MODEL_PATH"),
+        help="OpenVINO model directory (or set BLOOM_MODEL_PATH)",
+    )
+    args = parser.parse_args()
+    if not args.model:
+        parser.error("--model is required (or set BLOOM_MODEL_PATH)")
+
     # 1. Check OpenVINO devices
     from openvino import Core
     core = Core()
@@ -27,7 +39,7 @@ def main():
     # 2. Load model with openvino_genai
     import openvino_genai as ov_genai
 
-    model_path = r"D:\models\qwen\Qwen2.5-0.5B-Instruct-OpenVINO"
+    model_path = args.model
     print(f"[NPU-TEST] Loading model from: {model_path}")
 
     load_start = time.time()

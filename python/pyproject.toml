@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,13 +8,16 @@ version = "0.1.0"
 description = "Python SDK for the Bloom standalone multimodal inference engine (ctypes binding to the bloomai-ffi library)."
 readme = "README.md"
 requires-python = ">=3.8"
-license = { text = "Apache-2.0" }
+# Use the SPDX string form required by modern packaging metadata (PEP 639).
+# The previous table form emitted deprecation warnings with setuptools 84 and
+# is scheduled for removal in a future setuptools release.
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [{ name = "Bloom Contributors" }]
 keywords = ["inference", "edge-ai", "multimodal", "llm", "rust-ffi"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Rust",
@@ -35,4 +38,3 @@ Changelog = "https://github.com/constmark/bloom/blob/main/CHANGELOG.md"
 #   cargo build --release -p bloomai-ffi
 [tool.setuptools]
 packages = ["bloom_sdk"]
-license-files = ["LICENSE"]

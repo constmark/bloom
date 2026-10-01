@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import ctypes
 import hashlib
 import http.client
 import json
@@ -18,6 +19,7 @@ import pathlib
 import platform
 import re
 import secrets
+import signal
 import subprocess
 import tempfile
 import threading
@@ -85,6 +87,8 @@ def distribution(samples: list[float]) -> dict[str, Any]:
 
 
 def read_rss_bytes(pid: int) -> int:
+    if os.name == "nt":
+        return _read_windows_rss_bytes(pid)
     status_path = pathlib.Path(f"/proc/{pid}/status")
     if status_path.is_file():
         match = re.search(r"^VmRSS:\s*(\d+)\s+kB$", status_path.read_text(), re.MULTILINE)
@@ -95,6 +99,70 @@ def read_rss_bytes(pid: int) -> int:
         ["ps", "-o", "rss=", "-p", str(pid)], text=True, timeout=2
     ).strip()
     return int(output) * 1024
+
+
+def _read_windows_rss_bytes(pid: int) -> int:
+    """Read a process working set without relying on localized shell output.
+
+    ``ps`` is a PowerShell alias on Windows and does not accept the POSIX
+    ``-o rss`` flags used by the Unix fallback.  Calling the PSAPI directly
+    keeps workload evidence usable on Windows runners and installations with
+    a non-English system locale.
+    """
+    from ctypes import wintypes
+
+    process_query_limited_information = 0x1000
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    psapi = ctypes.WinDLL("psapi", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    class ProcessMemoryCounters(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("PageFaultCount", wintypes.DWORD),
+            ("PeakWorkingSetSize", ctypes.c_size_t),
+            ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t),
+            ("PeakPagefileUsage", ctypes.c_size_t),
+        ]
+
+    psapi.GetProcessMemoryInfo.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(ProcessMemoryCounters),
+        wintypes.DWORD,
+    ]
+    psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+    handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        error = ctypes.get_last_error()
+        raise OSError(error, f"OpenProcess({pid}) failed")
+    try:
+        counters = ProcessMemoryCounters()
+        counters.cb = ctypes.sizeof(counters)
+        if not psapi.GetProcessMemoryInfo(
+            handle, ctypes.byref(counters), counters.cb
+        ):
+            error = ctypes.get_last_error()
+            raise OSError(error, f"GetProcessMemoryInfo({pid}) failed")
+        return int(counters.WorkingSetSize)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def rss_source() -> str:
+    """Describe the platform API used by :func:`read_rss_bytes`."""
+    if os.name == "nt":
+        return "Windows PSAPI WorkingSetSize"
+    if pathlib.Path("/proc").is_dir():
+        return "/proc/<pid>/status VmRSS"
+    return "ps RSS"
 
 
 def host_hardware() -> dict[str, Any]:
@@ -123,6 +191,33 @@ def host_hardware() -> dict[str, Any]:
                 ["sysctl", "-n", "hw.memsize"], text=True, timeout=2
             ).strip())
         except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+    elif os.name == "nt":
+        # GlobalMemoryStatusEx is locale-independent and available on all
+        # supported Windows versions.  The ctypes call is kept here rather
+        # than shelling out to PowerShell so reports work in restricted CI
+        # environments as well.
+        try:
+            from ctypes import wintypes
+
+            class MemoryStatusEx(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", wintypes.DWORD),
+                    ("dwMemoryLoad", wintypes.DWORD),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            status = MemoryStatusEx()
+            status.dwLength = ctypes.sizeof(status)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                total_memory_bytes = int(status.ullTotalPhys)
+        except (AttributeError, OSError, TypeError):
             pass
     return {"cpu_model": cpu_model, "host_memory_total_bytes": total_memory_bytes}
 
@@ -339,12 +434,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         log_path = directory / "server.log"
         with log_path.open("wb") as log:
             started = time.monotonic()
+            creation_flags = (
+                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                if os.name == "nt"
+                else 0
+            )
             process = subprocess.Popen(
                 [str(binary), "--model", str(model), "--models-dir", str(directory / "models"),
                  "--host", "127.0.0.1", "--port", "0", "--backend", args.backend,
                  "--device", args.device, "--max-concurrent", str(max(levels)),
                  "--timeout", str(max(1, int(args.request_timeout) + 1))],
                 stdout=log, stderr=subprocess.STDOUT, env=environment,
+                creationflags=creation_flags,
             )
         try:
             port, ready = wait_ready(process, log_path, args.startup_timeout)
@@ -389,7 +490,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 after_rss = read_rss_bytes(process.pid)
             if not sampler.samples:
                 raise RuntimeError("host RSS sampler did not record any values")
-            process.terminate()
+            if os.name == "nt":
+                # ``Popen.terminate`` calls TerminateProcess on Windows and
+                # returns a non-zero status even after a healthy shutdown.
+                # A new process group lets the server observe Ctrl-Break and
+                # run its bounded graceful-drain path just like SIGTERM on
+                # POSIX.  Fall back to hard termination if a console is not
+                # available (for example, a detached CI job).
+                try:
+                    process.send_signal(signal.CTRL_BREAK_EVENT)
+                except (OSError, ValueError):
+                    process.terminate()
+            else:
+                process.terminate()
             process.wait(timeout=args.shutdown_timeout)
             if process.returncode != 0:
                 raise RuntimeError(f"server shutdown status {process.returncode}")
@@ -445,10 +558,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "disconnect": {"accepted": accepted, "recovery_ms": round(recovery_ms, 3),
                                "post_recovery_request": "pass"},
                 "host_memory": {
-                    "source": (
-                        "/proc/<pid>/status VmRSS" if pathlib.Path("/proc").is_dir()
-                        else "ps RSS"
-                    ) + ", sampled every 100 ms plus warm/recovery endpoints",
+                    "source": rss_source()
+                    + ", sampled every 100 ms plus warm/recovery endpoints",
                     "warm_baseline_bytes": baseline_rss,
                     "observed_peak_bytes": max(*sampler.samples, baseline_rss, after_rss),
                     "after_recovery_bytes": after_rss,

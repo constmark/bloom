@@ -48,6 +48,10 @@ pub const BLOOM_STATUS_PANIC: i32 = -7;
 pub const BLOOM_STATUS_CANCELLED: i32 = -8;
 
 const MAX_FFI_IDENTIFIER_BYTES: usize = 4 * 1024;
+// Windows extended-length paths may contain up to 32,767 UTF-16 code units.
+// UTF-8 can use up to four bytes per code point, so leave enough headroom for
+// non-ASCII (for example, CJK) model paths crossing the C ABI.
+const MAX_FFI_MODEL_PATH_BYTES: usize = 128 * 1024;
 const MAX_FFI_JSON_BYTES: usize = 16 * 1024 * 1024;
 
 /// A borrowed, length-delimited byte sequence used by ABI revision 2.
@@ -536,7 +540,7 @@ unsafe fn bloom_pipeline_load_v2_impl(
     error_buffer_len: usize,
 ) -> *mut BloomPipeline {
     let model_path =
-        match unsafe { slice_as_utf8(model_path, "model_path", MAX_FFI_IDENTIFIER_BYTES) } {
+        match unsafe { slice_as_utf8(model_path, "model_path", MAX_FFI_MODEL_PATH_BYTES) } {
             Ok(value) => value,
             Err((_, message)) => {
                 unsafe { write_error(&message, error_buffer, error_buffer_len) };

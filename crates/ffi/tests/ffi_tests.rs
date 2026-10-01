@@ -368,6 +368,28 @@ fn test_v2_rejects_oversized_and_malformed_inputs_with_stable_statuses() {
 }
 
 #[test]
+fn test_v2_allows_multibyte_model_paths_beyond_legacy_identifier_limit() {
+    unsafe {
+        // A multi-kilobyte UTF-8 path is valid at the ABI boundary. It will
+        // fail later during filesystem validation, but must not be rejected as
+        // an over-sized engine/device identifier.
+        let model_path = "模型".repeat(2_500);
+        let mut err_buf = [0 as c_char; 512];
+        let pipeline = bloom_pipeline_load_v2(
+            bloom_slice(model_path.as_bytes()),
+            bloom_slice(b"mock"),
+            bloom_slice(b"cpu"),
+            2048,
+            err_buf.as_mut_ptr(),
+            err_buf.len(),
+        );
+        assert!(pipeline.is_null());
+        let error = CStr::from_ptr(err_buf.as_ptr()).to_string_lossy();
+        assert!(!error.contains("exceeds the 4096-byte ABI limit"));
+    }
+}
+
+#[test]
 fn test_ffi_rejects_a_null_stream_callback() {
     unsafe {
         let model_path = CString::new(".").unwrap();

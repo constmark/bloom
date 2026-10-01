@@ -17,7 +17,7 @@ pub(crate) fn system_memory_bytes() -> Option<usize> {
         for line in meminfo.lines() {
             if let Some(rest) = line.strip_prefix("MemTotal:") {
                 let kb = rest.split_whitespace().next()?.parse::<usize>().ok()?;
-                return Some(kb * 1024);
+                return Some(kb.saturating_mul(1024));
             }
         }
         None
@@ -39,8 +39,57 @@ pub(crate) fn system_memory_bytes() -> Option<usize> {
     }
     #[cfg(target_os = "windows")]
     {
-        None
+        windows_memory_status().map(|(total, _)| total)
     }
+}
+
+// Keep the Windows probe local to this crate so users do not need an extra
+// runtime dependency just to report device capabilities.  GlobalMemoryStatusEx
+// is available on every supported Windows version and handles both x86 and
+// ARM64 hosts.
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct WindowsMemoryStatus {
+    length: u32,
+    memory_load: u32,
+    total_physical: u64,
+    available_physical: u64,
+    total_page_file: u64,
+    available_page_file: u64,
+    total_virtual: u64,
+    available_virtual: u64,
+    available_extended_virtual: u64,
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GlobalMemoryStatusEx(status: *mut WindowsMemoryStatus) -> i32;
+}
+
+#[cfg(target_os = "windows")]
+fn windows_memory_status() -> Option<(usize, usize)> {
+    let mut status = WindowsMemoryStatus {
+        length: std::mem::size_of::<WindowsMemoryStatus>() as u32,
+        memory_load: 0,
+        total_physical: 0,
+        available_physical: 0,
+        total_page_file: 0,
+        available_page_file: 0,
+        total_virtual: 0,
+        available_virtual: 0,
+        available_extended_virtual: 0,
+    };
+    // SAFETY: Windows fills the initialized, correctly sized structure.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) } != 0;
+    if !ok {
+        return None;
+    }
+    let max = usize::MAX as u64;
+    Some((
+        status.total_physical.min(max) as usize,
+        status.available_physical.min(max) as usize,
+    ))
 }
 
 fn conservative_available_memory(total: usize) -> usize {
@@ -56,7 +105,11 @@ pub(crate) fn available_free_memory() -> usize {
                 if let Some(rest) = line.strip_prefix("MemAvailable:") {
                     if let Some(kb) = rest.split_whitespace().next() {
                         if let Ok(kb_val) = kb.parse::<usize>() {
-                            return kb_val * 1024;
+                            let available = kb_val.saturating_mul(1024);
+                            // A malformed/procfs-emulated host can report
+                            // MemAvailable above MemTotal; keep the capability
+                            // contract internally consistent for schedulers.
+                            return available.min(system_memory_bytes().unwrap_or(available));
                         }
                     }
                 }
@@ -67,6 +120,10 @@ pub(crate) fn available_free_memory() -> usize {
     }
     #[cfg(not(target_os = "linux"))]
     {
+        #[cfg(target_os = "windows")]
+        if let Some((_, available)) = windows_memory_status() {
+            return available;
+        }
         let total = system_memory_bytes().unwrap_or(8 * GIB as usize);
         conservative_available_memory(total)
     }
@@ -199,36 +256,56 @@ fn cpu_vendor() -> Option<String> {
     }
 }
 
+fn python_check(script: &str) -> bool {
+    let mut candidates = Vec::with_capacity(3);
+    if let Ok(explicit) = std::env::var("BLOOM_PYTHON")
+        && !explicit.trim().is_empty()
+    {
+        candidates.push(explicit);
+    }
+    #[cfg(target_os = "windows")]
+    candidates.extend(["python".to_string(), "py".to_string()]);
+    #[cfg(not(target_os = "windows"))]
+    candidates.extend(["python3".to_string(), "python".to_string()]);
+
+    candidates.into_iter().any(|python| {
+        std::process::Command::new(python)
+            .args(["-c", script])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    })
+}
+
 fn check_mlx_python_available() -> bool {
-    std::process::Command::new("python3")
-        .args(["-c", "import mlx.core"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    python_check("import mlx.core")
 }
 
 fn check_mps_available() -> bool {
-    std::process::Command::new("python3")
-        .args([
-            "-c",
-            "import torch; print(torch.backends.mps.is_available())",
-        ])
-        .output()
-        .map(|o| {
-            o.status.success()
-                && String::from_utf8(o.stdout)
-                    .map(|s| s.trim() == "True")
-                    .unwrap_or(false)
-        })
-        .unwrap_or(false)
+    let mut candidates = Vec::with_capacity(3);
+    if let Ok(explicit) = std::env::var("BLOOM_PYTHON")
+        && !explicit.trim().is_empty()
+    {
+        candidates.push(explicit);
+    }
+    #[cfg(target_os = "windows")]
+    candidates.extend(["python".to_string(), "py".to_string()]);
+    #[cfg(not(target_os = "windows"))]
+    candidates.extend(["python3".to_string(), "python".to_string()]);
+    candidates.into_iter().any(|python| {
+        std::process::Command::new(python)
+            .args([
+                "-c",
+                "import torch; raise SystemExit(0 if torch.backends.mps.is_available() else 1)",
+            ])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    })
 }
 
 fn check_coreml_available() -> bool {
-    std::process::Command::new("python3")
-        .args(["-c", "import coremltools"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    python_check("import coremltools")
 }
 
 #[derive(Debug, Clone)]
