@@ -91,10 +91,9 @@ jobs:
         # documentation lint so it does not block PRs while docs catch up.
         run: cargo clippy --workspace --all-targets --locked -- -D warnings -A missing_docs
       - name: Test
-        # Keep all coverage while serializing process-global server fixtures;
-        # Linux otherwise leaves concurrent activation tests blocked.
+        # Fail visibly and preserve job logs if a test blocks indefinitely.
         timeout-minutes: 20
-        run: cargo test --workspace --locked -- --test-threads=1
+        run: cargo test --workspace --locked
       - name: Test Python SDK boundary
         run: |
           cargo build -p bloomai-ffi --locked

@@ -1415,11 +1415,6 @@ async fn activate_ollama_model_with_permission(
     let path = prepare_catalog_model_load(state, &catalog_id)
         .await
         .map_err(|error| OllamaActivationError::new(error.status, error.message))?;
-    // Storage inspection and preparation are serialized above, but model-load
-    // admission only updates runtime state and not storage. Release the
-    // storage permit before notifying the loader so a caller that immediately
-    // completes the queued load cannot wait on this task's still-held permit.
-    drop(_storage_guard);
     let admission = state
         .app
         .admit_model_load(path, Some(catalog_id), true)
@@ -1433,6 +1428,7 @@ async fn activate_ollama_model_with_permission(
                 OllamaActivationError::new(axum::http::StatusCode::SERVICE_UNAVAILABLE, message)
             }
         })?;
+    drop(_storage_guard);
 
     match admission {
         ModelLoadAdmission::AlreadyReady { runtime } => admit_ollama_runtime(state, runtime),
