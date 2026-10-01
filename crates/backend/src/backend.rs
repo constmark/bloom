@@ -169,10 +169,10 @@ fn cpu_vendor() -> Option<String> {
     {
         if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") {
             for line in cpuinfo.lines() {
-                if let Some(rest) = line.strip_prefix("vendor_id") {
-                    if let Some(id) = rest.split(':').nth(1) {
-                        return Some(id.trim().to_string());
-                    }
+                if let Some(rest) = line.strip_prefix("vendor_id")
+                    && let Some(id) = rest.split(':').nth(1)
+                {
+                    return Some(id.trim().to_string());
                 }
             }
         }
