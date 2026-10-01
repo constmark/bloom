@@ -53,12 +53,11 @@ pub(crate) fn available_free_memory() -> usize {
     {
         if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
             for line in meminfo.lines() {
-                if let Some(rest) = line.strip_prefix("MemAvailable:") {
-                    if let Some(kb) = rest.split_whitespace().next() {
-                        if let Ok(kb_val) = kb.parse::<usize>() {
-                            return kb_val * 1024;
-                        }
-                    }
+                if let Some(rest) = line.strip_prefix("MemAvailable:")
+                    && let Some(kb) = rest.split_whitespace().next()
+                    && let Ok(kb_val) = kb.parse::<usize>()
+                {
+                    return kb_val * 1024;
                 }
             }
         }
