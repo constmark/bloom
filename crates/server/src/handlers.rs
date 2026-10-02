@@ -1889,12 +1889,10 @@ async fn collect_scheduled_text(
         generated_tokens.push(token);
         generated_count.fetch_add(1, Ordering::Relaxed);
         if has_stop_sequences {
-            let delta = pipeline
-                .detokenize(&[token])
-                .map_err(|error| {
-                    scheduler.cancel_request(request_id);
-                    format!("Detokenization failed: {error}")
-                })?;
+            let delta = pipeline.detokenize(&[token]).map_err(|error| {
+                scheduler.cancel_request(request_id);
+                format!("Detokenization failed: {error}")
+            })?;
             let update = filter.push(&delta);
             text.push_str(&update.text);
             if update.stopped {
@@ -1909,12 +1907,10 @@ async fn collect_scheduled_text(
     if has_stop_sequences {
         text.push_str(&filter.finish());
     } else {
-        text = pipeline
-            .detokenize(&generated_tokens)
-            .map_err(|error| {
-                scheduler.cancel_request(request_id);
-                format!("Detokenization failed: {error}")
-            })?;
+        text = pipeline.detokenize(&generated_tokens).map_err(|error| {
+            scheduler.cancel_request(request_id);
+            format!("Detokenization failed: {error}")
+        })?;
     }
     Ok(GeneratedText {
         text,
