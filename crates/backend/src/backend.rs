@@ -102,16 +102,15 @@ pub(crate) fn available_free_memory() -> usize {
     {
         if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
             for line in meminfo.lines() {
-                if let Some(rest) = line.strip_prefix("MemAvailable:") {
-                    if let Some(kb) = rest.split_whitespace().next() {
-                        if let Ok(kb_val) = kb.parse::<usize>() {
-                            let available = kb_val.saturating_mul(1024);
-                            // A malformed/procfs-emulated host can report
-                            // MemAvailable above MemTotal; keep the capability
-                            // contract internally consistent for schedulers.
-                            return available.min(system_memory_bytes().unwrap_or(available));
-                        }
-                    }
+                if let Some(rest) = line.strip_prefix("MemAvailable:")
+                    && let Some(kb) = rest.split_whitespace().next()
+                    && let Ok(kb_val) = kb.parse::<usize>()
+                {
+                    let available = kb_val.saturating_mul(1024);
+                    // A malformed/procfs-emulated host can report
+                    // MemAvailable above MemTotal; keep the capability
+                    // contract internally consistent for schedulers.
+                    return available.min(system_memory_bytes().unwrap_or(available));
                 }
             }
         }
@@ -227,10 +226,10 @@ fn cpu_vendor() -> Option<String> {
     {
         if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") {
             for line in cpuinfo.lines() {
-                if let Some(rest) = line.strip_prefix("vendor_id") {
-                    if let Some(id) = rest.split(':').nth(1) {
-                        return Some(id.trim().to_string());
-                    }
+                if let Some(rest) = line.strip_prefix("vendor_id")
+                    && let Some(id) = rest.split(':').nth(1)
+                {
+                    return Some(id.trim().to_string());
                 }
             }
         }

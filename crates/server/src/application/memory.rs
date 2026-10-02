@@ -926,7 +926,13 @@ fn read_cgroup_constraints(
     let mut effective_limit: Option<usize> = None;
     let mut effective_available: Option<usize> = None;
     for root in roots {
-        let (limit, current) = read_cgroup_pair(root, limit_name, current_name)?;
+        let Some((limit, current)) = read_cgroup_pair(root, limit_name, current_name)? else {
+            // cgroup v2 does not expose resource-control files on its root
+            // cgroup. The mounted hierarchy can still enforce a finite limit
+            // on the delegated leaf, so ignore only an ancestor where both
+            // control files are absent.
+            continue;
+        };
         let Some(limit) = limit else {
             continue;
         };
@@ -949,21 +955,39 @@ fn read_cgroup_pair(
     root: &std::path::Path,
     limit_name: &str,
     current_name: &str,
-) -> Result<(Option<usize>, usize)> {
+) -> Result<Option<(Option<usize>, usize)>> {
     let limit_path = root.join(limit_name);
     let current_path = root.join(current_name);
-    let limit_text = std::fs::read_to_string(&limit_path).map_err(|error| {
-        anyhow!(
-            "failed to read cgroup memory limit telemetry at {}: {error}",
-            limit_path.display()
-        )
-    })?;
-    let current_text = std::fs::read_to_string(&current_path).map_err(|error| {
-        anyhow!(
-            "failed to read cgroup memory usage telemetry at {}: {error}",
-            current_path.display()
-        )
-    })?;
+    let limit_text = match std::fs::read_to_string(&limit_path) {
+        Ok(value) => Some(value),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(anyhow!(
+                "failed to read cgroup memory limit telemetry at {}: {error}",
+                limit_path.display()
+            ));
+        }
+    };
+    let current_text = match std::fs::read_to_string(&current_path) {
+        Ok(value) => Some(value),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(anyhow!(
+                "failed to read cgroup memory usage telemetry at {}: {error}",
+                current_path.display()
+            ));
+        }
+    };
+    let (limit_text, current_text) = match (limit_text, current_text) {
+        (None, None) => return Ok(None),
+        (Some(limit), Some(current)) => (limit, current),
+        _ => {
+            bail!(
+                "cgroup memory control files are incomplete at {}",
+                root.display()
+            );
+        }
+    };
     let current = current_text
         .trim()
         .parse::<u64>()
@@ -971,16 +995,16 @@ fn read_cgroup_pair(
     let current =
         usize::try_from(current).map_err(|_| anyhow!("cgroup memory usage is too large"))?;
     if limit_text.trim() == "max" {
-        return Ok((None, current));
+        return Ok(Some((None, current)));
     }
     let limit = limit_text
         .trim()
         .parse::<u64>()
         .map_err(|_| anyhow!("cgroup memory limit is invalid"))?;
-    Ok((
+    Ok(Some((
         Some(usize::try_from(limit).map_err(|_| anyhow!("cgroup memory limit is too large"))?),
         current,
-    ))
+    )))
 }
 
 #[cfg(target_os = "macos")]
@@ -1613,6 +1637,27 @@ mod tests {
             "29 23 0:26 / {} rw - cgroup2 cgroup rw\n",
             mountinfo_path(root)
         );
+        assert_eq!(
+            strict_linux_cgroup_memory_from("0::/tenant\n", &mountinfo).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn cgroup_probe_ignores_a_root_without_control_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let leaf = root.join("tenant");
+        std::fs::create_dir_all(&leaf).unwrap();
+        std::fs::write(leaf.join("memory.max"), "max\n").unwrap();
+        std::fs::write(leaf.join("memory.current"), "100\n").unwrap();
+        let mountinfo = format!(
+            "29 23 0:26 / {} rw - cgroup2 cgroup rw\n",
+            mountinfo_path(root)
+        );
+
+        // cgroup v2 resource-control files are absent on the mounted root;
+        // the delegated leaf still provides a complete, unlimited pair.
         assert_eq!(
             strict_linux_cgroup_memory_from("0::/tenant\n", &mountinfo).unwrap(),
             None

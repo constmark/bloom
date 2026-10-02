@@ -40,11 +40,11 @@ fn probe_intel_npu() -> bool {
             }
         }
         // Check for ivpu / intel_vpu kernel module
-        if let Ok(modules) = std::fs::read_to_string("/proc/modules") {
-            if modules.contains("intel_vpu") || modules.contains("ivpu") {
-                tracing::info!("Intel NPU kernel module detected");
-                return true;
-            }
+        if let Ok(modules) = std::fs::read_to_string("/proc/modules")
+            && (modules.contains("intel_vpu") || modules.contains("ivpu"))
+        {
+            tracing::info!("Intel NPU kernel module detected");
+            return true;
         }
     }
 
