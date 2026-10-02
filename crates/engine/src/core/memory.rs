@@ -430,6 +430,8 @@ mod tests {
     #[test]
     fn test_layer_placement_strategy() {
         let _lock = ENV_LOCK.lock().unwrap();
+        let _previous_gpu_layers = EnvVarGuard::remove("BLOOM_GPU_LAYERS");
+        let _previous_npu_layers = EnvVarGuard::remove("BLOOM_NPU_LAYERS");
         let strategy = LayerPlacementStrategy::new(8, Some(2));
         assert_eq!(strategy.placements.len(), 8);
         assert_eq!(strategy.placements[0], DevicePlacement::Gpu);
