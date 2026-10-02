@@ -153,27 +153,72 @@ fn repo_script_path(script_name: &str) -> PathBuf {
 }
 
 fn default_python() -> PathBuf {
-    if let Some(path) = std::env::var_os("BLOOM_PYTHON") {
-        return PathBuf::from(path);
-    }
-    if let Some(path) = std::env::var_os("BLOOM_ASR_PYTHON") {
-        return PathBuf::from(path);
-    }
-
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..");
+    resolve_python(
+        std::env::var_os("BLOOM_PYTHON").or_else(|| std::env::var_os("BLOOM_ASR_PYTHON")),
+        &repo_root,
+    )
+}
 
-    let candidates = [
-        repo_root.join(".venv").join("Scripts").join("python.exe"),
-        repo_root.join(".venv").join("bin").join("python"),
-        PathBuf::from("python"),
-    ];
+fn resolve_python(explicit: Option<std::ffi::OsString>, repo_root: &Path) -> PathBuf {
+    if let Some(path) = explicit {
+        return PathBuf::from(path);
+    }
 
-    candidates
-        .into_iter()
-        .find(|path| path.exists())
-        .unwrap_or_else(|| PathBuf::from("python"))
+    let candidates = if cfg!(target_os = "windows") {
+        vec![repo_root.join(".venv").join("Scripts").join("python.exe")]
+    } else {
+        vec![repo_root.join(".venv").join("bin").join("python")]
+    };
+
+    if let Some(path) = candidates.into_iter().find(|path| path.is_file()) {
+        return path;
+    }
+
+    platform_python_launchers()
+        .iter()
+        .find(|launcher| command_on_path(Path::new(launcher)))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(platform_python_launchers()[0]))
+}
+
+fn platform_python_launchers() -> &'static [&'static str] {
+    #[cfg(target_os = "windows")]
+    {
+        &["python", "py"]
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        &["python"]
+    }
+}
+
+fn command_on_path(command: &Path) -> bool {
+    if command.is_absolute() {
+        return command.is_file();
+    }
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|directory| {
+        let candidate = directory.join(command);
+        if candidate.is_file() {
+            return true;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            [".exe", ".cmd", ".bat"]
+                .iter()
+                .map(|extension| directory.join(format!("{}{}", command.display(), extension)))
+                .any(|candidate| candidate.is_file())
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            false
+        }
+    })
 }
 
 fn is_awq_model(model_path: &Path) -> bool {
@@ -520,6 +565,36 @@ mod tests {
     use super::*;
     use crate::test_env::{ENV_LOCK, EnvVarGuard};
     use tempfile::tempdir;
+
+    #[test]
+    fn python_override_wins_over_repository_candidates() {
+        let dir = tempdir().unwrap();
+        let explicit = dir.path().join("custom-python");
+        assert_eq!(
+            resolve_python(Some(explicit.clone().into_os_string()), dir.path()),
+            explicit
+        );
+    }
+
+    #[test]
+    fn repository_virtualenv_uses_platform_layout() {
+        let dir = tempdir().unwrap();
+        #[cfg(target_os = "windows")]
+        let python = dir.path().join(".venv/Scripts/python.exe");
+        #[cfg(not(target_os = "windows"))]
+        let python = dir.path().join(".venv/bin/python");
+        std::fs::create_dir_all(python.parent().unwrap()).unwrap();
+        std::fs::write(&python, b"").unwrap();
+        assert_eq!(resolve_python(None, dir.path()), python);
+    }
+
+    #[test]
+    fn python_fallback_order_matches_platform() {
+        #[cfg(target_os = "windows")]
+        assert_eq!(platform_python_launchers(), &["python", "py"]);
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(platform_python_launchers(), &["python"]);
+    }
 
     #[test]
     fn test_intel_npu_engine_metadata() {
