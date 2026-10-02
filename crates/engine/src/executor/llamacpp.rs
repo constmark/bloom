@@ -915,7 +915,11 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        let pid: libc::pid_t = fs::read_to_string(&pid_path).unwrap().trim().parse().unwrap();
+        let pid: libc::pid_t = fs::read_to_string(&pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
         let listener = TcpListener::bind((DEFAULT_HOST, 0)).unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
@@ -925,8 +929,14 @@ mod tests {
 
         // A successful waitpid with WNOHANG would mean the guard left a
         // zombie behind. ChildGuard must reap the process on drop.
-        assert_eq!(unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) }, -1);
-        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
+        assert_eq!(
+            unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
     }
 
     #[test]
