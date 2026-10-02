@@ -832,7 +832,30 @@ mod tests {
     fn test_default_model_root() {
         let root = default_model_root();
         #[cfg(target_os = "windows")]
-        assert_eq!(root, PathBuf::from("D:\\models"));
+        {
+            let expected_root = if let Some(root) = std::env::var_os("BLOOM_MODEL_ROOT") {
+                PathBuf::from(root)
+            } else {
+                let expected_home = std::env::var_os("HOME")
+                    .filter(|value| !value.is_empty())
+                    .or_else(|| {
+                        std::env::var_os("USERPROFILE").filter(|value| !value.is_empty())
+                    })
+                    .or_else(|| {
+                        let drive =
+                            std::env::var_os("HOMEDRIVE").filter(|value| !value.is_empty())?;
+                        let path =
+                            std::env::var_os("HOMEPATH").filter(|value| !value.is_empty())?;
+                        let mut home = drive;
+                        home.push(path);
+                        Some(home)
+                    })
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("."));
+                expected_home.join("models")
+            };
+            assert_eq!(root, expected_root);
+        }
         #[cfg(not(target_os = "windows"))]
         assert!(root.to_string_lossy().contains("models"));
     }

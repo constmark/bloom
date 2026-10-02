@@ -313,7 +313,7 @@ class BloomPipelineTests(unittest.TestCase):
         stream = pipeline.generate_stream("hello")
 
         self.assertEqual(next(stream), {"TextDelta": "hello"})
-        self.assertTrue(self.fake_lib.stream_started.is_set())
+        self.assertTrue(self.fake_lib.stream_started.wait(timeout=1))
 
         close_finished = threading.Event()
 
@@ -340,7 +340,7 @@ class BloomPipelineTests(unittest.TestCase):
         stream = pipeline.generate_stream("hello")
 
         self.assertEqual(next(stream), {"TextDelta": "hello"})
-        self.assertTrue(self.fake_lib.stream_started.is_set())
+        self.assertTrue(self.fake_lib.stream_started.wait(timeout=1))
         stream.close()
 
         self.assertTrue(self.fake_lib.stream_cancelled.wait(timeout=1))
