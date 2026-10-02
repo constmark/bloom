@@ -187,6 +187,8 @@ def compile_kernel(name, source, cache_dir, backend="cpu"):
             export_sym = "softmax_launch"
         elif "attention" in name:
             export_sym = "attention_launch"
+        elif "mrope" in name:
+            export_sym = "mrope_launch"
             
         # Define away __attribute__ and add robust linker export pragma for MSVC
         source = f'#ifdef _MSC_VER\n#define __attribute__(x)\n#pragma comment(linker, "/EXPORT:{export_sym}")\n#endif\n' + source
