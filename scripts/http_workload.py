@@ -331,7 +331,9 @@ def stream_request(
         finished = False
         total = 0
         while True:
-            line = response.fp.readline(MAX_EVENT_BYTES + 1)
+            # Read decoded body bytes: HTTP chunks need not align with SSE
+            # lines, and a persistent connection can outlive its response.
+            line = response.readline(MAX_EVENT_BYTES + 1)
             total += len(line)
             if len(line) > MAX_EVENT_BYTES or total > MAX_STREAM_BYTES:
                 raise RuntimeError("SSE stream exceeded byte limit")

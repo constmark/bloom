@@ -28,7 +28,10 @@ export BLOOM_TRAINED_EXPECTED_FAMILY="Llama"
 export BLOOM_TRAINED_EXPECTED_STORAGE_DTYPE="BF16"
 export BLOOM_TRAINED_EXPECTED_DTYPE="F32"
 export BLOOM_TRAINED_EXPECTED_CHAT_TEMPLATE_KIND="smollm2"
-export BLOOM_TRAINED_EXPECTED_RUNTIME_WEIGHT_BYTES="1447349824"
+# The immutable pinned revision's validated Safetensors element count materializes
+# to this exact F32 CPU weight footprint. Keep this exact gate tied to the
+# revision and file hashes above; do not broaden it to a tolerance.
+export BLOOM_TRAINED_EXPECTED_RUNTIME_WEIGHT_BYTES="1447284480"
 export BLOOM_TRAINED_CHAT_PROMPT='<|im_start|>system
 Follow the user instruction exactly.<|im_end|>
 <|im_start|>user
