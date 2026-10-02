@@ -426,7 +426,7 @@ def _fetch_json_endpoint(port: int, path: str, api_key: str, timeout: float) -> 
             raise RuntimeStatsError(path, "response exceeded byte limit")
         try:
             return json.loads(body)
-        except json.JSONDecodeError as error:
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
             raise RuntimeStatsError(path, "response was not valid JSON") from error
     except (OSError, http.client.HTTPException) as error:
         raise RuntimeStatsError(path, "request failed") from error

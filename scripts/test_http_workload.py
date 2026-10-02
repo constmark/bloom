@@ -108,6 +108,7 @@ class RuntimeStats(http.server.BaseHTTPRequestHandler):
     observability = observability_snapshot(requests_total=1, generated_total=2)
     kv_cache = kv_cache_snapshot(hits=1)
     expected_authorization = "Bearer test-key"
+    raw_body: bytes | None = None
 
     def do_GET(self) -> None:
         if self.headers.get("Authorization") != self.expected_authorization:
@@ -124,7 +125,7 @@ class RuntimeStats(http.server.BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             return
-        body = json.dumps(payload).encode()
+        body = self.raw_body if self.raw_body is not None else json.dumps(payload).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -142,6 +143,7 @@ class WorkloadTests(unittest.TestCase):
             requests_total=1, generated_total=2
         )
         RuntimeStats.kv_cache = kv_cache_snapshot(hits=1)
+        RuntimeStats.raw_body = None
 
     def setUp(self) -> None:
         super().setUp()
@@ -322,6 +324,25 @@ class WorkloadTests(unittest.TestCase):
             self.assertEqual(
                 baseline_missing.after_waves[0]["errors"]["baseline"]["status"],
                 "unavailable",
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
+    def test_runtime_stats_invalid_utf8_is_unavailable(self) -> None:
+        server, thread = self.runtime_stats_server()
+        try:
+            RuntimeStats.raw_body = b"\xff"
+            report = workload.fetch_runtime_stats(server.server_port, "test-key", 3)
+            self.assertEqual(report["status"], "unavailable")
+            self.assertEqual(
+                report["errors"]["observability"]["error"],
+                "response was not valid JSON",
+            )
+            self.assertEqual(
+                report["errors"]["kv_cache"]["error"],
+                "response was not valid JSON",
             )
         finally:
             server.shutdown()
