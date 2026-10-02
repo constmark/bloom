@@ -322,14 +322,39 @@ fn expand_tilde(path: PathBuf) -> Result<PathBuf> {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
+    home_dir_from_env(|name| std::env::var_os(name))
+}
+
+/// Resolve a user's home directory using the conventions exposed by the
+/// supported host platforms.  Windows services and older shells do not
+/// always provide `USERPROFILE`, but do provide the drive/path pair.  Keeping
+/// this logic in one small, testable helper also means `~` expansion behaves
+/// consistently for CLI, server, and config-file paths.
+fn home_dir_from_env<F>(mut get: F) -> Option<PathBuf>
+where
+    F: FnMut(&str) -> Option<std::ffi::OsString>,
+{
+    get("HOME")
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+        .or_else(|| {
+            get("USERPROFILE")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+        .or_else(|| {
+            let drive = get("HOMEDRIVE").filter(|value| !value.is_empty())?;
+            let path = get("HOMEPATH").filter(|value| !value.is_empty())?;
+            let mut home = PathBuf::from(drive);
+            home.push(path);
+            Some(home)
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
 
     #[test]
     fn process_config_preserves_all_sections_and_refuses_to_overwrite() {
@@ -352,6 +377,46 @@ mod tests {
         assert_eq!(loaded.infer.max_tokens, Some(17));
         assert_eq!(loaded.server.port, Some(8123));
         assert_eq!(loaded.bench.repetitions, Some(7));
+    }
+
+    #[test]
+    fn home_directory_supports_windows_drive_and_path_fallback() {
+        let home = home_dir_from_env(|name| match name {
+            "HOMEDRIVE" => Some(OsString::from("C:")),
+            "HOMEPATH" => Some(OsString::from(r"\Users\Bloom")),
+            _ => None,
+        });
+        let expected = if cfg!(windows) {
+            PathBuf::from(r"C:\Users\Bloom")
+        } else {
+            // PathBuf follows the host platform's separator rules.  This
+            // branch keeps the pure helper test meaningful on Unix CI while
+            // exercising the Windows drive/path input shape.
+            PathBuf::from(r"C:/\Users\Bloom")
+        };
+        assert_eq!(home, Some(expected));
+    }
+
+    #[test]
+    fn home_directory_prefers_standard_profile_variables() {
+        let home = home_dir_from_env(|name| match name {
+            "HOME" => Some(OsString::from("/home/bloom")),
+            "USERPROFILE" => Some(OsString::from(r"C:\Users\Bloom")),
+            "HOMEDRIVE" => Some(OsString::from("D:")),
+            "HOMEPATH" => Some(OsString::from(r"\Users\Other")),
+            _ => None,
+        });
+        assert_eq!(home, Some(PathBuf::from("/home/bloom")));
+    }
+
+    #[test]
+    fn home_directory_skips_empty_profile_variables() {
+        let home = home_dir_from_env(|name| match name {
+            "HOME" => Some(OsString::new()),
+            "USERPROFILE" => Some(OsString::from(r"C:\Users\Bloom")),
+            _ => None,
+        });
+        assert_eq!(home, Some(PathBuf::from(r"C:\Users\Bloom")));
     }
 
     #[test]

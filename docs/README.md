@@ -28,6 +28,7 @@ request.
 - [Production checklist](production.md)
 - [Production readiness gap register](production-readiness.md)
 - [September 2026 project assessment](project-assessment-2026-09.md)
+- [October 2026 cross-platform assessment](project-assessment-2026-10.md)
 
 ## Understand and extend Bloom
 

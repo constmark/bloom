@@ -51,6 +51,9 @@ impl ShutdownSignalListener {
 #[cfg(windows)]
 pub(crate) struct ShutdownSignalListener {
     interrupt: tokio::signal::windows::CtrlC,
+    break_signal: tokio::signal::windows::CtrlBreak,
+    close: tokio::signal::windows::CtrlClose,
+    shutdown: tokio::signal::windows::CtrlShutdown,
 }
 
 #[cfg(windows)]
@@ -58,15 +61,25 @@ impl ShutdownSignalListener {
     pub(crate) fn install() -> std::io::Result<Self> {
         Ok(Self {
             interrupt: tokio::signal::windows::ctrl_c()?,
+            // Console applications receive Ctrl-Break, console-close, and
+            // system-shutdown notifications independently of Ctrl-C. Treat
+            // each as a graceful interrupt so a Windows host does not leave
+            // in-flight requests behind when its console or session closes.
+            break_signal: tokio::signal::windows::ctrl_break()?,
+            close: tokio::signal::windows::ctrl_close()?,
+            shutdown: tokio::signal::windows::ctrl_shutdown()?,
         })
     }
 
     pub(crate) async fn recv(&mut self) -> std::io::Result<ShutdownSignal> {
-        self.interrupt
-            .recv()
-            .await
-            .map(|()| ShutdownSignal::Interrupt)
-            .ok_or_else(|| std::io::Error::other("Ctrl-C listener closed unexpectedly"))
+        tokio::select! {
+            signal = self.interrupt.recv() => signal,
+            signal = self.break_signal.recv() => signal,
+            signal = self.close.recv() => signal,
+            signal = self.shutdown.recv() => signal,
+        }
+        .map(|()| ShutdownSignal::Interrupt)
+        .ok_or_else(|| std::io::Error::other("Windows shutdown listener closed unexpectedly"))
     }
 }
 

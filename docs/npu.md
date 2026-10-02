@@ -22,6 +22,11 @@ Install OpenVINO using one of the official distribution paths:
 pip install openvino
 ```
 
+When Bloom needs a Python-backed NPU/TTS helper, set `BLOOM_PYTHON` to the
+interpreter that contains the OpenVINO packages. ModelScope downloads use
+`BLOOM_MODEL_ROOT` when set; otherwise they go to the current user's
+`models` directory on both Unix and Windows.
+
 To run through the OpenVINO engine:
 
 ```bash

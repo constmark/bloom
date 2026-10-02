@@ -10,6 +10,17 @@ use wasm_bindgen_futures::JsFuture;
 const MODAL_FOCUSABLE_SELECTOR: &str = "button:not([disabled]):not([tabindex=\"-1\"]),a[href]:not([tabindex=\"-1\"]),input:not([disabled]):not([tabindex=\"-1\"]),select:not([disabled]):not([tabindex=\"-1\"]),textarea:not([disabled]):not([tabindex=\"-1\"]),[tabindex]:not([tabindex=\"-1\"])";
 const MAX_BUFFERED_MICROPHONE_SECONDS: usize = 30;
 
+/// Keep the document language in sync with the selected UI locale for screen
+/// readers, browser translation tools, and correct punctuation rules.
+pub fn set_document_language(language: &str) {
+    let Some(document) = web_sys::window().and_then(|window| window.document()) else {
+        return;
+    };
+    if let Some(root) = document.document_element() {
+        let _ = root.set_attribute("lang", language);
+    }
+}
+
 /// A live browser microphone capture that exposes bounded mono PCM windows.
 ///
 /// The deprecated ScriptProcessor API is intentionally used here because it

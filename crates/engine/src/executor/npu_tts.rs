@@ -5,8 +5,8 @@
 //! - CosyVoice PyTorch backend (fallback)
 //! - ChatTTS backend (final fallback)
 //!
-//! Models can be downloaded automatically from ModelScope to `D:\models`
-//! when not found locally.
+//! Models can be downloaded automatically from ModelScope to the configured
+//! `BLOOM_MODEL_ROOT` (or the user's `models` directory) when not found locally.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -56,21 +56,31 @@ fn default_python() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("python"))
 }
 
-/// Default model root directory: `D:\models` on Windows, `$HOME/models` elsewhere.
+/// Default model root directory: the user's `models` directory on every
+/// platform. `BLOOM_MODEL_ROOT` remains the explicit override for managed or
+/// shared deployments.
 fn default_model_root() -> PathBuf {
     if let Some(root) = std::env::var_os("BLOOM_MODEL_ROOT") {
         return PathBuf::from(root);
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        PathBuf::from("D:\\models")
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        PathBuf::from(home).join("models")
-    }
+    let home = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+        .or_else(|| {
+            let drive = std::env::var_os("HOMEDRIVE").filter(|value| !value.is_empty())?;
+            let path = std::env::var_os("HOMEPATH").filter(|value| !value.is_empty())?;
+            let mut home = PathBuf::from(drive);
+            home.push(path);
+            Some(home)
+        })
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join("models")
 }
 
 /// Check if a TTS model directory has the expected layout.
@@ -149,7 +159,7 @@ const KNOWN_TTS_MODELS: &[ModelScopeRepo] = &[
 
 /// Download a model from ModelScope if it doesn't exist locally.
 ///
-/// Uses the `modelscope` Python SDK to download to `D:\models` (or configured root).
+/// Uses the `modelscope` Python SDK to download to the configured model root.
 fn ensure_model_available(model_name: &str) -> Result<PathBuf> {
     let model_root = default_model_root();
     let model_path = model_root.join(model_name);

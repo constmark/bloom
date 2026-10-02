@@ -53,9 +53,13 @@ warm/recovery endpoints; short peaks may be missed. The runner does not measure
 accelerator memory. Closing a client after HTTP acceptance proves recovery of
 the public request path, but does not prove interruption during an active model
 step. Model and binary hashing occurs before the cold-start timer and is
-checked again after shutdown. The runner currently requires Linux `/proc` or
-macOS `ps` for host RSS; Windows memory sampling has not been implemented. The
-report states the measurement limits explicitly.
+checked again after shutdown. Host RSS sampling uses Linux `/proc`, `ps` on
+other POSIX hosts, and the locale-independent Windows PSAPI
+`WorkingSetSize` API on Windows. The report states the measurement limits
+explicitly.
+
+The workload requests a graceful `SIGTERM` on POSIX and a console Ctrl-Break
+on Windows (with a hard-termination fallback when no console is available).
 
 This workload is one part of the [deployment exit criteria](production-readiness.md).
 Before promoting the Qwen2 CPU cell, run it on an immutable OS/hardware/build

@@ -3,6 +3,7 @@
 mod api;
 mod browser;
 mod chat;
+mod i18n;
 mod markdown;
 mod storage;
 
@@ -21,6 +22,7 @@ use chat::{
 };
 use dioxus::prelude::*;
 use gloo_timers::future::TimeoutFuture;
+use i18n::{Locale, UiCopy, copy as ui_copy};
 use markdown::render_assistant_markdown;
 
 const STYLE: Asset = asset!("/assets/style.css");
@@ -267,9 +269,10 @@ impl ConnectionState {
         }
     }
 
-    fn view(&self) -> (&'static str, String) {
+    fn view(&self, locale: Locale) -> (&'static str, String) {
+        let copy = ui_copy(locale);
         match self {
-            Self::Connecting => ("", "Connecting…".into()),
+            Self::Connecting => ("", copy.connecting.into()),
             Self::Ready {
                 model,
                 supports_text_input,
@@ -279,22 +282,22 @@ impl ConnectionState {
                 ..
             } => {
                 let task = if *supports_audio_input && !*supports_text_input {
-                    "Transcription"
+                    copy.transcription
                 } else if *supports_embeddings && !*supports_generation {
-                    "Embeddings"
+                    copy.embeddings
                 } else {
-                    "Generation"
+                    copy.generation
                 };
-                ("ok", format!("Ready · {task} · {model}"))
+                ("ok", format!("{} · {task} · {model}", copy.ready))
             }
             Self::Loading { model, progress } => {
-                ("pending", format!("Loading {progress}% · {model}"))
+                ("pending", format!("{} {progress}% · {model}", copy.loading))
             }
-            Self::NoModel => ("pending", "Choose a model".into()),
+            Self::NoModel => ("pending", copy.choose_model.into()),
             Self::LoadFailed { message } => ("err", message.clone()),
-            Self::AuthenticationRequired { .. } => ("err", "API key required".into()),
-            Self::Incompatible { .. } => ("err", "Incompatible Bloom server".into()),
-            Self::Offline => ("err", "Connection unavailable".into()),
+            Self::AuthenticationRequired { .. } => ("err", copy.api_key_required.into()),
+            Self::Incompatible { .. } => ("err", copy.incompatible_server.into()),
+            Self::Offline => ("err", copy.server_unavailable.into()),
         }
     }
 
@@ -365,49 +368,71 @@ impl ConnectionState {
     }
 }
 
-fn empty_state_view(connection: &ConnectionState) -> EmptyStateView {
+fn empty_state_view(connection: &ConnectionState, locale: Locale) -> EmptyStateView {
+    let copy = ui_copy(locale);
     match connection {
         ConnectionState::Connecting => EmptyStateView {
-            title: "Connecting to Bloom".to_string(),
-            body: "Waiting for the configured bloom_server instance to respond.".to_string(),
-            action: Some((EmptyStateAction::Settings, "Connection settings")),
+            title: format!("{} Bloom", copy.connecting),
+            body: match locale {
+                Locale::English => "Waiting for the configured bloom_server instance to respond.".to_string(),
+                Locale::SimplifiedChinese => "正在等待已配置的 bloom_server 实例响应。".to_string(),
+                Locale::Japanese => "設定された bloom_server の応答を待っています。".to_string(),
+            },
+            action: Some((EmptyStateAction::Settings, copy.connection_settings)),
         },
         ConnectionState::Offline => EmptyStateView {
-            title: "Bloom server is unavailable".to_string(),
-            body: "Start bloom_server, then verify the server address and API key.".to_string(),
-            action: Some((EmptyStateAction::Settings, "Check connection")),
+            title: copy.server_unavailable.to_string(),
+            body: match locale {
+                Locale::English => "Start bloom_server, then verify the server address and API key.".to_string(),
+                Locale::SimplifiedChinese => "请启动 bloom_server，然后检查服务地址和 API Key。".to_string(),
+                Locale::Japanese => "bloom_server を起動し、サーバーアドレスと API キーを確認してください。".to_string(),
+            },
+            action: Some((EmptyStateAction::Settings, copy.check_connection)),
         },
         ConnectionState::AuthenticationRequired { message } => EmptyStateView {
-            title: "API key required".to_string(),
-            body: format!(
-                "Bloom rejected the configured API key. Update it in Connection settings. {message}"
-            ),
-            action: Some((EmptyStateAction::Settings, "Update API key")),
+            title: copy.api_key_required.to_string(),
+            body: match locale {
+                Locale::English => format!("Bloom rejected the configured API key. Update it in Connection settings. {message}"),
+                Locale::SimplifiedChinese => format!("Bloom 拒绝了当前配置的 API Key。请在连接设置中更新。{message}"),
+                Locale::Japanese => format!("設定された API キーが Bloom に拒否されました。接続設定で更新してください。{message}"),
+            },
+            action: Some((EmptyStateAction::Settings, copy.update_api_key)),
         },
         ConnectionState::Incompatible { message } => EmptyStateView {
-            title: "Incompatible Bloom server".to_string(),
-            body: format!(
-                "The configured endpoint does not provide the readiness contract required by this UI. {message}"
-            ),
-            action: Some((EmptyStateAction::Settings, "Check server version")),
+            title: copy.incompatible_server.to_string(),
+            body: match locale {
+                Locale::English => format!("The configured endpoint does not provide the readiness contract required by this UI. {message}"),
+                Locale::SimplifiedChinese => format!("当前端点没有提供此 UI 所需的就绪协议。{message}"),
+                Locale::Japanese => format!("設定されたエンドポイントは、この UI に必要な readiness 契約を提供していません。{message}"),
+            },
+            action: Some((EmptyStateAction::Settings, copy.check_server_version)),
         },
         ConnectionState::NoModel => EmptyStateView {
-            title: "Choose a model to begin".to_string(),
-            body: "Open the catalog to import, download, inspect, or load a local model."
-                .to_string(),
-            action: Some((EmptyStateAction::Models, "Open models")),
+            title: copy.choose_model.to_string(),
+            body: match locale {
+                Locale::English => "Open the catalog to import, download, inspect, or load a local model.".to_string(),
+                Locale::SimplifiedChinese => "打开模型目录，即可导入、下载、检查或加载本地模型。".to_string(),
+                Locale::Japanese => "カタログを開いて、ローカルモデルをインポート、ダウンロード、確認、読み込みできます。".to_string(),
+            },
+            action: Some((EmptyStateAction::Models, copy.open_models)),
         },
         ConnectionState::Loading { model, progress } => EmptyStateView {
-            title: format!("Loading {model}"),
-            body: format!(
-                "Model preparation is {progress}% complete. Chat becomes available after the runtime is ready."
-            ),
-            action: Some((EmptyStateAction::Models, "View model status")),
+            title: format!("{} {model}", copy.loading),
+            body: match locale {
+                Locale::English => format!("Model preparation is {progress}% complete. Chat becomes available after the runtime is ready."),
+                Locale::SimplifiedChinese => format!("模型准备进度为 {progress}%。运行时就绪后即可开始对话。"),
+                Locale::Japanese => format!("モデルの準備は {progress}% 完了しました。ランタイムの準備が整うと会話できます。"),
+            },
+            action: Some((EmptyStateAction::Models, copy.view_model_status)),
         },
         ConnectionState::LoadFailed { message } => EmptyStateView {
-            title: "Model load failed".to_string(),
+            title: match locale {
+                Locale::English => "Model load failed".to_string(),
+                Locale::SimplifiedChinese => "模型加载失败".to_string(),
+                Locale::Japanese => "モデルの読み込みに失敗しました".to_string(),
+            },
             body: message.clone(),
-            action: Some((EmptyStateAction::Models, "Review models")),
+            action: Some((EmptyStateAction::Models, copy.review_models)),
         },
         ConnectionState::Ready {
             model,
@@ -416,18 +441,30 @@ fn empty_state_view(connection: &ConnectionState) -> EmptyStateView {
         } => {
             if *supports_generation {
                 EmptyStateView {
-                    title: "Start a local conversation".to_string(),
-                    body: format!(
-                        "{model} is ready. Messages stay in this browser and are sent only to your configured Bloom server."
-                    ),
+                    title: match locale {
+                        Locale::English => "Start a local conversation".to_string(),
+                        Locale::SimplifiedChinese => "开始本地对话".to_string(),
+                        Locale::Japanese => "ローカル会話を始める".to_string(),
+                    },
+                    body: match locale {
+                        Locale::English => format!("{model} is ready. Messages stay in this browser and are sent only to your configured Bloom server."),
+                        Locale::SimplifiedChinese => format!("{model} 已就绪。消息保留在当前浏览器中，只发送到你配置的 Bloom 服务。"),
+                        Locale::Japanese => format!("{model} の準備が整いました。メッセージはこのブラウザに保持され、設定した Bloom サーバーにのみ送信されます。"),
+                    },
                     action: None,
                 }
             } else {
                 EmptyStateView {
-                    title: "Embedding model ready".to_string(),
-                    body: format!(
-                        "{model} serves embeddings and reranking rather than text generation."
-                    ),
+                    title: match locale {
+                        Locale::English => "Embedding model ready".to_string(),
+                        Locale::SimplifiedChinese => "向量模型已就绪".to_string(),
+                        Locale::Japanese => "埋め込みモデルの準備完了".to_string(),
+                    },
+                    body: match locale {
+                        Locale::English => format!("{model} serves embeddings and reranking rather than text generation."),
+                        Locale::SimplifiedChinese => format!("{model} 用于向量与重排序，而不是文本生成。"),
+                        Locale::Japanese => format!("{model} はテキスト生成ではなく、埋め込みと再ランキングを提供します。"),
+                    },
                     action: None,
                 }
             }
@@ -657,6 +694,7 @@ fn build_chat_history(options: &ChatOptions, messages: &[DisplayMessage]) -> Vec
 #[component]
 fn App() -> Element {
     let config = use_signal(storage::load_connection);
+    let mut locale = use_signal(storage::load_locale);
     let (mut conversations, mut conversation_storage_notice_state) = use_hook(|| {
         let load = storage::load_conversations();
         (Signal::new(load.store), Signal::new(load.notice))
@@ -691,6 +729,10 @@ fn App() -> Element {
     let mut acknowledged_model_transition =
         use_signal(|| Option::<ConversationModelTransition>::None);
 
+    use_effect(move || {
+        browser::set_document_language(locale().html_lang());
+    });
+
     let _status_poller = use_future(move || async move {
         loop {
             let cfg = config();
@@ -710,7 +752,9 @@ fn App() -> Element {
         }
     });
 
-    let status_view = connection().view();
+    let selected_locale = locale();
+    let copy: UiCopy = ui_copy(selected_locale);
+    let status_view = connection().view(selected_locale);
     let conversation_snapshot = conversations();
     let conversation_storage_notice = conversation_storage_notice_state();
     let conversation_writes_blocked = conversation_storage_notice
@@ -1245,12 +1289,12 @@ fn App() -> Element {
             if !show_specialized_workspace {
                 aside {
                 class: if show_sidebar() { "sidebar open" } else { "sidebar" },
-                aria_label: "Conversations",
+                aria_label: copy.conversations,
                 div { class: "sidebar-header",
-                    div { class: "sidebar-title", "Conversations" }
+                    div { class: "sidebar-title", "{copy.conversations}" }
                     button {
                         class: "close-sidebar",
-                        aria_label: "Close conversations",
+                        aria_label: copy.close_conversations,
                         onclick: move |_| show_sidebar.set(false),
                         "×"
                     }
@@ -1259,13 +1303,13 @@ fn App() -> Element {
                     class: "new-chat-btn",
                     disabled: busy() || conversation_import_loading() || conversation_writes_blocked,
                     onclick: move |_| on_new_chat(()),
-                    "+ New chat"
+                    "{copy.new_chat}"
                 }
                 div { class: "conversation-search",
                     input {
                         r#type: "search",
-                        aria_label: "Search conversations",
-                        placeholder: "Search conversations",
+                        aria_label: copy.search_conversations,
+                        placeholder: copy.search_conversations,
                         maxlength: "{MAX_CONVERSATION_SEARCH_CHARS}",
                         value: "{conversation_search}",
                         oninput: move |event| {
@@ -1276,8 +1320,8 @@ fn App() -> Element {
                     }
                     if !conversation_search().is_empty() {
                         button {
-                            aria_label: "Clear conversation search",
-                            title: "Clear search",
+                            aria_label: copy.clear_search,
+                            title: copy.clear_search,
                             onclick: move |_| conversation_search.set(String::new()),
                             "×"
                         }
@@ -1291,7 +1335,7 @@ fn App() -> Element {
                 nav { class: "conversation-list", aria_label: "Saved conversations",
                     if visible_conversations.is_empty() {
                         div { class: "conversation-search-empty",
-                            "No conversations match this search."
+                            "{copy.no_conversations_match}"
                         }
                     }
                     for (conversation_id, conversation_title) in visible_conversations.iter() {
@@ -1352,8 +1396,8 @@ fn App() -> Element {
                 }
                 div { class: "conversation-backup",
                     div { class: "conversation-backup-copy",
-                        strong { "Conversation backup" }
-                        span { "Messages only; connection settings are excluded." }
+                        strong { "{copy.backup_title}" }
+                        span { "{copy.backup_description}" }
                     }
                     div { class: "conversation-backup-actions",
                         label {
@@ -1440,14 +1484,14 @@ fn App() -> Element {
                                 },
                             }
                             span {
-                                if conversation_import_loading() { "Reading…" } else { "Import" }
+                                if conversation_import_loading() { "{copy.reading}" } else { "{copy.import}" }
                             }
                         }
                         button {
                             class: "btn-ghost compact",
                             disabled: busy() || conversation_import_loading() || conversation_writes_blocked,
                             onclick: export_conversations,
-                            "Export"
+                            "{copy.export}"
                         }
                     }
                     if let Some(message) = conversation_archive_notice() {
@@ -1460,7 +1504,7 @@ fn App() -> Element {
             if !show_specialized_workspace && show_sidebar() {
                 button {
                     class: "sidebar-backdrop",
-                    aria_label: "Close conversations",
+                    aria_label: copy.close_conversations,
                     onclick: move |_| show_sidebar.set(false),
                 }
             }
@@ -1471,7 +1515,7 @@ fn App() -> Element {
                         if !show_specialized_workspace {
                             button {
                                 class: "menu-btn",
-                                aria_label: "Open conversations",
+                                aria_label: copy.open_conversations,
                                 onclick: move |_| show_sidebar.set(true),
                                 "☰"
                             }
@@ -1481,11 +1525,11 @@ fn App() -> Element {
                             h1 { class: "brand-title", "Bloom" }
                             div { class: "brand-sub",
                                 if show_speech_workspace {
-                                    "Live speech to text"
+                                    "{copy.brand_speech}"
                                 } else if show_embedding_workspace {
-                                    "Local embedding and reranking"
+                                    "{copy.brand_embedding}"
                                 } else {
-                                    "Local multimodal inference"
+                                    "{copy.brand_chat}"
                                 }
                             }
                         }
@@ -1502,17 +1546,42 @@ fn App() -> Element {
                         button {
                             class: "icon-btn",
                             onclick: move |_| show_models.set(true),
-                            "Models"
+                            "{copy.models}"
                         }
                         button {
                             class: "icon-btn diagnostics-button",
                             onclick: move |_| show_diagnostics.set(true),
-                            "Diagnostics"
+                            "{copy.diagnostics}"
                         }
                         button {
                             class: "icon-btn",
                             onclick: move |_| show_settings.set(true),
-                            "Settings"
+                            "{copy.settings}"
+                        }
+                        label {
+                            class: "language-switcher",
+                            title: copy.choose_language,
+                            span { class: "language-switcher-label", "{copy.language}" }
+                            select {
+                                aria_label: copy.choose_language,
+                                value: selected_locale.storage_value(),
+                                onchange: move |event| {
+                                    let Some(next) = Locale::from_storage_value(&event.value()) else {
+                                        return;
+                                    };
+                                    if let Err(message) = storage::save_locale(next) {
+                                        error.set(Some(message));
+                                        return;
+                                    }
+                                    locale.set(next);
+                                },
+                                for option_locale in Locale::ALL {
+                                    option {
+                                        value: option_locale.storage_value(),
+                                        "{option_locale.short_label()} · {option_locale.label()}"
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1603,6 +1672,7 @@ fn App() -> Element {
                         key: "{speech_workspace_model}",
                         config,
                         model: speech_workspace_model,
+                        locale: selected_locale,
                     }
                 } else if show_embedding_workspace {
                     EmbeddingWorkspace {
@@ -1610,12 +1680,14 @@ fn App() -> Element {
                         config,
                         model: embedding_workspace_model,
                         supports_rerank: embedding_workspace_rerank,
+                        locale: selected_locale,
                     }
                 } else {
                 MessageList {
                     key: "{conversation_snapshot.active_id}",
                     messages: active_messages,
                     connection: connection(),
+                    locale: selected_locale,
                     busy: busy(),
                     retry_unavailable_reason,
                     edit_unavailable_reason,
@@ -1672,7 +1744,7 @@ fn App() -> Element {
                                 span { "{image.name} · {format_bytes(image.bytes.len() as u64)}" }
                             }
                             button {
-                                aria_label: "Remove image attachment",
+                                aria_label: copy.remove_attachment,
                                 disabled: busy(),
                                 onclick: move |_| {
                                     attachment.set(None);
@@ -1743,11 +1815,11 @@ fn App() -> Element {
                                     });
                                 },
                             }
-                            if attachment_loading() { "Reading…" } else { "Attach" }
+                            if attachment_loading() { "{copy.attach_reading}" } else { "{copy.attach}" }
                         }
                         textarea {
                             aria_label: "Message",
-                            placeholder: "Type a message. Press Enter to send or Shift+Enter for a new line…",
+                            placeholder: copy.message_placeholder,
                             maxlength: "{MAX_CHAT_INPUT_CHARS}",
                             value: "{input}",
                             rows: 2,
@@ -1763,14 +1835,14 @@ fn App() -> Element {
                             button {
                                 class: "stop-btn",
                                 onclick: move |_| on_stop(()),
-                                "Stop"
+                                "{copy.stop}"
                             }
                         } else {
                             button {
                                 class: "send-btn",
                                 disabled: !can_send,
                                 onclick: move |_| on_send(()),
-                                "Send"
+                                "{copy.send}"
                             }
                         }
                     }
@@ -1791,11 +1863,11 @@ fn App() -> Element {
                         } else if let Some(transition) = pending_model_transition.as_ref() {
                             "{model_transition_unavailable_reason(transition)}"
                         } else if !connection().can_chat() {
-                            "Wait for the model to become ready before sending."
+                            "{copy.composer_waiting}"
                         } else if generation().response_format != ResponseFormatMode::Text {
                             "Responses are constrained to {generation().response_format.description()} output."
                         } else {
-                            "Responses stream from the OpenAI-compatible API."
+                            "{copy.composer_hint}"
                         }
                     }
                 }
@@ -1809,6 +1881,7 @@ fn App() -> Element {
                 on_close: move |_| show_settings.set(false),
                 generation,
                 context_window,
+                locale: selected_locale,
             }
         }
 
@@ -1816,6 +1889,7 @@ fn App() -> Element {
             ModelDrawer {
                 config,
                 on_close: move |_| show_models.set(false),
+                locale: selected_locale,
             }
         }
 
@@ -1823,6 +1897,7 @@ fn App() -> Element {
             DiagnosticsDrawer {
                 config,
                 on_close: move |_| show_diagnostics.set(false),
+                locale: selected_locale,
             }
         }
 
@@ -2007,7 +2082,8 @@ fn App() -> Element {
 }
 
 #[component]
-fn ModelDrawer(config: Signal<ConnConfig>, on_close: EventHandler<()>) -> Element {
+fn ModelDrawer(config: Signal<ConnConfig>, on_close: EventHandler<()>, locale: Locale) -> Element {
+    let copy = ui_copy(locale);
     use_modal_focus(MODEL_DRAWER_DIALOG_ID);
     let mut catalog = use_signal(|| Option::<api::ModelCatalog>::None);
     let mut catalog_error = use_signal(|| Option::<String>::None);
@@ -2559,12 +2635,12 @@ fn ModelDrawer(config: Signal<ConnConfig>, on_close: EventHandler<()>) -> Elemen
                 onkeydown: move |event| handle_modal_key(event, MODEL_DRAWER_DIALOG_ID, on_close),
                 div { class: "drawer-title-row",
                     div {
-                        h3 { id: "model-manager-title", "Models" }
+                        h3 { id: "model-manager-title", "{copy.models}" }
                         div { id: "model-manager-description", class: "drawer-sub", "Load models discovered by the Bloom server." }
                     }
                     button {
                         class: "drawer-close",
-                        aria_label: "Close model manager",
+                        aria_label: copy.close_conversations,
                         onclick: move |_| on_close.call(()),
                         "×"
                     }
@@ -4350,7 +4426,8 @@ fn format_speech_duration(samples: u64) -> String {
 }
 
 #[component]
-fn SpeechWorkspace(config: Signal<ConnConfig>, model: String) -> Element {
+fn SpeechWorkspace(config: Signal<ConnConfig>, model: String, locale: Locale) -> Element {
+    let copy = ui_copy(locale);
     let mut capture = use_signal(|| Option::<browser::MicrophoneCapture>::None);
     let mut starting = use_signal(|| false);
     let mut recording = use_signal(|| false);
@@ -4555,9 +4632,15 @@ fn SpeechWorkspace(config: Signal<ConnConfig>, model: String) -> Element {
         section { class: "embedding-workspace speech-workspace", aria_labelledby: "speech-workspace-title",
             div { class: "embedding-workspace-header",
                 div {
-                    span { class: "workspace-eyebrow", "Speech workspace" }
-                    h2 { id: "speech-workspace-title", "Live speech to text" }
-                    p { "Speak into your microphone and Bloom will append each model result while recording continues." }
+                    span { class: "workspace-eyebrow", "{copy.brand_speech}" }
+                    h2 { id: "speech-workspace-title", "{copy.brand_speech}" }
+                    p {
+                        match locale {
+                            Locale::English => "Speak into your microphone and Bloom will append each model result while recording continues.",
+                            Locale::SimplifiedChinese => "对着麦克风说话，Bloom 会在录音过程中持续追加模型结果。",
+                            Locale::Japanese => "マイクに話しかけると、Bloom が録音中にモデルの結果を追加します。",
+                        }
+                    }
                 }
                 div { class: "workspace-model-meta",
                     span { "Active model" }
@@ -4713,7 +4796,13 @@ fn encoder_input_preview(input: &str) -> String {
 }
 
 #[component]
-fn EmbeddingWorkspace(config: Signal<ConnConfig>, model: String, supports_rerank: bool) -> Element {
+fn EmbeddingWorkspace(
+    config: Signal<ConnConfig>,
+    model: String,
+    supports_rerank: bool,
+    locale: Locale,
+) -> Element {
+    let copy = ui_copy(locale);
     let mut mode = use_signal(|| EmbeddingWorkspaceMode::Embeddings);
     let mut embedding_input = use_signal(String::new);
     let mut dimensions_input = use_signal(String::new);
@@ -4834,8 +4923,8 @@ fn EmbeddingWorkspace(config: Signal<ConnConfig>, model: String, supports_rerank
         section { class: "embedding-workspace", aria_labelledby: "embedding-workspace-title",
             div { class: "embedding-workspace-header",
                 div {
-                    span { class: "workspace-eyebrow", "Encoder workspace" }
-                    h2 { id: "embedding-workspace-title", "Embeddings and reranking" }
+                    span { class: "workspace-eyebrow", "{copy.brand_embedding}" }
+                    h2 { id: "embedding-workspace-title", "{copy.brand_embedding}" }
                     p {
                         "Run bounded local vector operations with "
                         strong { "{model}" }
@@ -5109,6 +5198,7 @@ fn EmbeddingWorkspace(config: Signal<ConnConfig>, model: String, supports_rerank
 fn MessageList(
     messages: Vec<DisplayMessage>,
     connection: ConnectionState,
+    locale: Locale,
     busy: bool,
     retry_unavailable_reason: Option<String>,
     edit_unavailable_reason: Option<String>,
@@ -5124,13 +5214,31 @@ fn MessageList(
     let mut copied_message = use_signal(|| Option::<usize>::None);
     let mut visible_message_limit = use_signal(|| INITIAL_VISIBLE_MESSAGES);
     if messages.is_empty() {
-        let view = empty_state_view(&connection);
+        let copy = ui_copy(locale);
+        let view = empty_state_view(&connection, locale);
         return rsx! {
             div { class: "messages",
                 div { class: "empty-state",
-                    div { class: "logo", "✦" }
-                    h2 { "{view.title}" }
-                    p { "{view.body}" }
+                    div { class: "empty-state-mark", "B" }
+                    div { class: "empty-state-eyebrow", "{copy.home_eyebrow}" }
+                    h2 { "{copy.home_title}" }
+                    p { class: "empty-state-lead", "{copy.home_body}" }
+                    h3 { class: "empty-state-status-title", "{view.title}" }
+                    p { class: "empty-state-status-body", "{view.body}" }
+                    div { class: "empty-state-capabilities",
+                        div { class: "empty-state-capability",
+                            strong { "{copy.capability_local}" }
+                            span { "{copy.capability_local_body}" }
+                        }
+                        div { class: "empty-state-capability",
+                            strong { "{copy.capability_compatible}" }
+                            span { "{copy.capability_compatible_body}" }
+                        }
+                        div { class: "empty-state-capability",
+                            strong { "{copy.capability_multimodal}" }
+                            span { "{copy.capability_multimodal_body}" }
+                        }
+                    }
                     if let Some((action, label)) = view.action {
                         button {
                             class: "btn-primary empty-state-action",
@@ -5386,7 +5494,12 @@ fn MessageList(
 }
 
 #[component]
-fn DiagnosticsDrawer(config: Signal<ConnConfig>, on_close: EventHandler<()>) -> Element {
+fn DiagnosticsDrawer(
+    config: Signal<ConnConfig>,
+    on_close: EventHandler<()>,
+    locale: Locale,
+) -> Element {
+    let copy = ui_copy(locale);
     use_modal_focus(DIAGNOSTICS_DRAWER_DIALOG_ID);
     let mut snapshot = use_signal(|| Option::<api::ObservabilitySnapshot>::None);
     let mut diagnostics_error = use_signal(|| Option::<String>::None);
@@ -5459,14 +5572,14 @@ fn DiagnosticsDrawer(config: Signal<ConnConfig>, on_close: EventHandler<()>) -> 
                 onkeydown: move |event| handle_modal_key(event, DIAGNOSTICS_DRAWER_DIALOG_ID, on_close),
                 div { class: "drawer-title-row",
                     div {
-                        h3 { id: "runtime-diagnostics-title", "Runtime diagnostics" }
+                        h3 { id: "runtime-diagnostics-title", "{copy.diagnostics}" }
                         div { id: "runtime-diagnostics-description", class: "drawer-sub",
                             "Live, authenticated counters from the configured Bloom server."
                         }
                     }
                     button {
                         class: "drawer-close",
-                        aria_label: "Close runtime diagnostics",
+                        aria_label: copy.close_conversations,
                         onclick: move |_| on_close.call(()),
                         "×"
                     }
@@ -5668,7 +5781,9 @@ fn SettingsDrawer(
     on_close: EventHandler<()>,
     generation: Signal<ChatOptions>,
     context_window: Option<u64>,
+    locale: Locale,
 ) -> Element {
+    let copy = ui_copy(locale);
     use_modal_focus(SETTINGS_DRAWER_DIALOG_ID);
     let mut base_url = use_signal(|| config().base_url);
     let mut api_key = use_signal(|| config().api_key);
@@ -5802,7 +5917,7 @@ fn SettingsDrawer(
                 aria_describedby: "settings-description",
                 onclick: move |event| event.stop_propagation(),
                 onkeydown: move |event| handle_modal_key(event, SETTINGS_DRAWER_DIALOG_ID, on_close),
-                h3 { id: "settings-title", "Settings" }
+                h3 { id: "settings-title", "{copy.settings}" }
                 div { id: "settings-description", class: "drawer-sub", "Connect to a running bloom_server instance." }
 
                 div { class: "field",
@@ -6210,18 +6325,18 @@ fn ConfirmDialog(
 mod tests {
     use super::{
         ChatMessage, ConnectionState, ConversationImportMode, ConversationStore, DisplayMessage,
-        EmptyStateAction, GenerationOutcome, GenerationStats, ModalKeyAction, ModelIndexLocalState,
-        Readiness, api, append_transcript_segment, conversation_context_status,
-        conversation_import_candidate, conversation_model_transition, embedding_vector_norm,
-        embedding_vector_preview, empty_state_view, encoder_input_preview, format_duration,
-        format_duration_seconds, format_generation_millis, format_inventory_changes,
-        format_inventory_drift_severity, format_inventory_drift_status, format_load_phase,
-        format_model_precision, format_model_tasks, format_optional_bytes, format_optional_count,
-        format_parameter_count, format_percent, generation_outcome_label, integrity_phase_label,
-        license_policy_allows, message_window, modal_key_action, model_index_local_state,
-        model_index_poll_interval_seconds, model_index_upgrade_source_is_active,
-        model_provenance_summary, optional_seed, parse_optional_embedding_dimensions,
-        supported_image_mime, supported_model_import_filename,
+        EmptyStateAction, GenerationOutcome, GenerationStats, Locale, ModalKeyAction,
+        ModelIndexLocalState, Readiness, api, append_transcript_segment,
+        conversation_context_status, conversation_import_candidate, conversation_model_transition,
+        embedding_vector_norm, embedding_vector_preview, empty_state_view, encoder_input_preview,
+        format_duration, format_duration_seconds, format_generation_millis,
+        format_inventory_changes, format_inventory_drift_severity, format_inventory_drift_status,
+        format_load_phase, format_model_precision, format_model_tasks, format_optional_bytes,
+        format_optional_count, format_parameter_count, format_percent, generation_outcome_label,
+        integrity_phase_label, license_policy_allows, message_window, modal_key_action,
+        model_index_local_state, model_index_poll_interval_seconds,
+        model_index_upgrade_source_is_active, model_provenance_summary, optional_seed,
+        parse_optional_embedding_dimensions, supported_image_mime, supported_model_import_filename,
         unconfirmed_conversation_model_transition, valid_sha256_input,
         validate_context_reservation,
     };
@@ -6484,16 +6599,19 @@ mod tests {
 
     #[test]
     fn first_run_guidance_routes_users_to_the_actionable_drawer() {
-        let offline = empty_state_view(&ConnectionState::Offline);
+        let offline = empty_state_view(&ConnectionState::Offline, Locale::English);
         assert_eq!(offline.title, "Bloom server is unavailable");
         assert_eq!(
             offline.action,
             Some((EmptyStateAction::Settings, "Check connection"))
         );
 
-        let incompatible = empty_state_view(&ConnectionState::Incompatible {
-            message: "unsupported readiness contract".to_string(),
-        });
+        let incompatible = empty_state_view(
+            &ConnectionState::Incompatible {
+                message: "unsupported readiness contract".to_string(),
+            },
+            Locale::English,
+        );
         assert_eq!(incompatible.title, "Incompatible Bloom server");
         assert!(incompatible.body.contains("unsupported readiness contract"));
         assert_eq!(
@@ -6501,9 +6619,12 @@ mod tests {
             Some((EmptyStateAction::Settings, "Check server version"))
         );
 
-        let authentication = empty_state_view(&ConnectionState::AuthenticationRequired {
-            message: "HTTP 401 (Request ID: request-42)".to_string(),
-        });
+        let authentication = empty_state_view(
+            &ConnectionState::AuthenticationRequired {
+                message: "HTTP 401 (Request ID: request-42)".to_string(),
+            },
+            Locale::English,
+        );
         assert_eq!(authentication.title, "API key required");
         assert!(authentication.body.contains("request-42"));
         assert_eq!(
@@ -6511,36 +6632,42 @@ mod tests {
             Some((EmptyStateAction::Settings, "Update API key"))
         );
 
-        let no_model = empty_state_view(&ConnectionState::NoModel);
+        let no_model = empty_state_view(&ConnectionState::NoModel, Locale::English);
         assert_eq!(no_model.title, "Choose a model to begin");
         assert_eq!(
             no_model.action,
             Some((EmptyStateAction::Models, "Open models"))
         );
 
-        let ready = empty_state_view(&ConnectionState::Ready {
-            model: "tiny.gguf".to_string(),
-            supports_vision: false,
-            supports_text_input: true,
-            supports_audio_input: false,
-            supports_generation: true,
-            supports_embeddings: false,
-            supports_rerank: false,
-            context_window: Some(4_096),
-        });
+        let ready = empty_state_view(
+            &ConnectionState::Ready {
+                model: "tiny.gguf".to_string(),
+                supports_vision: false,
+                supports_text_input: true,
+                supports_audio_input: false,
+                supports_generation: true,
+                supports_embeddings: false,
+                supports_rerank: false,
+                context_window: Some(4_096),
+            },
+            Locale::English,
+        );
         assert!(ready.body.contains("tiny.gguf is ready"));
         assert_eq!(ready.action, None);
 
-        let encoder = empty_state_view(&ConnectionState::Ready {
-            model: "encoder".to_string(),
-            supports_vision: false,
-            supports_text_input: true,
-            supports_audio_input: false,
-            supports_generation: false,
-            supports_embeddings: true,
-            supports_rerank: true,
-            context_window: Some(256),
-        });
+        let encoder = empty_state_view(
+            &ConnectionState::Ready {
+                model: "encoder".to_string(),
+                supports_vision: false,
+                supports_text_input: true,
+                supports_audio_input: false,
+                supports_generation: false,
+                supports_embeddings: true,
+                supports_rerank: true,
+                context_window: Some(256),
+            },
+            Locale::English,
+        );
         assert_eq!(encoder.title, "Embedding model ready");
         assert!(encoder.body.contains("rather than text generation"));
     }
@@ -6730,7 +6857,10 @@ mod tests {
         });
         assert!(!speech.can_chat());
         assert!(speech.can_transcribe());
-        assert_eq!(speech.view().1, "Ready · Transcription · qwen-asr");
+        assert_eq!(
+            speech.view(Locale::English).1,
+            "Ready · Transcription · qwen-asr"
+        );
 
         let encoder = ConnectionState::from_readiness(Readiness {
             status: "ready".into(),

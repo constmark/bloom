@@ -44,13 +44,19 @@ impl IntelNpuBackend {
     fn probe_windows() -> BackendAvailability {
         let mut details = Vec::new();
 
-        // Check common Intel NPU driver locations.
+        // Check common Intel NPU driver locations. Resolve well-known roots
+        // from the environment so installations on a non-C: system drive
+        // are detected as well.
+        let system_root = env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let program_files = env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into());
+        let program_files_x86 =
+            env::var("ProgramFiles(x86)").unwrap_or_else(|_| r"C:\Program Files (x86)".into());
         let driver_paths = [
-            r"C:\Windows\System32\drivers\IntelNPU.sys",
-            r"C:\Windows\System32\drivers\ivpu.sys",
-            r"C:\Windows\System32\drivers\Intel\IntelNPU.sys",
-            r"C:\Program Files\Intel\Intel NPU driver",
-            r"C:\Program Files (x86)\Intel\Intel NPU driver",
+            format!(r"{system_root}\System32\drivers\IntelNPU.sys"),
+            format!(r"{system_root}\System32\drivers\ivpu.sys"),
+            format!(r"{system_root}\System32\drivers\Intel\IntelNPU.sys"),
+            format!(r"{program_files}\Intel\Intel NPU driver"),
+            format!(r"{program_files_x86}\Intel\Intel NPU driver"),
         ];
 
         let has_driver = driver_paths.iter().any(|p| Self::exists(p));
@@ -60,11 +66,11 @@ impl IntelNpuBackend {
 
         // System installation locations.
         let system_paths = [
-            r"C:\Program Files\Intel\OpenVINO",
-            r"C:\Program Files (x86)\Intel\OpenVINO",
-            r"C:\Program Files\Intel\openvino",
-            r"C:\Program Files (x86)\Intel\openvino",
-            r"C:\Intel\openvino",
+            format!(r"{program_files}\Intel\OpenVINO"),
+            format!(r"{program_files_x86}\Intel\OpenVINO"),
+            format!(r"{program_files}\Intel\openvino"),
+            format!(r"{program_files_x86}\Intel\openvino"),
+            r"C:\Intel\openvino".to_string(),
         ];
 
         for path in system_paths.iter() {
@@ -104,19 +110,22 @@ impl IntelNpuBackend {
         }
 
         // Check OpenVINO environment variables.
-        let has_openvino_env = Self::check_env_path("INTEL_OPENVINO_DIR")
-            || Self::check_env_path("OPENVINO_DIR")
-            || Self::check_env_path("PATH");
+        // PATH is intentionally not treated as an OpenVINO installation
+        // marker: on a normal Windows machine it almost always contains at
+        // least one existing directory.  Only explicit OpenVINO variables
+        // provide a meaningful signal here.
+        let has_openvino_env =
+            Self::check_env_path("INTEL_OPENVINO_DIR") || Self::check_env_path("OPENVINO_DIR");
 
         // Check system-wide and user-level OpenVINO DLL locations.
         let mut has_openvino_dll = false;
 
         // System DLL locations.
         let system_dlls = [
-            r"C:\Windows\System32\openvino.dll",
-            r"C:\Windows\System32\openvino_c.dll",
-            r"C:\Program Files\Intel\OpenVINO\runtime\bin\intel64\Release\openvino.dll",
-            r"C:\Program Files (x86)\Intel\OpenVINO\runtime\bin\intel64\Release\openvino.dll",
+            format!(r"{system_root}\System32\openvino.dll"),
+            format!(r"{system_root}\System32\openvino_c.dll"),
+            format!(r"{program_files}\Intel\OpenVINO\runtime\bin\intel64\Release\openvino.dll"),
+            format!(r"{program_files_x86}\Intel\OpenVINO\runtime\bin\intel64\Release\openvino.dll"),
         ];
 
         for dll in system_dlls.iter() {
@@ -177,7 +186,7 @@ impl IntelNpuBackend {
         details.push(format!("openvino dlls found: {}", has_openvino_dll));
 
         // Treat the NPU as available when either a driver or OpenVINO is installed.
-        if has_driver || has_openvino_dll {
+        if has_driver || has_openvino_dll || has_openvino || has_openvino_env {
             details.push("Intel NPU should be available through OpenVINO".to_string());
             BackendAvailability::available(details)
         } else {
@@ -205,8 +214,12 @@ impl IntelNpuBackend {
         let driver_paths = ["/sys/module/ivpu", "/sys/bus/pci/drivers/intel_vpu"];
         let openvino_hints = [
             "/opt/intel/openvino",
+            "/opt/intel/openvino/runtime/lib/intel64/libopenvino.so",
             "/usr/lib/libopenvino.so",
+            "/usr/local/lib/libopenvino.so",
             "/usr/lib/x86_64-linux-gnu/libopenvino.so",
+            "/usr/lib/aarch64-linux-gnu/libopenvino.so",
+            "/usr/lib/arm64-linux-gnu/libopenvino.so",
         ];
 
         let has_accel = accel_nodes.iter().any(|p| Self::exists(p));
@@ -221,7 +234,7 @@ impl IntelNpuBackend {
         details.push(format!("openvino runtime hint found: {}", has_openvino));
         details.push(format!("openvino environment vars: {}", has_openvino_env));
 
-        if (has_accel && has_driver) || has_openvino {
+        if (has_accel && has_driver) || has_openvino || has_openvino_env {
             BackendAvailability::available(details)
         } else {
             BackendAvailability::unavailable(

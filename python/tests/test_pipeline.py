@@ -227,6 +227,53 @@ class BloomPipelineTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "NUL"):
                     pipeline_module.BloomPipeline(**arguments)
 
+    def test_constructor_accepts_pathlike_and_localizes_diagnostics(self):
+        pipeline = pipeline_module.BloomPipeline(Path("模型/问答.gguf"), engine="mock", locale="zh_CN")
+        self.assertEqual(pipeline.locale, "zh-CN")
+        pipeline.close()
+
+        with pipeline_module.BloomPipeline(Path("模型/问答.gguf"), engine="mock", locale="zh-CN") as closed:
+            closed.close()
+            with self.assertRaisesRegex(pipeline_module.BloomError, "推理管道已关闭"):
+                closed.generate("你好")
+
+    def test_unicode_prompt_and_response_format_are_utf8_json(self):
+        pipeline = pipeline_module.BloomPipeline(Path("模型/问答.gguf"), engine="mock")
+        input_bytes, params_bytes = pipeline._prepare_input_params(
+            "请用中文回答 🌸", 8, 0.7, 0.9, None,
+            {"type": "json_object"},
+        )
+        self.assertIn("请用中文回答 🌸".encode("utf-8"), input_bytes)
+        self.assertIn(b'"response_format": {"type": "json_object"}', params_bytes)
+        self.assertEqual(pipeline.generate("你好", response_format={"type": "json_object"}), {"text": "ok"})
+        _, schema_params = pipeline._prepare_input_params(
+            "schema", 8, 0.7, 0.9, None,
+            {"type": "json_schema", "json_schema": {"name": "answer", "schema": {"type": "object"}}},
+        )
+        self.assertIn(
+            b'"response_format": {"type": "json_schema", "json_schema": {"type": "object"}}',
+            schema_params,
+        )
+        pipeline.close()
+
+    def test_response_format_shorthands_match_rust_serde_shape(self):
+        self.assertEqual(
+            pipeline_module._normalize_response_format("text"),
+            {"type": "text"},
+        )
+        self.assertEqual(
+            pipeline_module._normalize_response_format("json_object"),
+            {"type": "json_object"},
+        )
+        self.assertEqual(
+            pipeline_module._normalize_response_format(
+                {"json_schema": {"type": "object"}}
+            ),
+            {"type": "json_schema", "json_schema": {"type": "object"}},
+        )
+        with self.assertRaises(ValueError):
+            pipeline_module._normalize_response_format("json_schema")
+
     def test_revision_one_library_remains_supported(self):
         legacy_lib = FakeLibrary()
         for symbol in (

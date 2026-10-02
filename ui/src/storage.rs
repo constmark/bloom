@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::{ChatOptions, ConnConfig};
 use crate::chat::ConversationStore;
+use crate::i18n::Locale;
 
 const CONNECTION_STORAGE_KEY: &str = "bloom-ui-conn";
 const LEGACY_CONNECTION_STORAGE_KEY: &str = "bloom-web-conn";
@@ -15,7 +16,34 @@ const LEGACY_CONVERSATION_STORAGE_KEY: &str = "bloom-ui-conversations-v1";
 const CONVERSATION_STORAGE_VERSION: u32 = 2;
 const CONVERSATION_STORAGE_OBJECT: &str = "bloom.conversation_store";
 const GENERATION_STORAGE_KEY: &str = "bloom-ui-generation-v1";
+const LOCALE_STORAGE_KEY: &str = "bloom-ui-locale-v1";
 pub const CONVERSATION_RECOVERY_FILENAME: &str = "bloom-conversations-recovery.txt";
+
+pub fn load_locale() -> Locale {
+    let Some(storage) = local_storage() else {
+        return browser_locale();
+    };
+    storage
+        .get_item(LOCALE_STORAGE_KEY)
+        .ok()
+        .flatten()
+        .and_then(|value| Locale::from_storage_value(&value))
+        .unwrap_or_else(browser_locale)
+}
+
+pub fn save_locale(locale: Locale) -> Result<(), String> {
+    let storage = local_storage().ok_or("browser-local storage is unavailable")?;
+    storage
+        .set_item(LOCALE_STORAGE_KEY, locale.storage_value())
+        .map_err(|error| format!("failed to save interface language: {error:?}"))
+}
+
+fn browser_locale() -> Locale {
+    web_sys::window()
+        .and_then(|window| window.navigator().language())
+        .map(|language| Locale::from_language_tag(&language))
+        .unwrap_or(Locale::English)
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
