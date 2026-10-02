@@ -202,6 +202,8 @@ jobs:
         # Script SKIPs gracefully (exit 0) when model or llama.cpp is missing.
         run: ./scripts/compare_llamacpp.py
       - name: Docker build smoke
+        # Bound image-build stalls while leaving room for a cold dependency build.
+        timeout-minutes: 20
         run: docker build -t bloom:ci .
       - name: Test embedded UI in Chromium
         run: |
