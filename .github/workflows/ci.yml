@@ -243,6 +243,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --features metal --locked -- -D warnings -A missing_docs
       - name: Test
+        # Bound macOS workspace test stalls just like the Linux and Windows jobs.
+        timeout-minutes: 20
         run: cargo test --workspace --features metal --locked
 
   windows:
