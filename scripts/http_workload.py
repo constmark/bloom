@@ -14,6 +14,7 @@ import ctypes
 import hashlib
 import http.client
 import json
+import math
 import os
 import pathlib
 import platform
@@ -30,6 +31,16 @@ from typing import Any
 STARTUP_PORT = re.compile(r"server running on http://127\.0\.0\.1:(\d+)")
 MAX_EVENT_BYTES = 1024 * 1024
 MAX_STREAM_BYTES = 16 * 1024 * 1024
+RUNTIME_STATS_MAX_BYTES = 256 * 1024
+
+
+class RuntimeStatsError(ValueError):
+    """A bounded, credential-free error from an optional stats endpoint."""
+
+    def __init__(self, endpoint: str, reason: str) -> None:
+        super().__init__(f"{endpoint}: {reason}")
+        self.endpoint = endpoint
+        self.reason = reason
 
 
 def sha256_file(path: pathlib.Path) -> str:
@@ -262,6 +273,296 @@ def get_ready(port: int, timeout: float = 2) -> tuple[int, dict[str, Any]]:
         connection.close()
 
 
+def _require_stats_int(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise RuntimeStatsError("runtime stats", f"{field} is not a non-negative integer")
+    return value
+
+
+def _require_stats_number(value: Any, field: str) -> int | float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RuntimeStatsError("runtime stats", f"{field} is not numeric")
+    if not math.isfinite(value) or value < 0:
+        raise RuntimeStatsError("runtime stats", f"{field} is not a finite non-negative number")
+    return value
+
+
+def _require_stats_fraction(value: Any, field: str) -> int | float:
+    number = _require_stats_number(value, field)
+    if number > 1:
+        raise RuntimeStatsError("runtime stats", f"{field} is greater than one")
+    return number
+
+
+def _stats_int_group(payload: dict[str, Any], name: str, fields: tuple[str, ...]) -> dict[str, int]:
+    value = payload.get(name)
+    if not isinstance(value, dict):
+        raise RuntimeStatsError("runtime stats", f"{name} is not an object")
+    return {
+        field: _require_stats_int(value.get(field), f"{name}.{field}")
+        for field in fields
+    }
+
+
+def _sanitize_cachemesh(value: Any) -> dict[str, Any] | None:
+    """Keep cache counters and gauges, excluding unbounded/string metadata."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or not isinstance(value.get("enabled"), bool):
+        raise RuntimeStatsError("/v1/observability", "cachemesh is malformed")
+    tiers: dict[str, dict[str, int | float]] = {}
+    tier_fields = (
+        "hits", "misses", "evictions", "offloads", "restores",
+        "failed_offloads", "dropped", "bytes", "items", "hit_rate",
+    )
+    for tier in ("l1", "l2", "l3"):
+        tiers[tier] = _stats_int_group(value, tier, tier_fields[:-1])
+        tiers[tier]["hit_rate"] = _require_stats_fraction(
+            value[tier].get("hit_rate"), f"{tier}.hit_rate"
+        )
+    return {"enabled": value["enabled"], **tiers}
+
+
+def _sanitize_observability(payload: Any) -> dict[str, Any]:
+    """Validate and retain only bounded numeric runtime evidence.
+
+    Model names, paths, device labels, load errors, prompts and responses are
+    intentionally omitted. This keeps an optional benchmark report safe to
+    share while retaining the counters and gauges useful for interpretation.
+    """
+    if not isinstance(payload, dict):
+        raise RuntimeStatsError("/v1/observability", "response is not a JSON object")
+    if payload.get("schema_version") != 1 or payload.get("object") != "bloom.observability_snapshot":
+        raise RuntimeStatsError("/v1/observability", "unsupported snapshot identity")
+    server = payload.get("server")
+    if not isinstance(server, dict) or not isinstance(server.get("version"), str):
+        raise RuntimeStatsError("/v1/observability", "server metadata is malformed")
+    if not isinstance(payload.get("ready"), bool):
+        raise RuntimeStatsError("/v1/observability", "ready is malformed")
+    requests = _stats_int_group(payload, "requests", ("total", "completed", "failed", "in_flight"))
+    tokens = _stats_int_group(payload, "tokens", ("prompt_total", "generated_total"))
+    scheduler = payload.get("scheduler")
+    if not isinstance(scheduler, dict) or not isinstance(scheduler.get("ifb_enabled"), bool):
+        raise RuntimeStatsError("/v1/observability", "scheduler is malformed")
+    scheduler_values = _stats_int_group(
+        payload, "scheduler", ("prefill_queue", "decoding_queue", "active_requests")
+    )
+    kv_cache = _stats_int_group(
+        payload, "kv_cache",
+        ("total_blocks", "free_blocks", "active_blocks", "cached_blocks",
+         "hits", "misses", "evictions", "reuses"),
+    )
+    kv_cache["utilization"] = _require_stats_fraction(
+        payload["kv_cache"].get("utilization"), "kv_cache.utilization"
+    )
+    memory = payload.get("memory")
+    if not isinstance(memory, dict):
+        raise RuntimeStatsError("/v1/observability", "memory is malformed")
+    memory_values = {
+        field: _require_stats_int(memory.get(field), f"memory.{field}")
+        for field in ("total_vram", "used_vram", "total_ram", "used_ram", "peak_vram", "peak_ram")
+    }
+    load = payload.get("load")
+    if (
+        not isinstance(load, dict)
+        or load.get("phase") not in {"idle", "loading", "ready", "failed"}
+        or not isinstance(load.get("failure_present"), bool)
+    ):
+        raise RuntimeStatsError("/v1/observability", "load is malformed")
+    progress = _require_stats_int(load.get("progress"), "load.progress")
+    if progress > 100:
+        raise RuntimeStatsError("/v1/observability", "load.progress is greater than 100")
+    return {
+        "schema_version": 1,
+        "object": "bloom.observability_snapshot",
+        "server": {
+            "version": server["version"],
+            "uptime_seconds": _require_stats_int(server.get("uptime_seconds"), "server.uptime_seconds"),
+        },
+        "ready": payload["ready"],
+        "load": {
+            "phase": load["phase"],
+            "progress": progress,
+            "failure_present": load["failure_present"],
+        },
+        "requests": requests,
+        "tokens": tokens,
+        "scheduler": {"ifb_enabled": scheduler["ifb_enabled"], **scheduler_values},
+        "kv_cache": kv_cache,
+        "cachemesh": _sanitize_cachemesh(payload.get("cachemesh")),
+        "memory": memory_values,
+    }
+
+
+def _sanitize_kv_cache(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise RuntimeStatsError("/v1/kv-cache-stats", "response is not a JSON object")
+    return {
+        "total_blocks": _require_stats_int(payload.get("total_blocks"), "total_blocks"),
+        "free_blocks": _require_stats_int(payload.get("free_blocks"), "free_blocks"),
+        "active_blocks": _require_stats_int(payload.get("active_blocks"), "active_blocks"),
+        "cached_blocks": _require_stats_int(payload.get("cached_blocks"), "cached_blocks"),
+        "hits": _require_stats_int(payload.get("hits"), "hits"),
+        "misses": _require_stats_int(payload.get("misses"), "misses"),
+        "evictions": _require_stats_int(payload.get("evictions"), "evictions"),
+        "reuses": _require_stats_int(payload.get("reuses"), "reuses"),
+        "utilization": _require_stats_fraction(payload.get("utilization"), "utilization"),
+        "cachemesh": _sanitize_cachemesh(payload.get("cachemesh")),
+    }
+
+
+def _fetch_json_endpoint(port: int, path: str, api_key: str, timeout: float) -> Any:
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    try:
+        connection.request(
+            "GET", path,
+            headers={"Accept": "application/json", "Authorization": f"Bearer {api_key}"},
+        )
+        response = connection.getresponse()
+        body = response.read(RUNTIME_STATS_MAX_BYTES + 1)
+        if response.status != 200:
+            raise RuntimeStatsError(path, f"HTTP status {response.status}")
+        if len(body) > RUNTIME_STATS_MAX_BYTES:
+            raise RuntimeStatsError(path, "response exceeded byte limit")
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError as error:
+            raise RuntimeStatsError(path, "response was not valid JSON") from error
+    except (OSError, http.client.HTTPException) as error:
+        raise RuntimeStatsError(path, "request failed") from error
+    finally:
+        connection.close()
+
+
+def fetch_runtime_stats(port: int, api_key: str, timeout: float) -> dict[str, Any]:
+    """Fetch both authenticated snapshots, retaining partial availability."""
+    snapshots: dict[str, Any] = {}
+    errors: dict[str, dict[str, str]] = {}
+    for name, path, sanitizer in (
+        ("observability", "/v1/observability", _sanitize_observability),
+        ("kv_cache", "/v1/kv-cache-stats", _sanitize_kv_cache),
+    ):
+        try:
+            snapshots[name] = sanitizer(_fetch_json_endpoint(port, path, api_key, timeout))
+        except RuntimeStatsError as error:
+            errors[name] = {"status": "unavailable", "error": error.reason}
+    return {
+        "status": "available" if not errors else "unavailable",
+        "snapshots": snapshots,
+        "errors": errors,
+    }
+
+
+def _flatten_numeric(value: Any, prefix: str = "") -> dict[str, int | float]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, int | float] = {}
+    for key, item in value.items():
+        path = f"{prefix}.{key}" if prefix else key
+        if isinstance(item, bool):
+            continue
+        if isinstance(item, (int, float)):
+            result[path] = item
+        elif isinstance(item, dict):
+            result.update(_flatten_numeric(item, path))
+    return result
+
+
+COUNTER_SUFFIXES = (
+    ".requests.total", ".requests.completed", ".requests.failed",
+    ".tokens.prompt_total", ".tokens.generated_total",
+    ".kv_cache.hits", ".kv_cache.misses", ".kv_cache.evictions", ".kv_cache.reuses",
+    ".hits", ".misses", ".evictions", ".offloads", ".restores",
+    ".failed_offloads", ".dropped",
+)
+
+
+def compare_runtime_stats(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    """Compare snapshots without turning gauges into misleading deltas."""
+    deltas: dict[str, dict[str, int | float | None]] = {}
+    gauges: dict[str, dict[str, int | float]] = {}
+    reset = False
+    for endpoint in ("observability", "kv_cache"):
+        old_values = _flatten_numeric(before.get(endpoint, {}), endpoint)
+        new_values = _flatten_numeric(after.get(endpoint, {}), endpoint)
+        endpoint_deltas: dict[str, int | float | None] = {}
+        endpoint_gauges: dict[str, int | float] = {}
+        for path, value in new_values.items():
+            relative = path.removeprefix(f"{endpoint}.")
+            if any(relative.endswith(suffix.lstrip(".")) for suffix in COUNTER_SUFFIXES):
+                old = old_values.get(path)
+                if old is None or value < old:
+                    endpoint_deltas[relative] = None
+                    reset = True
+                else:
+                    endpoint_deltas[relative] = value - old
+            else:
+                endpoint_gauges[relative] = value
+        deltas[endpoint] = endpoint_deltas
+        gauges[endpoint] = endpoint_gauges
+    old_uptime = before.get("observability", {}).get("server", {}).get("uptime_seconds")
+    new_uptime = after.get("observability", {}).get("server", {}).get("uptime_seconds")
+    if isinstance(old_uptime, int) and isinstance(new_uptime, int) and new_uptime < old_uptime:
+        reset = True
+    return {
+        "status": "reset" if reset else "available",
+        "counter_deltas": deltas,
+        "gauges": gauges,
+    }
+
+
+class RuntimeStatsCollector:
+    """Collect optional endpoint snapshots outside request timing windows."""
+
+    def __init__(self, enabled: bool, port: int, api_key: str, timeout: float) -> None:
+        self.enabled = enabled
+        self.port = port
+        self.api_key = api_key
+        self.timeout = timeout
+        self.baseline: dict[str, Any] | None = None
+        self.after_waves: list[dict[str, Any]] = []
+        self.reset_seen = False
+        self.unavailable_seen = False
+
+    def capture_baseline(self) -> None:
+        if self.enabled:
+            self.baseline = fetch_runtime_stats(self.port, self.api_key, self.timeout)
+            self.unavailable_seen |= self.baseline["status"] == "unavailable"
+
+    def capture_after_wave(self, wave: int) -> None:
+        if not self.enabled:
+            return
+        current = fetch_runtime_stats(self.port, self.api_key, self.timeout)
+        entry: dict[str, Any] = {"wave": wave, **current}
+        if current["status"] == "unavailable":
+            self.unavailable_seen = True
+        elif self.baseline and self.baseline["status"] == "available":
+            comparison = compare_runtime_stats(self.baseline["snapshots"], current["snapshots"])
+            entry.update(comparison)
+            self.reset_seen |= comparison["status"] == "reset"
+        elif self.baseline and self.baseline["status"] == "unavailable":
+            self.unavailable_seen = True
+            entry["status"] = "unavailable"
+            entry["errors"] = {
+                "baseline": {"status": "unavailable", "error": "baseline snapshot unavailable"}
+            }
+        self.after_waves.append(entry)
+
+    def report(self) -> dict[str, Any]:
+        if not self.enabled:
+            return {"status": "disabled", "baseline": None, "after_waves": []}
+        status = "reset" if self.reset_seen else "unavailable" if self.unavailable_seen else "available"
+        return {
+            "status": status,
+            "baseline": self.baseline,
+            "after_waves": self.after_waves,
+            "limitations": [
+                "Snapshots are fetched outside timed request waves and are process-local observations.",
+                "Counter deltas are null when a server reset is detected; gauges are reported as observed values.",
+            ],
+        }
+
+
 def wait_ready(
     process: subprocess.Popen[bytes], log_path: pathlib.Path, timeout: float
 ) -> tuple[int, dict[str, Any]]:
@@ -457,9 +758,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 for _ in range(args.warmup):
                     stream_request(port, active_model, api_key, args.max_tokens, args.request_timeout)
                 baseline_rss = read_rss_bytes(process.pid)
+                runtime_stats = RuntimeStatsCollector(
+                    args.collect_runtime_stats, port, api_key, args.request_timeout
+                )
+                # Endpoint probes are deliberately outside the timed workload
+                # window. They are authenticated but do not carry prompts or
+                # model responses.
+                runtime_stats.capture_baseline()
                 waves: list[dict[str, Any]] = []
                 workload_started = time.monotonic()
                 deadline = time.monotonic() + args.duration_seconds
+                stats_elapsed = 0.0
                 request_count = 0
                 while request_count + sum(levels) <= args.max_requests:
                     for level in levels:
@@ -475,10 +784,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                                       (time.monotonic() - wave_started) * 1000,
                                       "results": results})
                         request_count += level
-                    if time.monotonic() >= deadline:
+                        # Keep observability probes out of wave elapsed time so
+                        # their latency cannot improve or penalize throughput.
+                        stats_started = time.monotonic()
+                        runtime_stats.capture_after_wave(len(waves))
+                        stats_elapsed += time.monotonic() - stats_started
+                    if time.monotonic() - stats_elapsed >= deadline:
                         break
-                workload_elapsed_ms = (time.monotonic() - workload_started) * 1000
-                if time.monotonic() < deadline:
+                workload_elapsed_ms = (time.monotonic() - workload_started - stats_elapsed) * 1000
+                if time.monotonic() - stats_elapsed < deadline:
                     raise RuntimeError("request cap reached before target duration")
                 accepted = 0
                 for _ in range(args.disconnects):
@@ -533,6 +847,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "concurrency": levels,
                     "max_completion_tokens": args.max_tokens,
                     "warmup": args.warmup,
+                    "collect_runtime_stats": args.collect_runtime_stats,
                 },
                 "cold_start_ms": round(cold_start_ms, 3),
                 "workload_elapsed_ms": round(workload_elapsed_ms, 3),
@@ -559,6 +874,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 ],
                 "disconnect": {"accepted": accepted, "recovery_ms": round(recovery_ms, 3),
                                "post_recovery_request": "pass"},
+                "runtime_stats": runtime_stats.report(),
                 "host_memory": {
                     "source": rss_source()
                     + ", sampled every 100 ms plus warm/recovery endpoints",
@@ -595,6 +911,10 @@ def main() -> int:
     parser.add_argument("--max-tokens", type=int, default=16)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--disconnects", type=int, default=2)
+    parser.add_argument(
+        "--collect-runtime-stats", action="store_true",
+        help="collect authenticated /v1/observability and /v1/kv-cache-stats snapshots",
+    )
     parser.add_argument("--startup-timeout", type=float, default=120)
     parser.add_argument("--request-timeout", type=float, default=60)
     parser.add_argument("--shutdown-timeout", type=float, default=10)
