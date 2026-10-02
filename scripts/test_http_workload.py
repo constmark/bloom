@@ -136,6 +136,21 @@ class RuntimeStats(http.server.BaseHTTPRequestHandler):
 
 
 class WorkloadTests(unittest.TestCase):
+    @staticmethod
+    def reset_runtime_stats_fixture() -> None:
+        RuntimeStats.observability = observability_snapshot(
+            requests_total=1, generated_total=2
+        )
+        RuntimeStats.kv_cache = kv_cache_snapshot(hits=1)
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.reset_runtime_stats_fixture()
+
+    def tearDown(self) -> None:
+        self.reset_runtime_stats_fixture()
+        super().tearDown()
+
     def test_model_tree_digest_is_ordered_and_rejects_symlinks(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             path = pathlib.Path(root)
@@ -322,6 +337,19 @@ class WorkloadTests(unittest.TestCase):
                 "status": "disabled", "baseline": None, "after_waves": []
             })
             fetch.assert_not_called()
+
+    def test_runtime_stats_tests_are_order_independent(self) -> None:
+        # The reset test intentionally mutates the handler fixture. Run it
+        # before the collector test to catch leaked class-level state that the
+        # default alphabetical order does not expose.
+        result = unittest.TestResult()
+        for name in (
+            "test_runtime_stats_marks_counter_reset_and_unavailable",
+            "test_runtime_stats_collector_authenticates_and_separates_deltas",
+        ):
+            WorkloadTests(name).run(result)
+        self.assertEqual(result.errors, [])
+        self.assertEqual(result.failures, [])
 
 
 if __name__ == "__main__":
