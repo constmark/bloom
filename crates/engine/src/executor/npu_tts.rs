@@ -838,9 +838,7 @@ mod tests {
             } else {
                 let expected_home = std::env::var_os("HOME")
                     .filter(|value| !value.is_empty())
-                    .or_else(|| {
-                        std::env::var_os("USERPROFILE").filter(|value| !value.is_empty())
-                    })
+                    .or_else(|| std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()))
                     .or_else(|| {
                         let drive =
                             std::env::var_os("HOMEDRIVE").filter(|value| !value.is_empty())?;
