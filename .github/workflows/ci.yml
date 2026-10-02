@@ -315,6 +315,8 @@ jobs:
       - name: Check WebAssembly target
         run: cargo check --manifest-path ui/Cargo.toml --target wasm32-unknown-unknown --all-targets --locked
       - name: Test state and protocol logic
+        # Bound the UI test suite so a stalled browser-facing fixture cannot hang CI.
+        timeout-minutes: 20
         run: cargo test --manifest-path ui/Cargo.toml --locked
       - name: Clippy
         run: cargo clippy --manifest-path ui/Cargo.toml --all-targets --locked -- -D warnings
