@@ -1863,6 +1863,15 @@ struct GeneratedText {
     stopped: bool,
 }
 
+fn stream_error_payload(error_type: &str, message: impl Into<String>) -> serde_json::Value {
+    json!({
+        "error": {
+            "message": message.into(),
+            "type": error_type,
+        }
+    })
+}
+
 async fn collect_scheduled_text(
     receiver: &mut mpsc::UnboundedReceiver<Result<u32, String>>,
     pipeline: &InferencePipeline,
@@ -1880,7 +1889,10 @@ async fn collect_scheduled_text(
         generated_tokens.push(token);
         generated_count.fetch_add(1, Ordering::Relaxed);
         if has_stop_sequences {
-            let delta = pipeline.detokenize(&[token]).unwrap_or_default();
+            let delta = pipeline.detokenize(&[token]).map_err(|error| {
+                scheduler.cancel_request(request_id);
+                format!("Detokenization failed: {error}")
+            })?;
             let update = filter.push(&delta);
             text.push_str(&update.text);
             if update.stopped {
@@ -1895,7 +1907,10 @@ async fn collect_scheduled_text(
     if has_stop_sequences {
         text.push_str(&filter.finish());
     } else {
-        text = pipeline.detokenize(&generated_tokens).unwrap_or_default();
+        text = pipeline.detokenize(&generated_tokens).map_err(|error| {
+            scheduler.cancel_request(request_id);
+            format!("Detokenization failed: {error}")
+        })?;
     }
     Ok(GeneratedText {
         text,
@@ -2420,6 +2435,9 @@ async fn handle_chat_completions_inner(
         let expose_text_deltas = tool_config.is_none();
         let sse_stream = UnboundedReceiverStream::new(rx)
             .map(move |item| {
+                if stream_failed_for_stream.load(Ordering::Acquire) {
+                    return None;
+                }
                 let chunk = match item {
                     Ok(tok) => {
                         record_stream_tokens(
@@ -2430,7 +2448,19 @@ async fn handle_chat_completions_inner(
                             &generated_count_for_stream,
                             1,
                         );
-                        let text = pipeline_for_stream.detokenize(&[tok]).unwrap_or_default();
+                        let text = match pipeline_for_stream.detokenize(&[tok]) {
+                            Ok(text) => text,
+                            Err(error) => {
+                                stream_failed_for_stream.store(true, Ordering::Release);
+                                scheduler_for_stop.cancel_request(&request_id_for_stop);
+                                return Some(Ok::<Event, std::convert::Infallible>(json_event(
+                                    stream_error_payload(
+                                        "internal_error",
+                                        format!("Detokenization failed: {error}"),
+                                    ),
+                                )));
+                            }
+                        };
                         let update = {
                             let mut filter = stop_filter_for_stream
                                 .lock()
@@ -2709,7 +2739,17 @@ async fn handle_chat_completions_inner(
                     );
                 }
             };
-        let completion_tokens = pipeline.tokenize(&generated_text).unwrap_or_default().len();
+        let completion_tokens = match pipeline.tokenize(&generated_text) {
+            Ok(tokens) => tokens.len(),
+            Err(error) => {
+                client_guard.finish(false);
+                return error_response(
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "tokenization_error",
+                    format!("Completion tokenization failed: {error}"),
+                );
+            }
+        };
         generated_count.store(completion_tokens as u64, Ordering::Relaxed);
 
         client_guard.finish(true);
@@ -2875,8 +2915,9 @@ async fn handle_chat_completions_inner(
     let start_request_id = request_id.clone();
     let start_model_id = model_id.clone();
     let generated_count_for_usage = Arc::clone(&generated_count);
+    let stream_failed_for_usage = Arc::clone(&stream_failed);
     let usage_stream = futures::stream::once(async move {
-        include_usage.then(|| {
+        (include_usage && !stream_failed_for_usage.load(Ordering::Acquire)).then(|| {
             Ok::<Event, std::convert::Infallible>(chat_usage_chunk(
                 usage_request_id,
                 usage_model_id,
@@ -2905,13 +2946,19 @@ async fn handle_chat_completions_inner(
                     .unwrap_or_else(|e| e.into_inner());
                 acc.clone()
             };
-            generated_count_for_validation.store(
-                pipeline_for_validation
-                    .tokenize(&text)
-                    .map(|tokens| tokens.len() as u64)
-                    .unwrap_or_else(|_| generated_count_for_validation.load(Ordering::Relaxed)),
-                Ordering::Relaxed,
-            );
+            let completion_tokens = match pipeline_for_validation.tokenize(&text) {
+                Ok(tokens) => tokens.len() as u64,
+                Err(error) => {
+                    stream_failed_for_validation.store(true, Ordering::Release);
+                    return Ok::<Event, std::convert::Infallible>(json_event(
+                        stream_error_payload(
+                            "tokenization_error",
+                            format!("Completion tokenization failed: {error}"),
+                        ),
+                    ));
+                }
+            };
+            generated_count_for_validation.store(completion_tokens, Ordering::Relaxed);
             match parse_chat_output(
                 &text,
                 &response_format_for_final,
@@ -3911,6 +3958,9 @@ pub(crate) async fn handle_completions(
         let pipeline_for_stream = Arc::clone(&pipeline);
         let sse_stream = UnboundedReceiverStream::new(rx)
             .map(move |item| {
+                if stream_failed_for_stream.load(Ordering::Acquire) {
+                    return None;
+                }
                 let chunk = match item {
                     Ok(tok) => {
                         record_stream_tokens(
@@ -3921,7 +3971,19 @@ pub(crate) async fn handle_completions(
                             &generated_count_for_stream,
                             1,
                         );
-                        let text = pipeline_for_stream.detokenize(&[tok]).unwrap_or_default();
+                        let text = match pipeline_for_stream.detokenize(&[tok]) {
+                            Ok(text) => text,
+                            Err(error) => {
+                                stream_failed_for_stream.store(true, Ordering::Release);
+                                scheduler_for_stop.cancel_request(&request_id_for_stop);
+                                return Some(Ok::<Event, std::convert::Infallible>(json_event(
+                                    stream_error_payload(
+                                        "internal_error",
+                                        format!("Detokenization failed: {error}"),
+                                    ),
+                                )));
+                            }
+                        };
                         let update = {
                             let mut filter = stop_filter_for_stream
                                 .lock()
@@ -4148,7 +4210,17 @@ pub(crate) async fn handle_completions(
                 message,
             );
         }
-        let completion_tokens = pipeline.tokenize(&generated_text).unwrap_or_default().len();
+        let completion_tokens = match pipeline.tokenize(&generated_text) {
+            Ok(tokens) => tokens.len(),
+            Err(error) => {
+                client_guard.finish(false);
+                return error_response(
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "tokenization_error",
+                    format!("Completion tokenization failed: {error}"),
+                );
+            }
+        };
         generated_count.store(completion_tokens as u64, Ordering::Relaxed);
 
         client_guard.finish(true);
@@ -5273,4 +5345,16 @@ pub(crate) async fn handle_backends(State(state): State<Arc<ServerState>>) -> im
         "data": backends,
         "active_model": model_id,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_error_payload_preserves_error_type_and_message() {
+        let payload = stream_error_payload("tokenization_error", "decoder failed");
+        assert_eq!(payload["error"]["type"], "tokenization_error");
+        assert_eq!(payload["error"]["message"], "decoder failed");
+    }
 }
