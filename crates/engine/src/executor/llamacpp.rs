@@ -899,27 +899,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn readiness_timeout_reaps_server_process() {
-        use std::fs;
-
-        let dir = tempfile::tempdir().unwrap();
-        let pid_path = dir.path().join("pid");
-        let mut command = Command::new("sh");
-        command
-            .args(["-c", "echo $ > \"$1\"; exec sleep 30", "test"])
-            .arg(&pid_path);
+        let mut command = Command::new("sleep");
+        command.arg("30");
 
         let mut child = ChildGuard::spawn(&mut command).unwrap();
-        let pid = (0..100)
-            .find_map(|_| {
-                let pid = fs::read_to_string(&pid_path)
-                    .ok()
-                    .and_then(|pid| pid.trim().parse::<libc::pid_t>().ok());
-                if pid.is_none() {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                pid
-            })
-            .expect("helper did not publish a valid pid");
+        let pid = child.id() as libc::pid_t;
         let listener = TcpListener::bind((DEFAULT_HOST, 0)).unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
