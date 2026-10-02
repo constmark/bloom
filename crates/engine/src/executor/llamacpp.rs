@@ -11,6 +11,7 @@ use bloomai_core::{DeviceClass, DeviceKind, GenerationParams, Modality, ModelFam
 use serde_json::json;
 
 use crate::core::parallelism::ParallelStrategy;
+use crate::core::process::ChildGuard;
 use crate::core::quantization::QuantMethod;
 use crate::engine::BackendMaturity;
 use crate::executor::speculative::speculative_mode_is_mtp;
@@ -146,8 +147,7 @@ impl Engine for LlamaCppEngine {
             command.stdout(Stdio::null()).stderr(Stdio::null());
         }
 
-        let mut child = command
-            .spawn()
+        let mut child = ChildGuard::spawn(&mut command)
             .with_context(|| format!("failed to start llama-server '{}'", binary.display()))?;
 
         let addr: SocketAddr = format!("{host}:{port}").parse()?;
@@ -179,7 +179,7 @@ impl Engine for LlamaCppEngine {
 }
 
 pub struct LlamaCppModel {
-    child: Mutex<Option<Child>>,
+    child: Mutex<Option<ChildGuard>>,
     addr: SocketAddr,
     metadata: ModelMetadata,
     spec_type: String,
@@ -894,6 +894,33 @@ mod tests {
         assert_eq!(llama_spec_type(" DRAFT-MTP "), "draft-mtp");
         assert_eq!(llama_spec_type("ngram"), "ngram-simple");
         assert_eq!(llama_spec_type("none"), "none");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readiness_timeout_reaps_server_process() {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+
+        let mut child = ChildGuard::spawn(&mut command).unwrap();
+        let pid = child.id() as libc::pid_t;
+        let listener = TcpListener::bind((DEFAULT_HOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        assert!(wait_until_ready(addr, &mut child, Duration::ZERO).is_err());
+        drop(child);
+
+        // A successful waitpid with WNOHANG would mean the guard left a
+        // zombie behind. ChildGuard must reap the process on drop.
+        assert_eq!(
+            unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
     }
 
     #[test]
