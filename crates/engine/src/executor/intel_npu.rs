@@ -518,6 +518,7 @@ impl LoadedModel for IntelNpuModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env::{ENV_LOCK, EnvVarGuard};
     use tempfile::tempdir;
 
     #[test]
@@ -560,6 +561,7 @@ mod tests {
 
     #[test]
     fn test_intel_npu_load_requires_export() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let engine = IntelNpuEngine;
         let dir = tempdir().unwrap();
         let model_path = dir.path();
@@ -575,10 +577,8 @@ mod tests {
         .unwrap();
 
         // Without BLOOM_NPU_AUTO_EXPORT, loading should fail
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::remove_var("BLOOM_NPU_AUTO_EXPORT") };
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::remove_var("BLOOM_OPENVINO_AUTO_EXPORT") };
+        let _npu_auto_export = EnvVarGuard::remove("BLOOM_NPU_AUTO_EXPORT");
+        let _openvino_auto_export = EnvVarGuard::remove("BLOOM_OPENVINO_AUTO_EXPORT");
         let res = engine.load(model_path, DeviceKind::Npu);
         assert!(res.is_err());
         assert!(

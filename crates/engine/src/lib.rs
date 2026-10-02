@@ -94,3 +94,50 @@ pub use crate::world::{
     ActionSchema, MockPolicyEngine, MockWorldModel, PolicyEngine, StateCacheManager,
     WorldModelConstraints, WorldModelEngine, WorldModelLoop, WorldStateSchema,
 };
+
+/// Shared process-environment isolation for unit tests.
+///
+/// Production code never compiles this module. Tests that exercise
+/// environment-backed configuration must hold `ENV_LOCK` for the complete
+/// operation and keep an `EnvVarGuard` alive until all environment reads have
+/// finished.
+#[cfg(test)]
+pub(crate) mod test_env {
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
+    pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    pub(crate) struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        pub(crate) fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: callers hold the shared test environment lock.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+
+        pub(crate) fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: callers hold the shared test environment lock.
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: the guard is only used while its shared test lock is held.
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+}

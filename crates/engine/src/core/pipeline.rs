@@ -506,6 +506,7 @@ fn memory_budget_exceeded_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env::{ENV_LOCK, EnvVarGuard};
     use crate::{Engine, ModelMetadata};
     use bloomai_core::{
         DType, DeviceKind, Modality, ModelFamily, ModelFile, ModelFormat, ModelIoSchema,
@@ -607,6 +608,7 @@ mod tests {
 
     #[test]
     fn load_standalone_rejects_declared_hash_mismatch_before_engine_load() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("weights.bin"), b"not-the-declared-content").unwrap();
 
@@ -704,6 +706,7 @@ mod tests {
 
     #[test]
     fn test_load_standalone_oom_cascade_recovery() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let manifest = ModelManifest {
             id: "dummy".to_string(),
@@ -723,8 +726,7 @@ mod tests {
         };
 
         // If strict memory budget is NOT set, it should fallback to CPU and succeed
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::remove_var("BLOOM_STRICT_MEMORY_BUDGET") };
+        let _strict_memory_budget = EnvVarGuard::remove("BLOOM_STRICT_MEMORY_BUDGET");
         let pipeline = InferencePipeline::load_standalone_with_context(
             &engine,
             DeviceKind::Gpu,
@@ -741,6 +743,7 @@ mod tests {
 
     #[test]
     fn strict_standalone_load_never_changes_the_admitted_device() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let manifest = ModelManifest {
             id: "strict-device".to_string(),
@@ -773,6 +776,7 @@ mod tests {
 
     #[test]
     fn strict_standalone_rejects_an_engine_that_reports_a_different_device() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let manifest = ModelManifest {
             id: "lying-device".to_string(),
@@ -806,6 +810,7 @@ mod tests {
 
     #[test]
     fn strict_standalone_rejects_an_engine_that_cannot_report_its_device() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let manifest = ModelManifest {
             id: "unknown-device".to_string(),

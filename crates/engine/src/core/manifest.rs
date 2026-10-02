@@ -2746,10 +2746,8 @@ pub fn validate_model_path(model_path: &Path) -> Result<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env::{ENV_LOCK, EnvVarGuard};
     use bloomai_core::{ModelFile, ModelFormat, ModelMemoryProfile};
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn model_tasks_have_one_trusted_manifest_classifier() {
@@ -2793,38 +2791,6 @@ mod tests {
         let mut reversed = tensors();
         reversed.reverse();
         assert_eq!(select_primary_gguf_dtype(reversed), "Q4_0");
-    }
-
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var(key).ok();
-            // FIXME: Audit that the environment access only happens in single-threaded code.
-            unsafe { std::env::set_var(key, value) };
-            Self { key, previous }
-        }
-
-        fn remove(key: &'static str) -> Self {
-            let previous = std::env::var(key).ok();
-            // FIXME: Audit that the environment access only happens in single-threaded code.
-            unsafe { std::env::remove_var(key) };
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match &self.previous {
-                // FIXME: Audit that the environment access only happens in single-threaded code.
-                Some(value) => unsafe { std::env::set_var(self.key, value) },
-                // FIXME: Audit that the environment access only happens in single-threaded code.
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
     }
 
     fn base_manifest_with_files(sizes: &[usize]) -> ModelManifest {
@@ -3065,6 +3031,7 @@ mod tests {
 
     #[test]
     fn test_estimate_memory_from_files() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let m = base_manifest_with_files(&[1_000_000_000, 500_000_000]);
         let est = estimate_memory(&m, 2048);
         // weights = 1.5 GB
@@ -3081,6 +3048,7 @@ mod tests {
 
     #[test]
     fn test_estimate_memory_fallback_to_min_ram() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let m = ModelManifest {
             memory_profile: ModelMemoryProfile {
                 min_ram_bytes: 4_000_000_000,
@@ -3097,6 +3065,7 @@ mod tests {
 
     #[test]
     fn test_estimate_memory_unknown_fallback() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let m = ModelManifest::default();
         let est = estimate_memory(&m, 512);
         // Unknown: 1 GB placeholder
@@ -3329,6 +3298,7 @@ mod tests {
 
     #[test]
     fn hf_nested_text_config_drives_the_canonical_kv_estimate() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("config.json"),
@@ -3445,6 +3415,7 @@ mod tests {
 
     #[test]
     fn hf_bert_manifest_declares_embedding_task_and_sentence_limit() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("config.json"),
@@ -3625,6 +3596,7 @@ mod tests {
 
     #[test]
     fn explicit_manifest_file_sizes_are_normalized_to_physical_bytes() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("weights.bin"), vec![0_u8; 4096]).unwrap();
         let manifest = ModelManifest {
@@ -3917,6 +3889,7 @@ mod tests {
 
     #[test]
     fn test_precise_kv_cache_estimation() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let mut m = ModelManifest::default();
         m.parameters
             .insert("num_hidden_layers".to_string(), serde_json::json!(32));
@@ -3933,6 +3906,7 @@ mod tests {
 
     #[test]
     fn test_memory_estimate_uses_quantization_bits() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let mut m = ModelManifest::default();
         m.parameters
             .insert("num_hidden_layers".to_string(), serde_json::json!(1));
@@ -3954,6 +3928,7 @@ mod tests {
 
     #[test]
     fn test_memory_estimate_uses_manifest_kv_cache_dtype() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let mut m = ModelManifest::default();
         m.parameters
             .insert("num_hidden_layers".to_string(), serde_json::json!(2));
@@ -3975,6 +3950,7 @@ mod tests {
 
     #[test]
     fn device_aware_memory_estimate_charges_the_physical_f32_kv_layout() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let mut manifest = ModelManifest {
             primary_dtype: DType::F16,
             ..ModelManifest::default()
@@ -4008,9 +3984,7 @@ mod tests {
     #[test]
     fn test_memory_estimate_applies_mmap_residency() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let previous = std::env::var("BLOOM_GPU_LAYERS").ok();
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::remove_var("BLOOM_GPU_LAYERS") };
+        let _gpu_layers = EnvVarGuard::remove("BLOOM_GPU_LAYERS");
 
         let mut m = ModelManifest::default();
         m.runtime_hints.supports_mmap = true;
@@ -4023,27 +3997,10 @@ mod tests {
         });
 
         let est = estimate_memory(&m, 0);
-
-        let result = std::panic::catch_unwind(|| {
-            assert!(est.mmap_residency_applied);
-            assert_eq!(est.weight_bytes, 1_000);
-            assert_eq!(est.host_weight_bytes, 300);
-            assert!(
-                est.total_bytes < est.weight_bytes + est.kv_cache_bytes + est.temp_tensor_bytes
-            );
-        });
-
-        if let Some(val) = previous {
-            // FIXME: Audit that the environment access only happens in single-threaded code.
-            unsafe { std::env::set_var("BLOOM_GPU_LAYERS", val) };
-        } else {
-            // FIXME: Audit that the environment access only happens in single-threaded code.
-            unsafe { std::env::remove_var("BLOOM_GPU_LAYERS") };
-        }
-
-        if let Err(err) = result {
-            std::panic::resume_unwind(err);
-        }
+        assert!(est.mmap_residency_applied);
+        assert_eq!(est.weight_bytes, 1_000);
+        assert_eq!(est.host_weight_bytes, 300);
+        assert!(est.total_bytes < est.weight_bytes + est.kv_cache_bytes + est.temp_tensor_bytes);
     }
 
     #[test]

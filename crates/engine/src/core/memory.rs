@@ -314,6 +314,7 @@ fn parse_macos_vm_stat_available(text: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env::{ENV_LOCK, EnvVarGuard};
     use bloomai_core::DType;
 
     fn estimate() -> MemoryEstimate {
@@ -428,6 +429,9 @@ mod tests {
 
     #[test]
     fn test_layer_placement_strategy() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _previous_gpu_layers = EnvVarGuard::remove("BLOOM_GPU_LAYERS");
+        let _previous_npu_layers = EnvVarGuard::remove("BLOOM_NPU_LAYERS");
         let strategy = LayerPlacementStrategy::new(8, Some(2));
         assert_eq!(strategy.placements.len(), 8);
         assert_eq!(strategy.placements[0], DevicePlacement::Gpu);
@@ -435,15 +439,9 @@ mod tests {
         assert_eq!(strategy.placements[2], DevicePlacement::Cpu);
         assert_eq!(strategy.placements[7], DevicePlacement::Cpu);
 
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("BLOOM_GPU_LAYERS", "4") };
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::set_var("BLOOM_NPU_LAYERS", "2") };
+        let _gpu_layers = EnvVarGuard::set("BLOOM_GPU_LAYERS", "4");
+        let _npu_layers = EnvVarGuard::set("BLOOM_NPU_LAYERS", "2");
         let strategy_env = LayerPlacementStrategy::new(8, None);
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::remove_var("BLOOM_GPU_LAYERS") };
-        // FIXME: Audit that the environment access only happens in single-threaded code.
-        unsafe { std::env::remove_var("BLOOM_NPU_LAYERS") };
 
         assert_eq!(strategy_env.placements[0], DevicePlacement::Gpu);
         assert_eq!(strategy_env.placements[3], DevicePlacement::Gpu);
