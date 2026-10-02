@@ -136,6 +136,20 @@ class RuntimeStats(http.server.BaseHTTPRequestHandler):
 
 
 class WorkloadTests(unittest.TestCase):
+    @staticmethod
+    def reset_runtime_stats_fixture() -> None:
+        RuntimeStats.observability = observability_snapshot(
+            requests_total=1, generated_total=2
+        )
+        RuntimeStats.kv_cache = kv_cache_snapshot(hits=1)
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.reset_runtime_stats_fixture()
+
+    def tearDown(self) -> None:
+        self.reset_runtime_stats_fixture()
+        super().tearDown()
     def test_model_tree_digest_is_ordered_and_rejects_symlinks(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             path = pathlib.Path(root)
@@ -312,6 +326,18 @@ class WorkloadTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=3)
+
+    def test_runtime_stats_tests_are_order_independent(self) -> None:
+        # Run the mutating test before the collector test to catch leaked
+        # class-level handler state that default alphabetical order hides.
+        result = unittest.TestResult()
+        for name in (
+            "test_runtime_stats_marks_counter_reset_and_unavailable",
+            "test_runtime_stats_collector_authenticates_and_separates_deltas",
+        ):
+            WorkloadTests(name).run(result)
+        self.assertEqual(result.errors, [])
+        self.assertEqual(result.failures, [])
 
     def test_runtime_stats_disabled_makes_no_endpoint_calls(self) -> None:
         with mock.patch.object(workload, "fetch_runtime_stats") as fetch:
