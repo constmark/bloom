@@ -70,6 +70,71 @@ class ContentLengthChat(FakeChat):
     content_length = True
 
 
+def observability_snapshot(*, requests_total: int, generated_total: int,
+                           uptime_seconds: int = 10) -> dict:
+    return {
+        "schema_version": 1,
+        "object": "bloom.observability_snapshot",
+        "created": 1,
+        "server": {"version": "test", "uptime_seconds": uptime_seconds},
+        "model": "/secret/model.gguf",
+        "ready": True,
+        "load": {"phase": "ready", "progress": 100,
+                  "requested_model": "/secret/model.gguf", "failure_present": False},
+        "speculative_mode": "none",
+        "requests": {"total": requests_total, "completed": requests_total,
+                      "failed": 0, "in_flight": 0},
+        "tokens": {"prompt_total": requests_total * 2, "generated_total": generated_total},
+        "scheduler": {"ifb_enabled": False, "prefill_queue": 0,
+                       "decoding_queue": 0, "active_requests": 0},
+        "startup_memory_estimate": None,
+        "kv_cache": {"total_blocks": 8, "free_blocks": 8, "active_blocks": 0,
+                      "cached_blocks": 0, "hits": requests_total, "misses": 0,
+                      "evictions": 0, "reuses": 0, "utilization": 0.0},
+        "cachemesh": None,
+        "memory": {"total_vram": 0, "used_vram": 0, "total_ram": 100,
+                    "used_ram": 50, "peak_vram": 0, "peak_ram": 50,
+                    "device_name": "secret-device"},
+    }
+
+
+def kv_cache_snapshot(*, hits: int) -> dict:
+    return {"total_blocks": 8, "free_blocks": 8, "active_blocks": 0,
+            "cached_blocks": 0, "hits": hits, "misses": 1, "evictions": 0,
+            "reuses": 0, "utilization": 0.0, "cachemesh": None}
+
+
+class RuntimeStats(http.server.BaseHTTPRequestHandler):
+    observability = observability_snapshot(requests_total=1, generated_total=2)
+    kv_cache = kv_cache_snapshot(hits=1)
+    expected_authorization = "Bearer test-key"
+
+    def do_GET(self) -> None:
+        if self.headers.get("Authorization") != self.expected_authorization:
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"error":"authorization rejected"}')
+            return
+        if self.path == "/v1/observability":
+            payload = self.observability
+        elif self.path == "/v1/kv-cache-stats":
+            payload = self.kv_cache
+        else:
+            self.send_response(404)
+            self.end_headers()
+            return
+        body = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        pass
+
+
 class WorkloadTests(unittest.TestCase):
     def test_model_tree_digest_is_ordered_and_rejects_symlinks(self) -> None:
         with tempfile.TemporaryDirectory() as root:
@@ -165,6 +230,97 @@ class WorkloadTests(unittest.TestCase):
                     self.request(NoTerminal)
         with self.assertRaisesRegex(RuntimeError, "omitted completion-token usage"):
             self.request(NoUsage)
+
+    def runtime_stats_server(self) -> tuple[http.server.ThreadingHTTPServer, threading.Thread]:
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), RuntimeStats)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return server, thread
+
+    def test_runtime_stats_collector_authenticates_and_separates_deltas(self) -> None:
+        server, thread = self.runtime_stats_server()
+        try:
+            collector = workload.RuntimeStatsCollector(
+                True, server.server_port, "test-key", 3
+            )
+            collector.capture_baseline()
+            RuntimeStats.observability = observability_snapshot(
+                requests_total=3, generated_total=8, uptime_seconds=11
+            )
+            RuntimeStats.kv_cache = kv_cache_snapshot(hits=3)
+            collector.capture_after_wave(1)
+            report = collector.report()
+            self.assertEqual(report["status"], "available")
+            self.assertEqual(report["after_waves"][0]["status"], "available")
+            self.assertEqual(
+                report["after_waves"][0]["counter_deltas"]["observability"]["requests.total"],
+                2,
+            )
+            self.assertEqual(
+                report["after_waves"][0]["counter_deltas"]["kv_cache"]["hits"],
+                2,
+            )
+            # The report only retains bounded numeric stats, not model paths,
+            # device labels, API keys or response bodies.
+            serialized = json.dumps(report)
+            self.assertNotIn("/secret/model.gguf", serialized)
+            self.assertNotIn("secret-device", serialized)
+            self.assertNotIn("test-key", serialized)
+            self.assertNotIn("authorization rejected", serialized)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
+    def test_runtime_stats_marks_counter_reset_and_unavailable(self) -> None:
+        server, thread = self.runtime_stats_server()
+        try:
+            collector = workload.RuntimeStatsCollector(
+                True, server.server_port, "test-key", 3
+            )
+            collector.capture_baseline()
+            RuntimeStats.observability = observability_snapshot(
+                requests_total=0, generated_total=0, uptime_seconds=1
+            )
+            RuntimeStats.kv_cache = kv_cache_snapshot(hits=0)
+            collector.capture_after_wave(1)
+            self.assertEqual(collector.report()["status"], "reset")
+            self.assertEqual(collector.after_waves[0]["status"], "reset")
+            self.assertIsNone(
+                collector.after_waves[0]["counter_deltas"]["observability"]["requests.total"]
+            )
+            RuntimeStats.observability = {"schema_version": 0}
+            collector.capture_after_wave(2)
+            self.assertEqual(collector.report()["status"], "reset")
+            self.assertEqual(collector.after_waves[1]["status"], "unavailable")
+            self.assertEqual(collector.after_waves[1]["errors"]["observability"]["status"],
+                             "unavailable")
+            RuntimeStats.observability = {"schema_version": 0}
+            baseline_missing = workload.RuntimeStatsCollector(
+                True, server.server_port, "test-key", 3
+            )
+            baseline_missing.capture_baseline()
+            RuntimeStats.observability = observability_snapshot(requests_total=4, generated_total=9)
+            baseline_missing.capture_after_wave(1)
+            self.assertEqual(baseline_missing.after_waves[0]["status"], "unavailable")
+            self.assertEqual(
+                baseline_missing.after_waves[0]["errors"]["baseline"]["status"],
+                "unavailable",
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
+    def test_runtime_stats_disabled_makes_no_endpoint_calls(self) -> None:
+        with mock.patch.object(workload, "fetch_runtime_stats") as fetch:
+            collector = workload.RuntimeStatsCollector(False, 1, "secret", 1)
+            collector.capture_baseline()
+            collector.capture_after_wave(1)
+            self.assertEqual(collector.report(), {
+                "status": "disabled", "baseline": None, "after_waves": []
+            })
+            fetch.assert_not_called()
 
 
 if __name__ == "__main__":

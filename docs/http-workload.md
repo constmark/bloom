@@ -31,6 +31,7 @@ python3 scripts/http_workload.py \
   --duration-seconds 7200 \
   --max-requests 100000 \
   --max-tokens 64 \
+  --collect-runtime-stats \
   --output qwen2-cpu-http-workload.json
 ```
 
@@ -44,6 +45,20 @@ report the active model, a finish event, positive completion-token usage, and
 before it expires fails the run. `--duration-seconds 0` runs one wave at each
 concurrency level for short CI mechanics checks. The request cap and
 per-request timeout bound the run when a server becomes slow.
+
+`--collect-runtime-stats` enables authenticated, bounded snapshots from
+`/v1/observability` and `/v1/kv-cache-stats`. The runner captures one baseline
+after warmup and one snapshot after each completed wave. Endpoint probes run
+outside each wave timer, so their latency cannot change reported request
+throughput. The report records only allow-listed counters and gauges; it never
+stores the API key, prompts, responses, model paths, device labels or raw
+endpoint bodies. The default is disabled, which avoids adding diagnostics
+requests. A collector can be `available`, `unavailable` (an endpoint is
+missing, unauthorized, malformed or timed out), or `reset` (a process-local
+counter decreased or uptime moved backwards). Counter deltas are reported only
+for monotonic counters; gauges such as queue depth, in-flight requests, block
+utilization and memory are reported as observed values. A reset produces a
+`null` delta instead of a negative value.
 
 `first_content_ms` is measured from client send to the first nonempty SSE
 content delta; it includes connection and admission time. `inter_content_delta_ms`
@@ -60,6 +75,14 @@ explicitly.
 
 The workload requests a graceful `SIGTERM` on POSIX and a console Ctrl-Break
 on Windows (with a hard-termination fallback when no console is available).
+
+The workload is a standalone HTTP client that drives the server's public
+request path. It does not reproduce an in-process benchmark or bypass the
+scheduler, and runtime snapshots are observational rather than transactional
+benchmark records. `inter_content_delta_ms` is an inter-event gap, not TPOT:
+one SSE content event may contain multiple tokens. Use the reported counters
+and gauges to explain a run, not as an arbitrary performance gate or a claim
+that another host, model or backend will achieve the same result.
 
 This workload is one part of the [deployment exit criteria](production-readiness.md).
 Before promoting the Qwen2 CPU cell, run it on an immutable OS/hardware/build
