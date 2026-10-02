@@ -32,25 +32,95 @@ fn repo_script_path(script_name: &str) -> PathBuf {
 }
 
 fn default_python() -> PathBuf {
-    if let Some(path) = std::env::var_os("BLOOM_ASR_PYTHON") {
-        return PathBuf::from(path);
-    }
-
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..");
-    let candidates = [
-        repo_root.join(".venv-qwen-asr").join("bin").join("python"),
-        repo_root.join(".venv").join("bin").join("python"),
+    resolve_python(std::env::var_os("BLOOM_ASR_PYTHON"), &repo_root)
+}
+
+fn resolve_python(explicit: Option<std::ffi::OsString>, repo_root: &Path) -> PathBuf {
+    if let Some(path) = explicit {
+        return PathBuf::from(path);
+    }
+
+    let mut candidates = Vec::with_capacity(7);
+    // Keep the Qwen-specific environment first, but use the native virtualenv
+    // layout on each platform. Windows virtualenvs expose Scripts/python.exe;
+    // Unix virtualenvs expose bin/python.
+    #[cfg(target_os = "windows")]
+    {
+        candidates.push(
+            repo_root
+                .join(".venv-qwen-asr")
+                .join("Scripts")
+                .join("python.exe"),
+        );
+        candidates.push(repo_root.join(".venv").join("Scripts").join("python.exe"));
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        candidates.push(repo_root.join(".venv-qwen-asr").join("bin").join("python"));
+        candidates.push(repo_root.join(".venv").join("bin").join("python"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    candidates.extend([
         PathBuf::from("/opt/homebrew/bin/python3.12"),
         PathBuf::from("python3.12"),
-        PathBuf::from("python3"),
-    ];
+    ]);
 
-    candidates
-        .into_iter()
-        .find(|path| path.is_absolute() && path.exists())
-        .unwrap_or_else(|| PathBuf::from("python3.12"))
+    for candidate in candidates {
+        if candidate.is_absolute() {
+            if candidate.is_file() {
+                return candidate;
+            }
+        } else if command_on_path(&candidate) {
+            return candidate;
+        }
+    }
+
+    platform_python_launchers()
+        .iter()
+        .find(|launcher| command_on_path(Path::new(launcher)))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(platform_python_launchers()[0]))
+}
+
+fn platform_python_launchers() -> &'static [&'static str] {
+    #[cfg(target_os = "windows")]
+    {
+        &["python", "py"]
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        &["python3", "python"]
+    }
+}
+
+fn command_on_path(command: &Path) -> bool {
+    if command.is_absolute() {
+        return command.is_file();
+    }
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|directory| {
+        let candidate = directory.join(command);
+        if candidate.is_file() {
+            return true;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            [".exe", ".cmd", ".bat"]
+                .iter()
+                .map(|extension| directory.join(format!("{}{}", command.display(), extension)))
+                .any(|candidate| candidate.is_file())
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            false
+        }
+    })
 }
 
 fn has_qwen_asr_layout(model_path: &Path) -> bool {
@@ -447,6 +517,36 @@ impl LoadedModel for FunASRModel {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn python_override_wins_over_repository_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let explicit = dir.path().join("custom-python");
+        assert_eq!(
+            resolve_python(Some(explicit.clone().into_os_string()), dir.path()),
+            explicit
+        );
+    }
+
+    #[test]
+    fn repository_virtualenv_uses_platform_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(target_os = "windows")]
+        let python = dir.path().join(".venv/Scripts/python.exe");
+        #[cfg(not(target_os = "windows"))]
+        let python = dir.path().join(".venv/bin/python");
+        fs::create_dir_all(python.parent().unwrap()).unwrap();
+        fs::write(&python, b"").unwrap();
+        assert_eq!(resolve_python(None, dir.path()), python);
+    }
+
+    #[test]
+    fn python_fallback_order_matches_documentation() {
+        #[cfg(target_os = "windows")]
+        assert_eq!(platform_python_launchers(), &["python", "py"]);
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(platform_python_launchers(), &["python3", "python"]);
+    }
 
     #[test]
     fn test_funasr_layout_detection_empty() {
