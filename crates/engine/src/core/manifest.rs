@@ -4000,9 +4000,7 @@ mod tests {
         assert!(est.mmap_residency_applied);
         assert_eq!(est.weight_bytes, 1_000);
         assert_eq!(est.host_weight_bytes, 300);
-        assert!(
-            est.total_bytes < est.weight_bytes + est.kv_cache_bytes + est.temp_tensor_bytes
-        );
+        assert!(est.total_bytes < est.weight_bytes + est.kv_cache_bytes + est.temp_tensor_bytes);
     }
 
     #[test]
