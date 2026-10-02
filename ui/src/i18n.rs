@@ -54,6 +54,7 @@ impl Locale {
         }
     }
 
+    #[cfg(test)]
     pub fn from_language_tag(value: &str) -> Self {
         let value = value.trim().to_ascii_lowercase();
         if value.starts_with("zh") {

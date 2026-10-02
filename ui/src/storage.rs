@@ -21,14 +21,14 @@ pub const CONVERSATION_RECOVERY_FILENAME: &str = "bloom-conversations-recovery.t
 
 pub fn load_locale() -> Locale {
     let Some(storage) = local_storage() else {
-        return browser_locale();
+        return Locale::English;
     };
     storage
         .get_item(LOCALE_STORAGE_KEY)
         .ok()
         .flatten()
         .and_then(|value| Locale::from_storage_value(&value))
-        .unwrap_or_else(browser_locale)
+        .unwrap_or(Locale::English)
 }
 
 pub fn save_locale(locale: Locale) -> Result<(), String> {
@@ -36,13 +36,6 @@ pub fn save_locale(locale: Locale) -> Result<(), String> {
     storage
         .set_item(LOCALE_STORAGE_KEY, locale.storage_value())
         .map_err(|error| format!("failed to save interface language: {error:?}"))
-}
-
-fn browser_locale() -> Locale {
-    web_sys::window()
-        .and_then(|window| window.navigator().language())
-        .map(|language| Locale::from_language_tag(&language))
-        .unwrap_or(Locale::English)
 }
 
 #[derive(Serialize, Deserialize)]
