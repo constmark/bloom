@@ -375,6 +375,7 @@ impl InferencePipeline {
 
     pub fn run(&self, input: ModelInput, params: &GenerationParams) -> Result<ModelOutput> {
         let _span = tracing::info_span!("pipeline.run").entered();
+        params.validate().map_err(BloomError::InvalidInput)?;
         self.model.infer(input, params)
     }
 
@@ -385,6 +386,7 @@ impl InferencePipeline {
         sink: &mut dyn OutputSink,
     ) -> Result<()> {
         let _span = tracing::info_span!("pipeline.run_stream").entered();
+        params.validate().map_err(BloomError::InvalidInput)?;
         self.model.infer_stream(input, params, sink)
     }
 
@@ -402,6 +404,14 @@ impl InferencePipeline {
 
     pub fn run_request(&self, request: InferenceRequest, sink: &mut dyn OutputSink) -> Result<()> {
         let _span = tracing::info_span!("pipeline.run_request").entered();
+        let params = GenerationParams {
+            max_tokens: request.params.max_tokens,
+            temperature: request.params.temperature,
+            top_p: request.params.top_p,
+            seed: request.params.seed,
+            response_format: request.params.response_format.clone(),
+        };
+        params.validate().map_err(BloomError::InvalidInput)?;
         self.model.infer_request(request, sink)
     }
 

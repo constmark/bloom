@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::{Result, anyhow};
 use bloomai_core::{
     DType, DeviceCapability, DeviceClass, DeviceKind, Modality, ModelFamily, ModelFormat,
-    ModelManifest,
+    ModelManifest, QuantScheme,
 };
 
 use crate::core::parallelism::ParallelStrategy;
@@ -197,22 +197,54 @@ pub fn default_engine_supports(
         ));
     }
 
-    // 5. File format check (skip if manifest has no files declared)
+    // 5. File format check (skip if manifest has no files declared).  A
+    // package may contain metadata files represented as `Unknown`, but every
+    // executable/weight format must be understood by the selected engine.
+    // Checking only `any(...)` here used to route mixed Safetensors+ONNX
+    // packages to a Safetensors engine and defer the failure until load time.
     if !cap.supported_formats.is_empty() && !manifest.files.is_empty() {
-        let has_supported = manifest
+        let unsupported: Vec<_> = manifest
             .files
             .iter()
-            .any(|f| cap.supported_formats.contains(&f.format));
-        if !has_supported {
-            let declared: Vec<_> = manifest.files.iter().map(|f| &f.format).collect();
+            .filter(|f| f.format != ModelFormat::Unknown)
+            .filter(|f| !cap.supported_formats.contains(&f.format))
+            .map(|f| f.format)
+            .collect();
+        if !unsupported.is_empty() {
             return SupportLevel::Unsupported(format!(
                 "engine '{}' does not support declared formats {:?} (supported: {:?})",
-                cap.engine_name, declared, cap.supported_formats
+                cap.engine_name, unsupported, cap.supported_formats
             ));
         }
     }
 
-    // 6. Backend dtype cross-check (device capability vs manifest)
+    // 6. Quantization method check.  Engines that advertise a non-empty
+    // method list are making a precise compatibility claim; honor it before
+    // loading so AWQ/GPTQ/NF4/etc. are never silently treated as GGUF.  An
+    // empty list means the engine accepts any quantized representation when
+    // `supports_quantized_models` is true (used by opaque vendor runtimes).
+    if manifest_is_quantized(manifest) {
+        if !cap.supports_quantized_models {
+            return SupportLevel::Fallback(format!(
+                "engine '{}' does not natively support quantized models{}; conversion or a quantized-capable engine is required",
+                cap.engine_name,
+                manifest_quant_method(manifest)
+                    .map(|method| format!(" ({method})"))
+                    .unwrap_or_default()
+            ));
+        }
+        if let Some(method) = manifest_quant_method(manifest)
+            && !cap.supported_quant_methods.is_empty()
+            && !cap.supported_quant_methods.contains(&method)
+        {
+            return SupportLevel::Fallback(format!(
+                "engine '{}' does not natively support {method} quantization (supported: {:?}); conversion or fallback may be needed",
+                cap.engine_name, cap.supported_quant_methods
+            ));
+        }
+    }
+
+    // 7. Backend dtype cross-check (device capability vs manifest)
     if !device_cap.supported_dtypes.is_empty()
         && !device_cap
             .supported_dtypes
@@ -225,6 +257,59 @@ pub fn default_engine_supports(
     }
 
     SupportLevel::Native
+}
+
+/// Resolve the quantization method represented by a trusted manifest.
+///
+/// Generic INT4 has no single method identity, so it is left as `None` and is
+/// still covered by the `supports_quantized_models` gate through its dtype.
+fn manifest_quant_method(manifest: &ModelManifest) -> Option<QuantMethod> {
+    if let Some(info) = manifest.quantization.as_ref() {
+        let method = match &info.scheme {
+            QuantScheme::None => return dtype_quant_method(manifest),
+            QuantScheme::GGUF(_) => QuantMethod::Gguf,
+            QuantScheme::AWQ => QuantMethod::Awq,
+            QuantScheme::GPTQ => QuantMethod::Gptq,
+            QuantScheme::INT8 => QuantMethod::Int8,
+            QuantScheme::NF4 => QuantMethod::Nf4,
+            QuantScheme::INT4 => return None,
+        };
+        // GGUF metadata with bits == 0 denotes a full precision tensor type
+        // (for example F32), not a quantized model.
+        if matches!(info.scheme, QuantScheme::GGUF(_)) && info.bits == 0 {
+            return None;
+        }
+        return Some(method);
+    }
+
+    // Older callers may only populate `primary_dtype`. Preserve compatibility
+    // by deriving a conservative method for the unambiguous 8-bit and NF4
+    // forms, and by recognizing GGUF weight files as GGUF quantization.
+    dtype_quant_method(manifest)
+}
+
+fn dtype_quant_method(manifest: &ModelManifest) -> Option<QuantMethod> {
+    match manifest.primary_dtype {
+        DType::Q8 | DType::I8 | DType::U8 => Some(QuantMethod::Int8),
+        DType::NF4 => Some(QuantMethod::Nf4),
+        DType::Q4 | DType::I4 if manifest.files.iter().any(|f| f.format == ModelFormat::Gguf) => {
+            Some(QuantMethod::Gguf)
+        }
+        _ => None,
+    }
+}
+
+fn manifest_is_quantized(manifest: &ModelManifest) -> bool {
+    if let Some(info) = manifest.quantization.as_ref()
+        && !matches!(info.scheme, QuantScheme::None)
+        && !(matches!(info.scheme, QuantScheme::GGUF(_)) && info.bits == 0)
+    {
+        return info.bits > 0;
+    }
+    matches!(
+        manifest.primary_dtype,
+        DType::Q4 | DType::I4 | DType::NF4 | DType::Q8 | DType::I8 | DType::U8
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -414,7 +499,7 @@ mod tests {
     use bloomai_core::{
         DType, DeviceCapability, DeviceClass, DeviceKind, GenerationParams, MemoryTopology,
         Modality, ModelFamily, ModelFormat, ModelIoSchema, ModelManifest, ModelMemoryProfile,
-        PowerState, RuntimeHints, ThermalState, constants::GIB,
+        PowerState, QuantScheme, QuantizationInfo, RuntimeHints, ThermalState, constants::GIB,
     };
 
     struct MockEngine;
@@ -522,6 +607,23 @@ mod tests {
         assert_eq!(output.text.unwrap(), "echo: hello");
     }
 
+    #[test]
+    fn pipeline_rejects_invalid_generation_params_before_backend_execution() {
+        let engine = MockEngine;
+        let backend = CpuBackend;
+        let pipeline = InferencePipeline::load(&engine, &backend, Path::new("")).unwrap();
+        let input = ModelInput::Text {
+            prompt: "hello".to_string(),
+        };
+        let params = GenerationParams {
+            max_tokens: 0,
+            ..GenerationParams::default()
+        };
+
+        let error = pipeline.run(input, &params).unwrap_err().to_string();
+        assert!(error.contains("max_tokens"));
+    }
+
     // ------------------------------------------------------------------
     // EngineCapability tests
     // ------------------------------------------------------------------
@@ -610,6 +712,55 @@ mod tests {
         }];
         let level = engine.supports(&manifest, &cpu_capability());
         assert!(matches!(level, SupportLevel::Unsupported(_)));
+    }
+
+    #[test]
+    fn test_supports_rejects_mixed_package_with_unsupported_artifact() {
+        let engine = MockEngine;
+        let mut manifest = text_manifest(ModelFamily::Llama, DType::F32);
+        manifest.files = vec![
+            bloomai_core::ModelFile {
+                name: "model.safetensors".to_string(),
+                format: ModelFormat::Safetensors,
+                size_bytes: 1000,
+                hash_sha256: None,
+                required: true,
+            },
+            bloomai_core::ModelFile {
+                name: "fallback.onnx".to_string(),
+                format: ModelFormat::Onnx,
+                size_bytes: 1000,
+                hash_sha256: None,
+                required: false,
+            },
+            bloomai_core::ModelFile {
+                name: "config.json".to_string(),
+                format: ModelFormat::Unknown,
+                size_bytes: 100,
+                hash_sha256: None,
+                required: true,
+            },
+        ];
+        let level = engine.supports(&manifest, &cpu_capability());
+        assert!(matches!(level, SupportLevel::Unsupported(_)));
+        assert!(level.reason().unwrap().contains("Onnx"));
+    }
+
+    #[test]
+    fn test_supports_quantization_method_before_load() {
+        let engine = MockEngine;
+        let mut manifest = text_manifest(ModelFamily::Llama, DType::F32);
+        manifest.quantization = Some(QuantizationInfo {
+            scheme: QuantScheme::AWQ,
+            bits: 4,
+            group_size: Some(128),
+            act_order: false,
+            kv_cache_dtype: None,
+            imatrix: false,
+        });
+        let level = engine.supports(&manifest, &cpu_capability());
+        assert!(matches!(level, SupportLevel::Fallback(_)));
+        assert!(level.reason().unwrap().contains("quantized models"));
     }
 
     // ------------------------------------------------------------------

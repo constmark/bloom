@@ -211,6 +211,13 @@ impl PagedAttentionCache {
                 self.config.block_size
             ));
         }
+        if block_id >= self.config.total_blocks {
+            return Err(anyhow!(
+                "block_id {} >= total_blocks {}",
+                block_id,
+                self.config.total_blocks
+            ));
+        }
         let expected = num_tokens.saturating_mul(self.config.kv_dim);
         if keys.len() != expected || values.len() != expected {
             return Err(anyhow!(
@@ -269,18 +276,48 @@ impl PagedAttentionCache {
                 self.config.block_size
             ));
         }
+        if block_id >= self.config.total_blocks {
+            return Err(anyhow!(
+                "block_id {} >= total_blocks {}",
+                block_id,
+                self.config.total_blocks
+            ));
+        }
 
         // Convert to F32 CPU vector for fallback compatibility
         let keys_f32 = keys.to_dtype(candle_core::DType::F32)?.flatten_all()?;
         let values_f32 = values.to_dtype(candle_core::DType::F32)?.flatten_all()?;
         let keys_vec = keys_f32.to_vec1::<f32>()?;
         let values_vec = values_f32.to_vec1::<f32>()?;
+        let expected = num_tokens
+            .checked_mul(self.config.kv_dim)
+            .ok_or_else(|| anyhow!("KV tensor shape overflows usize"))?;
+        if keys_vec.len() != expected || values_vec.len() != expected {
+            return Err(anyhow!(
+                "KV tensor shape mismatch: expected {} elements per tensor, got keys={}, values={}",
+                expected,
+                keys_vec.len(),
+                values_vec.len()
+            ));
+        }
+
+        // Tensor writes must obey the configured storage dtype too. Without
+        // this conversion a quantized cache would retain no readable vectors:
+        // `read_kv` intentionally consults the quantized fields for INT8/FP8.
+        let (stored_keys, stored_values, quantized_keys, quantized_values) =
+            if self.config.kv_dtype.needs_dequant() {
+                let qk = Int8QuantizedKv::quantize_f32(&keys_vec, num_tokens, self.config.kv_dim);
+                let qv = Int8QuantizedKv::quantize_f32(&values_vec, num_tokens, self.config.kv_dim);
+                (Vec::new(), Vec::new(), Some(qk), Some(qv))
+            } else {
+                (keys_vec, values_vec, None, None)
+            };
 
         let block_data = BlockKvData {
-            keys: keys_vec,
-            values: values_vec,
-            quantized_keys: None,
-            quantized_values: None,
+            keys: stored_keys,
+            values: stored_values,
+            quantized_keys,
+            quantized_values,
             num_tokens,
             keys_tensor: Some(keys),
             values_tensor: Some(values),
@@ -360,7 +397,9 @@ impl PagedAttentionCache {
                         }
                         // Block not yet populated — fill with zeros
                         let block_tokens = self.config.block_size;
-                        let block_elements = block_tokens * self.config.kv_dim;
+                        let block_elements = block_tokens
+                            .checked_mul(self.config.kv_dim)
+                            .ok_or_else(|| anyhow!("KV block shape overflows usize"))?;
                         all_keys.extend(std::iter::repeat_n(0.0f32, block_elements));
                         all_values.extend(std::iter::repeat_n(0.0f32, block_elements));
                     }
@@ -386,8 +425,28 @@ impl PagedAttentionCache {
         // 1. Read K and V from the paged cache blocks
         let (k, v) = self.read_kv(layer_idx, block_ids)?;
 
-        // Ensure we only use the valid seq_len elements of k and v
-        let expected_elements = seq_len * head_dim;
+        // Ensure dimensions are checked before slicing or handing memory to
+        // an optional native kernel. This keeps malformed requests from
+        // turning into a panic or out-of-bounds access in the FFI boundary.
+        let expected_elements = seq_len
+            .checked_mul(head_dim)
+            .ok_or_else(|| anyhow!("attention shape overflows usize"))?;
+        if q.len() < expected_elements {
+            anyhow::bail!(
+                "query contains fewer elements than expected for seq_len {} and head_dim {} (Q: {})",
+                seq_len,
+                head_dim,
+                q.len()
+            );
+        }
+        if output.len() < expected_elements {
+            anyhow::bail!(
+                "output contains fewer elements than expected for seq_len {} and head_dim {} (output: {})",
+                seq_len,
+                head_dim,
+                output.len()
+            );
+        }
         if k.len() < expected_elements || v.len() < expected_elements {
             anyhow::bail!(
                 "Paged cache blocks contain fewer elements than expected for seq_len {} and head_dim {} (K: {}, V: {})",
@@ -522,10 +581,17 @@ impl PagedAttentionCache {
             for block in layer_map.values() {
                 if self.config.kv_dtype.needs_dequant() {
                     if let (Some(qk), Some(qv)) = (&block.quantized_keys, &block.quantized_values) {
-                        total += qk.memory_bytes() + qv.memory_bytes();
+                        total = total
+                            .saturating_add(qk.memory_bytes().saturating_add(qv.memory_bytes()));
                     }
                 } else {
-                    total += (block.keys.len() + block.values.len()) * element_size;
+                    total = total.saturating_add(
+                        block
+                            .keys
+                            .len()
+                            .saturating_add(block.values.len())
+                            .saturating_mul(element_size),
+                    );
                 }
             }
         }
@@ -553,32 +619,52 @@ impl PagedAttentionCache {
         block_ids: &[usize],
         scale: f32,
     ) -> Result<Vec<f32>> {
+        if layer_idx >= self.config.num_layers {
+            return Err(anyhow!(
+                "layer_idx {} >= num_layers {}",
+                layer_idx,
+                self.config.num_layers
+            ));
+        }
         // Gather KV from blocks (dequantizes automatically if needed)
         let (keys, values) = self.read_kv(layer_idx, block_ids)?;
 
         let kv_dim = self.config.kv_dim;
+        if kv_dim == 0 {
+            return Err(anyhow!("paged attention requires kv_dim > 0"));
+        }
         let visible_block_ids = self.visible_blocks(block_ids);
-        let num_kv_tokens = visible_block_ids.len() * self.config.block_size;
+        let num_kv_tokens = visible_block_ids
+            .len()
+            .checked_mul(self.config.block_size)
+            .ok_or_else(|| anyhow!("KV token count overflows usize"))?;
+        let expected_kv_elements = num_kv_tokens
+            .checked_mul(kv_dim)
+            .ok_or_else(|| anyhow!("KV tensor shape overflows usize"))?;
 
-        if keys.len() != num_kv_tokens * kv_dim {
+        if keys.len() != expected_kv_elements || values.len() != expected_kv_elements {
             return Err(anyhow!(
-                "KV size mismatch: expected {}, got {}",
-                num_kv_tokens * kv_dim,
-                keys.len()
+                "KV size mismatch: expected {} elements per tensor, got keys={}, values={}",
+                expected_kv_elements,
+                keys.len(),
+                values.len()
             ));
         }
 
-        let seq_len = query.len() / kv_dim;
-        if query.len() != seq_len * kv_dim {
+        if !query.len().is_multiple_of(kv_dim) {
             return Err(anyhow!(
                 "query size {} not divisible by kv_dim {}",
                 query.len(),
                 kv_dim
             ));
         }
+        let seq_len = query.len() / kv_dim;
 
         // Scaled dot-product attention: softmax(Q * K^T * scale) * V
-        let mut output = vec![0.0f32; seq_len * kv_dim];
+        let output_len = seq_len
+            .checked_mul(kv_dim)
+            .ok_or_else(|| anyhow!("attention output shape overflows usize"))?;
+        let mut output = vec![0.0f32; output_len];
 
         for q_idx in 0..seq_len {
             let q = &query[q_idx * kv_dim..(q_idx + 1) * kv_dim];
@@ -639,8 +725,24 @@ impl PagedAttentionCache {
         let mut values_tensors = Vec::with_capacity(visible_block_ids.len());
 
         let q_dims = query.dims();
+        if q_dims.len() != 4 {
+            return Err(anyhow!(
+                "query must have rank 4 [batch, heads, seq, head_dim], got rank {}",
+                q_dims.len()
+            ));
+        }
         let batch = q_dims[0];
         let head_dim = q_dims[3];
+        if batch == 0 || q_dims[1] == 0 || q_dims[2] == 0 || head_dim == 0 {
+            return Err(anyhow!("query dimensions must be non-zero"));
+        }
+        if self.config.kv_dim == 0 || !self.config.kv_dim.is_multiple_of(head_dim) {
+            return Err(anyhow!(
+                "KV dimension {} is not compatible with query head dimension {}",
+                self.config.kv_dim,
+                head_dim
+            ));
+        }
 
         let num_kv_heads = self.config.kv_dim / head_dim;
 
@@ -694,8 +796,23 @@ impl PagedAttentionCache {
         attn_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let q_dims = q.dims();
+        if q_dims.len() != 4 || k.dims().len() != 4 || v.dims().len() != 4 {
+            return Err(anyhow!(
+                "scaled dot-product attention expects rank-4 tensors"
+            ));
+        }
         let num_heads = q_dims[1];
         let num_kv_heads = k.dim(1)?;
+        if num_heads == 0 || num_kv_heads == 0 {
+            return Err(anyhow!("attention head count must be non-zero"));
+        }
+        if !num_heads.is_multiple_of(num_kv_heads) {
+            return Err(anyhow!(
+                "query heads {} are not divisible by KV heads {}",
+                num_heads,
+                num_kv_heads
+            ));
+        }
         let num_kv_groups = num_heads / num_kv_heads;
 
         let k = if num_kv_groups > 1 {
@@ -746,7 +863,9 @@ impl PagedAttentionCache {
         let mut block_keys = self.block_keys.lock().unwrap_or_else(|e| e.into_inner());
         for (block_idx, &block_id) in block_ids.iter().enumerate() {
             for layer_idx in 0..self.config.num_layers {
-                let prefix_len = (block_idx + 1) * self.config.block_size;
+                let prefix_len = block_idx
+                    .saturating_add(1)
+                    .saturating_mul(self.config.block_size);
                 let key = if prefix_len <= prompt_tokens.len() {
                     CacheMeshKey::from_tokens_multimodal(
                         namespace,
@@ -983,6 +1102,46 @@ mod tests {
         assert_eq!(read_values.len(), values.len());
 
         // Verify approximate roundtrip (INT8 has limited precision)
+        for (orig, rec) in keys.iter().zip(read_keys.iter()) {
+            assert!((orig - rec).abs() < 0.05, "orig={}, rec={}", orig, rec);
+        }
+    }
+
+    #[test]
+    fn tensor_writes_validate_shape_and_block_id() {
+        let cache = PagedAttentionCache::new(test_config());
+        let device = Device::Cpu;
+        let keys = Tensor::zeros((4, 8), candle_core::DType::F32, &device).unwrap();
+        let values = Tensor::zeros((4, 8), candle_core::DType::F32, &device).unwrap();
+
+        let err = cache
+            .write_kv_tensor(0, 0, keys.clone(), values.clone(), 3)
+            .unwrap_err();
+        assert!(err.to_string().contains("shape mismatch"));
+
+        let err = cache.write_kv_tensor(0, 32, keys, values, 4).unwrap_err();
+        assert!(err.to_string().contains("block_id 32"));
+    }
+
+    #[test]
+    fn quantized_tensor_writes_round_trip_through_vector_reads() {
+        let mut config = test_config();
+        config.kv_dtype = KvCacheDtype::Int8;
+        let cache = PagedAttentionCache::new(config);
+        let alloc = cache
+            .allocate("req-quant-tensor", &[1, 2, 3, 4], 1)
+            .unwrap();
+        let block_id = alloc.allocated_blocks[0];
+        let device = Device::Cpu;
+        let keys: Vec<f32> = (0..32).map(|i| i as f32 * 0.1 - 1.5).collect();
+        let values: Vec<f32> = (0..32).map(|i| i as f32 * 0.05 - 0.8).collect();
+        let kt = Tensor::from_vec(keys.clone(), (4, 8), &device).unwrap();
+        let vt = Tensor::from_vec(values.clone(), (4, 8), &device).unwrap();
+
+        cache.write_kv_tensor(0, block_id, kt, vt, 4).unwrap();
+        let (read_keys, read_values) = cache.read_kv(0, &[block_id]).unwrap();
+        assert_eq!(read_keys.len(), keys.len());
+        assert_eq!(read_values.len(), values.len());
         for (orig, rec) in keys.iter().zip(read_keys.iter()) {
             assert!((orig - rec).abs() < 0.05, "orig={}, rec={}", orig, rec);
         }

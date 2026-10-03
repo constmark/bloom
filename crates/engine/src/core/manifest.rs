@@ -859,7 +859,11 @@ pub fn infer_manifest_from_gguf_summary(summary: &GgufMetadataSummary) -> ModelM
 pub fn load_manifest(model_path: &Path) -> Result<ModelManifest> {
     // Single-file GGUF path: --model points to a .gguf file directly.
     if model_path.is_file() {
-        if model_path.extension().and_then(|s| s.to_str()) == Some("gguf") {
+        let extension = model_path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase());
+        if extension.as_deref() == Some("gguf") {
             #[cfg(feature = "candle-engine")]
             {
                 let parent = model_path.parent().unwrap_or(Path::new("."));
@@ -878,31 +882,48 @@ pub fn load_manifest(model_path: &Path) -> Result<ModelManifest> {
                 .into());
             }
         }
-        if model_path
-            .extension()
-            .and_then(|s| s.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("onnx"))
-        {
+        if extension.as_deref() == Some("onnx") {
             let parent = model_path.parent().unwrap_or(Path::new("."));
             return infer_from_onnx(parent, model_path);
         }
-        if model_path
-            .extension()
-            .and_then(|s| s.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("spv") || ext.eq_ignore_ascii_case("spirv"))
-        {
+        if matches!(extension.as_deref(), Some("spv" | "spirv")) {
             let parent = model_path.parent().unwrap_or(Path::new("."));
             return infer_from_vulkan(parent, model_path);
+        }
+        if extension.as_deref() == Some("xml") {
+            let parent = model_path.parent().unwrap_or(Path::new("."));
+            return infer_from_openvino(parent, model_path);
         }
         if is_tensorrt_engine_file(model_path) {
             let parent = model_path.parent().unwrap_or(Path::new("."));
             return infer_from_tensorrt(parent, model_path);
+        }
+        if matches!(extension.as_deref(), Some("mlmodel" | "mlpackage")) {
+            let parent = model_path.parent().unwrap_or(Path::new("."));
+            return infer_from_coreml(parent, model_path);
+        }
+        if matches!(extension.as_deref(), Some("mlx" | "npz")) {
+            let parent = model_path.parent().unwrap_or(Path::new("."));
+            return infer_from_mlx(parent, model_path);
         }
         return Err(BloomError::InvalidInput(format!(
             "model_path must be a directory, got file: {}",
             model_path.display()
         ))
         .into());
+    }
+
+    // CoreML packages are directories with a `.mlpackage` suffix.  Handle
+    // the package itself before looking for generic model metadata inside it.
+    if model_path.is_dir()
+        && model_path
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("mlpackage"))
+    {
+        let mut manifest = infer_from_coreml(model_path, model_path)?;
+        validate_manifest(&mut manifest, model_path)?;
+        return Ok(manifest);
     }
 
     let explicit_manifest = model_path.join("bloom.json").exists();
@@ -928,8 +949,14 @@ pub fn load_manifest(model_path: &Path) -> Result<ModelManifest> {
             )
             .into());
         }
+    } else if let Some(ml) = find_mlx_in_dir(model_path) {
+        infer_from_mlx(model_path, &ml)?
+    } else if let Some(coreml) = find_coreml_in_dir(model_path) {
+        infer_from_coreml(model_path, &coreml)?
     } else if let Some(onnx) = find_onnx_in_dir(model_path) {
         infer_from_onnx(model_path, &onnx)?
+    } else if let Some(openvino) = find_openvino_in_dir(model_path) {
+        infer_from_openvino(model_path, &openvino)?
     } else if let Some(engine) = find_tensorrt_engine_in_dir(model_path) {
         infer_from_tensorrt(model_path, &engine)?
     } else if let Some(spv) = find_vulkan_spv_in_dir(model_path) {
@@ -1093,9 +1120,11 @@ fn is_executable_model_artifact(path: &Path) -> bool {
                     | "pt"
                     | "pth"
                     | "ckpt"
-                    | "npz"
                     | "npy"
+                    | "mlx"
+                    | "npz"
                     | "mlmodel"
+                    | "mlpackage"
                     | "tflite"
                     | "pte"
                     | "xml"
@@ -1111,9 +1140,10 @@ fn format_implied_by_extension(path: &Path) -> Option<ModelFormat> {
         "onnx" => Some(ModelFormat::Onnx),
         "engine" | "plan" => Some(ModelFormat::TensorRtEngine),
         "spv" | "spirv" => Some(ModelFormat::VulkanSpirv),
-        "mlmodel" => Some(ModelFormat::CoreMl),
+        "mlmodel" | "mlpackage" => Some(ModelFormat::CoreMl),
+        "mlx" | "npz" => Some(ModelFormat::Mlx),
         "xml" => Some(ModelFormat::OpenVinoIr),
-        // .bin/.pt/.pth/.npz/.npy are shared by multiple runtimes and do not
+        // .bin/.pt/.pth/.npy are shared by multiple runtimes and do not
         // identify one model format strongly enough for fail-closed matching.
         _ => None,
     }
@@ -1143,13 +1173,16 @@ fn validate_manifest(
         let relative = safe_manifest_relative_path(&file.name)?;
         if let Some(implied_format) = format_implied_by_extension(&relative)
             && file.format != implied_format
+            // MLX commonly stores weights in Safetensors containers.  Keep
+            // the logical MLX format while accepting that physical suffix.
+            && !(implied_format == ModelFormat::Safetensors && file.format == ModelFormat::Mlx)
         {
             return Err(BloomError::ModelLoad(format!(
                 "declared format {:?} for '{}' conflicts with the {:?} format required by its extension",
                 file.format, file.name, implied_format
             )));
         }
-        let path = model_path.join(relative);
+        let path = model_path.join(&relative);
         if file.required && !path.exists() {
             return Err(BloomError::MissingRequiredFile(file.name.clone()));
         }
@@ -1176,7 +1209,13 @@ fn validate_manifest(
             }
             file.size_bytes = actual;
 
-            if file.format == ModelFormat::Safetensors {
+            let is_safetensors = file.format == ModelFormat::Safetensors
+                || (file.format == ModelFormat::Mlx
+                    && relative
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("safetensors")));
+            if is_safetensors {
                 let summary = read_safetensors_header(&path).map_err(|error| {
                     BloomError::ModelLoad(format!(
                         "failed to validate Safetensors artifact '{}': {error:#}",
@@ -2250,6 +2289,81 @@ fn find_onnx_in_dir(model_path: &Path) -> Option<std::path::PathBuf> {
     candidates.into_iter().next()
 }
 
+/// Find an MLX weight artifact in a directory (non-recursive).
+fn find_mlx_in_dir(model_path: &Path) -> Option<std::path::PathBuf> {
+    if !model_path.is_dir() {
+        return None;
+    }
+    for name in ["weights.mlx", "weights.npz", "weights.safetensors"] {
+        let candidate = model_path.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    let mut candidates = std::fs::read_dir(model_path)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "mlx" | "npz"))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.into_iter().next()
+}
+
+/// Find a CoreML model file/package in a directory (non-recursive).
+fn find_coreml_in_dir(model_path: &Path) -> Option<std::path::PathBuf> {
+    if !model_path.is_dir() {
+        return None;
+    }
+    let mut candidates = std::fs::read_dir(model_path)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|ext| {
+                    matches!(ext.to_ascii_lowercase().as_str(), "mlmodel" | "mlpackage")
+                })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.into_iter().next()
+}
+
+/// Find an OpenVINO IR XML file in a directory (non-recursive).
+fn find_openvino_in_dir(model_path: &Path) -> Option<std::path::PathBuf> {
+    if !model_path.is_dir() {
+        return None;
+    }
+    for name in ["openvino_model.xml", "model.xml"] {
+        let candidate = model_path.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    let mut candidates = std::fs::read_dir(model_path)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("xml"))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.into_iter().next()
+}
+
 /// Find the preferred TensorRT engine file in a directory (non-recursive).
 fn find_tensorrt_engine_in_dir(model_path: &Path) -> Option<std::path::PathBuf> {
     if !model_path.is_dir() {
@@ -2316,6 +2430,147 @@ fn infer_from_onnx(model_path: &Path, onnx_path: &Path) -> Result<ModelManifest>
         .runtime_hints
         .preferred_backends
         .push("onnxruntime".to_string());
+    Ok(manifest)
+}
+
+fn infer_from_openvino(model_path: &Path, xml_path: &Path) -> Result<ModelManifest> {
+    let mut manifest = ModelManifest {
+        id: xml_path
+            .file_stem()
+            .or_else(|| model_path.file_name())
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+        family: ModelFamily::Custom("openvino".to_string()),
+        primary_dtype: DType::F32,
+        io_schema: ModelIoSchema {
+            inputs: vec![Modality::Multi],
+            outputs: vec![Modality::Multi],
+        },
+        license: Some("unknown".to_string()),
+        ..ModelManifest::default()
+    };
+
+    let relative = xml_path
+        .strip_prefix(model_path)
+        .unwrap_or(xml_path)
+        .to_string_lossy()
+        .into_owned();
+    let size_bytes = std::fs::metadata(xml_path)
+        .map(|m| m.len() as usize)
+        .unwrap_or(0);
+    manifest.files.push(ModelFile {
+        name: relative,
+        format: ModelFormat::OpenVinoIr,
+        size_bytes,
+        hash_sha256: None,
+        required: true,
+    });
+    // OpenVINO IR stores tensor data in a companion .bin file.  Account for it
+    // when present so memory planning and package inspection include all bytes.
+    let bin_path = xml_path.with_extension("bin");
+    if bin_path.is_file() {
+        let name = bin_path
+            .strip_prefix(model_path)
+            .unwrap_or(&bin_path)
+            .to_string_lossy()
+            .into_owned();
+        manifest.files.push(ModelFile {
+            name,
+            format: ModelFormat::Unknown,
+            size_bytes: std::fs::metadata(&bin_path)
+                .map(|m| m.len() as usize)
+                .unwrap_or(0),
+            hash_sha256: None,
+            required: true,
+        });
+    }
+    manifest
+        .runtime_hints
+        .preferred_backends
+        .push("openvino".to_string());
+    Ok(manifest)
+}
+
+fn infer_from_coreml(model_path: &Path, coreml_path: &Path) -> Result<ModelManifest> {
+    let mut manifest = ModelManifest {
+        id: coreml_path
+            .file_stem()
+            .or_else(|| model_path.file_name())
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+        family: ModelFamily::Custom("coreml".to_string()),
+        primary_dtype: DType::F16,
+        io_schema: ModelIoSchema {
+            inputs: vec![Modality::Multi],
+            outputs: vec![Modality::Multi],
+        },
+        license: Some("unknown".to_string()),
+        ..ModelManifest::default()
+    };
+    // A .mlpackage is itself a directory and therefore not a regular file in
+    // ModelFile's integrity contract. Keep package metadata loadable while
+    // allowing the CoreML adapter to discover the package directory directly.
+    if coreml_path.is_file() {
+        let name = coreml_path
+            .strip_prefix(model_path)
+            .unwrap_or(coreml_path)
+            .to_string_lossy()
+            .into_owned();
+        manifest.files.push(ModelFile {
+            name,
+            format: ModelFormat::CoreMl,
+            size_bytes: std::fs::metadata(coreml_path)
+                .map(|m| m.len() as usize)
+                .unwrap_or(0),
+            hash_sha256: None,
+            required: true,
+        });
+    }
+    manifest
+        .runtime_hints
+        .preferred_backends
+        .push("coreml".to_string());
+    Ok(manifest)
+}
+
+fn infer_from_mlx(model_path: &Path, mlx_path: &Path) -> Result<ModelManifest> {
+    let mut manifest = ModelManifest {
+        id: mlx_path
+            .file_stem()
+            .or_else(|| model_path.file_name())
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+        family: ModelFamily::Custom("mlx".to_string()),
+        primary_dtype: DType::F16,
+        io_schema: ModelIoSchema {
+            inputs: vec![Modality::Text],
+            outputs: vec![Modality::Text],
+        },
+        license: Some("unknown".to_string()),
+        ..ModelManifest::default()
+    };
+    let name = mlx_path
+        .strip_prefix(model_path)
+        .unwrap_or(mlx_path)
+        .to_string_lossy()
+        .into_owned();
+    manifest.files.push(ModelFile {
+        name,
+        format: ModelFormat::Mlx,
+        size_bytes: std::fs::metadata(mlx_path)
+            .map(|m| m.len() as usize)
+            .unwrap_or(0),
+        hash_sha256: None,
+        required: true,
+    });
+    manifest
+        .runtime_hints
+        .preferred_backends
+        .push("mlx".to_string());
+    manifest.runtime_hints.supports_mmap = true;
     Ok(manifest)
 }
 
@@ -3162,6 +3417,54 @@ mod tests {
         let manifest = load_manifest(dir.path()).unwrap();
         assert_eq!(manifest.files[0].format, ModelFormat::TensorRtEngine);
         assert_eq!(manifest.files[0].name, "model.engine");
+    }
+
+    #[test]
+    fn test_load_manifest_openvino_ir_directory_accounts_for_bin() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("openvino_model.xml"), b"<net/>").unwrap();
+        std::fs::write(dir.path().join("openvino_model.bin"), [0_u8; 4]).unwrap();
+
+        let manifest = load_manifest(dir.path()).unwrap();
+        assert_eq!(manifest.family, ModelFamily::Custom("openvino".to_string()));
+        assert!(
+            manifest
+                .files
+                .iter()
+                .any(|file| file.format == ModelFormat::OpenVinoIr)
+        );
+        assert!(
+            manifest
+                .files
+                .iter()
+                .any(|file| file.name == "openvino_model.bin")
+        );
+    }
+
+    #[test]
+    fn test_load_manifest_coreml_package_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("model.mlpackage");
+        std::fs::create_dir(&package).unwrap();
+        let manifest = load_manifest(&package).unwrap();
+        assert_eq!(manifest.family, ModelFamily::Custom("coreml".to_string()));
+        assert!(manifest.files.is_empty());
+        assert!(
+            manifest
+                .runtime_hints
+                .preferred_backends
+                .contains(&"coreml".to_string())
+        );
+    }
+
+    #[test]
+    fn test_load_manifest_mlx_weights_npz() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("weights.npz"), [0_u8; 4]).unwrap();
+        let manifest = load_manifest(dir.path()).unwrap();
+        assert_eq!(manifest.family, ModelFamily::Custom("mlx".to_string()));
+        assert_eq!(manifest.files[0].format, ModelFormat::Mlx);
+        assert_eq!(manifest.files[0].name, "weights.npz");
     }
 
     #[test]

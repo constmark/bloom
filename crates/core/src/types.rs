@@ -127,18 +127,27 @@ impl QuantizationInfo {
 
     /// Parse a GGUF quantization type string (e.g. "Q4_K_M") into QuantizationInfo.
     pub fn from_gguf_type(type_str: &str) -> Self {
-        let upper = type_str.to_uppercase();
-        let bits = if upper.starts_with("Q2") || upper.starts_with("IQ2") {
+        let upper = type_str.trim().to_uppercase();
+        // Keep this table aligned with llama.cpp's current GGML quantized
+        // tensor names, including importance (IQ) and ternary (TQ) variants.
+        // GGUF metadata may use a suffix such as `_K_M` or `_XS`; only the
+        // leading family determines effective bits per weight.
+        let bits = if upper.starts_with("Q1")
+            || upper.starts_with("IQ1")
+            || upper.starts_with("TQ1")
+        {
+            1
+        } else if upper.starts_with("Q2") || upper.starts_with("IQ2") || upper.starts_with("TQ2") {
             2
-        } else if upper.starts_with("Q3") || upper.starts_with("IQ3") {
+        } else if upper.starts_with("Q3") || upper.starts_with("IQ3") || upper.starts_with("TQ3") {
             3
-        } else if upper.starts_with("Q4") || upper.starts_with("IQ4") {
+        } else if upper.starts_with("Q4") || upper.starts_with("IQ4") || upper.starts_with("TQ4") {
             4
-        } else if upper.starts_with("Q5") || upper.starts_with("IQ5") {
+        } else if upper.starts_with("Q5") || upper.starts_with("IQ5") || upper.starts_with("TQ5") {
             5
         } else if upper.starts_with("Q6") {
             6
-        } else if upper.starts_with("Q8") {
+        } else if upper.starts_with("Q8") || upper.starts_with("IQ8") {
             8
         } else {
             0
@@ -257,6 +266,32 @@ impl Default for GenerationParams {
             seed: None,
             response_format: None,
         }
+    }
+}
+
+impl GenerationParams {
+    /// Validate sampling controls before they reach a backend.
+    ///
+    /// Protocol adapters normally perform the same checks so they can return
+    /// a protocol-specific 4xx response.  Keeping the invariant here as well
+    /// protects direct Rust, FFI, plugin, and embedded callers from passing
+    /// NaN/Inf values or a zero token budget into a backend.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_tokens == 0 {
+            return Err("max_tokens must be greater than zero".to_string());
+        }
+        if !self.temperature.is_finite() || !(0.0..=2.0).contains(&self.temperature) {
+            return Err("temperature must be finite and between 0 and 2".to_string());
+        }
+        if !self.top_p.is_finite() || !(0.0 < self.top_p && self.top_p <= 1.0) {
+            return Err("top_p must be finite, greater than 0, and at most 1".to_string());
+        }
+        if let Some(ResponseFormat::JsonSchema(schema)) = &self.response_format
+            && !schema.is_object()
+        {
+            return Err("json_schema response format must be a JSON object".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -402,6 +437,45 @@ mod tests {
     }
 
     #[test]
+    fn generation_params_validate_rejects_invalid_sampling_controls() {
+        let mut params = GenerationParams {
+            max_tokens: 0,
+            ..GenerationParams::default()
+        };
+        assert!(params.validate().is_err());
+
+        params = GenerationParams {
+            temperature: f64::NAN,
+            ..GenerationParams::default()
+        };
+        assert!(params.validate().is_err());
+
+        params = GenerationParams {
+            top_p: 0.0,
+            ..GenerationParams::default()
+        };
+        assert!(params.validate().is_err());
+
+        params = GenerationParams {
+            response_format: Some(ResponseFormat::JsonSchema(serde_json::json!("schema"))),
+            ..GenerationParams::default()
+        };
+        assert!(params.validate().is_err());
+    }
+
+    #[test]
+    fn generation_params_validate_accepts_supported_controls() {
+        let params = GenerationParams {
+            response_format: Some(ResponseFormat::JsonSchema(serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }))),
+            ..GenerationParams::default()
+        };
+        assert!(params.validate().is_ok());
+    }
+
+    #[test]
     fn test_benchmark_result_serde() {
         let result = BenchmarkResult {
             backend: "cpu".into(),
@@ -490,6 +564,12 @@ mod tests {
 
         let q2k = QuantizationInfo::from_gguf_type("Q2_K");
         assert_eq!(q2k.bits, 2);
+
+        let iq1s = QuantizationInfo::from_gguf_type("IQ1_S");
+        assert_eq!(iq1s.bits, 1);
+
+        let tq2 = QuantizationInfo::from_gguf_type("TQ2_0");
+        assert_eq!(tq2.bits, 2);
     }
 
     #[test]

@@ -30,6 +30,9 @@ pub enum ResourceError {
 
     #[error("model '{model_id}' already has active lease {lease_id}")]
     AlreadyLoaded { model_id: String, lease_id: u64 },
+
+    #[error("cache handle {handle_id} is already registered")]
+    CacheAlreadyRegistered { handle_id: u64 },
 }
 
 impl ResourceError {

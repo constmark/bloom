@@ -58,6 +58,15 @@ struct CacheRecord {
     priority: ResourcePriority,
 }
 
+/// Resources removed while satisfying a reservation. Offload callbacks are
+/// carried out after the coordinator mutex is released so user callbacks may
+/// safely inspect or update the coordinator without deadlocking it.
+struct EvictionBatch {
+    models: Vec<String>,
+    callbacks: Vec<(String, OffloadCallback)>,
+    removed: bool,
+}
+
 impl ResourceCoordinator {
     /// Create a new ResourceCoordinator with explicit budgets and memory topology.
     pub fn new(ram_budget: usize, vram_budget: usize, memory_topology: MemoryTopology) -> Self {
@@ -115,127 +124,121 @@ impl ResourceCoordinator {
         ticket: ResourceTicket,
         offload_cb: OffloadCallback,
     ) -> Result<BackendLease, ResourceError> {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-
-        // Check if already loaded
-        if let Some(existing) = inner.residencies.get(&ticket.model_id) {
-            return Err(ResourceError::AlreadyLoaded {
-                model_id: ticket.model_id.clone(),
-                lease_id: existing.lease_id,
-            });
-        }
-
         let (ram_budget, vram_budget) = self.effective_budget();
         let needed_ram = ticket.ram_bytes;
         let needed_vram = ticket.vram_bytes;
         let needed_cache = ticket.cache_bytes;
-
-        // For UMA: check total footprint against unified budget
-        let total_needed = needed_ram + needed_vram + needed_cache;
-        let total_used = inner.ram_allocated + inner.vram_allocated;
-
-        let can_fit = match self.memory_topology {
-            MemoryTopology::Unified | MemoryTopology::SharedSystemMemory => {
-                total_used + total_needed <= ram_budget
-            }
-            MemoryTopology::Discrete | MemoryTopology::RemoteMemory => {
-                inner.ram_allocated + needed_ram <= ram_budget
-                    && inner.vram_allocated + needed_vram <= vram_budget
-            }
-        };
-
+        // Saturating arithmetic keeps malformed, externally supplied tickets
+        // from wrapping into a tiny allocation and bypassing the budget.
+        let total_needed = needed_ram
+            .saturating_add(needed_vram)
+            .saturating_add(needed_cache);
         let mut evicted_models: Vec<String> = Vec::new();
+        loop {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
-        if !can_fit {
-            // Try eviction
-            evicted_models = self.try_evict(&mut inner, needed_ram, needed_vram, needed_cache)?;
+            if let Some(existing) = inner.residencies.get(&ticket.model_id) {
+                return Err(ResourceError::AlreadyLoaded {
+                    model_id: ticket.model_id.clone(),
+                    lease_id: existing.lease_id,
+                });
+            }
 
-            // Re-check after eviction
-            let total_used_after = inner.ram_allocated + inner.vram_allocated;
-            let can_fit_after = match self.memory_topology {
+            let total_used = inner.ram_allocated.saturating_add(inner.vram_allocated);
+            let can_fit = match self.memory_topology {
                 MemoryTopology::Unified | MemoryTopology::SharedSystemMemory => {
-                    total_used_after + total_needed <= ram_budget
+                    total_used.saturating_add(total_needed) <= ram_budget
                 }
                 MemoryTopology::Discrete | MemoryTopology::RemoteMemory => {
-                    inner.ram_allocated + needed_ram <= ram_budget
-                        && inner.vram_allocated + needed_vram <= vram_budget
+                    inner.ram_allocated.saturating_add(needed_ram) <= ram_budget
+                        && inner.vram_allocated.saturating_add(needed_vram) <= vram_budget
                 }
             };
 
-            if !can_fit_after {
+            if can_fit {
+                let lease_id = self.next_lease_id.fetch_add(1, Ordering::SeqCst);
+                let backend_name = ticket
+                    .preferred_backend
+                    .clone()
+                    .unwrap_or_else(|| "default".to_string());
+                inner.ram_allocated = inner.ram_allocated.saturating_add(needed_ram);
+                inner.vram_allocated = inner.vram_allocated.saturating_add(needed_vram);
+                let now = Instant::now();
+                let record = ModelResidencyRecord {
+                    model_id: ticket.model_id.clone(),
+                    lease_id,
+                    ram_bytes: needed_ram,
+                    vram_bytes: needed_vram,
+                    cache_bytes: needed_cache,
+                    priority: ticket.priority,
+                    strategy: ticket.strategy,
+                    backend_name: backend_name.clone(),
+                    offload_cb,
+                    last_accessed: now,
+                };
+                inner.residencies.insert(ticket.model_id.clone(), record);
+                inner.leases.insert(
+                    lease_id,
+                    LeaseRecord {
+                        model_id: ticket.model_id.clone(),
+                        backend_name: backend_name.clone(),
+                        granted_ram: needed_ram,
+                        granted_vram: needed_vram,
+                        created_at: now,
+                    },
+                );
+                tracing::info!(
+                    "Reserved resources for model '{}': ram={} vram={} cache={} lease_id={}",
+                    ticket.model_id,
+                    needed_ram,
+                    needed_vram,
+                    needed_cache,
+                    lease_id
+                );
+                return Ok(BackendLease {
+                    lease_id,
+                    ticket,
+                    granted_backend: backend_name,
+                    granted_ram: needed_ram,
+                    granted_vram: needed_vram,
+                    degraded: false,
+                    degraded_reason: None,
+                    evicted_models,
+                    created_at: now,
+                });
+            }
+
+            let batch = self.try_evict(&mut inner, needed_ram, needed_vram, needed_cache)?;
+            evicted_models.extend(batch.models);
+            drop(inner);
+
+            // Never invoke model code while holding the coordinator mutex.
+            for (model_id, callback) in batch.callbacks {
+                if let Err(error) = callback() {
+                    tracing::error!("Failed to evict model '{}': {}", model_id, error);
+                }
+            }
+            if !batch.removed {
+                let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                let total_used = inner.ram_allocated.saturating_add(inner.vram_allocated);
                 let deficit = match self.memory_topology {
-                    MemoryTopology::Unified | MemoryTopology::SharedSystemMemory => {
-                        (total_used_after + total_needed).saturating_sub(ram_budget)
-                    }
-                    MemoryTopology::Discrete | MemoryTopology::RemoteMemory => {
-                        let ram_deficit =
-                            (inner.ram_allocated + needed_ram).saturating_sub(ram_budget);
-                        let vram_deficit =
-                            (inner.vram_allocated + needed_vram).saturating_sub(vram_budget);
-                        ram_deficit.max(vram_deficit)
-                    }
+                    MemoryTopology::Unified | MemoryTopology::SharedSystemMemory => total_used
+                        .saturating_add(total_needed)
+                        .saturating_sub(ram_budget),
+                    MemoryTopology::Discrete | MemoryTopology::RemoteMemory => inner
+                        .ram_allocated
+                        .saturating_add(needed_ram)
+                        .saturating_sub(ram_budget)
+                        .max(
+                            inner
+                                .vram_allocated
+                                .saturating_add(needed_vram)
+                                .saturating_sub(vram_budget),
+                        ),
                 };
                 return Err(ResourceError::BudgetExceeded { deficit });
             }
         }
-
-        // Allocate
-        let lease_id = self.next_lease_id.fetch_add(1, Ordering::SeqCst);
-        let backend_name = ticket
-            .preferred_backend
-            .clone()
-            .unwrap_or_else(|| "default".to_string());
-
-        inner.ram_allocated += needed_ram;
-        inner.vram_allocated += needed_vram;
-
-        let now = Instant::now();
-
-        let record = ModelResidencyRecord {
-            model_id: ticket.model_id.clone(),
-            lease_id,
-            ram_bytes: needed_ram,
-            vram_bytes: needed_vram,
-            cache_bytes: needed_cache,
-            priority: ticket.priority,
-            strategy: ticket.strategy,
-            backend_name: backend_name.clone(),
-            offload_cb,
-            last_accessed: now,
-        };
-        inner.residencies.insert(ticket.model_id.clone(), record);
-
-        inner.leases.insert(
-            lease_id,
-            LeaseRecord {
-                model_id: ticket.model_id.clone(),
-                backend_name: backend_name.clone(),
-                granted_ram: needed_ram,
-                granted_vram: needed_vram,
-                created_at: now,
-            },
-        );
-
-        tracing::info!(
-            "Reserved resources for model '{}': ram={} vram={} cache={} lease_id={}",
-            ticket.model_id,
-            needed_ram,
-            needed_vram,
-            needed_cache,
-            lease_id
-        );
-
-        Ok(BackendLease {
-            lease_id,
-            ticket,
-            granted_backend: backend_name,
-            granted_ram: needed_ram,
-            granted_vram: needed_vram,
-            degraded: false,
-            degraded_reason: None,
-            evicted_models,
-            created_at: now,
-        })
     }
 
     /// Release a lease by lease_id.
@@ -274,21 +277,39 @@ impl ResourceCoordinator {
     /// Register a cache handle in the coordinator.
     pub fn register_cache(&self, handle: CacheHandle) -> Result<(), ResourceError> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let (ram_budget, _) = self.effective_budget();
-        let total_used = inner.ram_allocated + inner.vram_allocated;
-
-        if matches!(
-            self.memory_topology,
-            MemoryTopology::Unified | MemoryTopology::SharedSystemMemory
-        ) && total_used + handle.bytes > ram_budget
-        {
-            return Err(ResourceError::InsufficientUnifiedMemory {
-                requested: handle.bytes,
-                available: ram_budget.saturating_sub(total_used),
+        // Handle IDs are the cache's ownership key. Re-registering an ID while
+        // charging its bytes again would silently corrupt accounting (the map
+        // entry is replaced but the allocation counter is incremented twice),
+        // eventually causing premature evictions or permanent budget leaks.
+        if inner.caches.contains_key(&handle.handle_id) {
+            return Err(ResourceError::CacheAlreadyRegistered {
+                handle_id: handle.handle_id,
             });
         }
+        let (ram_budget, _) = self.effective_budget();
+        let total_used = inner.ram_allocated.saturating_add(inner.vram_allocated);
 
-        inner.ram_allocated += handle.bytes;
+        match self.memory_topology {
+            MemoryTopology::Unified | MemoryTopology::SharedSystemMemory
+                if total_used.saturating_add(handle.bytes) > ram_budget =>
+            {
+                return Err(ResourceError::InsufficientUnifiedMemory {
+                    requested: handle.bytes,
+                    available: ram_budget.saturating_sub(total_used),
+                });
+            }
+            MemoryTopology::Discrete | MemoryTopology::RemoteMemory
+                if inner.ram_allocated.saturating_add(handle.bytes) > ram_budget =>
+            {
+                return Err(ResourceError::InsufficientRam {
+                    requested: handle.bytes,
+                    available: ram_budget.saturating_sub(inner.ram_allocated),
+                });
+            }
+            _ => {}
+        }
+
+        inner.ram_allocated = inner.ram_allocated.saturating_add(handle.bytes);
         inner.caches.insert(
             handle.handle_id,
             CacheRecord {
@@ -373,7 +394,7 @@ impl ResourceCoordinator {
         needed_ram: usize,
         needed_vram: usize,
         needed_cache: usize,
-    ) -> Result<Vec<String>, ResourceError> {
+    ) -> Result<EvictionBatch, ResourceError> {
         let _span =
             tracing::info_span!("vram.evict", needed_ram, needed_vram, needed_cache).entered();
         // Collect evictable candidates: skip Critical and Resident strategy
@@ -419,6 +440,8 @@ impl ResourceCoordinator {
         });
 
         let mut evicted = Vec::new();
+        let mut callbacks = Vec::new();
+        let mut removed = false;
         let mut freed_ram: usize = 0;
         let mut freed_vram: usize = 0;
 
@@ -428,9 +451,13 @@ impl ResourceCoordinator {
             |inner: &ResourceCoordinatorInner, freed_ram: usize, freed_vram: usize| -> bool {
                 match self.memory_topology {
                     MemoryTopology::Unified | MemoryTopology::SharedSystemMemory => {
-                        let total_used = inner.ram_allocated + inner.vram_allocated;
-                        let total_needed = needed_ram + needed_vram + needed_cache;
-                        total_used.saturating_sub(freed_ram + freed_vram) + total_needed
+                        let total_used = inner.ram_allocated.saturating_add(inner.vram_allocated);
+                        let total_needed = needed_ram
+                            .saturating_add(needed_vram)
+                            .saturating_add(needed_cache);
+                        total_used
+                            .saturating_sub(freed_ram.saturating_add(freed_vram))
+                            .saturating_add(total_needed)
                             > ram_budget
                     }
                     MemoryTopology::Discrete | MemoryTopology::RemoteMemory => {
@@ -453,13 +480,15 @@ impl ResourceCoordinator {
                 if let Ok(handle_id) = id.parse::<u64>()
                     && let Some(cache) = inner.caches.remove(&handle_id)
                 {
+                    removed = true;
                     inner.ram_allocated = inner.ram_allocated.saturating_sub(cache.bytes);
                     freed_ram += cache.bytes;
                     tracing::info!("Evicted cache handle {} ({} bytes)", handle_id, cache.bytes);
                 }
             } else {
-                let removed = inner.residencies.remove(id);
-                if let Some(record) = removed {
+                let removed_record = inner.residencies.remove(id);
+                if let Some(record) = removed_record {
+                    removed = true;
                     tracing::info!(
                         "Evicting model '{}' (priority={:?}, ram={}, vram={})",
                         id,
@@ -467,9 +496,7 @@ impl ResourceCoordinator {
                         ram,
                         vram
                     );
-                    if let Err(e) = (record.offload_cb)() {
-                        tracing::error!("Failed to evict model '{}': {}", id, e);
-                    }
+                    callbacks.push((id.clone(), record.offload_cb));
                     inner.ram_allocated = inner.ram_allocated.saturating_sub(record.ram_bytes);
                     inner.vram_allocated = inner.vram_allocated.saturating_sub(record.vram_bytes);
                     freed_ram += record.ram_bytes;
@@ -480,7 +507,11 @@ impl ResourceCoordinator {
             }
         }
 
-        Ok(evicted)
+        Ok(EvictionBatch {
+            models: evicted,
+            callbacks,
+            removed,
+        })
     }
 
     // ====================================================================
@@ -646,6 +677,35 @@ mod tests {
     }
 
     #[test]
+    fn eviction_callback_runs_without_holding_coordinator_lock() {
+        let coord = std::sync::Arc::new(ResourceCoordinator::new(
+            1000,
+            1000,
+            MemoryTopology::Discrete,
+        ));
+        let callback_coord = std::sync::Arc::clone(&coord);
+        let callback: OffloadCallback = std::sync::Arc::new(move || {
+            // Re-entering the coordinator used to deadlock because callbacks
+            // were invoked while `reserve` held its mutex.
+            let _ = callback_coord.snapshot();
+            Ok(())
+        });
+        coord
+            .reserve(
+                make_ticket("evict-me", 800, 0, ResourcePriority::Low),
+                callback,
+            )
+            .unwrap();
+        let lease = coord
+            .reserve(
+                make_ticket("new-model", 400, 0, ResourcePriority::Normal),
+                noop_cb(),
+            )
+            .unwrap();
+        assert_eq!(lease.evicted_models, vec!["evict-me"]);
+    }
+
+    #[test]
     fn test_coordinator_critical_not_evicted() {
         let coord = ResourceCoordinator::new(1000, 1000, MemoryTopology::Discrete);
 
@@ -787,6 +847,41 @@ mod tests {
 
         coord.release_cache(1);
         assert_eq!(coord.snapshot().cache_count, 0);
+        assert_eq!(coord.snapshot().ram_allocated, 0);
+    }
+
+    #[test]
+    fn duplicate_cache_handle_does_not_double_charge_memory() {
+        let coord = ResourceCoordinator::new(1000, 1000, MemoryTopology::Discrete);
+        let handle = CacheHandle {
+            handle_id: 7,
+            model_id: "m1".to_string(),
+            cache_kind: CacheKind::KvCache,
+            bytes: 200,
+            priority: ResourcePriority::Normal,
+        };
+        coord.register_cache(handle.clone()).unwrap();
+        let err = coord.register_cache(handle).unwrap_err();
+        assert!(matches!(
+            err,
+            ResourceError::CacheAlreadyRegistered { handle_id: 7 }
+        ));
+        assert_eq!(coord.snapshot().ram_allocated, 200);
+        assert_eq!(coord.snapshot().cache_count, 1);
+    }
+
+    #[test]
+    fn discrete_cache_registration_respects_ram_budget() {
+        let coord = ResourceCoordinator::new(100, 1_000, MemoryTopology::Discrete);
+        let handle = CacheHandle {
+            handle_id: 8,
+            model_id: "m1".to_string(),
+            cache_kind: CacheKind::KvCache,
+            bytes: 128,
+            priority: ResourcePriority::Normal,
+        };
+        let err = coord.register_cache(handle).unwrap_err();
+        assert!(matches!(err, ResourceError::InsufficientRam { .. }));
         assert_eq!(coord.snapshot().ram_allocated, 0);
     }
 

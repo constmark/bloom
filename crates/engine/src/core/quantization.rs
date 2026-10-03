@@ -162,9 +162,16 @@ impl QuantMethod {
             || lower.contains("q2")
             || lower.contains("q3")
             || lower.contains("q6")
+            || lower.contains("q1")
             || lower.contains("iq2")
             || lower.contains("iq3")
             || lower.contains("iq4")
+            || lower.contains("iq1")
+            || lower.contains("tq1")
+            || lower.contains("tq2")
+            || lower.contains("tq3")
+            || lower.contains("tq4")
+            || lower.contains("tq5")
         {
             Self::Gguf
         } else {
@@ -314,7 +321,9 @@ impl QuantizationConfig {
             Some(t) => {
                 let lower = t.to_lowercase();
                 // IQ (importance) quantization variants
-                if lower.contains("iq2_xxs") {
+                if lower.contains("iq1_s") || lower.contains("iq1_m") {
+                    (QuantMethod::Gguf, 1, "gguf_iq1")
+                } else if lower.contains("iq2_xxs") {
                     (QuantMethod::Gguf, 2, "gguf_iq2_xxs")
                 } else if lower.contains("iq2_xs") {
                     (QuantMethod::Gguf, 2, "gguf_iq2_xs")
@@ -355,6 +364,10 @@ impl QuantizationConfig {
                     (QuantMethod::Gguf, 6, "gguf_q6_k")
                 } else if lower.contains("q8_0") {
                     (QuantMethod::Gguf, 8, "gguf_q8_0")
+                } else if lower.contains("tq1") {
+                    (QuantMethod::Gguf, 1, "gguf_tq1")
+                } else if lower.contains("tq2") {
+                    (QuantMethod::Gguf, 2, "gguf_tq2")
                 } else if lower.contains("q2") || lower.contains("q3") {
                     (QuantMethod::Gguf, 3, "gguf_q3")
                 } else {
