@@ -80,6 +80,24 @@ impl MetalQuantizer {
         total_elements: usize,
     ) -> Result<Tensor> {
         tracing::info!("Running native Metal AWQ dequantization...");
+        validate_awq_inputs(qweight, scales, qzeros, total_elements)?;
+        // The Metal kernels intentionally use a narrow, explicit wire format:
+        // packed weights/zero-points are uint32 and scales are float16.  Model
+        // checkpoints commonly store scales as F32, so convert before handing
+        // the buffers to Metal.  Interpreting an F32 buffer as half silently
+        // produces corrupted weights (and used to evade CPU-only tests).
+        let qweight = qweight
+            .to_device(qweight.device())?
+            .to_dtype(candle_core::DType::U32)?
+            .contiguous()?;
+        let scales = scales
+            .to_device(qweight.device())?
+            .to_dtype(candle_core::DType::F16)?
+            .contiguous()?;
+        let qzeros = qzeros
+            .to_device(qweight.device())?
+            .to_dtype(candle_core::DType::U32)?
+            .contiguous()?;
         let out = Tensor::zeros(total_elements, candle_core::DType::F16, qweight.device())?;
 
         if let Device::Metal(metal_device) = qweight.device() {
@@ -122,6 +140,10 @@ impl MetalQuantizer {
 
                 let total_elements_u32 = total_elements as u32;
                 encoder.set_bytes(4, &total_elements_u32);
+                let scale_count = scales.elem_count() as u32;
+                let zero_count = qzeros.elem_count() as u32;
+                encoder.set_bytes(5, &scale_count);
+                encoder.set_bytes(6, &zero_count);
 
                 let threads_per_grid = objc2_metal::MTLSize {
                     width: total_elements,
@@ -165,6 +187,25 @@ impl MetalQuantizer {
         total_elements: usize,
     ) -> Result<Tensor> {
         tracing::info!("Running native Metal GPTQ dequantization...");
+        validate_gptq_inputs(qweight, scales, qzeros, g_idx, total_elements)?;
+        // See the AWQ path above.  In particular, F32 scales must be converted
+        // to F16 because the kernel's pointer type is `half*`.
+        let qweight = qweight
+            .to_device(qweight.device())?
+            .to_dtype(candle_core::DType::U32)?
+            .contiguous()?;
+        let scales = scales
+            .to_device(qweight.device())?
+            .to_dtype(candle_core::DType::F16)?
+            .contiguous()?;
+        let qzeros = qzeros
+            .to_device(qweight.device())?
+            .to_dtype(candle_core::DType::U32)?
+            .contiguous()?;
+        let g_idx = g_idx
+            .to_device(qweight.device())?
+            .to_dtype(candle_core::DType::U32)?
+            .contiguous()?;
         let out = Tensor::zeros(total_elements, candle_core::DType::F16, qweight.device())?;
 
         if let Device::Metal(metal_device) = qweight.device() {
@@ -219,6 +260,10 @@ impl MetalQuantizer {
 
                 let total_elements_u32 = total_elements as u32;
                 encoder.set_bytes(5, &total_elements_u32);
+                let scale_count = scales.elem_count() as u32;
+                let zero_count = qzeros.elem_count() as u32;
+                encoder.set_bytes(6, &scale_count);
+                encoder.set_bytes(7, &zero_count);
 
                 let threads_per_grid = objc2_metal::MTLSize {
                     width: total_elements,
@@ -380,6 +425,96 @@ impl MetalQuantizer {
     }
 }
 
+#[cfg(feature = "metal")]
+fn validate_awq_inputs(
+    qweight: &Tensor,
+    scales: &Tensor,
+    qzeros: &Tensor,
+    total_elements: usize,
+) -> Result<()> {
+    if total_elements == 0 {
+        return Err(candle_core::Error::Msg(
+            "Metal AWQ dequantization requires at least one output element".into(),
+        ));
+    }
+    if total_elements > u32::MAX as usize {
+        return Err(candle_core::Error::Msg(
+            "Metal AWQ dequantization output is too large for the kernel".into(),
+        ));
+    }
+    let packed = total_elements.div_ceil(8);
+    let blocks = total_elements.div_ceil(128);
+    let zero_words = blocks.div_ceil(8);
+    if qweight.elem_count() < packed {
+        return Err(candle_core::Error::Msg(format!(
+            "AWQ qweight has {} elements, need at least {}",
+            qweight.elem_count(),
+            packed
+        )));
+    }
+    if scales.elem_count() < blocks {
+        return Err(candle_core::Error::Msg(format!(
+            "AWQ scales has {} elements, need at least {}",
+            scales.elem_count(),
+            blocks
+        )));
+    }
+    if qzeros.elem_count() < zero_words {
+        return Err(candle_core::Error::Msg(format!(
+            "AWQ qzeros has {} elements, need at least {}",
+            qzeros.elem_count(),
+            zero_words
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "metal")]
+fn validate_gptq_inputs(
+    qweight: &Tensor,
+    scales: &Tensor,
+    qzeros: &Tensor,
+    g_idx: &Tensor,
+    total_elements: usize,
+) -> Result<()> {
+    if total_elements == 0 {
+        return Err(candle_core::Error::Msg(
+            "Metal GPTQ dequantization requires at least one output element".into(),
+        ));
+    }
+    if total_elements > u32::MAX as usize {
+        return Err(candle_core::Error::Msg(
+            "Metal GPTQ dequantization output is too large for the kernel".into(),
+        ));
+    }
+    let packed = total_elements.div_ceil(8);
+    if qweight.elem_count() < packed {
+        return Err(candle_core::Error::Msg(format!(
+            "GPTQ qweight has {} elements, need at least {}",
+            qweight.elem_count(),
+            packed
+        )));
+    }
+    if g_idx.elem_count() < total_elements {
+        return Err(candle_core::Error::Msg(format!(
+            "GPTQ g_idx has {} elements, need at least {}",
+            g_idx.elem_count(),
+            total_elements
+        )));
+    }
+    if scales.elem_count() == 0 {
+        return Err(candle_core::Error::Msg(
+            "GPTQ scales has no elements".into(),
+        ));
+    }
+    if qzeros.elem_count() == 0 {
+        return Err(candle_core::Error::Msg(
+            "GPTQ qzeros has no elements".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,5 +556,80 @@ mod tests {
         assert_eq!(res_vec.len(), 128);
         assert!((res_vec[0] - 10.0).abs() < 1e-3);
         assert!((res_vec[1] - 8.0).abs() < 1e-3);
+    }
+
+    // These tests intentionally require a real Apple GPU.  They catch ABI
+    // mismatches between the Rust tensor buffers and the Metal kernels (in
+    // particular F32 checkpoint scales being read as half), which CPU-only
+    // fallback tests cannot observe.
+    #[cfg(all(feature = "metal", feature = "hardware-tests"))]
+    #[test]
+    fn test_metal_awq_matches_cpu_for_f32_scales() {
+        let metal = Device::new_metal(0).expect("Metal device is required");
+        let qweight = Tensor::from_slice(&[0x12345678u32; 16], (16,), &metal).unwrap();
+        let scales = Tensor::from_slice(&[2.0f32], (1,), &metal).unwrap();
+        let qzeros = Tensor::from_slice(&[3u32], (1,), &metal).unwrap();
+
+        let quantizer = MetalQuantizer::new(&metal).unwrap();
+        let gpu = quantizer
+            .dequantize_awq(&qweight, &scales, &qzeros, 128)
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let cpu = MetalQuantizer::dequantize_awq_cpu(&qweight, &scales, &qzeros, 128)
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        assert_eq!(gpu.len(), cpu.len());
+        assert!(
+            gpu.iter()
+                .zip(cpu.iter())
+                .all(|(actual, expected)| (actual - expected).abs() < 0.02)
+        );
+    }
+
+    #[cfg(all(feature = "metal", feature = "hardware-tests"))]
+    #[test]
+    fn test_metal_gptq_matches_cpu_for_f32_scales() {
+        let metal = Device::new_metal(0).expect("Metal device is required");
+        let qweight = Tensor::from_slice(&[0x12345678u32; 16], (16,), &metal).unwrap();
+        let scales = Tensor::from_slice(&[2.0f32; 2], (2,), &metal).unwrap();
+        let qzeros = Tensor::from_slice(&[0x00000033u32], (1,), &metal).unwrap();
+        let g_idx = Tensor::from_slice(&[0u32; 128], (128,), &metal).unwrap();
+
+        let quantizer = MetalQuantizer::new(&metal).unwrap();
+        let gpu = quantizer
+            .dequantize_gptq(&qweight, &scales, &qzeros, &g_idx, 128)
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let cpu = MetalQuantizer::dequantize_gptq_cpu(&qweight, &scales, &qzeros, &g_idx, 128)
+            .unwrap()
+            .to_device(&Device::Cpu)
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        assert_eq!(gpu.len(), cpu.len());
+        assert!(
+            gpu.iter()
+                .zip(cpu.iter())
+                .all(|(actual, expected)| (actual - expected).abs() < 0.02)
+        );
     }
 }

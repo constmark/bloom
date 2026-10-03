@@ -10,6 +10,8 @@ kernel void dequantize_awq_int4(
     device const uint *qzeros [[buffer(2)]],
     device half *output [[buffer(3)]],
     constant uint &total_elements [[buffer(4)]],
+    constant uint &scale_count [[buffer(5)]],
+    constant uint &zero_count [[buffer(6)]],
     uint id [[thread_position_in_grid]]
 ) {
     if (id >= total_elements) return;
@@ -22,8 +24,16 @@ kernel void dequantize_awq_int4(
     
     // AWQ default block size is 128
     uint block_idx = id / 128;
-    
+    if (block_idx >= scale_count) {
+        output[id] = half(0.0);
+        return;
+    }
+
     uint z_idx = block_idx / 8;
+    if (z_idx >= zero_count) {
+        output[id] = half(0.0);
+        return;
+    }
     uint z_shift = (block_idx % 8) * 4;
     uint packed_z = qzeros[z_idx];
     uint z_quant = (packed_z >> z_shift) & 0xF;
@@ -40,6 +50,8 @@ kernel void dequantize_gptq_int4(
     device const uint *g_idx [[buffer(3)]],
     device half *output [[buffer(4)]],
     constant uint &total_elements [[buffer(5)]],
+    constant uint &scale_count [[buffer(6)]],
+    constant uint &zero_count [[buffer(7)]],
     uint id [[thread_position_in_grid]]
 ) {
     if (id >= total_elements) return;
@@ -52,8 +64,16 @@ kernel void dequantize_gptq_int4(
     uint w_quant = (packed_w >> shift) & 0xF;
     
     uint group = g_idx[id];
-    
+    if (group >= scale_count) {
+        output[id] = half(0.0);
+        return;
+    }
+
     uint z_idx = group / 8;
+    if (z_idx >= zero_count) {
+        output[id] = half(0.0);
+        return;
+    }
     uint z_shift = (group % 8) * 4;
     uint packed_z = qzeros[z_idx];
     uint z_quant = (packed_z >> z_shift) & 0xF;
