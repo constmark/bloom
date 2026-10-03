@@ -1124,6 +1124,16 @@ mod tests {
     }
 
     #[test]
+    fn zero_block_size_is_rejected_without_panicking() {
+        let pool = BloomKvCachePool::new(0, 4);
+        let err = pool
+            .allocate_paged("invalid", &[1, 2], 1, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("block_size"));
+        assert_eq!(pool.block_for_handle(1, 0), None);
+    }
+
+    #[test]
     fn quantized_tensor_writes_round_trip_through_vector_reads() {
         let mut config = test_config();
         config.kv_dtype = KvCacheDtype::Int8;
