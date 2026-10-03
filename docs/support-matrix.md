@@ -119,6 +119,14 @@ On Apple Silicon, run the local Metal gates explicitly:
 ```bash
 cargo test -p bloomai-engine --features 'metal hardware-tests' --lib executor::metal_quant
 cargo build -p bloomai-server --features metal --bin bloom_server
+
+fixture_root=$(mktemp -d /tmp/bloom-metal-smoke.XXXXXX)
+cargo run --locked -p bloomai-engine --example generate_tiny_qwen2_fixture -- \
+  --output "$fixture_root/model"
+python3 scripts/openai_compat_smoke.py \
+  --server-bin target/debug/bloom_server \
+  --model "$fixture_root/model" --require-model \
+  --backend candle --device gpu --max-tokens 2
 ```
 
 The hardware gate compares native Metal AWQ/GPTQ dequantization against the CPU
