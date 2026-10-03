@@ -171,23 +171,37 @@ impl TokenAdmission {
         }
 
         let budget = config.budget();
-        let used_total = self.used_prefill_tokens + self.used_decode_tokens;
-        if used_total + tokens > budget.total_tokens {
+        let Some(used_total) = self
+            .used_prefill_tokens
+            .checked_add(self.used_decode_tokens)
+        else {
+            return false;
+        };
+        let Some(new_total) = used_total.checked_add(tokens) else {
+            return false;
+        };
+        if new_total > budget.total_tokens {
             return false;
         }
 
         match phase {
             TokenPhase::Prefill => {
-                if self.used_prefill_tokens + tokens > budget.prefill_tokens {
+                let Some(new_phase) = self.used_prefill_tokens.checked_add(tokens) else {
+                    return false;
+                };
+                if new_phase > budget.prefill_tokens {
                     return false;
                 }
-                self.used_prefill_tokens += tokens;
+                self.used_prefill_tokens = new_phase;
             }
             TokenPhase::Decode => {
-                if self.used_decode_tokens + tokens > budget.decode_tokens {
+                let Some(new_phase) = self.used_decode_tokens.checked_add(tokens) else {
+                    return false;
+                };
+                if new_phase > budget.decode_tokens {
                     return false;
                 }
-                self.used_decode_tokens += tokens;
+                self.used_decode_tokens = new_phase;
             }
         }
         true
@@ -226,5 +240,27 @@ mod tests {
         assert!(admission.try_reserve(&config, TokenPhase::Prefill, 8));
         assert!(!admission.try_reserve(&config, TokenPhase::Decode, 4));
         assert!(admission.try_reserve(&config, TokenPhase::Decode, 2));
+    }
+
+    #[test]
+    fn admission_rejects_token_count_overflow() {
+        let config = TokenSchedulingConfig {
+            max_prefill_tokens_per_step: usize::MAX,
+            max_decode_tokens_per_step: usize::MAX,
+            max_total_tokens_per_step: usize::MAX,
+            ..Default::default()
+        };
+        let mut admission = TokenAdmission::default();
+
+        assert!(admission.try_reserve(&config, TokenPhase::Prefill, 1));
+        // A wrapped total or phase counter could otherwise make this request
+        // look cheap and bypass the configured token budget.
+        assert!(!admission.try_reserve(
+            &config,
+            TokenPhase::Prefill,
+            usize::MAX
+        ));
+        assert_eq!(admission.used_prefill_tokens, 1);
+        assert_eq!(admission.used_decode_tokens, 0);
     }
 }
