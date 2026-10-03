@@ -1647,6 +1647,7 @@ mod tests {
             assert!(state.block_table.is_empty());
             assert!(state.active_requests.is_empty());
             assert!(state.handle_to_request_id.is_empty());
+            assert!(state.request_id_to_handle.is_empty());
             assert_eq!(state.next_handle, 1);
         }
 
@@ -1671,6 +1672,7 @@ mod tests {
             let request_id = state.handle_to_request_id.get(&handle).unwrap();
             assert!(request_id.starts_with("legacy-request-"));
             assert!(state.active_requests.contains_key(request_id));
+            assert_eq!(state.request_id_to_handle.get(request_id), Some(&handle));
             assert_eq!(state.next_handle, handle + 1);
         }
         let allocated = pool.get_metrics();
@@ -1682,6 +1684,7 @@ mod tests {
         {
             let state = pool.state.lock().unwrap_or_else(|e| e.into_inner());
             assert!(state.handle_to_request_id.is_empty());
+            assert!(state.request_id_to_handle.is_empty());
             assert_eq!(state.active_requests.len(), 1);
             assert!(state.active_requests.values().all(|record| !record.active));
         }
@@ -1719,6 +1722,11 @@ mod tests {
         assert!(!state.active_requests.contains_key("cached"));
         assert!(state.active_requests.contains_key("replacement"));
         assert_eq!(state.handle_to_request_id.len(), 1);
+        assert_eq!(state.request_id_to_handle.len(), 1);
+        assert_eq!(
+            state.request_id_to_handle.get("replacement"),
+            Some(&allocation.handle)
+        );
         assert!(
             state
                 .handle_to_request_id
@@ -1819,6 +1827,38 @@ mod tests {
         assert_eq!(metrics.free_blocks, 0);
         assert_eq!(metrics.active_blocks, 2);
         assert_eq!(metrics.cached_blocks, 2); // req2 is still cached
+    }
+
+    #[test]
+    fn compact_inactive_removes_both_handle_indexes() {
+        let pool = BloomKvCachePool::new(4, 2);
+        let allocation = pool
+            .allocate_paged("compact-me", &[1, 2, 3, 4, 5, 6, 7, 8], 0, None)
+            .unwrap();
+        pool.free_paged("compact-me");
+
+        {
+            let state = pool.state.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                state
+                    .handle_to_request_id
+                    .get(&allocation.handle)
+                    .map(String::as_str),
+                Some("compact-me")
+            );
+            assert_eq!(
+                state.request_id_to_handle.get("compact-me"),
+                Some(&allocation.handle)
+            );
+        }
+
+        assert_eq!(pool.compact_inactive(2), 2);
+
+        assert!(pool.block_for_handle(allocation.handle, 0).is_none());
+        let state = pool.state.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(state.active_requests.is_empty());
+        assert!(state.handle_to_request_id.is_empty());
+        assert!(state.request_id_to_handle.is_empty());
     }
 
     #[test]
