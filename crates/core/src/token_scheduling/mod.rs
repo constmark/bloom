@@ -255,11 +255,7 @@ mod tests {
         assert!(admission.try_reserve(&config, TokenPhase::Prefill, 1));
         // A wrapped total or phase counter could otherwise make this request
         // look cheap and bypass the configured token budget.
-        assert!(!admission.try_reserve(
-            &config,
-            TokenPhase::Prefill,
-            usize::MAX
-        ));
+        assert!(!admission.try_reserve(&config, TokenPhase::Prefill, usize::MAX));
         assert_eq!(admission.used_prefill_tokens, 1);
         assert_eq!(admission.used_decode_tokens, 0);
     }
