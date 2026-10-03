@@ -214,8 +214,18 @@ impl ResourceCoordinator {
 
             // Never invoke model code while holding the coordinator mutex.
             for (model_id, callback) in batch.callbacks {
-                if let Err(error) = callback() {
-                    tracing::error!("Failed to evict model '{}': {}", model_id, error);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback()));
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::error!("Failed to evict model '{}': {}", model_id, error);
+                    }
+                    Err(_) => {
+                        tracing::error!(
+                            "Eviction callback panicked for model '{}'; continuing",
+                            model_id
+                        );
+                    }
                 }
             }
             if !batch.removed {
@@ -703,6 +713,26 @@ mod tests {
             )
             .unwrap();
         assert_eq!(lease.evicted_models, vec!["evict-me"]);
+    }
+
+    #[test]
+    fn panicking_eviction_callback_does_not_poison_reservations() {
+        let coord = ResourceCoordinator::new(1000, 1000, MemoryTopology::Discrete);
+        let callback: OffloadCallback =
+            std::sync::Arc::new(|| -> Result<(), String> { panic!("simulated offload failure") });
+        coord
+            .reserve(
+                make_ticket("panic-model", 800, 0, ResourcePriority::Low),
+                callback,
+            )
+            .unwrap();
+        let lease = coord
+            .reserve(
+                make_ticket("after-panic", 400, 0, ResourcePriority::Normal),
+                noop_cb(),
+            )
+            .unwrap();
+        assert_eq!(lease.evicted_models, vec!["panic-model"]);
     }
 
     #[test]

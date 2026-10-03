@@ -801,9 +801,7 @@ impl KvCachePool for BloomKvCachePool {
                     .checked_add(1)
                     .and_then(|index| index.checked_mul(self.block_size))
                     .ok_or_else(|| {
-                        BloomError::SchedulingFailed(
-                            "KV prefix length overflows usize".into(),
-                        )
+                        BloomError::SchedulingFailed("KV prefix length overflows usize".into())
                     })?;
                 let prefix = prompt_tokens[0..prefix_len].to_vec();
                 let key = PrefixCacheKey {

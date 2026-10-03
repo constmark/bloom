@@ -34,7 +34,7 @@ or file detection alone does not mean that inference works.
 | Backend | Device | Build or runtime requirement | Status |
 | --- | --- | --- | --- |
 | Candle CPU | CPU | Default features | `experimental` |
-| Candle Metal | Apple GPU | `--features metal` | `experimental` |
+| Candle Metal | Apple GPU | `--features metal` | `experimental` — Apple M5/Metal 4 has a repeatable native Qwen2 tiny-fixture OpenAI smoke and AWQ/GPTQ dequantization hardware gate (`cargo test -p bloomai-engine --features 'metal hardware-tests' --lib executor::metal_quant`); trained-model quality and wider quantized checkpoint coverage still need pinned evidence |
 | Candle CUDA | NVIDIA GPU | `--features cuda` and CUDA toolchain | `experimental` |
 | OpenVINO | Intel CPU, GPU, or NPU | OpenVINO runtime | `external-runtime` |
 | llama.cpp | CPU or GPU | Compatible `llama-server` | `external-runtime` |
@@ -113,6 +113,18 @@ BLOOM_REQUIRE_MODEL=1 \
 BLOOM_MODEL_PATH=/path/to/model.gguf \
 ./scripts/ollama_compat_smoke.py --require-model --require-ollama-sdk
 ```
+
+On Apple Silicon, run the local Metal gates explicitly:
+
+```bash
+cargo test -p bloomai-engine --features 'metal hardware-tests' --lib executor::metal_quant
+cargo build -p bloomai-server --features metal --bin bloom_server
+```
+
+The hardware gate compares native Metal AWQ/GPTQ dequantization against the CPU
+reference with F32 checkpoint scales. The generated tiny-fixture smoke exercises
+the server and OpenAI/Ollama protocol paths, but it is intentionally untrained
+and is not model-quality evidence.
 
 Promotion to `stable` requires a pinned model source and hash, a reproducible
 command, successful task-specific quality evidence, and an appropriate

@@ -241,6 +241,14 @@ pub fn default_engine_supports(
                 "engine '{}' does not natively support {method} quantization (supported: {:?}); conversion or fallback may be needed",
                 cap.engine_name, cap.supported_quant_methods
             ));
+        } else if manifest_quant_method(manifest).is_none()
+            && !cap.supported_quant_methods.is_empty()
+            && manifest_uses_unclassified_quantization(manifest)
+        {
+            return SupportLevel::Fallback(format!(
+                "engine '{}' cannot identify the model's quantization method; supported methods are {:?}",
+                cap.engine_name, cap.supported_quant_methods
+            ));
         }
     }
 
@@ -310,6 +318,19 @@ fn manifest_is_quantized(manifest: &ModelManifest) -> bool {
         manifest.primary_dtype,
         DType::Q4 | DType::I4 | DType::NF4 | DType::Q8 | DType::I8 | DType::U8
     )
+}
+
+fn manifest_uses_unclassified_quantization(manifest: &ModelManifest) -> bool {
+    if let Some(info) = manifest.quantization.as_ref() {
+        return matches!(info.scheme, QuantScheme::INT4)
+            || (matches!(info.scheme, QuantScheme::None)
+                && matches!(manifest.primary_dtype, DType::Q4 | DType::I4));
+    }
+    matches!(manifest.primary_dtype, DType::Q4 | DType::I4)
+        && !manifest
+            .files
+            .iter()
+            .any(|file| file.format == ModelFormat::Gguf)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

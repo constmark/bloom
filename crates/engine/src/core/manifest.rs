@@ -583,48 +583,82 @@ pub fn plan_oom_downgrade(
 /// Infer `QuantizationInfo` from an HF `config.json` value.
 pub fn infer_quantization(config: &serde_json::Value) -> Option<QuantizationInfo> {
     let quant_config = config.get("quantization_config")?;
-    let method = quant_config.get("quant_method")?.as_str()?;
-    match method {
-        "awq" => {
-            let group_size = quant_config
-                .get("group_size")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as usize);
-            Some(QuantizationInfo {
-                scheme: QuantScheme::AWQ,
-                bits: quant_config
-                    .get("bits")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(4) as u8,
-                group_size,
-                act_order: false,
-                kv_cache_dtype: None,
-                imatrix: false,
-            })
+    let method = quant_config
+        .get("quant_method")
+        .and_then(serde_json::Value::as_str)
+        .map(|method| method.to_ascii_lowercase())?;
+    let bits = quant_config
+        .get("bits")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            quant_config
+                .get("weight_bits")
+                .and_then(serde_json::Value::as_u64)
+        })
+        .map(|bits| bits.clamp(1, u8::MAX as u64) as u8);
+    let group_size = quant_config
+        .get("group_size")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok());
+    let act_order = quant_config
+        .get("desc_act")
+        .or_else(|| quant_config.get("act_order"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let kv_cache_dtype = quant_config
+        .get("kv_cache_dtype")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|dtype| match dtype.to_ascii_lowercase().as_str() {
+            "f32" | "float32" => Some(DType::F32),
+            "f16" | "float16" => Some(DType::F16),
+            "bf16" | "bfloat16" => Some(DType::BF16),
+            "q8" | "int8" | "i8" => Some(DType::Q8),
+            "q4" | "int4" | "i4" => Some(DType::Q4),
+            _ => None,
+        });
+
+    let (scheme, default_bits) = match method.as_str() {
+        "awq" | "awq_marlin" => (QuantScheme::AWQ, 4),
+        "gptq" | "gptq_marlin" | "marlin" => (QuantScheme::GPTQ, 4),
+        "bitsandbytes" | "bnb" => {
+            let four_bit = quant_config
+                .get("load_in_4bit")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+                || quant_config.get("bnb_4bit_compute_dtype").is_some();
+            if four_bit {
+                let nf4 = quant_config
+                    .get("bnb_4bit_quant_type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("nf4"));
+                (
+                    if nf4 {
+                        QuantScheme::NF4
+                    } else {
+                        QuantScheme::INT4
+                    },
+                    4,
+                )
+            } else {
+                (QuantScheme::INT8, 8)
+            }
         }
-        "gptq" => {
-            let group_size = quant_config
-                .get("group_size")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as usize);
-            let act_order = quant_config
-                .get("desc_act")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            Some(QuantizationInfo {
-                scheme: QuantScheme::GPTQ,
-                bits: quant_config
-                    .get("bits")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(4) as u8,
-                group_size,
-                act_order,
-                kv_cache_dtype: None,
-                imatrix: false,
-            })
-        }
-        _ => None,
-    }
+        "nf4" => (QuantScheme::NF4, 4),
+        "int8" | "eetq" | "fp8" | "fbgemm_fp8" => (QuantScheme::INT8, 8),
+        "int4" | "fp4" | "hqq" | "aqlm" | "exl2" | "quanto" | "torchao" => (QuantScheme::INT4, 4),
+        _ => return None,
+    };
+    Some(QuantizationInfo {
+        scheme,
+        bits: bits.unwrap_or(default_bits),
+        group_size,
+        act_order,
+        kv_cache_dtype,
+        imatrix: quant_config
+            .get("imatrix")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    })
 }
 
 /// Metadata extracted from a GGUF header and tensor table.
@@ -3465,6 +3499,35 @@ mod tests {
         assert_eq!(manifest.family, ModelFamily::Custom("mlx".to_string()));
         assert_eq!(manifest.files[0].format, ModelFormat::Mlx);
         assert_eq!(manifest.files[0].name, "weights.npz");
+    }
+
+    #[test]
+    fn test_infer_hf_quantization_variants() {
+        let awq = serde_json::json!({
+            "quantization_config": {"quant_method": "awq_marlin", "bits": 4, "group_size": 128}
+        });
+        let info = infer_quantization(&awq).unwrap();
+        assert!(matches!(info.scheme, QuantScheme::AWQ));
+        assert_eq!(info.bits, 4);
+
+        let nf4 = serde_json::json!({
+            "quantization_config": {
+                "quant_method": "bitsandbytes",
+                "load_in_4bit": true,
+                "bnb_4bit_quant_type": "nf4",
+                "kv_cache_dtype": "bf16"
+            }
+        });
+        let info = infer_quantization(&nf4).unwrap();
+        assert!(matches!(info.scheme, QuantScheme::NF4));
+        assert_eq!(info.kv_cache_dtype, Some(DType::BF16));
+
+        let int8 = serde_json::json!({
+            "quantization_config": {"quant_method": "bitsandbytes", "load_in_8bit": true}
+        });
+        let info = infer_quantization(&int8).unwrap();
+        assert!(matches!(info.scheme, QuantScheme::INT8));
+        assert_eq!(info.bits, 8);
     }
 
     #[test]
