@@ -368,6 +368,12 @@ impl QuantizationConfig {
                     (QuantMethod::Gguf, 1, "gguf_tq1")
                 } else if lower.contains("tq2") {
                     (QuantMethod::Gguf, 2, "gguf_tq2")
+                } else if lower.contains("tq3") {
+                    (QuantMethod::Gguf, 3, "gguf_tq3")
+                } else if lower.contains("tq4") {
+                    (QuantMethod::Gguf, 4, "gguf_tq4")
+                } else if lower.contains("tq5") {
+                    (QuantMethod::Gguf, 5, "gguf_tq5")
                 } else if lower.contains("q2") || lower.contains("q3") {
                     (QuantMethod::Gguf, 3, "gguf_q3")
                 } else {
@@ -686,6 +692,12 @@ mod tests {
         let qc_q4km = QuantizationConfig::from_gguf_metadata(Some("Q4_K_M"));
         assert_eq!(qc_q4km.weight_bits, 4);
         assert_eq!(qc_q4km.source_format, "gguf_q4_k_m");
+
+        let qc_iq1 = QuantizationConfig::from_gguf_metadata(Some("IQ1_S"));
+        assert_eq!(qc_iq1.weight_bits, 1);
+
+        let qc_tq2 = QuantizationConfig::from_gguf_metadata(Some("TQ2_0"));
+        assert_eq!(qc_tq2.weight_bits, 2);
 
         let qc_q6k = QuantizationConfig::from_gguf_metadata(Some("Q6_K"));
         assert_eq!(qc_q6k.weight_bits, 6);

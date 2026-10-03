@@ -328,6 +328,9 @@ impl BloomKvCachePool {
     /// outside the allocated range. Used by the batch executor's KV bridge to
     /// route extracted model KV into the correct paged-cache block.
     pub fn block_for_handle(&self, handle: usize, token_pos: usize) -> Option<usize> {
+        if self.block_size == 0 {
+            return None;
+        }
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let request_id = state.handle_to_request_id.get(&handle)?;
         let record = state.active_requests.get(request_id)?;
@@ -595,6 +598,12 @@ impl KvCachePool for BloomKvCachePool {
         max_new_tokens: usize,
         multimodal_hash: Option<&str>,
     ) -> Result<KvCacheAllocation> {
+        if self.block_size == 0 {
+            return Err(BloomError::SchedulingFailed(
+                "KV cache block_size must be greater than zero".into(),
+            )
+            .into());
+        }
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut evicted_blocks = Vec::new();
 
@@ -630,13 +639,21 @@ impl KvCachePool for BloomKvCachePool {
             });
         }
 
-        let total_tokens = prompt_tokens.len() + max_new_tokens;
+        let total_tokens = prompt_tokens
+            .len()
+            .checked_add(max_new_tokens)
+            .ok_or_else(|| BloomError::SchedulingFailed("KV token count overflows usize".into()))?;
         let needed_blocks = total_tokens.div_ceil(self.block_size);
         let num_prompt_blocks = prompt_tokens.len() / self.block_size;
         let mut reused_blocks = Vec::new();
         let mut reused_prefixes = Vec::new();
         for i in 0..num_prompt_blocks {
-            let prefix_len = (i + 1) * self.block_size;
+            let prefix_len = i
+                .checked_add(1)
+                .and_then(|index| index.checked_mul(self.block_size))
+                .ok_or_else(|| {
+                    BloomError::SchedulingFailed("KV prefix length overflows usize".into())
+                })?;
             let prefix = &prompt_tokens[0..prefix_len];
             let key = PrefixCacheKey {
                 tokens: prefix.to_vec(),
@@ -780,7 +797,14 @@ impl KvCachePool for BloomKvCachePool {
             state.block_ref_counts.insert(block_id, 1);
 
             let key = if next_prompt_block_idx < num_prompt_blocks {
-                let prefix_len = (next_prompt_block_idx + 1) * self.block_size;
+                let prefix_len = next_prompt_block_idx
+                    .checked_add(1)
+                    .and_then(|index| index.checked_mul(self.block_size))
+                    .ok_or_else(|| {
+                        BloomError::SchedulingFailed(
+                            "KV prefix length overflows usize".into(),
+                        )
+                    })?;
                 let prefix = prompt_tokens[0..prefix_len].to_vec();
                 let key = PrefixCacheKey {
                     tokens: prefix,
