@@ -1733,8 +1733,7 @@ impl InferenceScheduler {
                                 priority: r.priority,
                                 created_at: r.created_at,
                                 last_accessed: r.last_accessed,
-                                kv_cache_tokens: r.prompt_tokens.len()
-                                    + r.generated_tokens.len(),
+                                kv_cache_tokens: r.prompt_tokens.len() + r.generated_tokens.len(),
                                 generated_tokens: r.generated_tokens.len(),
                                 estimated_token_value: Some(1.0),
                                 is_active: matches!(
@@ -1756,8 +1755,7 @@ impl InferenceScheduler {
                                 priority: r.priority,
                                 created_at: r.created_at,
                                 last_accessed: r.last_accessed,
-                                kv_cache_tokens: r.prompt_tokens.len()
-                                    + r.generated_tokens.len(),
+                                kv_cache_tokens: r.prompt_tokens.len() + r.generated_tokens.len(),
                                 generated_tokens: r.generated_tokens.len(),
                                 estimated_token_value: Some(1.0),
                                 is_active: false,
