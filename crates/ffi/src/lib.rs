@@ -110,7 +110,11 @@ unsafe impl Sync for FfiOutputSinkV2<'_> {}
 
 impl OutputSink for FfiOutputSink {
     fn on_chunk(&mut self, chunk: OutputChunk) -> Result<()> {
-        let chunk_json = serde_json::to_string(&chunk).unwrap_or_else(|_| "{}".to_string());
+        // Preserve serialization failures for the caller. Emitting `{}` here
+        // would look like a valid event to ABI v1 consumers while silently
+        // dropping the actual output if a future output variant cannot be
+        // represented by JSON.
+        let chunk_json = serde_json::to_string(&chunk)?;
         let chunk_c = CString::new(chunk_json).map_err(|e| anyhow!("{}", e))?;
         unsafe {
             (self.callback)(self.user_data, chunk_c.as_ptr());
@@ -1302,12 +1306,41 @@ mod tests {
     use std::ffi::{CStr, CString};
     use std::os::raw::c_char;
 
-    use super::{BloomSlice, bloom_pipeline_load, bloom_pipeline_load_v2, catch_ffi_panic};
+    use bloomai_engine::core::io::OutputChunk;
+    use bloomai_engine::model::OutputSink;
+
+    use super::{
+        BloomSlice, FfiOutputSink, bloom_pipeline_load, bloom_pipeline_load_v2, catch_ffi_panic,
+    };
+
+    unsafe extern "C" fn capture_callback(
+        user_data: *mut std::ffi::c_void,
+        chunk_json: *const c_char,
+    ) {
+        unsafe {
+            *user_data.cast::<Option<String>>() =
+                Some(CStr::from_ptr(chunk_json).to_string_lossy().into_owned());
+        }
+    }
 
     #[test]
     fn ffi_panic_guard_returns_the_supplied_fallback() {
         let value = catch_ffi_panic(|| panic!("test panic"), || 17);
         assert_eq!(value, 17);
+    }
+
+    #[test]
+    fn legacy_stream_preserves_non_finite_audio_values() {
+        let mut callback_value = None;
+        let mut sink = FfiOutputSink {
+            callback: capture_callback,
+            user_data: (&mut callback_value as *mut Option<String>).cast(),
+        };
+
+        let result = sink.on_chunk(OutputChunk::AudioDelta(vec![f32::NAN]));
+
+        assert!(result.is_ok());
+        assert_eq!(callback_value.as_deref(), Some(r#"{"AudioDelta":[null]}"#));
     }
 
     #[test]

@@ -32,6 +32,14 @@ hosted independently, or its static build can be embedded in the server by the
 `serve-ui` feature. This keeps browser dependencies outside every inference
 path.
 
+Within the server, protocol adapters are kept separate from reusable
+application services. For example, `application::embedding` owns bounded input
+preparation, output validation, normalization, and rerank ordering without
+depending on Axum, request DTOs, or `ServerState`; the OpenAI and Ollama modules
+only perform protocol validation, runtime admission, and response projection.
+This keeps the same embedding behavior available to additional adapters without
+copying HTTP concerns into the execution path.
+
 ## Request flow
 
 1. A request enters through `bloom_infer`, the server protocol adapters, or an SDK.

@@ -351,6 +351,29 @@ class BloomPipelineTests(unittest.TestCase):
         self.assertEqual(self.fake_lib.freed_tokens, 1)
         pipeline.close()
 
+    def test_stream_timeout_cancels_a_blocked_v2_native_worker(self):
+        self.fake_lib.block_stream = True
+        pipeline = pipeline_module.BloomPipeline(".", engine="mock")
+        stream = pipeline.generate_stream("hello", timeout=0.01)
+
+        self.assertEqual(next(stream), {"TextDelta": "hello"})
+        with self.assertRaisesRegex(TimeoutError, "waiting for streaming output"):
+            next(stream)
+
+        self.assertTrue(self.fake_lib.stream_cancelled.wait(timeout=1))
+        self.assertGreaterEqual(self.fake_lib.cancel_calls, 1)
+        self.assertEqual(self.fake_lib.freed_tokens, 1)
+        pipeline.close()
+
+    def test_stream_timeout_is_validated_before_starting_native_worker(self):
+        pipeline = pipeline_module.BloomPipeline(".", engine="mock")
+        for timeout in (True, -1, float("nan"), float("inf"), "1"):
+            with self.subTest(timeout=timeout):
+                with self.assertRaises(ValueError):
+                    next(pipeline.generate_stream("hello", timeout=timeout))
+        self.assertFalse(self.fake_lib.stream_started.is_set())
+        pipeline.close()
+
     def _install_burst(self, count, *, legacy=False, status=0):
         self.burst_blocked = threading.Event()
         self.burst_finished = threading.Event()

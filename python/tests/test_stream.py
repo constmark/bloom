@@ -57,6 +57,20 @@ class StreamBufferTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertEqual(values, [None])
 
+    def test_receive_timeout_does_not_wait_for_native_completion(self):
+        buffer = _stream.StreamBuffer()
+        with self.assertRaisesRegex(TimeoutError, "waiting for streaming output"):
+            buffer.receive(timeout=0.01)
+        buffer.stop()
+
+    def test_receive_rejects_invalid_timeout(self):
+        buffer = _stream.StreamBuffer()
+        for timeout in (True, -1, float("nan"), float("inf"), "1"):
+            with self.subTest(timeout=timeout):
+                with self.assertRaises(ValueError):
+                    buffer.receive(timeout=timeout)
+        buffer.stop()
+
 
 if __name__ == "__main__":
     unittest.main()

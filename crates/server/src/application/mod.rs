@@ -3,6 +3,7 @@
 //! the server composition root, CLI parsing, or HTTP protocol modules.
 pub(crate) mod backend_registry;
 pub(crate) mod config;
+pub(crate) mod embedding;
 pub(crate) mod inference;
 pub(crate) mod loader;
 pub(crate) mod memory;

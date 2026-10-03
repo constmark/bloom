@@ -25,7 +25,7 @@ struct BloomReadiness: Decodable {
         schemaVersion == 3
             && object == "bloom.readiness"
             && status == "ready"
-            && model != nil
+            && model?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
             && modelTasks.contains("generation")
     }
 }
@@ -135,6 +135,7 @@ enum BloomClientError: LocalizedError {
     case serverNotReady(String)
     case invalidHTTPResponse
     case http(Int, String)
+    case streamError(String)
     case malformedStream
     case streamEndedWithoutDone
 
@@ -150,6 +151,8 @@ enum BloomClientError: LocalizedError {
             return "The server returned an invalid HTTP response."
         case let .http(status, message):
             return "Server error \(status): \(message)"
+        case let .streamError(message):
+            return "Generation failed: \(message)"
         case .malformedStream:
             return "The server returned malformed streaming data."
         case .streamEndedWithoutDone:

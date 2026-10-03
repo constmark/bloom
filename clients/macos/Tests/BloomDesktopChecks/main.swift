@@ -57,4 +57,43 @@ let encoderOnly = try JSONDecoder().decode(
 )
 require(!encoderOnly.supportsChat, "Encoder-only readiness should not enable chat")
 
+let emptyModel = try JSONDecoder().decode(
+    BloomReadiness.self,
+    from: Data(
+        """
+        {
+          "schema_version": 3,
+          "object": "bloom.readiness",
+          "status": "ready",
+          "progress": 100,
+          "model": "   ",
+          "model_tasks": ["generation"],
+          "context_window": 1024,
+          "load_error": null
+        }
+        """.utf8
+    )
+)
+require(!emptyModel.supportsChat, "A blank model name must not enable chat")
+
+_ = try BloomAPIClient(serverURL: " https://localhost:3000/bloom/ ", apiKey: "")
+for invalidURL in [
+    "localhost:3000",
+    "ftp://localhost:3000",
+    "https://user:password@localhost:3000",
+    "https://localhost:3000?token=secret",
+    "https://localhost:3000/#fragment"
+] {
+    do {
+        _ = try BloomAPIClient(serverURL: invalidURL, apiKey: "")
+        fatalError("URL should have been rejected: \(invalidURL)")
+    } catch BloomClientError.invalidServerURL {
+        // Expected.
+    }
+}
+require(
+    BloomClientError.streamError("model failed").errorDescription == "Generation failed: model failed",
+    "Streaming API errors should be readable"
+)
+
 print("Bloom Desktop checks passed")

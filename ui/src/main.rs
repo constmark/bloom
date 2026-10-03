@@ -169,6 +169,19 @@ fn model_transition_unavailable_reason(transition: &ConversationModelTransition)
     )
 }
 
+/// Only apply an asynchronous connection probe result to the configuration it
+/// was started with.  Settings can be edited while a probe is in flight; a
+/// late response from the old endpoint must never describe the new endpoint.
+fn connection_probe_is_current(requested: &ConnConfig, current: &ConnConfig) -> bool {
+    requested == current
+}
+
+/// Monotonically increasing token used by the Settings drawer to ignore a
+/// probe that was superseded by a newer probe or by edited fields.
+fn probe_generation_is_current(requested: u64, current: u64) -> bool {
+    requested == current
+}
+
 fn conversation_import_candidate(
     local: &ConversationStore,
     imported: &ConversationStore,
@@ -737,16 +750,28 @@ fn App() -> Element {
         loop {
             let cfg = config();
             match api::fetch_connection_readiness(&cfg).await {
-                Ok(readiness) => connection.set(ConnectionState::from_readiness(readiness)),
-                Err(api::ReadinessError::Authentication(message)) => {
+                Ok(readiness) if connection_probe_is_current(&cfg, &config()) => {
+                    connection.set(ConnectionState::from_readiness(readiness))
+                }
+                Err(api::ReadinessError::Authentication(message))
+                    if connection_probe_is_current(&cfg, &config()) =>
+                {
                     connection.set(ConnectionState::AuthenticationRequired { message })
                 }
-                Err(api::ReadinessError::Incompatible(message)) => {
+                Err(api::ReadinessError::Incompatible(message))
+                    if connection_probe_is_current(&cfg, &config()) =>
+                {
                     connection.set(ConnectionState::Incompatible { message })
                 }
-                Err(api::ReadinessError::Unavailable(_)) => {
+                Err(api::ReadinessError::Unavailable(_))
+                    if connection_probe_is_current(&cfg, &config()) =>
+                {
                     connection.set(ConnectionState::Offline)
                 }
+                // The user edited the endpoint or credential while this
+                // request was in flight. Ignore its result and let the next
+                // poll (or the reactive future restart) probe the new config.
+                _ => {}
             }
             TimeoutFuture::new(STATUS_POLL_INTERVAL_MS).await;
         }
@@ -5806,12 +5831,18 @@ fn SettingsDrawer(
     let mut json_schema = use_signal(|| generation().json_schema);
     let mut test_result = use_signal(|| Option::<(bool, String)>::None);
     let mut testing = use_signal(|| false);
+    let mut probe_generation = use_signal(|| 0_u64);
     let max_tokens_limit = context_window
         .and_then(|window| usize::try_from(window.saturating_sub(1)).ok())
         .unwrap_or(32_768)
         .clamp(1, 32_768);
 
     let mut on_test = move |_| {
+        // Invalidate any earlier probe before starting this one.  This also
+        // makes a second probe authoritative if a caller triggers it before
+        // the first response has arrived.
+        probe_generation += 1;
+        let requested_generation = probe_generation();
         testing.set(true);
         test_result.set(None);
         let cfg = ConnConfig {
@@ -5819,6 +5850,9 @@ fn SettingsDrawer(
             api_key: api_key(),
             remember_api_key: remember_api_key(),
         };
+        let current_base_url = base_url;
+        let current_api_key = api_key;
+        let current_remember_api_key = remember_api_key;
         spawn(async move {
             let result = match api::fetch_connection_readiness(&cfg).await {
                 Ok(readiness) if readiness.status == "ready" => (
@@ -5856,8 +5890,17 @@ fn SettingsDrawer(
                 }
                 Err(error) => (false, format!("Connection failed: {error}")),
             };
-            test_result.set(Some(result));
-            testing.set(false);
+            let current_cfg = ConnConfig {
+                base_url: current_base_url().trim_end_matches('/').to_string(),
+                api_key: current_api_key(),
+                remember_api_key: current_remember_api_key(),
+            };
+            if probe_generation_is_current(requested_generation, probe_generation())
+                && connection_probe_is_current(&cfg, &current_cfg)
+            {
+                test_result.set(Some(result));
+                testing.set(false);
+            }
         });
     };
 
@@ -5927,7 +5970,12 @@ fn SettingsDrawer(
                         value: "{base_url}",
                         maxlength: "{MAX_BASE_URL_CHARS}",
                         placeholder: "http://127.0.0.1:3000",
-                        oninput: move |event| base_url.set(event.value()),
+                        oninput: move |event| {
+                            base_url.set(event.value());
+                            probe_generation += 1;
+                            testing.set(false);
+                            test_result.set(None);
+                        },
                     }
                     div { class: "help", "Defaults to the current origin when the UI is embedded in Bloom." }
                 }
@@ -5939,7 +5987,12 @@ fn SettingsDrawer(
                         value: "{api_key}",
                         maxlength: "{MAX_API_KEY_CHARS}",
                         placeholder: "BLOOM_API_KEY",
-                        oninput: move |event| api_key.set(event.value()),
+                        oninput: move |event| {
+                            api_key.set(event.value());
+                            probe_generation += 1;
+                            testing.set(false);
+                            test_result.set(None);
+                        },
                     }
                     div { class: "help", "Required when the server uses --api-key. Hidden from diagnostics and conversation exports." }
                 }
@@ -5948,7 +6001,12 @@ fn SettingsDrawer(
                         input {
                             r#type: "checkbox",
                             checked: remember_api_key(),
-                            onchange: move |event| remember_api_key.set(event.checked()),
+                            onchange: move |event| {
+                                remember_api_key.set(event.checked());
+                                probe_generation += 1;
+                                testing.set(false);
+                                test_result.set(None);
+                            },
                         }
                         span { "Remember API key in this browser" }
                     }
@@ -6327,20 +6385,43 @@ mod tests {
         ChatMessage, ConnectionState, ConversationImportMode, ConversationStore, DisplayMessage,
         EmptyStateAction, GenerationOutcome, GenerationStats, Locale, ModalKeyAction,
         ModelIndexLocalState, Readiness, api, append_transcript_segment,
-        conversation_context_status, conversation_import_candidate, conversation_model_transition,
-        embedding_vector_norm, embedding_vector_preview, empty_state_view, encoder_input_preview,
-        format_duration, format_duration_seconds, format_generation_millis,
-        format_inventory_changes, format_inventory_drift_severity, format_inventory_drift_status,
-        format_load_phase, format_model_precision, format_model_tasks, format_optional_bytes,
-        format_optional_count, format_parameter_count, format_percent, generation_outcome_label,
-        integrity_phase_label, license_policy_allows, message_window, modal_key_action,
-        model_index_local_state, model_index_poll_interval_seconds,
-        model_index_upgrade_source_is_active, model_provenance_summary, optional_seed,
-        parse_optional_embedding_dimensions, supported_image_mime, supported_model_import_filename,
+        connection_probe_is_current, conversation_context_status, conversation_import_candidate,
+        conversation_model_transition, embedding_vector_norm, embedding_vector_preview,
+        empty_state_view, encoder_input_preview, format_duration, format_duration_seconds,
+        format_generation_millis, format_inventory_changes, format_inventory_drift_severity,
+        format_inventory_drift_status, format_load_phase, format_model_precision,
+        format_model_tasks, format_optional_bytes, format_optional_count, format_parameter_count,
+        format_percent, generation_outcome_label, integrity_phase_label, license_policy_allows,
+        message_window, modal_key_action, model_index_local_state,
+        model_index_poll_interval_seconds, model_index_upgrade_source_is_active,
+        model_provenance_summary, optional_seed, parse_optional_embedding_dimensions,
+        probe_generation_is_current, supported_image_mime, supported_model_import_filename,
         unconfirmed_conversation_model_transition, valid_sha256_input,
         validate_context_reservation,
     };
     use dioxus::prelude::Key;
+
+    #[test]
+    fn connection_probe_results_are_scoped_to_current_configuration() {
+        let requested = api::ConnConfig {
+            base_url: "http://127.0.0.1:3000".to_string(),
+            api_key: "old-key".to_string(),
+            remember_api_key: false,
+        };
+        let edited = api::ConnConfig {
+            api_key: "new-key".to_string(),
+            ..requested.clone()
+        };
+
+        assert!(connection_probe_is_current(&requested, &requested));
+        assert!(!connection_probe_is_current(&requested, &edited));
+    }
+
+    #[test]
+    fn newer_connection_probe_or_edit_invalidates_an_older_result() {
+        assert!(probe_generation_is_current(7, 7));
+        assert!(!probe_generation_is_current(7, 8));
+    }
 
     #[test]
     fn modal_keyboard_policy_closes_and_cycles_without_capturing_other_keys() {

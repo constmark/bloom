@@ -84,6 +84,15 @@ class ArchitectureTests(unittest.TestCase):
             with self.subTest(code=code):
                 self.assertTrue(self.check_source("crates/server/src/application/runtime_service.rs", code))
 
+    def test_embedding_service_rejects_transport_dependencies(self):
+        for code in [
+            "use axum::Json;",
+            "use crate::server_state::ServerState;",
+            "fn map_error(error: ApiError) {}",
+        ]:
+            with self.subTest(code=code):
+                self.assertTrue(self.check_source("crates/server/src/application/embedding.rs", code))
+
     def test_application_unit_tests_can_import_their_owner(self):
         self.assertEqual(self.check_source(
             "crates/server/src/application/inference.rs",

@@ -1,7 +1,9 @@
 """Bounded handoff from native callbacks to a Python stream consumer."""
 
 from collections import deque
+import math
 import threading
+import time
 
 
 MAX_STREAM_CHUNKS = 64
@@ -36,7 +38,24 @@ class StreamBuffer:
                     return
                 self._condition.wait()
 
-    def receive(self):
+    def receive(self, timeout=None):
+        """Return the next chunk, or ``None`` after a clean terminal state.
+
+        ``timeout`` bounds the wait for this individual chunk.  A timeout of
+        zero performs a non-blocking check.  A :class:`TimeoutError` is raised
+        when no chunk or terminal state is observed before the deadline.
+        """
+        if timeout is not None:
+            if (
+                not isinstance(timeout, (int, float))
+                or isinstance(timeout, bool)
+                or not math.isfinite(timeout)
+                or timeout < 0
+            ):
+                raise ValueError("timeout must be a finite non-negative number or None")
+            deadline = time.monotonic() + timeout
+        else:
+            deadline = None
         with self._condition:
             while True:
                 if self.stopped.is_set():
@@ -50,7 +69,13 @@ class StreamBuffer:
                     if self._error is not None:
                         raise self._error
                     return None
-                self._condition.wait()
+                if deadline is None:
+                    self._condition.wait()
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("Timed out waiting for streaming output")
+                    self._condition.wait(remaining)
 
     def finish(self, error=None):
         with self._condition:

@@ -61,6 +61,10 @@ Slow consumers apply backpressure to native callbacks. Individual chunks over
 release their workers; leaving the pipeline context also stops its streams and
 waits for active native calls before freeing the handle.
 
+Pass `timeout` to `generate_stream` to bound the wait for each next chunk. A
+`TimeoutError` stops the stream and releases its worker; omit it (the default)
+to wait indefinitely for native output.
+
 The wrapper negotiates ABI revision 2 and supports revision 1 fallback.
 Revision 2 cancellation is cooperative at output boundaries. Revision 1 has
 no native cancellation and must finish its native call before pipeline close

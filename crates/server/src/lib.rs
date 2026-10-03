@@ -87,6 +87,7 @@ mod tool_calling;
 mod ui;
 
 use application::backend_registry::engine_registry;
+use application::embedding::{EmbeddingBatchOutput, EmbeddingProjection, MAX_EMBEDDING_DIMENSIONS};
 use application::inference::{InferenceLifecycle, InferenceLifecycleResources, StreamExecution};
 use application::loader::model_loader_loop;
 use application::memory::RuntimeMemoryPlanner;

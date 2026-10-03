@@ -654,12 +654,26 @@ class BloomPipeline:
         top_p: float = 0.9,
         seed: Optional[int] = None,
         response_format: Optional[Union[str, Mapping[str, Any]]] = None,
+        timeout: Optional[float] = None,
     ) -> Generator[Dict[str, Any], None, None]:
         """
         Run streaming inference.
         
         Yields parsed OutputChunks progressively, with bounded backpressure.
+        ``timeout`` optionally bounds each wait for the next chunk.  When the
+        deadline expires, the stream is stopped and :class:`TimeoutError` is
+        raised; the default ``None`` preserves an unbounded wait.
         """
+        if (
+            timeout is not None
+            and (
+                not isinstance(timeout, (int, float))
+                or isinstance(timeout, bool)
+                or not math.isfinite(timeout)
+                or timeout < 0
+            )
+        ):
+            raise ValueError("timeout must be a finite non-negative number or None")
         input_bytes, params_bytes = self._prepare_input_params(
             prompt_or_input, max_tokens, temperature, top_p, seed, response_format
         )
@@ -795,7 +809,7 @@ class BloomPipeline:
 
         try:
             while True:
-                chunk = buffer.receive()
+                chunk = buffer.receive(timeout)
                 if chunk is None:
                     thread.join()
                     break

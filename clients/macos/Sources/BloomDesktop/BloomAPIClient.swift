@@ -3,19 +3,25 @@ import Foundation
 struct BloomAPIClient {
     let serverURL: URL
     let apiKey: String
+    private let session: URLSession
 
-    init(serverURL: String, apiKey: String) throws {
+    init(serverURL: String, apiKey: String, session: URLSession = .shared) throws {
         let trimmed = serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
         guard
             let url = URL(string: trimmed),
             let scheme = url.scheme?.lowercased(),
             scheme == "http" || scheme == "https",
-            url.host != nil
+            url.host != nil,
+            url.user == nil,
+            url.password == nil,
+            url.query == nil,
+            url.fragment == nil
         else {
             throw BloomClientError.invalidServerURL
         }
         self.serverURL = url
         self.apiKey = apiKey
+        self.session = session
     }
 
     @MainActor
@@ -25,7 +31,7 @@ struct BloomAPIClient {
         request.cachePolicy = .reloadIgnoringLocalCacheData
         applyHeaders(to: &request)
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw BloomClientError.invalidHTTPResponse
         }
@@ -36,7 +42,12 @@ struct BloomAPIClient {
             throw BloomClientError.http(http.statusCode, Self.errorMessage(from: data))
         }
 
-        let readiness = try JSONDecoder().decode(BloomReadiness.self, from: data)
+        let readiness: BloomReadiness
+        do {
+            readiness = try JSONDecoder().decode(BloomReadiness.self, from: data)
+        } catch {
+            throw BloomClientError.incompatibleServer
+        }
         guard readiness.schemaVersion == 3, readiness.object == "bloom.readiness" else {
             throw BloomClientError.incompatibleServer
         }
@@ -68,7 +79,7 @@ struct BloomAPIClient {
             )
         )
 
-        let (bytes, response) = try await URLSession.shared.bytes(for: request)
+        let (bytes, response) = try await session.bytes(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw BloomClientError.invalidHTTPResponse
         }
@@ -91,7 +102,7 @@ struct BloomAPIClient {
                 receivedDone = true
             case let .data(data):
                 if let envelope = try? JSONDecoder().decode(APIErrorEnvelope.self, from: data) {
-                    throw BloomClientError.http(200, envelope.error.message)
+                    throw BloomClientError.streamError(envelope.error.message)
                 }
                 guard let chunk = try? JSONDecoder().decode(ChatCompletionChunk.self, from: data) else {
                     throw BloomClientError.malformedStream
