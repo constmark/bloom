@@ -1708,50 +1708,6 @@ impl InferenceScheduler {
             let active_tokens = metrics.active_blocks * block_size;
             let total_tokens = metrics.total_blocks * block_size;
 
-            // Collect KvSessionInfo for eviction decisions
-            let mut sessions = Vec::new();
-            {
-                let active = self
-                    .active_requests
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                for r in active.values() {
-                    sessions.push(KvSessionInfo {
-                        request_id: r.id.clone(),
-                        model_id: r.model_id.clone(),
-                        priority: r.priority,
-                        created_at: r.created_at,
-                        last_accessed: r.last_accessed,
-                        kv_cache_tokens: r.prompt_tokens.len() + r.generated_tokens.len(),
-                        generated_tokens: r.generated_tokens.len(),
-                        estimated_token_value: Some(1.0),
-                        is_active: matches!(
-                            r.state,
-                            RequestState::Decoding { .. } | RequestState::Prefill
-                        ),
-                    });
-                }
-            }
-            {
-                let decoding = self
-                    .decoding_queue
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                for r in decoding.iter() {
-                    sessions.push(KvSessionInfo {
-                        request_id: r.id.clone(),
-                        model_id: r.model_id.clone(),
-                        priority: r.priority,
-                        created_at: r.created_at,
-                        last_accessed: r.last_accessed,
-                        kv_cache_tokens: r.prompt_tokens.len() + r.generated_tokens.len(),
-                        generated_tokens: r.generated_tokens.len(),
-                        estimated_token_value: Some(1.0),
-                        is_active: false,
-                    });
-                }
-            }
-
             let mut eviction_mgr = self
                 .kv_eviction_manager
                 .lock()
@@ -1761,6 +1717,52 @@ impl InferenceScheduler {
             // Check admission
             match eviction_mgr.check_admission(active_tokens, total_tokens) {
                 AdmissionResult::Rejected { reason, .. } => {
+                    // Only collect session metadata on the rejection path. Most submissions
+                    // are admitted, so keeping this scan out of the hot path avoids locking
+                    // both request queues and cloning every active request on each submit.
+                    let mut sessions = Vec::new();
+                    {
+                        let active = self
+                            .active_requests
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        for r in active.values() {
+                            sessions.push(KvSessionInfo {
+                                request_id: r.id.clone(),
+                                model_id: r.model_id.clone(),
+                                priority: r.priority,
+                                created_at: r.created_at,
+                                last_accessed: r.last_accessed,
+                                kv_cache_tokens: r.prompt_tokens.len() + r.generated_tokens.len(),
+                                generated_tokens: r.generated_tokens.len(),
+                                estimated_token_value: Some(1.0),
+                                is_active: matches!(
+                                    r.state,
+                                    RequestState::Decoding { .. } | RequestState::Prefill
+                                ),
+                            });
+                        }
+                    }
+                    {
+                        let decoding = self
+                            .decoding_queue
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        for r in decoding.iter() {
+                            sessions.push(KvSessionInfo {
+                                request_id: r.id.clone(),
+                                model_id: r.model_id.clone(),
+                                priority: r.priority,
+                                created_at: r.created_at,
+                                last_accessed: r.last_accessed,
+                                kv_cache_tokens: r.prompt_tokens.len() + r.generated_tokens.len(),
+                                generated_tokens: r.generated_tokens.len(),
+                                estimated_token_value: Some(1.0),
+                                is_active: false,
+                            });
+                        }
+                    }
+
                     // Try to evict inactive sessions to make room
                     let victims = eviction_mgr.select_eviction_victims(&sessions, num_tokens);
                     if victims.is_empty() {

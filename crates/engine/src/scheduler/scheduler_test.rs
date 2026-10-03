@@ -165,6 +165,56 @@ mod tests {
     }
 
     #[test]
+    fn admitted_submit_does_not_lock_eviction_session_queues() {
+        let scheduler = Arc::new(InferenceScheduler::new(
+            Arc::new(MockExecutor),
+            Arc::new(MockKvPool::new(10)),
+        ));
+        let active = scheduler
+            .active_requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let decoding = scheduler
+            .decoding_queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (tx, rx) = mpsc::channel();
+        let submitter = Arc::clone(&scheduler);
+        let worker = std::thread::spawn(move || {
+            let request = Request {
+                id: "admitted-with-queues-locked".to_string(),
+                model_id: "m1".to_string(),
+                prompt_tokens: vec![1],
+                generated_tokens: Vec::new(),
+                params: GenerationParams {
+                    max_tokens: 1,
+                    ..Default::default()
+                },
+                state: RequestState::Pending,
+                priority: 1,
+                kv_handle: None,
+                created_at: std::time::Instant::now(),
+                last_accessed: std::time::Instant::now(),
+                preemption_count: 0,
+                decode_started_at: None,
+                last_scheduled_at: None,
+                multimodal_hash: None,
+            };
+            tx.send(submitter.submit(request)).unwrap();
+        });
+
+        // The admitted path must not scan either session queue. Release both
+        // guards before joining so this test also terminates on regression.
+        let result = rx.recv_timeout(Duration::from_secs(2));
+        drop(decoding);
+        drop(active);
+        worker.join().unwrap();
+        result
+            .expect("admitted submit waited on eviction session queues")
+            .unwrap();
+    }
+
+    #[test]
     fn test_scheduler_cancellation_removes_orphaned_token_sender() {
         let executor = Arc::new(MockExecutor);
         let kv_pool = Arc::new(MockKvPool::new(10));
