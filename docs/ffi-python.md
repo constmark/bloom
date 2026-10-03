@@ -148,6 +148,9 @@ callers must observe these rules:
 
 - Every `BloomSlice` points to exactly `len` readable bytes for the complete
   call. Input is UTF-8; JSON slices must contain the documented object shapes.
+- Device names accept `cpu`, `gpu`, `cuda`, `metal`, `npu`, and `intel-npu`.
+  The accelerator aliases map to Bloom's generic device class and are shared
+  with the HTTP server's CLI configuration.
 - A non-NULL error buffer points to `error_buffer_len` writable bytes.
 - A pipeline handle is freed exactly once and is not used concurrently with
   `bloom_pipeline_free`.

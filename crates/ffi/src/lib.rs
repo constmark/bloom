@@ -19,6 +19,7 @@ use bloomai_engine::executor::candle::CandleEngine;
 use bloomai_engine::executor::coreml::CoreMlEngine;
 use bloomai_engine::executor::funasr::FunASREngine;
 use bloomai_engine::executor::intel_npu::IntelNpuEngine;
+use bloomai_engine::executor::laya::LayaEngine;
 use bloomai_engine::executor::llamacpp::LlamaCppEngine;
 use bloomai_engine::executor::longcat_image_edit::LongCatImageEditEngine;
 use bloomai_engine::executor::mlx::MlxEngine;
@@ -228,6 +229,7 @@ static ENGINE_REGISTRY: once_cell::sync::Lazy<EngineRegistry> = once_cell::sync:
     registry.register("coreml", Box::new(CoreMlEngine));
     registry.register("mlx", Box::new(MlxEngine));
     registry.register("llamacpp", Box::new(LlamaCppEngine));
+    registry.register("laya", Box::new(LayaEngine));
     #[cfg(feature = "candle-engine")]
     registry.register("wan", Box::new(WanEngine));
     registry.register("vulkan", Box::new(VulkanEngine));
@@ -256,6 +258,18 @@ fn catch_ffi_panic<T>(operation: impl FnOnce() -> T, on_panic: impl FnOnce() -> 
     match catch_unwind(AssertUnwindSafe(operation)) {
         Ok(value) => value,
         Err(_) => on_panic(),
+    }
+}
+
+/// Parse device names accepted by both the native ABI and the server CLI.
+/// Aliases intentionally collapse to the generic Bloom device class; the
+/// selected engine remains responsible for choosing its concrete runtime.
+fn device_kind_from_name(name: &str) -> Option<DeviceKind> {
+    match name.to_ascii_lowercase().as_str() {
+        "cpu" => Some(DeviceKind::Cpu),
+        "gpu" | "cuda" | "metal" => Some(DeviceKind::Gpu),
+        "npu" | "intel-npu" => Some(DeviceKind::Npu),
+        _ => None,
     }
 }
 
@@ -450,13 +464,11 @@ unsafe fn bloom_pipeline_load_impl(
             }
         };
 
-        let device = match device_name_str.to_lowercase().as_str() {
-            "cpu" => DeviceKind::Cpu,
-            "gpu" => DeviceKind::Gpu,
-            "npu" => DeviceKind::Npu,
-            other => {
+        let device = match device_kind_from_name(device_name_str) {
+            Some(device) => device,
+            None => {
                 write_error(
-                    &format!("Unknown device kind: {}", other),
+                    &format!("Unknown device kind: {}", device_name_str),
                     error_buffer,
                     error_buffer_len,
                 );
@@ -1306,6 +1318,7 @@ mod tests {
     use std::ffi::{CStr, CString};
     use std::os::raw::c_char;
 
+    use bloomai_core::DeviceKind;
     use bloomai_engine::core::io::OutputChunk;
     use bloomai_engine::model::OutputSink;
 
@@ -1364,6 +1377,18 @@ mod tests {
         assert!(pipeline.is_null());
         let error = unsafe { CStr::from_ptr(error_buffer.as_ptr()) }.to_string_lossy();
         assert!(error.contains("caught an internal panic"));
+    }
+
+    #[test]
+    fn device_aliases_match_the_server_cli_contract() {
+        assert_eq!(super::device_kind_from_name("CPU"), Some(DeviceKind::Cpu));
+        assert_eq!(super::device_kind_from_name("cuda"), Some(DeviceKind::Gpu));
+        assert_eq!(super::device_kind_from_name("METAL"), Some(DeviceKind::Gpu));
+        assert_eq!(
+            super::device_kind_from_name("intel-npu"),
+            Some(DeviceKind::Npu)
+        );
+        assert_eq!(super::device_kind_from_name("tpu"), None);
     }
 
     #[test]

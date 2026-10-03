@@ -10,6 +10,7 @@ use crate::application::embedding::{
     MAX_NATIVE_EMBEDDING_MICROBATCH_ITEMS, collect_embedding, normalize_embedding_batch,
     prepare_embedding_inputs, rank_embedding_documents, validate_embedding_output,
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
 #[derive(Debug)]
 pub(crate) struct EmbeddingBatchResult {
@@ -58,9 +59,9 @@ pub(crate) fn validate_openai_embedding_request(
     if request
         .encoding_format
         .as_deref()
-        .is_some_and(|format| format != "float")
+        .is_some_and(|format| !matches!(format, "float" | "base64"))
     {
-        return Err("Only encoding_format='float' is currently supported.".to_string());
+        return Err("encoding_format must be either 'float' or 'base64'.".to_string());
     }
     if request
         .dimensions
@@ -89,6 +90,19 @@ pub(crate) fn validate_openai_embedding_request(
         ));
     }
     Ok(())
+}
+
+/// Encode an embedding vector using OpenAI's `encoding_format: "base64"`
+/// representation. The wire format is the contiguous little-endian IEEE-754
+/// binary32 representation of each value, wrapped in standard padded base64.
+/// Keeping this conversion here makes the HTTP adapter's encoding explicit and
+/// avoids relying on the host's native float byte order.
+pub(crate) fn encode_embedding_base64(values: &[f32]) -> String {
+    let mut bytes = Vec::with_capacity(values.len().saturating_mul(std::mem::size_of::<f32>()));
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    BASE64_STANDARD.encode(bytes)
 }
 
 pub(crate) async fn execute_embedding_batch(
@@ -399,7 +413,7 @@ mod tests {
         let valid = serde_json::from_value::<EmbeddingRequest>(json!({
             "model": "default",
             "input": ["one", "two"],
-            "encoding_format": "float",
+            "encoding_format": "base64",
             "dimensions": 2,
             "user": "local-client",
             "future": null
@@ -408,7 +422,7 @@ mod tests {
         validate_openai_embedding_request(&valid).unwrap();
 
         for invalid in [
-            json!({"input": "one", "encoding_format": "base64"}),
+            json!({"input": "one", "encoding_format": "binary"}),
             json!({"input": "one", "dimensions": 0}),
             json!({"input": "one", "user": ""}),
             json!({"input": "one", "future": true}),
@@ -416,5 +430,11 @@ mod tests {
             let invalid = serde_json::from_value::<EmbeddingRequest>(invalid).unwrap();
             assert!(validate_openai_embedding_request(&invalid).is_err());
         }
+    }
+
+    #[test]
+    fn base64_embedding_encoding_is_little_endian_float32() {
+        // 1.0f32 and -2.5f32 in IEEE-754 little-endian bytes.
+        assert_eq!(encode_embedding_base64(&[1.0, -2.5]), "AACAPwAAIMA=");
     }
 }

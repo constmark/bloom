@@ -4471,6 +4471,10 @@ pub(crate) async fn handle_embeddings(
         .into_iter()
         .enumerate()
         .map(|(index, embedding)| {
+            let embedding = match payload.encoding_format.as_deref() {
+                Some("base64") => json!(encode_embedding_base64(&embedding)),
+                _ => json!(embedding),
+            };
             json!({
                 "object": "embedding",
                 "embedding": embedding,

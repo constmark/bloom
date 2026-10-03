@@ -324,12 +324,14 @@ family. Other packages must declare trusted `bloom_task=embedding` or
 signals. Encoder-only models reject Chat, Completions, and Responses generation
 with HTTP 422 `unsupported_operation`.
 
-Only `encoding_format: "float"` is supported. `dimensions` may be omitted for
-the native width or set from 1 through 16,384; requesting more dimensions than
-the model produces fails instead of fabricating values. An optional nonblank,
-control-free `user` string of at most 256 characters is admitted as unused
-compatibility metadata. Other non-null extension fields fail closed before
-runtime admission.
+`encoding_format` may be omitted or set to `"float"` (the default), or set to
+`"base64"` for OpenAI-compatible compact transport. Base64 vectors contain
+the contiguous little-endian IEEE-754 binary32 values wrapped in standard
+padded base64. `dimensions` may be omitted for the native width or set from 1
+through 16,384; requesting more dimensions than the model produces fails
+instead of fabricating values. An optional nonblank, control-free `user` string
+of at most 256 characters is admitted as unused compatibility metadata. Other
+non-null extension fields fail closed before runtime admission.
 
 Bloom tokenizes the complete batch before inference and rejects an input that
 exceeds the active context window; this endpoint does not silently truncate.

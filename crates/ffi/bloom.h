@@ -123,8 +123,12 @@ void bloom_buffer_free(BloomOwnedBuffer* buffer);
  * Load a model pipeline.
  *
  * @param model_path Path to the model directory or single file (GGUF).
- * @param engine_name Name of the execution engine (e.g. "candle", "openvino", "funasr").
- * @param device_name Name of the target device kind ("cpu", "gpu", "npu").
+ * @param engine_name Name of the execution engine (e.g. "candle", "openvino",
+ * "funasr", "laya", or "llamacpp").
+ * @param device_name Name of the target device kind ("cpu", "gpu", "cuda",
+ * "metal", "npu", or "intel-npu"). Device aliases map to Bloom's generic
+ * device class so native integrations can share configuration with the HTTP
+ * server.
  * @param context_size Maximum sequence length context; must be greater than zero.
  * @param error_buffer Buffer to write the error message on failure.
  * @param error_buffer_len Capacity of the error buffer in bytes.
