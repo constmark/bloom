@@ -243,6 +243,13 @@ pub(crate) struct PoolState {
     lru_list: VecDeque<String>, // request IDs of inactive requests
     next_handle: usize,
     handle_to_request_id: HashMap<usize, String>,
+    /// Reverse lookup for the stable handle assigned to each allocated request.
+    ///
+    /// `handle_to_request_id` is used on the hot path that resolves a block for
+    /// a batch executor handle. The reverse map keeps request-id based
+    /// allocation refreshes and eviction cleanup O(1) as the number of active
+    /// handles grows.
+    request_id_to_handle: HashMap<String, usize>,
     pub(crate) metrics: KvCacheMetrics,
 }
 
@@ -290,6 +297,7 @@ impl BloomKvCachePool {
                 lru_list: VecDeque::new(),
                 next_handle: 1,
                 handle_to_request_id: HashMap::new(),
+                request_id_to_handle: HashMap::new(),
                 metrics: KvCacheMetrics {
                     total_blocks,
                     free_blocks: total_blocks,
@@ -354,6 +362,9 @@ impl BloomKvCachePool {
                 let Some(record) = state.active_requests.remove(&evict_id) else {
                     continue;
                 };
+                if let Some(handle) = state.request_id_to_handle.remove(&evict_id) {
+                    state.handle_to_request_id.remove(&handle);
+                }
                 for (block_id, prefix) in record.blocks.iter().zip(record.prefixes.iter()) {
                     let count = state.block_ref_counts.entry(*block_id).or_insert(1);
                     *count = count.saturating_sub(1);
@@ -548,15 +559,25 @@ impl KvCachePool for BloomKvCachePool {
     fn free(&self, handle: usize) {
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(request_id) = state.handle_to_request_id.remove(&handle)
-                && let Some(record) = state.active_requests.get_mut(&request_id)
-            {
-                record.active = false;
-                record.last_accessed = Instant::now();
-                if let Some(pos) = state.lru_list.iter().position(|r| r == &request_id) {
-                    state.lru_list.remove(pos);
+            if let Some(request_id) = state.handle_to_request_id.remove(&handle) {
+                // `free` is the terminal release path. The request record is
+                // retained as an inactive prefix-cache entry, but neither
+                // handle index may continue to resolve this released handle.
+                if state
+                    .request_id_to_handle
+                    .get(&request_id)
+                    .is_some_and(|mapped| *mapped == handle)
+                {
+                    state.request_id_to_handle.remove(&request_id);
                 }
-                state.lru_list.push_back(request_id.clone());
+                if let Some(record) = state.active_requests.get_mut(&request_id) {
+                    record.active = false;
+                    record.last_accessed = Instant::now();
+                    if let Some(pos) = state.lru_list.iter().position(|r| r == &request_id) {
+                        state.lru_list.remove(pos);
+                    }
+                    state.lru_list.push_back(request_id.clone());
+                }
             }
             state.update_block_counts(self.total_blocks);
         }
@@ -579,10 +600,9 @@ impl KvCachePool for BloomKvCachePool {
 
         if state.active_requests.contains_key(request_id) {
             let handle = state
-                .handle_to_request_id
-                .iter()
-                .find(|(_, rid)| *rid == request_id)
-                .map(|(&h, _)| h)
+                .request_id_to_handle
+                .get(request_id)
+                .copied()
                 .ok_or_else(|| {
                     BloomError::SchedulingFailed(format!(
                         "active KV cache handle disappeared for request {request_id}"
@@ -680,9 +700,9 @@ impl KvCachePool for BloomKvCachePool {
                     break;
                 };
                 if let Some(record) = state.active_requests.remove(&evict_id) {
-                    state
-                        .handle_to_request_id
-                        .retain(|_, request_id| request_id != &evict_id);
+                    if let Some(handle) = state.request_id_to_handle.remove(&evict_id) {
+                        state.handle_to_request_id.remove(&handle);
+                    }
                     for (block_id, prefix) in record.blocks.iter().zip(record.prefixes.iter()) {
                         let count = state.block_ref_counts.entry(*block_id).or_insert(1);
                         *count = count.saturating_sub(1);
@@ -791,6 +811,9 @@ impl KvCachePool for BloomKvCachePool {
         state
             .handle_to_request_id
             .insert(handle, request_id.to_string());
+        state
+            .request_id_to_handle
+            .insert(request_id.to_string(), handle);
 
         state.active_requests.insert(
             request_id.to_string(),
