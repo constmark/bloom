@@ -188,17 +188,22 @@ impl TokenBucketRateLimiter {
         }
 
         let now = Instant::now();
-        let bucket_config = self
-            .config
-            .per_model_overrides
-            .get(model_id)
-            .cloned()
-            .unwrap_or_else(|| self.config.default_bucket.clone());
-
-        let bucket = self
-            .buckets
-            .entry(model_id.to_string())
-            .or_insert_with(|| TokenBucket::new(&bucket_config));
+        // Existing buckets are the hot path: avoid cloning configuration and
+        // allocating a temporary model-id key on every token admission.
+        let bucket = match self.buckets.get_mut(model_id) {
+            Some(bucket) => bucket,
+            None => {
+                let bucket_config = self
+                    .config
+                    .per_model_overrides
+                    .get(model_id)
+                    .cloned()
+                    .unwrap_or_else(|| self.config.default_bucket.clone());
+                self.buckets
+                    .entry(model_id.to_owned())
+                    .or_insert_with(|| TokenBucket::new(&bucket_config))
+            }
+        };
 
         if bucket.try_consume(tokens, now) {
             RateLimitDecision::Allowed
