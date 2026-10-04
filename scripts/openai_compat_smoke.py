@@ -11,11 +11,13 @@ with a deterministic tool fixture to require successful function lifecycles.
 from __future__ import annotations
 
 import argparse
+import base64
 import importlib.metadata
 import json
 import math
 import os
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -1379,7 +1381,6 @@ def request_openai_sdk_embeddings(
         model=model_id,
         input=["local AI runtime", "bounded retrieval"],
         dimensions=2,
-        encoding_format="float",
     )
     if response.model != model_id or len(response.data) != 2:
         raise AssertionError(f"OpenAI SDK decoded an invalid embedding response: {response}")
@@ -1389,10 +1390,40 @@ def request_openai_sdk_embeddings(
         norm = math.sqrt(math.fsum(float(value) ** 2 for value in embedding.embedding))
         if not math.isclose(norm, 1.0, rel_tol=1e-4, abs_tol=1e-4):
             raise AssertionError(f"OpenAI SDK embedding was not L2-normalized: {norm}")
+
+    base64_response = client.embeddings.create(
+        model=model_id,
+        input=["local AI runtime", "bounded retrieval"],
+        dimensions=2,
+        encoding_format="base64",
+    )
+    if base64_response.model != model_id or len(base64_response.data) != 2:
+        raise AssertionError(
+            f"OpenAI SDK returned an invalid base64 embedding response: {base64_response}"
+        )
+    for index, embedding in enumerate(base64_response.data):
+        encoded = embedding.embedding
+        if embedding.index != index or not isinstance(encoded, str):
+            raise AssertionError(
+                f"OpenAI SDK returned an invalid base64 embedding item: {embedding}"
+            )
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+            values = struct.unpack("<2f", raw)
+        except (ValueError, struct.error) as error:
+            raise AssertionError(
+                f"OpenAI SDK returned malformed base64 embedding data: {embedding}"
+            ) from error
+        norm = math.sqrt(math.fsum(float(value) ** 2 for value in values))
+        if not math.isclose(norm, 1.0, rel_tol=1e-4, abs_tol=1e-4):
+            raise AssertionError(
+                f"OpenAI SDK base64 embedding was not L2-normalized: {norm}"
+            )
     return {
         "status": "ok",
         "vectors": len(response.data),
         "dimensions": 2,
+        "base64": "ok",
         "model_retrieve": "ok",
     }
 

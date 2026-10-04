@@ -420,6 +420,9 @@ mod tests {
         }))
         .unwrap();
         validate_openai_embedding_request(&valid).unwrap();
+        let mut float = valid.clone();
+        float.encoding_format = Some("float".to_string());
+        validate_openai_embedding_request(&float).unwrap();
 
         for invalid in [
             json!({"input": "one", "encoding_format": "binary"}),

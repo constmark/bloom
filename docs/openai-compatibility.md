@@ -516,9 +516,10 @@ BLOOM_MODEL_PATH=/path/to/embedding-model \
   --embedding-only --require-model --require-openai-sdk
 ```
 
-This mode validates SDK-decoded projected embeddings, L2 norms, token usage,
-stable rerank ties, score bounds, `top_n`, returned documents, and response
-identity.
+This mode validates the official SDK's default embedding request (which may use
+the compact base64 transport), an explicit base64 response decoded as little-
+endian float32 values, projected embeddings, L2 norms, token usage, stable
+rerank ties, score bounds, `top_n`, returned documents, and response identity.
 
 Maintainers can run the immutable trained MiniLM profile directly:
 
