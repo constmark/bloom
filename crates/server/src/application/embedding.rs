@@ -127,8 +127,7 @@ pub(crate) fn collect_embedding(
         },
     )?;
 
-    embedding
-        .ok_or_else(|| anyhow!("model did not produce OutputChunk::Embedding"))
+    embedding.ok_or_else(|| anyhow!("model did not produce OutputChunk::Embedding"))
 }
 
 pub(crate) fn validate_embedding_output(
