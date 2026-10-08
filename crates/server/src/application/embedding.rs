@@ -108,8 +108,7 @@ pub(crate) fn collect_embedding(
     pipeline: Arc<InferencePipeline>,
     text: String,
 ) -> Result<Vec<f32>> {
-    let embedding = Arc::new(std::sync::Mutex::new(None::<Vec<f32>>));
-    let embedding_sink = Arc::clone(&embedding);
+    let mut embedding = None;
     let params = bloomai_core::GenerationParams {
         max_tokens: 1,
         temperature: 0.0,
@@ -120,20 +119,15 @@ pub(crate) fn collect_embedding(
     pipeline.run_stream(
         ModelInput::Text { prompt: text },
         &params,
-        &mut move |chunk: OutputChunk| {
+        &mut |chunk: OutputChunk| {
             if let OutputChunk::Embedding(values) = chunk {
-                let mut slot = embedding_sink.lock().unwrap_or_else(|e| e.into_inner());
-                *slot = Some(values);
+                embedding = Some(values);
             }
             Ok(())
         },
     )?;
 
-    embedding
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
-        .ok_or_else(|| anyhow!("model did not produce OutputChunk::Embedding"))
+    embedding.ok_or_else(|| anyhow!("model did not produce OutputChunk::Embedding"))
 }
 
 pub(crate) fn validate_embedding_output(
