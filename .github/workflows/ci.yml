@@ -244,6 +244,8 @@ jobs:
           toolchain: "1.97.1"
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Test macOS client contracts
+        run: ./scripts/test_macos_client.sh
       - name: Check (Metal features)
         run: cargo check --workspace --all-targets --features metal --locked
       - name: Clippy
