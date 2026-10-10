@@ -484,7 +484,10 @@ mod tests {
         let missing_script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../npu_script_missing_for_test.py");
         assert!(!missing_script.exists());
-        assert!(!script_available_or_skip(&missing_script, "npu_script_missing_for_test.py"));
+        assert!(!script_available_or_skip(
+            &missing_script,
+            "npu_script_missing_for_test.py"
+        ));
     }
 
     #[test]
