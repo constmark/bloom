@@ -24,7 +24,9 @@ static site or embed it in the server binary.
 - Multiple browser-local conversations with automatic titles and guarded deletion
 - Case-insensitive conversation search across titles and message text, plus safe renaming
 - Versioned, bounded conversation backup with transactional merge or confirmed full-history restore
-- Configurable server URL and API key with session-only storage by default and explicit opt-in persistence
+- Configurable server URL, inference API key, and session-only operator API key
+  for split-credential deployments; the inference key supports explicit opt-in
+  persistence while the operator key never enters persistent storage
 - Versioned UI/server readiness handshake with explicit unavailable and incompatible states
 - Task-aware generation, live speech-to-text, or embedding/rerank workspace selection from readiness v3
 - Browser microphone capture with bounded 16 kHz mono PCM windows, live ASR partials, final-window flushing, and copyable transcripts
@@ -113,8 +115,12 @@ storage are trusted; the key then remains in `localStorage` until it is cleared
 or replaced. Connections saved by an older Bloom UI retain their existing key
 and are marked as remembered, avoiding a surprise logout during migration.
 Disabling the option moves the current key into session storage and removes it
-from the persistent connection record. Conversation and diagnostics exports
-never include either form of the credential.
+from the persistent connection record. When the server uses distinct
+`BLOOM_API_KEY` and `BLOOM_OPERATOR_API_KEY`, the operator key is entered
+separately in Settings and is sent only to authenticated model-management
+routes. It remains in this tab's `sessionStorage` and is never written to
+persistent connection settings. Conversation and diagnostics exports never
+include either form of the credential.
 
 The main workspace follows the current readiness state. It links offline users
 directly to connection settings, sends an empty or failed runtime to the Models

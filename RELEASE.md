@@ -209,12 +209,14 @@ TTFT, TBT, tokens/s, peak memory, OS, and hardware in
 ## Artifacts
 
 - Linux application archive containing the embedded browser UI,
-  `bloom_infer`, `bloom_server`, `bloom_bench`, `inspect_gguf`, and docs.
+  `bloom_desktop`, `bloom_infer`, `bloom_server`, `bloom_bench`,
+  `inspect_gguf`, and docs.
 - macOS application archive containing the embedded browser UI,
-  `bloom_infer`, `bloom_server`, `bloom_bench`, `inspect_gguf`, and docs.
+  `bloom_desktop`, `bloom_infer`, `bloom_server`, `bloom_bench`,
+  `inspect_gguf`, and docs.
 - Windows zip application archive containing the embedded browser UI,
-  `bloom_infer.exe`, `bloom_server.exe`, `bloom_bench.exe`, `inspect_gguf.exe`,
-  and docs.
+  `bloom_desktop.exe`, `bloom_infer.exe`, `bloom_server.exe`,
+  `bloom_bench.exe`, `inspect_gguf.exe`, and docs.
 - Docker image for CPU/local serving.
 - SHA-256 checksums for every published archive.
 - A signed GitHub build-provenance attestation for every archive and checksum

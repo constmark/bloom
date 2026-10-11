@@ -605,15 +605,7 @@ impl CandleEngine {
 
         let mut eos_token_ids = Vec::new();
         if let Some(eos_id) = config.get("eos_token_id") {
-            if let Some(arr) = eos_id.as_array() {
-                for v in arr {
-                    if let Some(id) = v.as_u64() {
-                        eos_token_ids.push(id as u32);
-                    }
-                }
-            } else if let Some(id) = eos_id.as_u64() {
-                eos_token_ids.push(id as u32);
-            }
+            eos_token_ids = parse_eos_token_ids(eos_id)?;
         }
         if eos_token_ids.is_empty() {
             match model_type {
@@ -693,6 +685,32 @@ fn estimate_model_size(model_path: &Path) -> usize {
         total_size = 1_200_000_000;
     }
     total_size
+}
+
+/// Parse EOS token metadata without silently truncating malformed model IDs.
+///
+/// Model configuration files are external input. A value larger than the
+/// tokenizer's `u32` token ID range must fail model loading rather than wrap
+/// into a different token and make generation terminate unpredictably.
+fn parse_eos_token_ids(value: &serde_json::Value) -> Result<Vec<u32>> {
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+
+    let values = value
+        .as_array()
+        .map(|items| items.as_slice())
+        .unwrap_or_else(|| std::slice::from_ref(value));
+    let mut ids = Vec::with_capacity(values.len());
+    for item in values {
+        let raw = item.as_u64().ok_or_else(|| {
+            anyhow!("eos_token_id must be an unsigned integer or an array of unsigned integers")
+        })?;
+        let id = u32::try_from(raw)
+            .map_err(|_| anyhow!("eos_token_id {raw} exceeds the supported u32 token ID range"))?;
+        ids.push(id);
+    }
+    Ok(ids)
 }
 
 /// Read a GGUF file's header and synthesise a minimal config.json that can be
@@ -3541,6 +3559,31 @@ mod tests {
 
         let invalid = serde_json::json!({ "model_type": "invalid_model" });
         assert_eq!(ModelType::from_config(&invalid), None);
+    }
+
+    #[test]
+    fn eos_token_ids_reject_overflow_and_malformed_values() {
+        assert_eq!(
+            parse_eos_token_ids(&serde_json::json!(151645)).unwrap(),
+            vec![151645]
+        );
+        assert_eq!(
+            parse_eos_token_ids(&serde_json::json!([1, 2, 3])).unwrap(),
+            vec![1, 2, 3]
+        );
+        assert!(
+            parse_eos_token_ids(&serde_json::json!(u64::from(u32::MAX) + 1))
+                .unwrap_err()
+                .to_string()
+                .contains("u32 token ID range")
+        );
+        assert!(parse_eos_token_ids(&serde_json::json!([-1])).is_err());
+        assert!(parse_eos_token_ids(&serde_json::json!("151645")).is_err());
+        assert!(
+            parse_eos_token_ids(&serde_json::Value::Null)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

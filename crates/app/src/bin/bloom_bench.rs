@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
 
 use anyhow::{Result, anyhow};
-use bloomai_core::{BenchmarkResult, DType, DeviceKind, GenerationParams};
+use bloomai_core::{BenchmarkResult, DType, GenerationParams};
 use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 use serde::{Deserialize, Serialize};
@@ -139,8 +139,9 @@ struct Args {
     #[arg(long, default_value = "candle")]
     backend: String,
 
-    /// Device to run on: cpu, gpu.
-    #[arg(long, default_value = "cpu")]
+    /// Device to run on: auto, cpu, gpu, or npu. Auto probes the host and
+    /// chooses the best device supported by the selected engine.
+    #[arg(long, default_value = "auto")]
     device: String,
 
     /// Precision to load the model with: f32, f16, bf16.
@@ -317,6 +318,7 @@ fn main() -> Result<()> {
     registry.register("wan", Box::new(WanEngine));
 
     let backend_name = if args.backend == "candle" {
+        let has_format = |format| manifest.files.iter().any(|file| file.format == format);
         // Auto-select engine based on manifest family and details
         let is_qwen_vl = manifest.family == bloomai_core::ModelFamily::Qwen
             && (manifest.id.to_lowercase().contains("vl")
@@ -328,6 +330,16 @@ fn main() -> Result<()> {
                     .unwrap_or(false));
         if is_qwen_vl {
             "qwen3_vl"
+        } else if has_format(bloomai_core::ModelFormat::Onnx) {
+            "onnxruntime"
+        } else if has_format(bloomai_core::ModelFormat::OpenVinoIr) {
+            "openvino"
+        } else if has_format(bloomai_core::ModelFormat::CoreMl) {
+            "coreml"
+        } else if has_format(bloomai_core::ModelFormat::Mlx) {
+            "mlx"
+        } else if has_format(bloomai_core::ModelFormat::VulkanSpirv) {
+            "vulkan"
         } else if matches!(&manifest.family, bloomai_core::ModelFamily::Custom(c) if c == "longcat-image-edit")
         {
             "longcat"
@@ -350,12 +362,9 @@ fn main() -> Result<()> {
             e
         )
     })?;
-    let device_kind = match args.device.to_lowercase().as_str() {
-        "cpu" => DeviceKind::Cpu,
-        "gpu" | "cuda" | "metal" => DeviceKind::Gpu,
-        "npu" | "intel-npu" => DeviceKind::Npu,
-        other => return Err(anyhow!("unsupported device: {}", other)),
-    };
+    let device_kind = bloomai_backend::BackendRegistry::default()
+        .resolve_device_selector(&args.device, &engine.supported_devices())
+        .map_err(|error| anyhow!("could not resolve device '{}': {error}", args.device))?;
 
     let load_start = Instant::now();
     let pipeline = InferencePipeline::load_standalone_with_context(
@@ -397,7 +406,8 @@ fn main() -> Result<()> {
         vec![args.prompt.clone()]
     };
 
-    let device_label = args.device.clone();
+    // Keep benchmark metadata truthful when the requested selector is `auto`.
+    let device_label = format!("{:?}", pipeline.device()).to_lowercase();
     let os_label = if cfg!(target_os = "macos") {
         "macOS".to_string()
     } else if cfg!(target_os = "linux") {

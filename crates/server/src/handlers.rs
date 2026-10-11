@@ -5344,9 +5344,50 @@ pub(crate) async fn handle_backends(State(state): State<Arc<ServerState>>) -> im
         })
         .collect();
 
+    // Engine capabilities describe what an adapter was built to support, but
+    // they do not tell a GUI whether the host actually has a usable device.
+    // Reuse the backend registry's bounded, side-effect-free probes so a
+    // graphical client can make an actionable device recommendation without
+    // attempting a model load.  Keep this additive to preserve existing
+    // `/v1/backends` consumers.
+    let device_statuses =
+        tokio::task::spawn_blocking(|| bloomai_backend::BackendRegistry::default().status())
+            .await
+            .unwrap_or_default();
+    let devices: Vec<serde_json::Value> = device_statuses
+        .into_iter()
+        .map(|status| {
+            let capability = status.capability.map(|cap| {
+                json!({
+                    "backend_name": cap.backend_name,
+                    "vendor": cap.vendor,
+                    "device_class": format!("{:?}", cap.device_class),
+                    "memory_topology": format!("{:?}", cap.memory_topology),
+                    "max_memory": cap.max_memory,
+                    "available_memory": cap.available_memory,
+                    "supported_dtypes": cap.supported_dtypes.iter().map(|dtype| format!("{:?}", dtype)).collect::<Vec<_>>(),
+                    "supported_formats": cap.supported_formats.iter().map(|format| format!("{:?}", format)).collect::<Vec<_>>(),
+                    "supports_mmap": cap.supports_mmap,
+                    "has_quantization_kernels": cap.has_quantization_kernels,
+                    "supports_streaming": cap.supports_streaming,
+                    "max_batch_tokens": cap.max_batch_tokens,
+                    "available_parallelism": cap.available_parallelism,
+                })
+            });
+            json!({
+                "name": status.name,
+                "available": status.available,
+                "reason": status.reason,
+                "details": status.details,
+                "capability": capability,
+            })
+        })
+        .collect();
+
     Json(json!({
         "object": "list",
         "data": backends,
+        "devices": devices,
         "active_model": model_id,
     }))
 }

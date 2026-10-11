@@ -30,7 +30,7 @@ size and hash.
 | `self_check.status` | `passed` for a native doctor run, or `not_run_cross_target` when the build host could not execute the target |
 | `self_check.doctor_status` | Doctor `pass` or `warn` result when executed; otherwise `null` |
 | `self_check.failures` | Zero for a passed native self-check; otherwise `null` |
-| `binaries` | Sorted executable names, byte sizes, and lowercase SHA-256 digests |
+| `binaries` | Sorted executable names (`bloom_bench`, `bloom_desktop`, `bloom_infer`, `bloom_server`, and `inspect_gguf`), byte sizes, and lowercase SHA-256 digests |
 
 Windows targets use `.exe` binary names. Linux and macOS targets use
 extensionless binary names with executable archive modes.

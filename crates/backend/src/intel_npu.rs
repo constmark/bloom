@@ -294,7 +294,7 @@ impl Backend for IntelNpuBackend {
             max_memory: total_memory,
             available_memory: avail_memory,
             supported_dtypes: vec![DType::F16, DType::Q4, DType::Q8],
-            supported_formats: vec![ModelFormat::OpenVinoIr],
+            supported_formats: vec![ModelFormat::OpenVinoIr, ModelFormat::Onnx],
             supports_mmap: true,
             has_quantization_kernels: true, // Supported via OpenVINO
             supports_streaming: false,

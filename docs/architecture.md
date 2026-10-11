@@ -60,7 +60,7 @@ copying HTTP concerns into the execution path.
 | `bloomai-core` | Public data types, manifests, resource contracts, reusable scheduling/resource policies, and errors |
 | `bloomai-backend` | Device capabilities, hardware probing, reservation, and backend registry |
 | `bloomai-engine` | Model loading, processors, executors, inference pipeline, and scheduler |
-| `bloomai-app` | Process configuration files and `bloom_infer`, `bloom_bench`, `bloom_quantize`, and `inspect_gguf` entry points |
+| `bloomai-app` | Process configuration files and `bloom_desktop`, `bloom_infer`, `bloom_bench`, `bloom_quantize`, and `inspect_gguf` entry points |
 | `bloomai-server` | Application assembly, model lifecycle, HTTP protocols, operations, and optional embedded UI adapter |
 | `bloomai-tilelang` | Dynamic kernel compilation and loading |
 | `bloomai-ffi` | Pre-1.0 C ABI used by native and Python consumers |

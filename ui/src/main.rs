@@ -240,6 +240,29 @@ enum EmptyStateAction {
     Settings,
 }
 
+/// The most useful drawer to open for a given runtime status. Keeping this
+/// policy separate from the header event handler makes the recovery path
+/// explicit and keeps it covered by a small, deterministic unit test.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectionStatusAction {
+    Models,
+    Settings,
+    Diagnostics,
+}
+
+fn connection_status_action(connection: &ConnectionState) -> ConnectionStatusAction {
+    match connection {
+        ConnectionState::Connecting
+        | ConnectionState::Offline
+        | ConnectionState::AuthenticationRequired { .. }
+        | ConnectionState::Incompatible { .. } => ConnectionStatusAction::Settings,
+        ConnectionState::NoModel
+        | ConnectionState::Loading { .. }
+        | ConnectionState::LoadFailed { .. } => ConnectionStatusAction::Models,
+        ConnectionState::Ready { .. } => ConnectionStatusAction::Diagnostics,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct EmptyStateView {
     title: String,
@@ -1293,6 +1316,14 @@ fn App() -> Element {
             });
         }
     };
+    // Turn the always-visible runtime status into a direct recovery/diagnostic
+    // entry point.  The destination follows the current state so users do not
+    // have to guess which drawer contains the next useful action.
+    let status_action = move |_| match connection_status_action(&connection()) {
+        ConnectionStatusAction::Settings => show_settings.set(true),
+        ConnectionStatusAction::Models => show_models.set(true),
+        ConnectionStatusAction::Diagnostics => show_diagnostics.set(true),
+    };
     let show_embedding_workspace = connection().can_embed() && !connection().can_chat();
     let show_speech_workspace = connection().can_transcribe() && !connection().can_chat();
     let show_specialized_workspace = show_embedding_workspace || show_speech_workspace;
@@ -1560,11 +1591,17 @@ fn App() -> Element {
                         }
                     }
                     div { class: "header-actions",
-                        span {
+                        button {
                             class: "status-pill {status_view.0}",
-                            role: "status",
+                            r#type: "button",
                             aria_live: "polite",
                             aria_atomic: "true",
+                            aria_label: "Open connection details",
+                            // Keep the full connection state available to assistive
+                            // technology and as a tooltip when the compact mobile
+                            // indicator hides the text label.
+                            title: "{status_view.1}",
+                            onclick: status_action,
                             span { class: "status-dot" }
                             "{status_view.1}"
                         }
@@ -5812,6 +5849,7 @@ fn SettingsDrawer(
     use_modal_focus(SETTINGS_DRAWER_DIALOG_ID);
     let mut base_url = use_signal(|| config().base_url);
     let mut api_key = use_signal(|| config().api_key);
+    let mut operator_api_key = use_signal(|| config().operator_api_key);
     let mut remember_api_key = use_signal(|| config().remember_api_key);
     let mut max_tokens = use_signal(|| generation().max_tokens);
     let mut temperature = use_signal(|| generation().temperature);
@@ -5848,10 +5886,12 @@ fn SettingsDrawer(
         let cfg = ConnConfig {
             base_url: base_url().trim_end_matches('/').to_string(),
             api_key: api_key(),
+            operator_api_key: operator_api_key(),
             remember_api_key: remember_api_key(),
         };
         let current_base_url = base_url;
         let current_api_key = api_key;
+        let current_operator_api_key = operator_api_key;
         let current_remember_api_key = remember_api_key;
         spawn(async move {
             let result = match api::fetch_connection_readiness(&cfg).await {
@@ -5893,6 +5933,7 @@ fn SettingsDrawer(
             let current_cfg = ConnConfig {
                 base_url: current_base_url().trim_end_matches('/').to_string(),
                 api_key: current_api_key(),
+                operator_api_key: current_operator_api_key(),
                 remember_api_key: current_remember_api_key(),
             };
             if probe_generation_is_current(requested_generation, probe_generation())
@@ -5908,6 +5949,7 @@ fn SettingsDrawer(
         let cfg = ConnConfig {
             base_url: base_url().trim_end_matches('/').to_string(),
             api_key: api_key(),
+            operator_api_key: operator_api_key(),
             remember_api_key: remember_api_key(),
         };
         let parsed_seed = match optional_seed(&seed()) {
@@ -5995,6 +6037,23 @@ fn SettingsDrawer(
                         },
                     }
                     div { class: "help", "Required when the server uses --api-key. Hidden from diagnostics and conversation exports." }
+                }
+                div { class: "field",
+                    label { r#for: "operator-api-key", "Operator API key (optional)" }
+                    input {
+                        id: "operator-api-key",
+                        r#type: "password",
+                        value: "{operator_api_key}",
+                        maxlength: "{MAX_API_KEY_CHARS}",
+                        placeholder: "BLOOM_OPERATOR_API_KEY",
+                        oninput: move |event| {
+                            operator_api_key.set(event.value());
+                            probe_generation += 1;
+                            testing.set(false);
+                            test_result.set(None);
+                        },
+                    }
+                    div { class: "help", "Used for model management when the server separates operator and inference credentials. Kept only in this tab's session storage." }
                 }
                 div { class: "field credential-persistence-field",
                     label { class: "checkbox-row",
@@ -6382,17 +6441,17 @@ fn ConfirmDialog(
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatMessage, ConnectionState, ConversationImportMode, ConversationStore, DisplayMessage,
-        EmptyStateAction, GenerationOutcome, GenerationStats, Locale, ModalKeyAction,
-        ModelIndexLocalState, Readiness, api, append_transcript_segment,
-        connection_probe_is_current, conversation_context_status, conversation_import_candidate,
-        conversation_model_transition, embedding_vector_norm, embedding_vector_preview,
-        empty_state_view, encoder_input_preview, format_duration, format_duration_seconds,
-        format_generation_millis, format_inventory_changes, format_inventory_drift_severity,
-        format_inventory_drift_status, format_load_phase, format_model_precision,
-        format_model_tasks, format_optional_bytes, format_optional_count, format_parameter_count,
-        format_percent, generation_outcome_label, integrity_phase_label, license_policy_allows,
-        message_window, modal_key_action, model_index_local_state,
+        ChatMessage, ConnectionState, ConnectionStatusAction, ConversationImportMode,
+        ConversationStore, DisplayMessage, EmptyStateAction, GenerationOutcome, GenerationStats,
+        Locale, ModalKeyAction, ModelIndexLocalState, Readiness, api, append_transcript_segment,
+        connection_probe_is_current, connection_status_action, conversation_context_status,
+        conversation_import_candidate, conversation_model_transition, embedding_vector_norm,
+        embedding_vector_preview, empty_state_view, encoder_input_preview, format_duration,
+        format_duration_seconds, format_generation_millis, format_inventory_changes,
+        format_inventory_drift_severity, format_inventory_drift_status, format_load_phase,
+        format_model_precision, format_model_tasks, format_optional_bytes, format_optional_count,
+        format_parameter_count, format_percent, generation_outcome_label, integrity_phase_label,
+        license_policy_allows, message_window, modal_key_action, model_index_local_state,
         model_index_poll_interval_seconds, model_index_upgrade_source_is_active,
         model_provenance_summary, optional_seed, parse_optional_embedding_dimensions,
         probe_generation_is_current, supported_image_mime, supported_model_import_filename,
@@ -6406,6 +6465,7 @@ mod tests {
         let requested = api::ConnConfig {
             base_url: "http://127.0.0.1:3000".to_string(),
             api_key: "old-key".to_string(),
+            operator_api_key: String::new(),
             remember_api_key: false,
         };
         let edited = api::ConnConfig {
@@ -6751,6 +6811,44 @@ mod tests {
         );
         assert_eq!(encoder.title, "Embedding model ready");
         assert!(encoder.body.contains("rather than text generation"));
+    }
+
+    #[test]
+    fn connection_status_opens_the_recovery_drawer_for_each_runtime_state() {
+        assert_eq!(
+            connection_status_action(&ConnectionState::Offline),
+            ConnectionStatusAction::Settings
+        );
+        assert_eq!(
+            connection_status_action(&ConnectionState::AuthenticationRequired {
+                message: "missing key".to_string(),
+            }),
+            ConnectionStatusAction::Settings
+        );
+        assert_eq!(
+            connection_status_action(&ConnectionState::NoModel),
+            ConnectionStatusAction::Models
+        );
+        assert_eq!(
+            connection_status_action(&ConnectionState::Loading {
+                model: "tiny.gguf".to_string(),
+                progress: 40,
+            }),
+            ConnectionStatusAction::Models
+        );
+        assert_eq!(
+            connection_status_action(&ConnectionState::Ready {
+                model: "tiny.gguf".to_string(),
+                supports_vision: false,
+                supports_text_input: true,
+                supports_audio_input: false,
+                supports_generation: true,
+                supports_embeddings: false,
+                supports_rerank: false,
+                context_window: Some(4_096),
+            }),
+            ConnectionStatusAction::Diagnostics
+        );
     }
 
     #[test]

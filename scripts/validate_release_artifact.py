@@ -31,7 +31,7 @@ MAX_READINESS_ARTIFACT_BYTES = 64 * 1024
 MAX_SBOM_BYTES = 8 * 1024 * 1024
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 TARGET_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
-EXPECTED_BINARIES = ("bloom_bench", "bloom_infer", "bloom_server", "inspect_gguf")
+EXPECTED_BINARIES = ("bloom_bench", "bloom_desktop", "bloom_infer", "bloom_server", "inspect_gguf")
 REQUIRED_FILES = (
     "BLOOM-DEPENDENCY-POLICY.json",
     "BLOOM-RELEASE.json",
@@ -41,6 +41,11 @@ REQUIRED_FILES = (
     "README.md",
     "RELEASE.md",
     "SECURITY.md",
+    "fun_asr_infer.py",
+    "qwen_asr_infer.py",
+    "openvino_llm_infer.py",
+    "npu_tts_infer.py",
+    "onnxruntime_infer.py",
     "docs/release-manifest.md",
     "docs/release-quickstart.md",
     "docs/release-server-quickstart.md",

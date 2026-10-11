@@ -229,10 +229,72 @@ pub fn available_system_memory() -> Option<usize> {
             .ok()
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
+    {
+        windows_available_physical_memory()
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         None
     }
+}
+
+// Keep the Windows probe local to the engine crate.  The memory planner is
+// used by the standalone runtime even when the backend crate is disabled, so
+// it cannot rely on the backend's capability probe.  GlobalMemoryStatusEx is
+// available on every supported Windows version, including ARM64.
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct WindowsMemoryStatus {
+    length: u32,
+    memory_load: u32,
+    total_physical: u64,
+    available_physical: u64,
+    total_page_file: u64,
+    available_page_file: u64,
+    total_virtual: u64,
+    available_virtual: u64,
+    available_extended_virtual: u64,
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GlobalMemoryStatusEx(status: *mut WindowsMemoryStatus) -> i32;
+}
+
+#[cfg(target_os = "windows")]
+fn windows_available_physical_memory() -> Option<usize> {
+    let mut status = WindowsMemoryStatus {
+        length: std::mem::size_of::<WindowsMemoryStatus>() as u32,
+        memory_load: 0,
+        total_physical: 0,
+        available_physical: 0,
+        total_page_file: 0,
+        available_page_file: 0,
+        total_virtual: 0,
+        available_virtual: 0,
+        available_extended_virtual: 0,
+    };
+    // SAFETY: Windows fills the initialized structure whose length matches
+    // the API contract. The API does not retain the pointer after returning.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) } != 0;
+    if !ok {
+        return None;
+    }
+
+    // Convert explicitly so a 32-bit process cannot wrap a 64-bit host
+    // report. Saturating to usize::MAX preserves a conservative budget.
+    Some(saturating_u64_to_usize(status.available_physical))
+}
+
+/// Convert an OS-reported byte count to the process address width without
+/// wrapping. Windows reports physical memory as `u64`, while a 32-bit Bloom
+/// process must keep its planner values representable as `usize`.
+#[cfg(any(target_os = "windows", test))]
+fn saturating_u64_to_usize(value: u64) -> usize {
+    value.min(usize::MAX as u64) as usize
 }
 
 /// Return whether an untyped runtime error explicitly reports memory exhaustion.
@@ -418,6 +480,13 @@ mod tests {
         assert!(!error_text_indicates_oom(
             "bloom model configuration failed"
         ));
+    }
+
+    #[test]
+    fn os_memory_byte_conversion_saturates_without_wrapping() {
+        assert_eq!(saturating_u64_to_usize(0), 0);
+        assert_eq!(saturating_u64_to_usize(usize::MAX as u64), usize::MAX);
+        assert_eq!(saturating_u64_to_usize(u64::MAX), usize::MAX);
     }
 
     #[test]

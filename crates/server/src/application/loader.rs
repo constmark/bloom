@@ -444,6 +444,7 @@ mod tests {
     fn strict_admission_rejects_backends_without_verified_device_reporting() {
         assert!(validate_strict_runtime_backend("candle").is_ok());
         assert!(validate_strict_runtime_backend("qwen3_vl").is_ok());
+        assert!(validate_strict_runtime_backend("onnxruntime").is_ok());
         let error = validate_strict_runtime_backend("wan")
             .unwrap_err()
             .to_string();

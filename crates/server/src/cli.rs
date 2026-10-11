@@ -63,8 +63,9 @@ pub(crate) struct Args {
     #[arg(long, default_value = "candle")]
     pub backend: String,
 
-    /// Device to run on: cpu, gpu.
-    #[arg(long, default_value = "cpu")]
+    /// Device to run on: auto, cpu, gpu, or npu. Auto probes the host and
+    /// chooses the best device supported by the selected engine.
+    #[arg(long, default_value = "auto")]
     pub device: String,
 
     /// Precision to load the model with: f32, f16, bf16.

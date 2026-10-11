@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Result, anyhow};
-use bloomai_core::{BackendLease, DeviceCapability, ResourceError, ResourceTicket};
+use bloomai_core::{BackendLease, DeviceCapability, DeviceKind, ResourceError, ResourceTicket};
 
 use crate::backend::{
     Backend, BackendAvailability, CpuBackend, CudaBackend, MetalBackend, MlxBackend,
@@ -74,6 +74,61 @@ impl BackendRegistry {
         let mut names: Vec<&str> = self.backends.keys().map(String::as_str).collect();
         names.sort_unstable();
         names
+    }
+
+    /// Resolve a CLI/UI device selector against the devices an engine can
+    /// actually use. `auto` probes the local backends and picks the fastest
+    /// available accelerator before falling back to CPU. Keeping this policy
+    /// in the registry makes the server, CLI and future GUI clients agree on
+    /// the same safe startup behaviour.
+    pub fn resolve_device_selector(
+        &self,
+        selector: &str,
+        supported_devices: &[DeviceKind],
+    ) -> Result<DeviceKind> {
+        let normalized = selector.trim().to_ascii_lowercase();
+        let explicit = match normalized.as_str() {
+            "cpu" => Some(DeviceKind::Cpu),
+            "gpu" | "cuda" | "metal" => Some(DeviceKind::Gpu),
+            "npu" | "intel-npu" => Some(DeviceKind::Npu),
+            "auto" => None,
+            other => return Err(anyhow!("unsupported device: {other}")),
+        };
+        if let Some(device) = explicit {
+            if !supported_devices.is_empty() && !supported_devices.contains(&device) {
+                return Err(anyhow!(
+                    "device selector '{}' is not supported by the selected engine",
+                    selector.trim()
+                ));
+            }
+            return Ok(device);
+        }
+
+        // GPUs offer the best latency in the common Candle/llama.cpp paths;
+        // NPU is next where an engine explicitly supports it. CPU is always
+        // the final portable fallback. Do not select a device the engine did
+        // not declare, even if the host happens to expose it.
+        let candidates = [DeviceKind::Gpu, DeviceKind::Npu, DeviceKind::Cpu];
+        for device in candidates {
+            if !supported_devices.is_empty() && !supported_devices.contains(&device) {
+                continue;
+            }
+            let backend_name = match device {
+                DeviceKind::Cpu => "cpu",
+                DeviceKind::Gpu => "gpu",
+                DeviceKind::Npu => "intel-npu",
+            };
+            if self
+                .get(backend_name)
+                .is_ok_and(|backend| backend.availability().available)
+            {
+                return Ok(device);
+            }
+        }
+
+        Err(anyhow!(
+            "no available device satisfies the engine's declared capabilities"
+        ))
     }
 
     pub fn status(&self) -> Vec<BackendStatus> {
@@ -163,7 +218,9 @@ impl BackendRegistry {
 #[cfg(test)]
 mod tests {
     use super::BackendRegistry;
-    use bloomai_core::{DeviceCapability, DeviceClass, MemoryTopology, PowerState, ThermalState};
+    use bloomai_core::{
+        DeviceCapability, DeviceClass, DeviceKind, MemoryTopology, PowerState, ThermalState,
+    };
 
     #[test]
     fn default_registry_has_cpu() {
@@ -257,6 +314,37 @@ mod tests {
         assert_eq!(backend.info().name, "metal");
         #[cfg(not(target_os = "macos"))]
         assert_eq!(backend.info().name, "cuda");
+    }
+
+    #[test]
+    fn resolve_device_selector_accepts_aliases_and_auto_cpu_fallback() {
+        let registry = BackendRegistry::default();
+        assert_eq!(
+            registry
+                .resolve_device_selector("CPU", &[DeviceKind::Cpu])
+                .unwrap(),
+            DeviceKind::Cpu
+        );
+        assert_eq!(
+            registry
+                .resolve_device_selector("auto", &[DeviceKind::Cpu])
+                .unwrap(),
+            DeviceKind::Cpu
+        );
+        assert_eq!(
+            registry
+                .resolve_device_selector("gpu", &[DeviceKind::Gpu])
+                .unwrap(),
+            DeviceKind::Gpu
+        );
+        assert!(
+            registry
+                .resolve_device_selector("gpu", &[DeviceKind::Cpu])
+                .unwrap_err()
+                .to_string()
+                .contains("not supported by the selected engine")
+        );
+        assert!(registry.resolve_device_selector("quantum", &[]).is_err());
     }
 
     struct DummyBackend;

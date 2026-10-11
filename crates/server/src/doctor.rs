@@ -627,6 +627,22 @@ fn configured_device(args: &Args) -> Result<(DeviceKind, &'static str)> {
             },
         )),
         "npu" | "intel-npu" => Ok((DeviceKind::Npu, "intel-npu")),
+        "auto" => {
+            let engines = engine_registry();
+            let engine = engines.get(&args.backend).map_err(|error| {
+                anyhow!("backend is unavailable for automatic device selection: {error}")
+            })?;
+            let supported_devices = engine.supported_devices();
+            let selected =
+                BackendRegistry::default().resolve_device_selector("auto", &supported_devices)?;
+            let backend_name = match selected {
+                DeviceKind::Cpu => "cpu",
+                DeviceKind::Gpu if cfg!(target_os = "macos") => "metal",
+                DeviceKind::Gpu => "cuda",
+                DeviceKind::Npu => "intel-npu",
+            };
+            Ok((selected, backend_name))
+        }
         _ => Err(anyhow!("unsupported device")),
     }
 }

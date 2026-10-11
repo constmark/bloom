@@ -34,9 +34,11 @@ clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 bloomai-core.workspace = true
+bloomai-backend.workspace = true
 bloomai-engine.workspace = true
 candle-core = { version = "0.10", optional = true }
 libc = "0.2"
+tokio = { version = "1.52.3", features = ["rt", "signal", "time"] }
 
 [dev-dependencies]
 tempfile = "3"

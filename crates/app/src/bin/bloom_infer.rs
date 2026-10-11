@@ -135,8 +135,9 @@ struct Args {
     #[arg(long, default_value_t = false)]
     stream: bool,
 
-    /// Device to run on: cpu, gpu.
-    #[arg(long, default_value = "cpu")]
+    /// Device to run on: auto, cpu, gpu, or npu. Auto probes the host and
+    /// chooses the best device supported by the selected engine.
+    #[arg(long, default_value = "auto")]
     device: String,
 
     /// Selection of backend engine: candle, laya, openvino, funasr, qwen3_vl, longcat.
@@ -373,6 +374,7 @@ fn select_backend_name(
     manifest: &bloomai_core::ModelManifest,
 ) -> String {
     if explicit_engine.is_none() && backend == "candle" {
+        let has_format = |format| manifest.files.iter().any(|file| file.format == format);
         let is_qwen_vl = manifest.family == bloomai_core::ModelFamily::Qwen
             && (manifest.id.to_lowercase().contains("vl")
                 || manifest
@@ -383,6 +385,16 @@ fn select_backend_name(
                     .unwrap_or(false));
         if speculative_mode_is_mtp(speculative) {
             "llamacpp".to_string()
+        } else if has_format(bloomai_core::ModelFormat::Onnx) {
+            "onnxruntime".to_string()
+        } else if has_format(bloomai_core::ModelFormat::OpenVinoIr) {
+            "openvino".to_string()
+        } else if has_format(bloomai_core::ModelFormat::CoreMl) {
+            "coreml".to_string()
+        } else if has_format(bloomai_core::ModelFormat::Mlx) {
+            "mlx".to_string()
+        } else if has_format(bloomai_core::ModelFormat::VulkanSpirv) {
+            "vulkan".to_string()
         } else if is_qwen_vl {
             "qwen3_vl".to_string()
         } else if matches!(&manifest.family, bloomai_core::ModelFamily::Custom(c) if c == "longcat-image-edit")
@@ -402,16 +414,10 @@ fn select_backend_name(
     }
 }
 
-fn parse_device(s: &str) -> Result<DeviceKind> {
-    match s.to_lowercase().as_str() {
-        "cpu" => Ok(DeviceKind::Cpu),
-        "gpu" | "cuda" | "metal" => Ok(DeviceKind::Gpu),
-        "npu" | "intel-npu" => Ok(DeviceKind::Npu),
-        other => Err(anyhow!(
-            "unsupported device '{}', expected: cpu, gpu, npu",
-            other
-        )),
-    }
+fn parse_device(s: &str, supported_devices: &[DeviceKind]) -> Result<DeviceKind> {
+    bloomai_backend::BackendRegistry::default()
+        .resolve_device_selector(s, supported_devices)
+        .map_err(|error| anyhow!("could not resolve device '{}': {error}", s))
 }
 
 /// Parse a dtype string from the CLI into a DType enum value.
@@ -810,7 +816,7 @@ fn main() -> Result<()> {
         return run_bench(&args, engine, &model_path);
     }
 
-    let device = parse_device(&args.device)?;
+    let device = parse_device(&args.device, &engine.supported_devices())?;
 
     if !args.quiet {
         tracing::info!(
@@ -1153,11 +1159,14 @@ fn main() -> Result<()> {
     } else {
         0.0
     };
+    // Report the device actually used after `auto` resolution and any
+    // load-time fallback, rather than echoing the user's selector.
+    let selected_device_label = format!("{:?}", pipeline.device()).to_lowercase();
 
     // Output metrics
     if args.bench_json {
         let result = BenchmarkResult {
-            backend: args.device.clone(),
+            backend: selected_device_label.clone(),
             model_id: pipeline.metadata().id.clone(),
             dtype: dtype_label,
             quantization: manifest
@@ -1184,7 +1193,7 @@ fn main() -> Result<()> {
         eprintln!(
             "Model: {} | Backend: {} | Dtype: {:?}",
             pipeline.metadata().id,
-            args.device,
+            selected_device_label,
             dtype_label
         );
         eprintln!(
@@ -1212,7 +1221,7 @@ fn print_inspect(
     manifest: &bloomai_core::ModelManifest,
     registry: &EngineRegistry,
 ) -> Result<()> {
-    let device = parse_device(&args.device)?;
+    let device = parse_device(&args.device, &selected.supported_devices())?;
     let mem = bloomai_engine::estimate_memory_for_device(manifest, args.context_size, device);
     let engines = registry
         .iter()
@@ -1613,7 +1622,7 @@ fn parse_on_off(value: &str) -> Result<bool> {
 // ==========================================
 
 fn run_bench(args: &Args, engine: &dyn Engine, model_path: &std::path::Path) -> Result<()> {
-    let device_kind = parse_device(&args.device)?;
+    let device_kind = parse_device(&args.device, &engine.supported_devices())?;
     let load_start = Instant::now();
     let pipeline = InferencePipeline::load_standalone_with_context(
         engine,
@@ -1799,7 +1808,7 @@ fn run_bench(args: &Args, engine: &dyn Engine, model_path: &std::path::Path) -> 
     );
 
     let result = BenchmarkResult {
-        backend: args.device.clone(),
+        backend: format!("{:?}", pipeline.device()).to_lowercase(),
         model_id: pipeline.metadata().id.clone(),
         dtype: dtype_label,
         quantization: pipeline
@@ -1966,6 +1975,31 @@ mod tests {
             select_backend_name(None, "candle", "native-mtp", &manifest),
             "llamacpp"
         );
+    }
+
+    #[test]
+    fn select_backend_auto_routes_known_model_formats() {
+        for (format, expected) in [
+            (bloomai_core::ModelFormat::Onnx, "onnxruntime"),
+            (bloomai_core::ModelFormat::OpenVinoIr, "openvino"),
+            (bloomai_core::ModelFormat::CoreMl, "coreml"),
+            (bloomai_core::ModelFormat::Mlx, "mlx"),
+            (bloomai_core::ModelFormat::VulkanSpirv, "vulkan"),
+        ] {
+            let mut manifest = bloomai_core::ModelManifest::default();
+            manifest.files.push(bloomai_core::ModelFile {
+                name: "model.bin".to_string(),
+                format,
+                size_bytes: 1,
+                hash_sha256: None,
+                required: true,
+            });
+            assert_eq!(
+                select_backend_name(None, "candle", "none", &manifest),
+                expected,
+                "format {format:?}"
+            );
+        }
     }
 
     #[test]

@@ -39,16 +39,32 @@ fn is_bundled_script(path: &Path) -> bool {
     };
     if !matches!(
         filename,
-        "fun_asr_infer.py" | "qwen_asr_infer.py" | "openvino_llm_infer.py" | "npu_tts_infer.py"
+        "fun_asr_infer.py"
+            | "qwen_asr_infer.py"
+            | "openvino_llm_infer.py"
+            | "npu_tts_infer.py"
+            | "onnxruntime_infer.py"
     ) {
         return false;
     }
     let bundled = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../scripts")
         .join(filename);
-    path.canonicalize()
+    let source_match = path
+        .canonicalize()
         .ok()
         .zip(bundled.canonicalize().ok())
+        .is_some_and(|(actual, expected)| actual == expected);
+    if source_match {
+        return true;
+    }
+    // Release archives place the bridge next to the executable. Treat that
+    // exact, immutable package location as bundled while still rejecting a
+    // same-named script from an arbitrary working directory.
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|parent| parent.join(filename)))
+        .and_then(|packaged| path.canonicalize().ok().zip(packaged.canonicalize().ok()))
         .is_some_and(|(actual, expected)| actual == expected)
 }
 

@@ -3,7 +3,9 @@
 This archive is a self-contained Bloom application for the target recorded in
 `BLOOM-RELEASE.json`. The `bloom_server` executable (`bloom_server.exe` on
 Windows) contains both the local API and the browser UI; no separate web server
-or JavaScript installation is required.
+or JavaScript installation is required. `bloom_desktop`
+(`bloom_desktop.exe` on Windows) owns a local server child, waits for
+readiness, and opens that embedded UI.
 
 ## 1. Verify the archive
 
@@ -43,6 +45,12 @@ hashes. `BLOOM-SBOM.cdx.json` contains the release-target CycloneDX dependency
 inventory, including the independent wasm UI graph when embedded;
 `BLOOM-DEPENDENCY-POLICY.json` records the reviewed registry sources
 and declared license expressions that admitted it.
+
+The archive also carries the Python bridges beside the binaries:
+`onnxruntime_infer.py`, `openvino_llm_infer.py`, `fun_asr_infer.py`,
+`qwen_asr_infer.py`, and `npu_tts_infer.py`. Install the corresponding runtime
+packages in the Python environment used by `BLOOM_PYTHON` (or the backend
+specific override) before selecting an external backend.
 
 ## 2. Run the deployment check
 
@@ -90,13 +98,13 @@ has an executable loader.
 Linux or macOS:
 
 ```bash
-./bloom_server --open-browser
+./bloom_desktop -- --device auto
 ```
 
 Windows PowerShell:
 
 ```powershell
-.\bloom_server.exe --open-browser
+.\bloom_desktop.exe -- --device auto
 ```
 
 Bloom binds only to `127.0.0.1:3000` by default. It opens the embedded UI after
@@ -133,7 +141,7 @@ already present in `PATH`:
 
 ```bash
 mkdir -p "$HOME/.local/bin"
-install -m 755 bloom_server bloom_infer bloom_bench inspect_gguf "$HOME/.local/bin/"
+install -m 755 bloom_desktop bloom_server bloom_infer bloom_bench inspect_gguf "$HOME/.local/bin/"
 ```
 
 The UI remains embedded inside `bloom_server`; moving that executable does not
@@ -146,7 +154,7 @@ directory to the user `PATH` through Windows Settings:
 ```powershell
 $bin = "$HOME\.local\bin"
 New-Item -ItemType Directory -Force $bin
-Copy-Item .\bloom_server.exe, .\bloom_infer.exe, .\bloom_bench.exe, .\inspect_gguf.exe $bin
+Copy-Item .\bloom_desktop.exe, .\bloom_server.exe, .\bloom_infer.exe, .\bloom_bench.exe, .\inspect_gguf.exe $bin
 ```
 
 The UI remains embedded inside `bloom_server.exe`; it does not depend on the

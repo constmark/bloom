@@ -23,7 +23,7 @@ Every adapter must:
 | llama.cpp | External process | `external-runtime` | Starts `llama-server` for GGUF fallback and MTP |
 | FunASR / Qwen ASR | External Python | `external-runtime` | Runs model-specific ASR scripts |
 | Laya | Native Rust (`laya-decision`) | `experimental` | Runs ModernBERT decision checkpoints and returns typed JSON answers |
-| ONNX Runtime | In-process runtime | `skeleton` | File probing and diagnostics only |
+| ONNX Runtime | Python `onnxruntime` bridge | `experimental` | Executes the first model input/output; text, audio, image bytes and numeric outputs are supported |
 | TensorRT | Vendor runtime | `skeleton` | Plan detection and diagnostics only |
 | CoreML | Apple framework | `skeleton` | Package probing and diagnostics only |
 | MLX | Apple runtime | `skeleton` | Weight probing and diagnostics only |
@@ -32,10 +32,11 @@ Every adapter must:
 The [support matrix](support-matrix.md) is authoritative when this table and
 runtime behavior differ.
 
-## ONNX inspection
+## ONNX Runtime execution
 
-The ONNX adapter does not execute graphs in the default build. It can inspect a
-single file or a directory containing `model.onnx`, `encoder.onnx`, or
+The ONNX adapter executes through the bundled Python bridge when the selected
+Python interpreter has `onnxruntime` (or `onnxruntime-gpu`) installed. It can
+load a single file or a directory containing `model.onnx`, `encoder.onnx`, or
 `decoder.onnx`:
 
 ```bash
@@ -44,6 +45,19 @@ cargo run --bin bloom_infer -- \
   --backend onnxruntime \
   --inspect
 ```
+
+For inference, set `BLOOM_ONNX_PYTHON` or `BLOOM_PYTHON` when Python is not on
+`PATH`. `BLOOM_ONNX_EXECUTION_PROVIDER=CUDA|OpenVINO|CPU` selects the provider;
+the bridge falls back to CPU only when that provider is unavailable. The first
+model input is populated from the request and the first output is returned as
+text or flattened numeric logits. Model loading first invokes the bridge with
+`--probe --model-path PATH --device DEVICE --provider PROVIDER`; it must create
+the session with the requested execution provider and print
+`{"ok":true,"device":"...","provider":"..."}`. Inference then writes one
+serialized `ModelInput` object to stdin and expects one `ModelOutput` object on
+stdout (at minimum, `text` and `logits`; omitted optional fields default to
+`null`). Models that require a tokenizer or multiple named inputs should
+provide a custom `BLOOM_ONNX_SCRIPT` implementing both parts of this contract.
 
 ## llama.cpp
 

@@ -975,7 +975,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skeleton_onnx_engine_is_reported_before_load() {
+    async fn external_onnx_engine_is_reported_before_load() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(temp.path().join("tiny.onnx"), b"onnx").unwrap();
         let manager = ModelPreflightManager::new(
@@ -986,16 +986,9 @@ mod tests {
 
         let report = manager.inspect("tiny.onnx").await.unwrap();
 
-        assert!(!report.loadable);
+        assert!(report.loadable, "{:?}", report.load_blocker);
         assert_eq!(report.runtime.selected_engine, "onnxruntime");
-        assert_eq!(report.runtime.engine_maturity, "skeleton");
-        assert!(
-            report
-                .load_blocker
-                .as_deref()
-                .unwrap()
-                .contains("skeleton adapter")
-        );
+        assert_eq!(report.runtime.engine_maturity, "experimental");
     }
 
     #[tokio::test]
@@ -1126,8 +1119,11 @@ mod tests {
         assert!(!resident.memory.fits_budget);
         assert!(resident.loadable, "{:?}", resident.load_blocker);
 
-        std::fs::write(temp.path().join("unsupported.onnx"), b"onnx").unwrap();
-        let unsupported = manager.inspect_resident("unsupported.onnx").await.unwrap();
+        std::fs::write(temp.path().join("unsupported.mlmodel"), b"coreml").unwrap();
+        let unsupported = manager
+            .inspect_resident("unsupported.mlmodel")
+            .await
+            .unwrap();
         assert!(!unsupported.loadable);
         assert_eq!(unsupported.runtime.support, "unsupported");
     }

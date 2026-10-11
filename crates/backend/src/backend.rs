@@ -409,6 +409,10 @@ impl Backend for CpuBackend {
                 ModelFormat::Gguf,
                 ModelFormat::Safetensors,
                 ModelFormat::OpenVinoIr,
+                // ONNX execution is provided through the optional external
+                // Python bridge, but it still consumes CPU resources and
+                // must pass the same preflight device-format gate.
+                ModelFormat::Onnx,
             ],
             supports_mmap: true,
             has_quantization_kernels: true, // Candle CPU supports quantization
@@ -438,29 +442,33 @@ impl Backend for MetalBackend {
     }
 
     fn availability(&self) -> BackendAvailability {
-        if cfg!(target_os = "macos") {
-            let mut details = vec![
-                format!("host os: {}", std::env::consts::OS),
-                "Metal backend provides GPU acceleration via MPS/CoreML".to_string(),
-            ];
-            // Check for MPS availability via Python torch
-            if check_mps_available() {
-                details.push("PyTorch MPS backend is available".to_string());
-            } else {
-                details
-                    .push("PyTorch MPS not detected; Metal ops may use CPU fallback".to_string());
-            }
-            // Check for CoreML availability
-            if check_coreml_available() {
-                details.push("CoreML framework is available".to_string());
-            }
-            BackendAvailability::available(details)
-        } else {
-            BackendAvailability::unavailable(
+        if !cfg!(target_os = "macos") {
+            return BackendAvailability::unavailable(
                 "metal backend supports macOS only",
                 vec![format!("host os: {}", std::env::consts::OS)],
-            )
+            );
         }
+        if !cfg!(feature = "metal") {
+            return BackendAvailability::unavailable(
+                "metal backend is not enabled in this build",
+                vec!["Recompile with --features metal".to_string()],
+            );
+        }
+        let mut details = vec![
+            format!("host os: {}", std::env::consts::OS),
+            "Metal backend provides GPU acceleration via MPS/CoreML".to_string(),
+        ];
+        // Check for MPS availability via Python torch
+        if check_mps_available() {
+            details.push("PyTorch MPS backend is available".to_string());
+        } else {
+            details.push("PyTorch MPS not detected; Metal ops may use CPU fallback".to_string());
+        }
+        // Check for CoreML availability
+        if check_coreml_available() {
+            details.push("CoreML framework is available".to_string());
+        }
+        BackendAvailability::available(details)
     }
 
     fn capability(&self) -> DeviceCapability {
@@ -473,7 +481,11 @@ impl Backend for MetalBackend {
             max_memory: total_memory,
             available_memory: available_free_memory(),
             supported_dtypes: vec![DType::F32, DType::F16, DType::BF16, DType::Q8, DType::Q4],
-            supported_formats: vec![ModelFormat::Gguf, ModelFormat::Safetensors],
+            supported_formats: vec![
+                ModelFormat::Gguf,
+                ModelFormat::Safetensors,
+                ModelFormat::Onnx,
+            ],
             supports_mmap: true,
             has_quantization_kernels: true, // we added metal_quant
             supports_streaming: true,
@@ -528,7 +540,11 @@ impl Backend for CudaBackend {
             max_memory: total_memory,
             available_memory: avail_memory,
             supported_dtypes: vec![DType::F32, DType::F16, DType::BF16, DType::Q8, DType::Q4],
-            supported_formats: vec![ModelFormat::Gguf, ModelFormat::Safetensors],
+            supported_formats: vec![
+                ModelFormat::Gguf,
+                ModelFormat::Safetensors,
+                ModelFormat::Onnx,
+            ],
             supports_mmap: false,
             has_quantization_kernels: true,
             supports_streaming: true,
@@ -685,7 +701,7 @@ mod tests {
     fn metal_availability_gives_mps_coreml_info() {
         let backend = MetalBackend;
         let avail = backend.availability();
-        if cfg!(target_os = "macos") {
+        if cfg!(all(target_os = "macos", feature = "metal")) {
             assert!(avail.available);
             assert!(
                 avail

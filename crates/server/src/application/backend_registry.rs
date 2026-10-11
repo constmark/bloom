@@ -117,7 +117,10 @@ pub(crate) fn validate_ifb_backend(enable_ifb: bool, backend_name: &str) -> Resu
 }
 
 pub(crate) fn validate_strict_runtime_backend(backend_name: &str) -> Result<()> {
-    if !matches!(backend_name, "candle" | "qwen3_vl" | "laya") {
+    // ONNX uses the same selected physical device contract as the server
+    // (CPU/CUDA/CoreML/OpenVINO provider) and accounts its manifest footprint
+    // before spawning the external Python bridge.
+    if !matches!(backend_name, "candle" | "qwen3_vl" | "laya" | "onnxruntime") {
         return Err(anyhow!(
             "strict aggregate memory admission requires a backend that reports its verified physical device; selected backend '{backend_name}' does not yet provide that contract"
         ));

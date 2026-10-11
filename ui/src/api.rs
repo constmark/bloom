@@ -2157,6 +2157,10 @@ pub struct ModelImportMetadata<'a> {
 pub struct ConnConfig {
     pub base_url: String,
     pub api_key: String,
+    /// Optional elevated credential used only for model-management endpoints.
+    /// This value is intentionally kept in browser session storage by the UI;
+    /// it is never serialized into persistent connection settings.
+    pub operator_api_key: String,
     pub remember_api_key: bool,
 }
 
@@ -2165,6 +2169,7 @@ impl Default for ConnConfig {
         Self {
             base_url: default_base_url(),
             api_key: String::new(),
+            operator_api_key: String::new(),
             remember_api_key: false,
         }
     }
@@ -2207,7 +2212,28 @@ impl ConnConfig {
                 "API key must contain at most {MAX_API_KEY_CHARS} printable ASCII characters without spaces."
             ));
         }
+        if self.operator_api_key.chars().count() > MAX_API_KEY_CHARS
+            || !self
+                .operator_api_key
+                .bytes()
+                .all(|byte| (0x21..=0x7e).contains(&byte))
+        {
+            return Err(format!(
+                "Operator API key must contain at most {MAX_API_KEY_CHARS} printable ASCII characters without spaces."
+            ));
+        }
         Ok(())
+    }
+
+    /// Select the credential for privileged model-management requests while
+    /// retaining backwards compatibility with servers that only configured a
+    /// single API key.
+    pub fn model_management_api_key(&self) -> &str {
+        if self.operator_api_key.is_empty() {
+            &self.api_key
+        } else {
+            &self.operator_api_key
+        }
     }
 }
 
@@ -2335,11 +2361,19 @@ pub fn default_base_url() -> String {
 }
 
 fn auth_headers(cfg: &ConnConfig, headers: &web_sys::Headers) {
-    if !cfg.api_key.is_empty() {
+    auth_headers_for_key(&cfg.api_key, headers);
+}
+
+fn auth_headers_for_key(api_key: &str, headers: &web_sys::Headers) {
+    if !api_key.is_empty() {
         headers
-            .set("Authorization", &format!("Bearer {}", cfg.api_key))
+            .set("Authorization", &format!("Bearer {api_key}"))
             .ok();
     }
+}
+
+fn auth_headers_for_model_management(cfg: &ConnConfig, headers: &web_sys::Headers) {
+    auth_headers_for_key(cfg.model_management_api_key(), headers);
 }
 
 /// Fetch liveness and model-loading state.
@@ -2952,7 +2986,7 @@ pub async fn fetch_model_catalog(cfg: &ConnConfig) -> Result<ModelCatalog, Strin
         "{}/v1/model-management/models",
         cfg.base_url.trim_end_matches('/')
     );
-    let response = request(cfg, &url, "GET", None).await?;
+    let response = operator_request(cfg, &url, "GET", None).await?;
     if !response.ok() {
         return Err(read_response_error(&response).await);
     }
@@ -2984,7 +3018,7 @@ pub async fn fetch_model_index(
         cfg.base_url.trim_end_matches('/')
     );
     let method = if force_refresh { "POST" } else { "GET" };
-    let response = request(cfg, &url, method, None).await?;
+    let response = operator_request(cfg, &url, method, None).await?;
     if !response.ok() {
         return Err(read_response_error(&response).await);
     }
@@ -3387,7 +3421,7 @@ pub async fn fetch_model_inventory(cfg: &ConnConfig) -> Result<ModelInventory, S
         "{}/v1/model-management/inventory",
         cfg.base_url.trim_end_matches('/')
     );
-    let response = request(cfg, &url, "GET", None).await?;
+    let response = operator_request(cfg, &url, "GET", None).await?;
     if !response.ok() {
         return Err(read_response_error(&response).await);
     }
@@ -3430,7 +3464,7 @@ pub async fn reconcile_model_inventory_file(
         "{}/v1/model-management/inventory/reconcile",
         cfg.base_url.trim_end_matches('/')
     );
-    let response = request(cfg, &url, "POST", Some(&text)).await?;
+    let response = operator_request(cfg, &url, "POST", Some(&text)).await?;
     if !response.ok() {
         return Err(read_response_error(&response).await);
     }
@@ -3458,7 +3492,7 @@ pub async fn restore_model_from_inventory(
     if body.len() as u64 > MAX_MODEL_INVENTORY_BYTES {
         return Err("model inventory exceeds the supported restore size limit".to_string());
     }
-    let response = request(cfg, &url, "POST", Some(&body)).await?;
+    let response = operator_request(cfg, &url, "POST", Some(&body)).await?;
     if !response.ok() {
         return Err(read_response_error(&response).await);
     }
@@ -3687,7 +3721,7 @@ pub async fn preflight_model(
     );
     let body = serde_json::to_string(&serde_json::json!({ "id": model_id }))
         .map_err(|error| format!("failed to encode model preflight request: {error}"))?;
-    let response = request(cfg, &url, "POST", Some(&body)).await?;
+    let response = operator_request(cfg, &url, "POST", Some(&body)).await?;
     if !response.ok() {
         return Err(read_response_error(&response).await);
     }
@@ -3706,7 +3740,7 @@ pub async fn switch_model(cfg: &ConnConfig, model_id: &str) -> Result<(), String
     );
     let body = serde_json::to_string(&serde_json::json!({ "id": model_id }))
         .map_err(|error| format!("failed to encode model switch request: {error}"))?;
-    let response = request(cfg, &url, "POST", Some(&body)).await?;
+    let response = operator_request(cfg, &url, "POST", Some(&body)).await?;
     if response.ok() {
         Ok(())
     } else {
@@ -3720,7 +3754,7 @@ pub async fn unload_model(cfg: &ConnConfig) -> Result<(), String> {
         "{}/v1/model-management/unload",
         cfg.base_url.trim_end_matches('/')
     );
-    let response = request(cfg, &url, "POST", Some("{}")).await?;
+    let response = operator_request(cfg, &url, "POST", Some("{}")).await?;
     if response.ok() {
         Ok(())
     } else {
@@ -3736,7 +3770,7 @@ pub async fn remove_model(cfg: &ConnConfig, model_id: &str) -> Result<(), String
     );
     let body = serde_json::to_string(&serde_json::json!({ "id": model_id }))
         .map_err(|error| format!("failed to encode model removal request: {error}"))?;
-    let response = request(cfg, &url, "POST", Some(&body)).await?;
+    let response = operator_request(cfg, &url, "POST", Some(&body)).await?;
     if response.ok() {
         Ok(())
     } else {
@@ -3752,7 +3786,7 @@ pub async fn verify_model_integrity(cfg: &ConnConfig, model_id: &str) -> Result<
     );
     let body = serde_json::to_string(&serde_json::json!({ "id": model_id }))
         .map_err(|error| format!("failed to encode model integrity request: {error}"))?;
-    let response = request(cfg, &url, "POST", Some(&body)).await?;
+    let response = operator_request(cfg, &url, "POST", Some(&body)).await?;
     if response.ok() {
         Ok(())
     } else {
@@ -3766,7 +3800,7 @@ pub async fn cancel_model_integrity(cfg: &ConnConfig) -> Result<(), String> {
         "{}/v1/model-management/integrity",
         cfg.base_url.trim_end_matches('/')
     );
-    let response = request(cfg, &url, "DELETE", None).await?;
+    let response = operator_request(cfg, &url, "DELETE", None).await?;
     if response.ok() {
         Ok(())
     } else {
@@ -3785,7 +3819,7 @@ pub async fn inspect_model_download_source(
     );
     let body = serde_json::to_string(&ModelDownloadSourceRequest { url: source_url })
         .map_err(|error| format!("failed to encode model source inspection request: {error}"))?;
-    let response = request(cfg, &endpoint, "POST", Some(&body)).await?;
+    let response = operator_request(cfg, &endpoint, "POST", Some(&body)).await?;
     if !response.ok() {
         return Err(read_response_error(&response).await);
     }
@@ -3905,7 +3939,7 @@ pub async fn download_model(
         license: non_empty(license),
     })
     .map_err(|error| format!("failed to encode model download request: {error}"))?;
-    let response = request(cfg, &url_endpoint, "POST", Some(&body)).await?;
+    let response = operator_request(cfg, &url_endpoint, "POST", Some(&body)).await?;
     if response.ok() {
         Ok(())
     } else {
@@ -3929,7 +3963,7 @@ pub async fn download_index_model(cfg: &ConnConfig, model_index_id: &str) -> Res
         "{}/v1/model-management/index/{model_index_id}/download",
         cfg.base_url.trim_end_matches('/')
     );
-    let response = request(cfg, &endpoint, "POST", None).await?;
+    let response = operator_request(cfg, &endpoint, "POST", None).await?;
     if response.ok() {
         Ok(())
     } else {
@@ -3943,7 +3977,7 @@ pub async fn cancel_model_download(cfg: &ConnConfig) -> Result<(), String> {
         "{}/v1/model-management/downloads",
         cfg.base_url.trim_end_matches('/')
     );
-    let response = request(cfg, &url, "DELETE", None).await?;
+    let response = operator_request(cfg, &url, "DELETE", None).await?;
     if response.ok() {
         Ok(())
     } else {
@@ -3980,7 +4014,7 @@ async fn model_download_control(
         "license": non_empty(license)
     }))
     .map_err(|error| format!("failed to encode model download action: {error}"))?;
-    let response = request(cfg, &url, "POST", Some(&body)).await?;
+    let response = operator_request(cfg, &url, "POST", Some(&body)).await?;
     if response.ok() {
         Ok(())
     } else {
@@ -4098,7 +4132,7 @@ pub async fn discard_model_import(cfg: &ConnConfig, filename: &str) -> Result<()
         "{}/v1/model-management/imports/{encoded}",
         cfg.base_url.trim_end_matches('/')
     );
-    let response = request(cfg, &url, "DELETE", None).await?;
+    let response = operator_request(cfg, &url, "DELETE", None).await?;
     if response.ok() {
         Ok(())
     } else {
@@ -4125,7 +4159,7 @@ async fn cancellable_request(
     }
     let headers = web_sys::Headers::new()
         .map_err(|error| ModelImportClientError::Request(format!("{error:?}")))?;
-    auth_headers(cfg, &headers);
+    auth_headers_for_model_management(cfg, &headers);
     let opts = web_sys::RequestInit::new();
     opts.set_method(method);
     opts.set_headers(&headers);
@@ -5196,12 +5230,31 @@ async fn request(
     method: &str,
     body: Option<&str>,
 ) -> Result<web_sys::Response, String> {
+    request_with_key(cfg, url, method, body, cfg.api_key.as_str()).await
+}
+
+async fn operator_request(
+    cfg: &ConnConfig,
+    url: &str,
+    method: &str,
+    body: Option<&str>,
+) -> Result<web_sys::Response, String> {
+    request_with_key(cfg, url, method, body, cfg.model_management_api_key()).await
+}
+
+async fn request_with_key(
+    cfg: &ConnConfig,
+    url: &str,
+    method: &str,
+    body: Option<&str>,
+    api_key: &str,
+) -> Result<web_sys::Response, String> {
     cfg.validate()?;
     if let Some(body) = body {
         validate_request_body_size("HTTP request", body.len(), MAX_HTTP_REQUEST_BODY_BYTES)?;
     }
     let headers = web_sys::Headers::new().map_err(|error| format!("{error:?}"))?;
-    auth_headers(cfg, &headers);
+    auth_headers_for_key(api_key, &headers);
     let opts = web_sys::RequestInit::new();
     opts.set_method(method);
     opts.set_headers(&headers);
@@ -5584,6 +5637,7 @@ mod tests {
         ConnConfig {
             base_url: base_url.to_string(),
             api_key: api_key.to_string(),
+            operator_api_key: String::new(),
             remember_api_key: false,
         }
     }

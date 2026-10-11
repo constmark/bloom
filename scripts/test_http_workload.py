@@ -136,6 +136,57 @@ class RuntimeStats(http.server.BaseHTTPRequestHandler):
         pass
 
 
+class BackendInventory(http.server.BaseHTTPRequestHandler):
+    expected_authorization = "Bearer test-key"
+    payload: dict[str, object] = {
+        "object": "list",
+        "data": [{"name": "candle", "diagnostic_tips": "/secret/model.gguf"}],
+        "active_model": "/secret/model.gguf",
+        "devices": [
+            {
+                "name": "cpu",
+                "available": True,
+                "reason": None,
+                "details": ["native host probe"],
+                "capability": {
+                    "backend_name": "cpu",
+                    "vendor": "generic",
+                    "device_class": "cpu",
+                    "memory_topology": "unified",
+                    "max_memory": 16 * 1024 * 1024 * 1024,
+                    "available_memory": 8 * 1024 * 1024 * 1024,
+                    "supported_dtypes": ["F32", "BF16"],
+                    "supported_formats": ["Gguf", "Safetensors"],
+                    "supports_mmap": True,
+                    "has_quantization_kernels": True,
+                    "supports_streaming": True,
+                    "max_batch_tokens": 4096,
+                    "available_parallelism": 8,
+                },
+            }
+        ],
+    }
+
+    def do_GET(self) -> None:
+        if self.headers.get("Authorization") != self.expected_authorization:
+            self.send_response(401)
+            self.end_headers()
+            return
+        if self.path != "/v1/backends":
+            self.send_response(404)
+            self.end_headers()
+            return
+        body = json.dumps(self.payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        pass
+
+
 class WorkloadTests(unittest.TestCase):
     @staticmethod
     def reset_runtime_stats_fixture() -> None:
@@ -254,6 +305,42 @@ class WorkloadTests(unittest.TestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         return server, thread
+
+    def backend_inventory_server(self) -> tuple[http.server.ThreadingHTTPServer, threading.Thread]:
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), BackendInventory)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return server, thread
+
+    def test_backend_inventory_retains_physical_probe_and_redacts_model_metadata(self) -> None:
+        server, thread = self.backend_inventory_server()
+        try:
+            report = workload.fetch_backend_inventory(server.server_port, "test-key", 3)
+            self.assertEqual(report["status"], "available")
+            self.assertEqual(report["devices"][0]["name"], "cpu")
+            self.assertEqual(report["devices"][0]["capability"]["available_parallelism"], 8)
+            serialized = json.dumps(report)
+            self.assertNotIn("/secret/model.gguf", serialized)
+            self.assertNotIn("diagnostic_tips", serialized)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
+    def test_backend_inventory_rejects_unbounded_capability_text(self) -> None:
+        server, thread = self.backend_inventory_server()
+        try:
+            BackendInventory.payload["devices"][0]["details"] = [
+                "x" * (workload.BACKEND_TEXT_MAX_BYTES + 1)
+            ]
+            report = workload.fetch_backend_inventory(server.server_port, "test-key", 3)
+            self.assertEqual(report["status"], "unavailable")
+            self.assertIn("exceeds the byte limit", report["error"])
+        finally:
+            BackendInventory.payload["devices"][0]["details"] = ["native host probe"]
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
 
     def test_runtime_stats_collector_authenticates_and_separates_deltas(self) -> None:
         server, thread = self.runtime_stats_server()

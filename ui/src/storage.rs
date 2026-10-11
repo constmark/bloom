@@ -11,6 +11,7 @@ use crate::i18n::Locale;
 const CONNECTION_STORAGE_KEY: &str = "bloom-ui-conn";
 const LEGACY_CONNECTION_STORAGE_KEY: &str = "bloom-web-conn";
 const SESSION_API_KEY_STORAGE_KEY: &str = "bloom-ui-api-key-v1";
+const SESSION_OPERATOR_API_KEY_STORAGE_KEY: &str = "bloom-ui-operator-api-key-v1";
 const CONVERSATION_STORAGE_KEY: &str = "bloom-ui-conversations-v2";
 const LEGACY_CONVERSATION_STORAGE_KEY: &str = "bloom-ui-conversations-v1";
 const CONVERSATION_STORAGE_VERSION: u32 = 2;
@@ -102,7 +103,17 @@ pub fn load_connection() -> ConnConfig {
     let session_api_key = session
         .as_ref()
         .and_then(|session| session.get_item(SESSION_API_KEY_STORAGE_KEY).ok().flatten());
-    let Some(config) = decode_connection_settings(&text, session_api_key.as_deref()) else {
+    let session_operator_api_key = session.as_ref().and_then(|session| {
+        session
+            .get_item(SESSION_OPERATOR_API_KEY_STORAGE_KEY)
+            .ok()
+            .flatten()
+    });
+    let Some(config) = decode_connection_settings(
+        &text,
+        session_api_key.as_deref(),
+        session_operator_api_key.as_deref(),
+    ) else {
         return ConnConfig::default();
     };
     if (config.remember_api_key || (config.api_key.is_empty() && session_api_key.is_some()))
@@ -136,6 +147,15 @@ pub fn save_connection(config: &ConnConfig) -> Result<(), String> {
             .transpose()?
             .flatten()
     };
+    let previous_session_operator_api_key = session
+        .as_ref()
+        .map(|session| {
+            session
+                .get_item(SESSION_OPERATOR_API_KEY_STORAGE_KEY)
+                .map_err(|error| format!("failed to read session operator API key: {error:?}"))
+        })
+        .transpose()?
+        .flatten();
 
     if !config.remember_api_key {
         match (session.as_ref(), config.api_key.is_empty()) {
@@ -155,8 +175,31 @@ pub fn save_connection(config: &ConnConfig) -> Result<(), String> {
         }
     }
 
+    match (session.as_ref(), config.operator_api_key.is_empty()) {
+        (Some(session), false) => session
+            .set_item(
+                SESSION_OPERATOR_API_KEY_STORAGE_KEY,
+                &config.operator_api_key,
+            )
+            .map_err(|error| format!("failed to save session operator API key: {error:?}"))?,
+        (Some(session), true) => session
+            .remove_item(SESSION_OPERATOR_API_KEY_STORAGE_KEY)
+            .map_err(|error| format!("failed to clear session operator API key: {error:?}"))?,
+        (None, false) => {
+            return Err(
+                "Browser session storage is unavailable. Allow session storage to use an operator API key."
+                    .to_string(),
+            );
+        }
+        (None, true) => {}
+    }
+
     if let Err(error) = storage.set_item(CONNECTION_STORAGE_KEY, &text) {
         restore_session_api_key(session.as_ref(), previous_session_api_key.as_deref());
+        restore_session_operator_api_key(
+            session.as_ref(),
+            previous_session_operator_api_key.as_deref(),
+        );
         return Err(format!("failed to save connection settings: {error:?}"));
     }
     if config.remember_api_key
@@ -167,7 +210,11 @@ pub fn save_connection(config: &ConnConfig) -> Result<(), String> {
     Ok(())
 }
 
-fn decode_connection_settings(text: &str, session_api_key: Option<&str>) -> Option<ConnConfig> {
+fn decode_connection_settings(
+    text: &str,
+    session_api_key: Option<&str>,
+    session_operator_api_key: Option<&str>,
+) -> Option<ConnConfig> {
     let stored = serde_json::from_str::<StoredConnection>(text).ok()?;
     let remember_api_key = stored
         .remember_api_key
@@ -179,10 +226,12 @@ fn decode_connection_settings(text: &str, session_api_key: Option<&str>) -> Opti
         } else {
             session_api_key.unwrap_or_default().to_string()
         },
+        operator_api_key: session_operator_api_key.unwrap_or_default().to_string(),
         remember_api_key,
     };
     if config.validate().is_err() {
         config.api_key.clear();
+        config.operator_api_key.clear();
         config.validate().ok()?;
     }
     Some(config)
@@ -210,6 +259,20 @@ fn restore_session_api_key(storage: Option<&web_sys::Storage>, api_key: Option<&
         let _ = storage.set_item(SESSION_API_KEY_STORAGE_KEY, api_key);
     } else {
         let _ = storage.remove_item(SESSION_API_KEY_STORAGE_KEY);
+    }
+}
+
+fn restore_session_operator_api_key(
+    storage: Option<&web_sys::Storage>,
+    operator_api_key: Option<&str>,
+) {
+    let Some(storage) = storage else {
+        return;
+    };
+    if let Some(operator_api_key) = operator_api_key {
+        let _ = storage.set_item(SESSION_OPERATOR_API_KEY_STORAGE_KEY, operator_api_key);
+    } else {
+        let _ = storage.remove_item(SESSION_OPERATOR_API_KEY_STORAGE_KEY);
     }
 }
 
@@ -383,6 +446,7 @@ mod tests {
         let config = ConnConfig {
             base_url: "https://example.com/bloom".to_string(),
             api_key: "secret-token".to_string(),
+            operator_api_key: "operator-token".to_string(),
             remember_api_key: false,
         };
 
@@ -391,7 +455,11 @@ mod tests {
         assert!(!encoded.contains("secret-token"));
         assert!(encoded.contains("\"remember_api_key\":false"));
         assert_eq!(
-            decode_connection_settings(&encoded, Some("secret-token")),
+            decode_connection_settings(
+                &encoded,
+                Some("secret-token"),
+                Some("operator-token"),
+            ),
             Some(config)
         );
     }
@@ -401,6 +469,7 @@ mod tests {
         let config = ConnConfig {
             base_url: "http://127.0.0.1:3000".to_string(),
             api_key: "remembered-token".to_string(),
+            operator_api_key: String::new(),
             remember_api_key: true,
         };
 
@@ -408,7 +477,7 @@ mod tests {
         assert!(encoded.contains("remembered-token"));
         assert!(encoded.contains("\"remember_api_key\":true"));
         assert_eq!(
-            decode_connection_settings(&encoded, Some("stale-session-token")),
+            decode_connection_settings(&encoded, Some("stale-session-token"), None),
             Some(config)
         );
     }
@@ -416,7 +485,7 @@ mod tests {
     #[test]
     fn legacy_connection_credentials_remain_available_until_policy_is_changed() {
         let legacy = r#"{"base_url":"http://localhost:3000","api_key":"legacy-token"}"#;
-        let decoded = decode_connection_settings(legacy, None).unwrap();
+        let decoded = decode_connection_settings(legacy, None, None).unwrap();
 
         assert_eq!(decoded.api_key, "legacy-token");
         assert!(decoded.remember_api_key);
@@ -431,10 +500,11 @@ mod tests {
     fn connection_storage_rejects_unknown_fields_and_discards_invalid_keys() {
         let unknown =
             r#"{"base_url":"http://localhost:3000","remember_api_key":false,"extra":true}"#;
-        assert!(decode_connection_settings(unknown, None).is_none());
+        assert!(decode_connection_settings(unknown, None, None).is_none());
 
         let session_only = r#"{"base_url":"http://localhost:3000","remember_api_key":false}"#;
-        let decoded = decode_connection_settings(session_only, Some("contains space")).unwrap();
+        let decoded =
+            decode_connection_settings(session_only, Some("contains space"), None).unwrap();
         assert_eq!(decoded.base_url, "http://localhost:3000");
         assert!(decoded.api_key.is_empty());
         assert!(!decoded.remember_api_key);

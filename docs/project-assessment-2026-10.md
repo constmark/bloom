@@ -16,7 +16,7 @@ Unicode/multilingual input rather than adding another inference backend.
 | Native paths | ABI v2 limited model paths to the identifier limit, excluding long and multibyte Windows paths. Home-directory lookup ignored `HOMEDRIVE`/`HOMEPATH`; Llama.cpp and NPU/TTS helpers had Unix-only or hard-coded roots. | Added a 128 KiB UTF-8 model-path limit, Windows home fallbacks, portable Llama.cpp lookup, and configurable per-user model roots. |
 | Python SDK | `PathLike` model paths, non-ASCII JSON, structured-output parameters, and localized diagnostics were incomplete. | Added UTF-8-preserving `PathLike` support, BCP-47 aliases for English/Chinese diagnostics, OpenAI/native response-format normalization, and response-shape validation. |
 | Packaging | Setuptools 84 emitted deprecation warnings for the old license metadata form. | Migrated to SPDX `license` and `project.license-files`, requiring the supporting setuptools version. |
-| Workload evidence | RSS and host-memory collection relied on POSIX commands, so Windows reports could be invalid or localized. | Added locale-independent Windows PSAPI and `GlobalMemoryStatusEx` collection, report the measurement source, and test the sampler in-process. |
+| Workload evidence | RSS and host-memory collection relied on POSIX commands, so Windows reports could be invalid or localized; the requested `auto` device was not independently represented in the workload artifact. | Added locale-independent Windows PSAPI and `GlobalMemoryStatusEx` collection, report the measurement source, and test the sampler in-process. The workload now records a bounded, authenticated `/v1/backends` physical-device inventory after readiness, so accelerator availability is evidence rather than a CLI selector claim. |
 
 ## Validation
 
@@ -34,3 +34,34 @@ The broader support matrix remains accurate: most model/device combinations
 are experimental until they have target-hardware correctness, performance,
 and soak evidence. This iteration improves the boundary and deployment
 experience without promoting an unmeasured accelerator path to stable.
+
+## Edge GUI iteration (2026-10-10)
+
+The repository now has a complete inventory path for the graphical runtime:
+the server exposes engine declarations and live physical-device probes from
+`GET /v1/backends`, the model manager can inspect/import/download/preflight
+packages, and the connection indicator is an actionable control. On desktop
+and mobile layouts, clicking the indicator opens the next useful surface:
+settings for connection failures, model management for an unavailable model,
+and runtime diagnostics when the active model is ready. The full state remains
+available to assistive technology through the button label and tooltip.
+
+Startup no longer requires a hardware guess. `--device auto` is the default
+for the server, standalone inference, and benchmarking commands. A shared
+backend-registry policy checks the selected engine's declared devices, probes
+compiled/runtime availability, prefers GPU then NPU, and falls back to CPU.
+Metal is reported unavailable when the binary was not built with its feature,
+which prevents a GUI or auto-selection from promising an accelerator that
+cannot execute in the current binary. Windows now contributes real available
+physical memory to runtime admission, and malformed EOS token metadata is
+rejected instead of being silently truncated.
+
+The remaining release blockers are evidence and vendor coverage rather than
+missing control flow: CoreML/MLX/Vulkan/TensorRT adapters still need
+executable runtime integrations; external OpenVINO/ASR/NPU paths now ship
+their Python bridges but still require the corresponding packages and model
+profiles; ONNX now has an executable, packaged Python `onnxruntime` bridge but
+remains experimental until real model/provider evidence is published; and a stable deployment cell still needs target-hardware soak,
+performance, cancellation, upgrade/rollback, and trained multimodal quality
+evidence. Those paths remain explicitly labelled experimental, external, or
+skeleton in the support matrix and in the GUI capability response.

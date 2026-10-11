@@ -26,8 +26,10 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
 };
+#[cfg(test)]
+use bloomai_core::DeviceKind;
 use bloomai_core::{
-    DeviceKind, GenerationParams,
+    GenerationParams,
     constants::{GIB, MIB},
 };
 use clap::builder::BoolishValueParser;
@@ -498,18 +500,22 @@ async fn run_server(args: Args, config_path: PathBuf) -> Result<()> {
     // Validate runtime selection before any storage cleanup or directory
     // creation can occur.
     let registry = engine_registry();
-    registry.get(&args.backend).map_err(|e| {
+    let engine = registry.get(&args.backend).map_err(|e| {
         anyhow!(
             "{}. Supported engines are: candle, laya, openvino, funasr, qwen3_vl, longcat, intel-npu, npu-tts, onnxruntime, coreml, mlx, vulkan, llamacpp, wan.",
             e
         )
     })?;
-    let device_kind = match args.device.to_lowercase().as_str() {
-        "cpu" => DeviceKind::Cpu,
-        "gpu" | "cuda" | "metal" => DeviceKind::Gpu,
-        "npu" | "intel-npu" => DeviceKind::Npu,
-        other => return Err(anyhow!("unsupported device: {}", other)),
-    };
+    let device_kind = bloomai_backend::BackendRegistry::default()
+        .resolve_device_selector(&args.device, &engine.supported_devices())
+        .map_err(|error| anyhow!("could not resolve device '{}': {error}", args.device))?;
+    if args.device.eq_ignore_ascii_case("auto") {
+        tracing::info!(
+            backend = args.backend,
+            selected_device = ?device_kind,
+            "automatically selected the best available device"
+        );
+    }
     let runtime_memory = RuntimeMemoryPlanner::new(&args.runtime_config()?, device_kind)?;
 
     let model_license_policy = Arc::new(ModelLicensePolicy::new(
@@ -4286,6 +4292,34 @@ mod tests {
 
         let response = handle_model_index(State(state)).await;
         assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn backends_endpoint_includes_physical_device_probe_results() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, _receiver) = test_server_state(temp.path().to_path_buf());
+
+        let response = handle_backends(State(state)).await.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["object"], "list");
+        assert!(body["data"].is_array());
+        let devices = body["devices"].as_array().expect("device probe list");
+        assert!(devices.iter().any(|device| device["name"] == "cpu"));
+        assert!(
+            devices
+                .iter()
+                .all(|device| device["available"].is_boolean())
+        );
+        assert!(
+            devices
+                .iter()
+                .filter(|device| device["name"] == "cpu" && device["available"] == true)
+                .all(|device| device["capability"].is_object())
+        );
     }
 
     #[tokio::test]
@@ -9122,15 +9156,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_switch_rejects_an_unsupported_engine_before_queueing() {
+    async fn model_switch_rejects_a_skeleton_engine_before_queueing() {
         let temp = tempfile::tempdir().unwrap();
-        std::fs::write(temp.path().join("tiny.onnx"), b"onnx").unwrap();
+        std::fs::write(temp.path().join("tiny.mlmodel"), b"coreml").unwrap();
         let (state, mut receiver) = test_server_state(temp.path().to_path_buf());
 
         let response = handle_model_switch(
             State(state),
             Json(ModelSwitchRequest {
-                id: "tiny.onnx".to_string(),
+                id: "tiny.mlmodel".to_string(),
             }),
         )
         .await;

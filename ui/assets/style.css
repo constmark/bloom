@@ -244,9 +244,12 @@ button:focus-visible, a:focus-visible, textarea:focus-visible, input:focus-visib
   display: inline-flex; align-items: center; gap: 6px;
   padding: 4px 10px; border-radius: 999px;
   font-size: 12px; font-weight: 500;
+  font-family: inherit;
   background: #f1f5f9; color: var(--text-dim);
   border: 1px solid var(--border);
+  cursor: pointer;
 }
+.status-pill:hover { filter: brightness(0.98); }
 .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #cbd5e1; }
 .status-pill.ok { background: #e7f6f0; color: var(--ok); border-color: #bfe6d5; }
 .status-pill.ok .status-dot { background: var(--ok); }
@@ -1611,7 +1614,19 @@ button:focus-visible, a:focus-visible, textarea:focus-visible, input:focus-visib
   .close-sidebar { width: 30px; height: 30px; font-size: 20px; }
   .menu-btn { width: 30px; height: 30px; font-size: 16px; }
   .brand-sub { display: none; }
-  .status-pill { display: none; }
+  /* Keep a compact connection indicator visible on small screens.  The full
+     model/task label is too wide for the header, but hiding it entirely made
+     an offline or loading runtime indistinguishable from a ready one. */
+  .status-pill {
+    display: inline-flex;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    justify-content: center;
+    flex: 0 0 24px;
+    font-size: 0;
+  }
+  .status-pill .status-dot { width: 9px; height: 9px; }
   .app-header { padding: 12px; }
   .header-actions { gap: 4px; }
   .icon-btn { padding: 6px 8px; font-size: 11px; }

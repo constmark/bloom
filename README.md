@@ -81,7 +81,7 @@ cd bloom
 cargo build --release --bin bloom_infer --bin bloom_server
 ```
 
-Run a local model with the default CPU backend:
+Run a local model with automatic device selection:
 
 ```bash
 cargo run --release --bin bloom_infer -- \
@@ -90,6 +90,12 @@ cargo run --release --bin bloom_infer -- \
   --max-tokens 128 \
   --stream
 ```
+
+`bloom_infer` and `bloom_server` use `--device auto` by default. Auto probes
+the compiled backends and host devices, selects an available accelerator that
+the chosen engine declares, and falls back to CPU. Pass `--device cpu`,
+`--device gpu`, or `--device npu` when a deployment needs an explicit choice;
+`bloom_server --doctor` reports the selected device and its availability.
 
 Model paths may point to a single `.gguf` file or to a model directory. A
 Hugging Face-style directory normally contains `config.json`, `tokenizer.json`,
@@ -803,7 +809,7 @@ paths. The current source of truth is the
 | Candle on CUDA | Experimental | Build with `--features cuda` |
 | OpenVINO and ASR bridges | External runtime | Require additional runtimes or Python packages |
 | Laya decision models | Experimental native runtime | Use a Laya checkpoint directory and JSON `{state, questions}` input; returns typed answers rather than generated text |
-| ONNX Runtime | Skeleton | Inspection and capability diagnostics only |
+| ONNX Runtime | External runtime | Bundled Python bridge; install `onnxruntime` or `onnxruntime-gpu` |
 
 Do not infer production readiness from the presence of an engine adapter. A
 path is promoted only after reproducible real-model validation and benchmark
@@ -817,7 +823,9 @@ contract, and streams OpenAI-compatible chat completions without loading a Web
 UI or embedding a browser runtime. API keys remain in memory and the server URL
 is saved as a local preference.
 
-Start a Metal backend, then build and open the desktop client:
+Start a Metal backend, then build and open the desktop client. The server can
+select the available device automatically, while `--device gpu` remains useful
+when you need an explicit GPU selection:
 
 ```bash
 cargo run --release --features metal --bin bloom_server -- \
@@ -829,6 +837,30 @@ just desktop-run
 
 The application bundle is written to `target/macos/Bloom Desktop.app`. Run the
 native parser and readiness tests with `just desktop-test`.
+
+## Cross-platform desktop launcher
+
+Release archives also include `bloom_desktop` (`bloom_desktop.exe` on
+Windows). It starts the sibling `bloom_server`, waits for a valid `/ready`
+response (including the intentional `503` empty-model state), opens the
+embedded UI, and keeps the server child attached to the terminal. Press
+`Ctrl-C` once to use Bloom's graceful shutdown path; if the child fails before
+readiness, the launcher reports the exit status and cleans it up. Server
+options are passed after a second `--`:
+
+```bash
+# Linux or macOS, from an extracted release archive
+./bloom_desktop -- --models-dir "$HOME/.bloom/models" --device auto
+
+# Windows PowerShell
+.\bloom_desktop.exe -- --models-dir "$HOME\.bloom\models" --device auto
+```
+
+Use `--server-bin /path/to/bloom_server` when the server is not beside the
+launcher, `--no-browser` for headless operation, or `--wait-seconds N` to
+change the startup deadline. From a checkout, `just desktop-launch
+/path/to/models` builds the embedded UI and runs the same lifecycle on Linux,
+macOS, or Windows.
 
 ## Web UI
 

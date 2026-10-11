@@ -32,6 +32,9 @@ STARTUP_PORT = re.compile(r"server running on http://127\.0\.0\.1:(\d+)")
 MAX_EVENT_BYTES = 1024 * 1024
 MAX_STREAM_BYTES = 16 * 1024 * 1024
 RUNTIME_STATS_MAX_BYTES = 256 * 1024
+BACKEND_INVENTORY_MAX_BYTES = 256 * 1024
+BACKEND_INVENTORY_MAX_ENTRIES = 64
+BACKEND_TEXT_MAX_BYTES = 512
 
 
 class RuntimeStatsError(ValueError):
@@ -40,6 +43,14 @@ class RuntimeStatsError(ValueError):
     def __init__(self, endpoint: str, reason: str) -> None:
         super().__init__(f"{endpoint}: {reason}")
         self.endpoint = endpoint
+        self.reason = reason
+
+
+class BackendInventoryError(ValueError):
+    """A bounded, credential-free error from the backend inventory endpoint."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"/v1/backends: {reason}")
         self.reason = reason
 
 
@@ -434,6 +445,136 @@ def _fetch_json_endpoint(port: int, path: str, api_key: str, timeout: float) -> 
         connection.close()
 
 
+def _bounded_backend_text(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise BackendInventoryError(f"{field} is not a non-empty string")
+    encoded = value.encode("utf-8")
+    if len(encoded) > BACKEND_TEXT_MAX_BYTES:
+        raise BackendInventoryError(f"{field} exceeds the byte limit")
+    return value
+
+
+def _bounded_optional_backend_text(value: Any, field: str) -> str | None:
+    if value is None:
+        return None
+    return _bounded_backend_text(value, field)
+
+
+def _bounded_backend_strings(value: Any, field: str) -> list[str]:
+    if not isinstance(value, list) or len(value) > BACKEND_INVENTORY_MAX_ENTRIES:
+        raise BackendInventoryError(f"{field} is not a bounded array")
+    return [_bounded_backend_text(item, f"{field}[{index}]") for index, item in enumerate(value)]
+
+
+def _backend_nonnegative_int(value: Any, field: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise BackendInventoryError(f"{field} is not a non-negative integer or null")
+    return value
+
+
+def _sanitize_backend_inventory(payload: Any) -> dict[str, Any]:
+    """Validate and retain physical-device evidence from ``/v1/backends``.
+
+    The endpoint also returns the active model and engine capability metadata.
+    The report intentionally drops model identity and unbounded descriptive
+    fields so a workload result can be shared without exposing local paths or
+    prompts.  The retained device capability fields are sufficient to prove
+    which compiled/runtime probes were available on the host.
+    """
+    if not isinstance(payload, dict) or payload.get("object") != "list":
+        raise BackendInventoryError("response is not a backend list")
+    devices = payload.get("devices")
+    if not isinstance(devices, list) or len(devices) > BACKEND_INVENTORY_MAX_ENTRIES:
+        raise BackendInventoryError("devices is not a bounded array")
+    sanitized: list[dict[str, Any]] = []
+    for index, item in enumerate(devices):
+        if not isinstance(item, dict):
+            raise BackendInventoryError(f"devices[{index}] is not an object")
+        name = _bounded_backend_text(item.get("name"), f"devices[{index}].name")
+        available = item.get("available")
+        if not isinstance(available, bool):
+            raise BackendInventoryError(f"devices[{index}].available is not boolean")
+        reason = item.get("reason")
+        if reason is not None and (
+            not isinstance(reason, str) or len(reason.encode("utf-8")) > BACKEND_TEXT_MAX_BYTES
+        ):
+            raise BackendInventoryError(f"devices[{index}].reason is too large or not a string")
+        details = item.get("details")
+        if details is not None:
+            details = _bounded_backend_strings(details, f"devices[{index}].details")
+        capability = item.get("capability")
+        if capability is not None:
+            if not isinstance(capability, dict):
+                raise BackendInventoryError(f"devices[{index}].capability is not an object or null")
+            cap: dict[str, Any] = {
+                "backend_name": _bounded_backend_text(
+                    capability.get("backend_name"), f"devices[{index}].capability.backend_name"
+                ),
+                "vendor": _bounded_optional_backend_text(
+                    capability.get("vendor"), f"devices[{index}].capability.vendor"
+                ),
+                "device_class": _bounded_backend_text(
+                    capability.get("device_class"), f"devices[{index}].capability.device_class"
+                ),
+                "memory_topology": _bounded_backend_text(
+                    capability.get("memory_topology"),
+                    f"devices[{index}].capability.memory_topology",
+                ),
+                "max_memory": _backend_nonnegative_int(
+                    capability.get("max_memory"), f"devices[{index}].capability.max_memory"
+                ),
+                "available_memory": _backend_nonnegative_int(
+                    capability.get("available_memory"),
+                    f"devices[{index}].capability.available_memory",
+                ),
+                "supported_dtypes": _bounded_backend_strings(
+                    capability.get("supported_dtypes"),
+                    f"devices[{index}].capability.supported_dtypes",
+                ),
+                "supported_formats": _bounded_backend_strings(
+                    capability.get("supported_formats"),
+                    f"devices[{index}].capability.supported_formats",
+                ),
+            }
+            for field in (
+                "supports_mmap",
+                "has_quantization_kernels",
+                "supports_streaming",
+            ):
+                value = capability.get(field)
+                if not isinstance(value, bool):
+                    raise BackendInventoryError(f"devices[{index}].capability.{field} is not boolean")
+                cap[field] = value
+            for field in ("max_batch_tokens", "available_parallelism"):
+                cap[field] = _backend_nonnegative_int(
+                    capability.get(field), f"devices[{index}].capability.{field}"
+                )
+            sanitized_capability: dict[str, Any] | None = cap
+        else:
+            sanitized_capability = None
+        sanitized.append(
+            {
+                "name": name,
+                "available": available,
+                "reason": reason,
+                "details": details,
+                "capability": sanitized_capability,
+            }
+        )
+    return {"status": "available", "devices": sanitized}
+
+
+def fetch_backend_inventory(port: int, api_key: str, timeout: float) -> dict[str, Any]:
+    """Fetch physical backend probes, retaining a safe partial report."""
+    try:
+        payload = _fetch_json_endpoint(port, "/v1/backends", api_key, timeout)
+        return _sanitize_backend_inventory(payload)
+    except (RuntimeStatsError, BackendInventoryError) as error:
+        return {"status": "unavailable", "devices": [], "error": str(error)}
+
+
 def fetch_runtime_stats(port: int, api_key: str, timeout: float) -> dict[str, Any]:
     """Fetch both authenticated snapshots, retaining partial availability."""
     snapshots: dict[str, Any] = {}
@@ -754,6 +895,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             port, ready = wait_ready(process, log_path, args.startup_timeout)
             cold_start_ms = (time.monotonic() - started) * 1000
             active_model = ready["model"]
+            # Capture the server's physical-device probes after readiness and
+            # outside the timed workload. This is the authoritative host
+            # evidence for an ``auto`` selection; the CLI selector alone does
+            # not prove that a runtime accelerator was actually available.
+            backend_inventory = fetch_backend_inventory(
+                port, api_key, args.request_timeout
+            )
             with MemorySampler(process.pid) as sampler:
                 for _ in range(args.warmup):
                     stream_request(port, active_model, api_key, args.max_tokens, args.request_timeout)
@@ -841,6 +989,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "python": platform.python_version(),
                     **host_hardware(),
                 },
+                "backend_inventory": backend_inventory,
                 "settings": {
                     "duration_seconds": args.duration_seconds,
                     "max_requests": args.max_requests,

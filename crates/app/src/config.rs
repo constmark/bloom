@@ -192,7 +192,7 @@ pub fn write_default_config(path: &Path) -> Result<()> {
 fn example_config() -> BloomConfig {
     BloomConfig {
         infer: InferConfig {
-            device: Some("cpu".to_string()),
+            device: Some("auto".to_string()),
             backend: Some("candle".to_string()),
             max_tokens: Some(128),
             temperature: Some(0.7),
@@ -213,7 +213,7 @@ fn example_config() -> BloomConfig {
             host: Some("127.0.0.1".to_string()),
             port: Some(3000),
             backend: Some("candle".to_string()),
-            device: Some("cpu".to_string()),
+            device: Some("auto".to_string()),
             max_concurrent: Some(4),
             max_loaded_models: Some(1),
             context_size: Some(2048),
@@ -253,7 +253,7 @@ fn example_config() -> BloomConfig {
         bench: BenchConfig {
             prompt: Some("Explain quantum computing in simple terms".to_string()),
             backend: Some("candle".to_string()),
-            device: Some("cpu".to_string()),
+            device: Some("auto".to_string()),
             max_tokens: Some(128),
             repetitions: Some(3),
             warmup: Some(1),

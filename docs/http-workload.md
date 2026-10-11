@@ -36,7 +36,7 @@ python3 scripts/http_workload.py \
 ```
 
 The report contains the model and server SHA-256, server version, configured
-backend/device, CPU model, host RAM, OS and architecture, requested settings, cold-start time, completed
+backend/device, a sanitized `/v1/backends` physical-device inventory, CPU model, host RAM, OS and architecture, requested settings, cold-start time, completed
 request and reported token counts, latency distributions, first-content
 latency, per-wave completion throughput, disconnect recovery, and host RSS
 baseline/observed peak/after-recovery drift. Each streaming response must
@@ -45,6 +45,14 @@ report the active model, a finish event, positive completion-token usage, and
 before it expires fails the run. `--duration-seconds 0` runs one wave at each
 concurrency level for short CI mechanics checks. The request cap and
 per-request timeout bound the run when a server becomes slow.
+
+The `backend_inventory` report section is collected after readiness and before
+the timed waves. It retains only bounded physical probe results (availability,
+vendor, memory topology, supported formats/dtypes, and execution flags) and
+never includes the active model ID, local paths, prompts, or engine diagnostic
+text. An unavailable inventory is recorded as evidence failure rather than
+silently treated as proof of hardware support; the workload itself can still
+finish so operators can inspect a partial report.
 
 `--collect-runtime-stats` enables authenticated, bounded snapshots from
 `/v1/observability` and `/v1/kv-cache-stats`. The runner captures one baseline

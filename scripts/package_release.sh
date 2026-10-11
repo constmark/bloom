@@ -110,7 +110,7 @@ if [ "$PACKAGE_UI" = true ]; then
 fi
 
 # Build arguments
-CARGO_ARGS=("--locked" "--release" "--workspace" "--bin" "bloom_infer" "--bin" "bloom_server" "--bin" "bloom_bench" "--bin" "inspect_gguf")
+CARGO_ARGS=("--locked" "--release" "--workspace" "--bin" "bloom_infer" "--bin" "bloom_server" "--bin" "bloom_bench" "--bin" "inspect_gguf" "--bin" "bloom_desktop")
 
 if [ "$PACKAGE_UI" = true ]; then
     CARGO_ARGS+=("--features" "serve-ui")
@@ -149,7 +149,7 @@ mkdir -p "$PKG_DIR"
 
 # Copy binaries to staging directory
 echo "Staging binaries from $BIN_SRC_DIR..."
-BINARIES=("bloom_infer" "bloom_server" "bloom_bench" "inspect_gguf")
+BINARIES=("bloom_infer" "bloom_server" "bloom_bench" "inspect_gguf" "bloom_desktop")
 for bin in "${BINARIES[@]}"; do
     if [ "$IS_WINDOWS" = true ]; then
         if [ -f "${BIN_SRC_DIR}/${bin}.exe" ]; then
@@ -167,6 +167,17 @@ for bin in "${BINARIES[@]}"; do
             exit 1
         fi
     fi
+done
+
+# External-runtime bridges are shipped beside the native binaries so an
+# extracted archive can execute Python-backed adapters without depending on
+# the source checkout. Each bridge still requires the operator to install its
+# corresponding Python runtime package.
+cp "${WORKSPACE_DIR}/scripts/onnxruntime_infer.py" "$PKG_DIR/onnxruntime_infer.py"
+chmod +x "$PKG_DIR/onnxruntime_infer.py"
+for bridge in fun_asr_infer.py qwen_asr_infer.py openvino_llm_infer.py npu_tts_infer.py; do
+    cp "${WORKSPACE_DIR}/scripts/${bridge}" "$PKG_DIR/${bridge}"
+    chmod +x "$PKG_DIR/${bridge}"
 done
 
 # Run the staged native server without binding a port or loading a model. This
@@ -281,7 +292,7 @@ if self_check_status == "passed":
     if (checks.get("embedded_ui") == "pass") != embedded_ui:
         raise SystemExit("native package embedded-UI report does not match the build mode")
 
-binary_names = ["bloom_bench", "bloom_infer", "bloom_server", "inspect_gguf"]
+binary_names = ["bloom_bench", "bloom_desktop", "bloom_infer", "bloom_server", "inspect_gguf"]
 binaries = []
 for name in binary_names:
     path = package_root / (f"{name}.exe" if (package_root / f"{name}.exe").is_file() else name)

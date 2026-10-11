@@ -198,6 +198,11 @@ server-ui: ui-build
 app models_dir: server-ui
     ./target/release/bloom_server --models-dir "{{models_dir}}" --open-browser
 
+# Build and run the cross-platform desktop launcher. Server options follow a
+# second `--` so this recipe remains independent of the server CLI surface.
+desktop-launch models_dir: server-ui
+    cargo run --locked --release -p bloomai-app --bin bloom_desktop -- -- --models-dir "{{models_dir}}" --device auto
+
 # Build the native SwiftUI macOS client as target/macos/Bloom Desktop.app.
 desktop-build:
     ./scripts/build_macos_client.sh

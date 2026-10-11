@@ -24,6 +24,14 @@ enum AsrRuntime {
 }
 
 fn repo_script_path(script_name: &str) -> PathBuf {
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(parent) = executable.parent()
+    {
+        let packaged = parent.join(script_name);
+        if packaged.is_file() {
+            return packaged;
+        }
+    }
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
