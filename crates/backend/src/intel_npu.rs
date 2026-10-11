@@ -323,6 +323,18 @@ impl Backend for IntelNpuBackend {
 mod tests {
     use super::*;
 
+    fn script_available_or_skip(path: &std::path::Path, script_name: &str) -> bool {
+        if path.exists() {
+            return true;
+        }
+
+        println!(
+            "Skipping {script_name} test because the required script is missing: {}",
+            path.display()
+        );
+        false
+    }
+
     #[test]
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn test_intel_npu_backend_availability() {
@@ -377,6 +389,9 @@ mod tests {
         };
         let demo_path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../npu_demo.py");
+        if !script_available_or_skip(&demo_path, "npu_demo.py") {
+            return;
+        }
 
         let output = std::process::Command::new(python_bin)
             .arg(&demo_path)
@@ -420,6 +435,9 @@ mod tests {
         };
         let sweep_path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../npu_sweep.py");
+        if !script_available_or_skip(&sweep_path, "npu_sweep.py") {
+            return;
+        }
 
         let output = std::process::Command::new(python_bin)
             .arg(&sweep_path)
@@ -459,6 +477,17 @@ mod tests {
         );
 
         println!("Real NPU performance sweep test passed and dashboard generated successfully!");
+    }
+
+    #[test]
+    fn test_missing_npu_script_is_skipped() {
+        let missing_script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../npu_script_missing_for_test.py");
+        assert!(!missing_script.exists());
+        assert!(!script_available_or_skip(
+            &missing_script,
+            "npu_script_missing_for_test.py"
+        ));
     }
 
     #[test]
