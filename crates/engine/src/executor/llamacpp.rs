@@ -754,17 +754,33 @@ impl StreamJsonEventParser {
             self.pending.len().saturating_add(bytes.len()) <= MAX_STREAM_EVENT_BYTES,
             "llama-server stream line exceeds the byte limit"
         );
-        self.pending.extend_from_slice(bytes);
-        while let Some(line_end) = self.pending.iter().position(|&b| b == b'\n') {
-            let mut line = self.pending.drain(..=line_end).collect::<Vec<_>>();
-            if line.ends_with(b"\n") {
-                line.pop();
+        let mut pending = std::mem::take(&mut self.pending);
+        pending.extend_from_slice(bytes);
+        let mut consumed = 0;
+        while let Some(relative_line_end) = pending[consumed..]
+            .iter()
+            .position(|&b| b == b'\n')
+        {
+            let line_end = consumed + relative_line_end;
+            let line_result = {
+                let mut line = &pending[consumed..line_end];
+                if line.ends_with(b"\r") {
+                    line = &line[..line.len() - 1];
+                }
+                self.handle_line(line, on_event)
+            };
+            consumed = line_end + 1;
+            if let Err(err) = line_result {
+                pending.drain(..consumed);
+                self.pending = pending;
+                return Err(err);
             }
-            if line.ends_with(b"\r") {
-                line.pop();
-            }
-            self.handle_line(&line, on_event)?;
         }
+        // Defer compaction until all complete lines in this chunk are handled.
+        // Draining once avoids repeatedly moving the unconsumed tail for streams
+        // containing many short lines.
+        pending.drain(..consumed);
+        self.pending = pending;
         Ok(())
     }
 
@@ -1048,6 +1064,31 @@ mod tests {
         parser.finish(&mut |_| Ok(())).unwrap();
 
         assert_eq!(content, "ab");
+    }
+
+    #[test]
+    fn parses_many_short_ndjson_lines() {
+        const EVENT_COUNT: usize = 30_000;
+        let line = b"{\"content\":\"x\"}\n";
+        let mut stream = Vec::with_capacity(EVENT_COUNT * line.len());
+        for _ in 0..EVENT_COUNT {
+            stream.extend_from_slice(line);
+        }
+
+        let mut parser = StreamJsonEventParser::default();
+        let mut count = 0;
+        let mut content = String::with_capacity(EVENT_COUNT);
+        parser
+            .push_bytes(&stream, &mut |event| {
+                count += 1;
+                content.push_str(event["content"].as_str().unwrap());
+                Ok(())
+            })
+            .unwrap();
+        parser.finish(&mut |_| Ok(())).unwrap();
+
+        assert_eq!(count, EVENT_COUNT);
+        assert_eq!(content, "x".repeat(EVENT_COUNT));
     }
 
     #[test]
