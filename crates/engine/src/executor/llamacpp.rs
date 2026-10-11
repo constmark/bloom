@@ -757,10 +757,7 @@ impl StreamJsonEventParser {
         let mut pending = std::mem::take(&mut self.pending);
         pending.extend_from_slice(bytes);
         let mut consumed = 0;
-        while let Some(relative_line_end) = pending[consumed..]
-            .iter()
-            .position(|&b| b == b'\n')
-        {
+        while let Some(relative_line_end) = pending[consumed..].iter().position(|&b| b == b'\n') {
             let line_end = consumed + relative_line_end;
             let line_result = {
                 let mut line = &pending[consumed..line_end];
