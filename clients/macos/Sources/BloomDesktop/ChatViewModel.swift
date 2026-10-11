@@ -49,7 +49,7 @@ final class ChatViewModel: ObservableObject {
     @Published var apiKey = ""
     @Published private(set) var connectionState: ConnectionState = .disconnected
     @Published private(set) var modelName: String?
-    @Published private(set) var contextWindow: Int?
+    @Published private(set) var contextWindow: UInt64?
     @Published private(set) var messages: [DesktopMessage] = []
     @Published var draft = ""
     @Published private(set) var isGenerating = false
@@ -96,7 +96,7 @@ final class ChatViewModel: ObservableObject {
 
             if readiness.supportsChat {
                 connectionState = .ready
-            } else if readiness.status == "loading" {
+            } else if readiness.loading {
                 connectionState = .loading(readiness.progress)
                 errorMessage = "The model is still loading. Connect again when it reaches 100%."
             } else {
