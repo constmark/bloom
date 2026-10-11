@@ -455,11 +455,7 @@ mod tests {
         assert!(!encoded.contains("secret-token"));
         assert!(encoded.contains("\"remember_api_key\":false"));
         assert_eq!(
-            decode_connection_settings(
-                &encoded,
-                Some("secret-token"),
-                Some("operator-token"),
-            ),
+            decode_connection_settings(&encoded, Some("secret-token"), Some("operator-token")),
             Some(config)
         );
     }
