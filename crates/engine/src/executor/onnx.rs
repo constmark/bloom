@@ -408,6 +408,24 @@ mod tests {
         }
     }
 
+    fn test_python() -> &'static str {
+        if cfg!(windows) {
+            "python"
+        } else {
+            "python3"
+        }
+    }
+
+    fn write_fake_bridge(dir: &Path) -> PathBuf {
+        let script = dir.join("fake_onnx.py");
+        std::fs::write(
+            &script,
+            "import json\nimport sys\n\nif sys.argv[1] == '--probe':\n    print(json.dumps({'ok': True, 'device': 'CPU', 'provider': 'CPUExecutionProvider'}))\nelse:\n    json.load(sys.stdin)\n    print(json.dumps({'text': 'fake output', 'logits': None}))\n",
+        )
+        .unwrap();
+        script
+    }
+
     #[test]
     fn capability_declares_onnx_contract() {
         let cap = OnnxRuntimeEngine.capability();
@@ -443,16 +461,9 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("model.onnx"), b"placeholder").unwrap();
-        let script = dir.path().join("fake-onnx.sh");
-        std::fs::write(
-            &script,
-            "#!/bin/sh\nif [ \"$1\" = \"--probe\" ]; then printf '%s\\n' '{\"ok\":true,\"device\":\"CPU\",\"provider\":\"CPUExecutionProvider\"}'; else cat >/dev/null; printf '%s\\n' '{\"text\":\"fake output\",\"logits\":null}'; fi\n",
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = write_fake_bridge(dir.path());
         let _script = EnvVarGuard::set("BLOOM_ONNX_SCRIPT", script.to_str().unwrap());
-        let _python = EnvVarGuard::set("BLOOM_ONNX_PYTHON", "sh");
+        let _python = EnvVarGuard::set("BLOOM_ONNX_PYTHON", test_python());
 
         let model = OnnxRuntimeEngine
             .load(dir.path(), DeviceKind::Cpu)
@@ -460,7 +471,6 @@ mod tests {
         assert_eq!(model.metadata().id, "model");
     }
 
-    #[cfg(unix)]
     #[test]
     fn external_bridge_round_trip_uses_json_protocol() {
         use crate::test_env::{ENV_LOCK, EnvVarGuard};
@@ -468,16 +478,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let model_file = dir.path().join("model.onnx");
         std::fs::write(&model_file, b"placeholder").unwrap();
-        let script = dir.path().join("fake-onnx.sh");
-        std::fs::write(
-            &script,
-            "#!/bin/sh\nif [ \"$1\" = \"--probe\" ]; then printf '%s\\n' '{\"ok\":true,\"device\":\"CPU\",\"provider\":\"CPUExecutionProvider\"}'; else cat >/dev/null; printf '%s\\n' '{\"text\":\"fake output\",\"logits\":null}'; fi\n",
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = write_fake_bridge(dir.path());
         let _script = EnvVarGuard::set("BLOOM_ONNX_SCRIPT", script.to_str().unwrap());
-        let _python = EnvVarGuard::set("BLOOM_ONNX_PYTHON", "sh");
+        let _python = EnvVarGuard::set("BLOOM_ONNX_PYTHON", test_python());
         let model = OnnxRuntimeEngine
             .load(&model_file, DeviceKind::Cpu)
             .unwrap();
