@@ -591,14 +591,26 @@ mod tests {
         assert_eq!(display_host("::"), "[::1]");
     }
 
+    fn read_probe_request(stream: &mut TcpStream) {
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 256];
+        loop {
+            let count = stream.read(&mut chunk).expect("read probe request");
+            assert!(count > 0, "probe request ended before its headers");
+            request.extend_from_slice(&chunk[..count]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                return;
+            }
+        }
+    }
+
     #[test]
     fn readiness_probe_accepts_empty_catalog_status() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind probe listener");
         let port = listener.local_addr().expect("probe address").port();
         let worker = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept probe request");
-            let mut request = [0_u8; 256];
-            let _ = stream.read(&mut request);
+            read_probe_request(&mut stream);
             stream
                 .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
                 .expect("write probe response");
@@ -617,8 +629,7 @@ mod tests {
         let port = listener.local_addr().expect("probe address").port();
         let worker = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept probe request");
-            let mut request = [0_u8; 256];
-            let _ = stream.read(&mut request);
+            read_probe_request(&mut stream);
             stream
                 .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
                 .expect("write probe response");
