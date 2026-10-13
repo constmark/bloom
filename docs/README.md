@@ -36,6 +36,7 @@ request.
 - [Support matrix](support-matrix.md)
 - [Scheduler](scheduler.md)
 - [Backend adapters](backend-adapters.md)
+- [Edge inference project shortlist](edge-inference-options-2026-10.md)
 - [Plugins and processors](plugins.md)
 - [World-model schema](world-model.md)
 
