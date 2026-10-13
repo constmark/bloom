@@ -14,11 +14,11 @@ use bloomai_core::{
     },
 };
 use std::any::Any;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::{Deref, DerefMut};
 use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicU64, Ordering as AtomicOrdering},
+    Arc, Mutex, TryLockError,
+    atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
 };
 use std::time::Instant;
 
@@ -277,6 +277,8 @@ pub struct BloomKvCachePool {
     pub(crate) state: Mutex<PoolState>,
     on_free: Mutex<Option<Box<dyn Fn(usize) + Send + Sync + 'static>>>,
     on_evict: Mutex<Option<Box<dyn Fn(&[usize]) + Send + Sync + 'static>>>,
+    on_allocate:
+        Mutex<Option<Box<dyn Fn(&str, &[u32], &[usize], Option<&str>) + Send + Sync + 'static>>>,
 }
 
 impl BloomKvCachePool {
@@ -306,6 +308,7 @@ impl BloomKvCachePool {
             }),
             on_free: Mutex::new(None),
             on_evict: Mutex::new(None),
+            on_allocate: Mutex::new(None),
         }
     }
 
@@ -321,6 +324,16 @@ impl BloomKvCachePool {
         F: Fn(&[usize]) + Send + Sync + 'static,
     {
         *self.on_evict.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(f));
+    }
+
+    /// Install a callback that observes every paged allocation. The callback
+    /// runs after the pool releases its state lock, so consumers may update
+    /// their own allocation metadata without lock inversion.
+    pub fn set_on_allocate<F>(&self, f: F)
+    where
+        F: Fn(&str, &[u32], &[usize], Option<&str>) + Send + Sync + 'static,
+    {
+        *self.on_allocate.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(f));
     }
 
     /// Resolve the block id that owns `token_pos` for the request identified by
@@ -349,6 +362,18 @@ impl BloomKvCachePool {
         }
         if let Some(ref f) = *self.on_evict.lock().unwrap_or_else(|e| e.into_inner()) {
             f(blocks);
+        }
+    }
+
+    fn notify_allocated(
+        &self,
+        request_id: &str,
+        prompt_tokens: &[u32],
+        blocks: &[usize],
+        multimodal_hash: Option<&str>,
+    ) {
+        if let Some(ref f) = *self.on_allocate.lock().unwrap_or_else(|e| e.into_inner()) {
+            f(request_id, prompt_tokens, blocks, multimodal_hash);
         }
     }
 
@@ -632,11 +657,19 @@ impl KvCachePool for BloomKvCachePool {
                 record.blocks.clone()
             };
 
-            return Ok(KvCacheAllocation {
+            let allocation = KvCacheAllocation {
                 handle,
                 matched_tokens: 0,
                 allocated_blocks,
-            });
+            };
+            drop(state);
+            self.notify_allocated(
+                request_id,
+                prompt_tokens,
+                &allocation.allocated_blocks,
+                multimodal_hash,
+            );
+            return Ok(allocation);
         }
 
         let total_tokens = prompt_tokens
@@ -860,6 +893,12 @@ impl KvCachePool for BloomKvCachePool {
         };
         drop(state);
         self.notify_evicted(&evicted_blocks);
+        self.notify_allocated(
+            request_id,
+            prompt_tokens,
+            &allocation.allocated_blocks,
+            multimodal_hash,
+        );
         Ok(allocation)
     }
 
@@ -918,7 +957,10 @@ pub struct ExecutionBatch {
     pub tokens: Vec<u32>,
     pub cu_seqlens: Vec<usize>,
     pub kv_handles: Vec<usize>,
-    /// Per-request start positions for decode phase (prompt_len + generated_tokens).
+    /// Per-request start positions for decode phase.  The first sampled token
+    /// is produced by prefill but has not yet entered the model KV cache, so
+    /// the decode input (the last sampled token) starts at
+    /// `prompt_len + generated_tokens - 1`.
     pub start_positions: Vec<usize>,
     /// Per-request generation parameters (temperature, top_p, seed) for sampling.
     pub params: Vec<GenerationParams>,
@@ -1050,6 +1092,12 @@ pub trait Scheduler: Send + Sync {
 pub trait EngineExecutor: Send + Sync {
     fn execute(&self, batch: ExecutionBatch) -> Result<BatchResult>;
     fn max_batch_size(&self, phase: ExecutionPhase) -> usize;
+
+    /// Return a verified reusable prefix for a newly allocated request.
+    /// Executors without a KV restore capability must recompute the prompt.
+    fn prepare_prefill(&self, _handle: usize, _prompt_len: usize) -> Result<usize> {
+        Ok(0)
+    }
 }
 
 /// Fairness strategy for balancing request classes.
@@ -1503,8 +1551,8 @@ impl Scheduler for BloomScheduler {
 /// Engine-local token scheduler for continuous batching and chunked prefill.
 pub struct InferenceScheduler {
     executor: Arc<dyn EngineExecutor>,
-    /// Serializes batch construction/execution with destructive cancellation
-    /// so a KV handle cannot be freed or reused while an executor is using it.
+    /// Serializes allocation/prefix restoration, batch construction/execution,
+    /// and cancellation so KV storage cannot change underneath an executor.
     execution_gate: Mutex<()>,
     prefill_queue: Mutex<VecDeque<ScheduledRequest>>,
     decoding_queue: Mutex<VecDeque<ScheduledRequest>>,
@@ -1522,6 +1570,16 @@ pub struct InferenceScheduler {
     preemption_manager: Mutex<PreemptionManager>,
     kv_eviction_manager: Mutex<KvEvictionManager>,
     pending_prefill_requests: Mutex<HashMap<RequestId, ScheduledRequest>>,
+    /// Prompt tokens already present in the prefix cache for queued requests.
+    /// One prompt token is retained for execution so the model can produce
+    /// first-token logits after restoring a complete cached prefix.
+    prefill_reuse_tokens: Mutex<HashMap<RequestId, usize>>,
+    /// Cancellation requests that arrive while submission owns the execution
+    /// gate. Allocation can block on a backend, so waiting for the gate here
+    /// would deadlock a caller that must release that backend before the
+    /// cancellation call can return.
+    cancelled_while_busy: Mutex<HashSet<RequestId>>,
+    submission_in_progress: AtomicBool,
 }
 
 impl InferenceScheduler {
@@ -1567,16 +1625,90 @@ impl InferenceScheduler {
             preemption_manager,
             kv_eviction_manager,
             pending_prefill_requests: Mutex::new(HashMap::new()),
+            prefill_reuse_tokens: Mutex::new(HashMap::new()),
+            cancelled_while_busy: Mutex::new(HashSet::new()),
+            submission_in_progress: AtomicBool::new(false),
         }
+    }
+
+    fn record_prefill_reuse(&self, request_id: &str, prompt_len: usize, matched_tokens: usize) {
+        let reusable = matched_tokens.min(prompt_len.saturating_sub(1));
+        self.prefill_reuse_tokens
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(request_id.to_string(), reusable);
+    }
+
+    fn prefill_reuse_for(&self, request_id: &str) -> usize {
+        self.prefill_reuse_tokens
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(request_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn clear_prefill_reuse(&self, request_id: &str) {
+        self.prefill_reuse_tokens
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(request_id);
     }
 
     /// Cancel a request by ID, freeing its KV cache allocation.
     pub fn cancel_request(&self, request_id: &str) -> bool {
-        let _execution = self
-            .execution_gate
+        match self.execution_gate.try_lock() {
+            Ok(_execution) => self.cancel_request_inner(request_id),
+            Err(TryLockError::Poisoned(error)) => {
+                let _execution = error.into_inner();
+                self.cancel_request_inner(request_id)
+            }
+            Err(TryLockError::WouldBlock) => {
+                if self.submission_in_progress.load(AtomicOrdering::Acquire) {
+                    // Submission has not published the allocation yet.
+                    // Remember the cancellation and return immediately; the
+                    // submit owner will perform the actual KV cleanup once it
+                    // leaves the critical section.
+                    self.token_senders
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .remove(request_id);
+                    self.cancelled_while_busy
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .insert(request_id.to_string());
+                    true
+                } else {
+                    // An executor owns the gate. Preserve the stronger
+                    // invariant that active KV and runtime guards are not
+                    // released until that executor returns.
+                    let _execution = self
+                        .execution_gate
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    self.cancel_request_inner(request_id)
+                }
+            }
+        }
+    }
+
+    fn take_busy_cancellation(&self, request_id: &str) -> bool {
+        self.cancelled_while_busy
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        self.cancel_request_inner(request_id)
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(request_id)
+    }
+
+    fn drain_busy_cancellations(&self) {
+        let request_ids = self
+            .cancelled_while_busy
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .drain()
+            .collect::<Vec<_>>();
+        for request_id in request_ids {
+            self.cancel_request_inner(&request_id);
+        }
     }
 
     /// Cancel while the caller already owns `execution_gate`.
@@ -1608,6 +1740,7 @@ impl InferenceScheduler {
             (pending.remove(request_id), chunked_removed)
         };
         if let Some(req) = pending_request {
+            self.clear_prefill_reuse(request_id);
             if let Some(handle) = req.kv_handle {
                 self.kv_pool.free(handle);
             }
@@ -1623,6 +1756,7 @@ impl InferenceScheduler {
                 .and_then(|pos| prefill.remove(pos))
         };
         if let Some(req) = prefill_request {
+            self.clear_prefill_reuse(request_id);
             if let Some(handle) = req.kv_handle {
                 self.kv_pool.free(handle);
             }
@@ -1641,6 +1775,7 @@ impl InferenceScheduler {
                 .and_then(|pos| decoding.remove(pos))
         };
         if let Some(req) = decoding_request {
+            self.clear_prefill_reuse(request_id);
             if let Some(handle) = req.kv_handle {
                 self.kv_pool.free(handle);
             }
@@ -1656,6 +1791,7 @@ impl InferenceScheduler {
             active.remove(request_id)
         };
         if let Some(req) = active_request {
+            self.clear_prefill_reuse(request_id);
             if let Some(handle) = req.kv_handle {
                 self.kv_pool.free(handle);
             }
@@ -1711,15 +1847,50 @@ impl InferenceScheduler {
     }
 
     fn submit_scheduled_request(&self, request: ScheduledRequest) -> Result<()> {
+        let _execution = self
+            .execution_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.drain_busy_cancellations();
         let request_id = request.id.clone();
         let result = self.submit_inner(request);
         if result.is_err() {
+            self.clear_prefill_reuse(&request_id);
             self.token_senders
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&request_id);
+            self.cancelled_while_busy
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&request_id);
         }
         result
+    }
+
+    /// Retain ownership before restoration, and release it on any failure.
+    /// Callers already hold `execution_gate`, including scheduling fallbacks.
+    fn prepare_allocated_prefill(
+        &self,
+        request: &mut ScheduledRequest,
+        allocation: KvCacheAllocation,
+    ) -> Result<()> {
+        request.kv_handle = Some(allocation.handle);
+        match self
+            .executor
+            .prepare_prefill(allocation.handle, request.prompt_tokens.len())
+        {
+            Ok(reusable) => {
+                self.record_prefill_reuse(&request.id, request.prompt_tokens.len(), reusable);
+                Ok(())
+            }
+            Err(error) => {
+                self.clear_prefill_reuse(&request.id);
+                request.kv_handle = None;
+                self.kv_pool.free(allocation.handle);
+                Err(error)
+            }
+        }
     }
 
     fn submit_inner(&self, mut request: ScheduledRequest) -> Result<()> {
@@ -1796,7 +1967,7 @@ impl InferenceScheduler {
                     }
                     // Free evicted requests
                     for victim in victims {
-                        self.cancel_request(&victim.request_id);
+                        self.cancel_request_inner(&victim.request_id);
                     }
                 }
                 AdmissionResult::Admitted => {}
@@ -1813,15 +1984,30 @@ impl InferenceScheduler {
         // prompt_tokens, silently breaking both eviction and prefix reuse.
         let max_new_tokens = request.params.max_tokens;
         let prompt_tokens = request.prompt_tokens.clone();
-        let alloc = self.kv_pool.allocate_paged(
+        self.submission_in_progress
+            .store(true, AtomicOrdering::Release);
+        let alloc_result = self.kv_pool.allocate_paged(
             &request.id,
             &prompt_tokens,
             max_new_tokens,
             request.multimodal_hash.as_deref(),
-        )?;
-        let slot = alloc.handle;
+        );
+        self.submission_in_progress
+            .store(false, AtomicOrdering::Release);
+        let alloc = alloc_result?;
+        self.prepare_allocated_prefill(&mut request, alloc)?;
 
-        request.kv_handle = Some(slot);
+        // A cancellation can arrive while the backend is still allocating
+        // pages. The cancellation path records it without waiting for this
+        // gate, so release the just-created allocation before publishing the
+        // request into a scheduler queue.
+        if self.take_busy_cancellation(&request.id) {
+            self.clear_prefill_reuse(&request.id);
+            if let Some(handle) = request.kv_handle.take() {
+                self.kv_pool.free(handle);
+            }
+            return Ok(());
+        }
         request.state = RequestState::Pending;
 
         if self.config.chunked_prefill.enabled {
@@ -1847,6 +2033,7 @@ impl InferenceScheduler {
             .execution_gate
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        self.drain_busy_cancellations();
 
         // Check and perform preemption if high-priority requests are waiting
         let preempted_ids = self.check_and_perform_preemption()?;
@@ -2052,6 +2239,7 @@ impl InferenceScheduler {
                     if let Some(handle) = req.kv_handle.take() {
                         self.kv_pool.free(handle);
                     }
+                    self.clear_prefill_reuse(&req.id);
 
                     // Update request state
                     req.preemption_count = decision.preemption_count;
@@ -2131,18 +2319,6 @@ impl InferenceScheduler {
                     continue;
                 }
 
-                let chunk_size = state.next_chunk_size();
-                let phase_budget = self.config.budget().prefill_tokens.min(self.max_num_tokens);
-                let remaining_budget = self
-                    .max_num_tokens
-                    .saturating_sub(*tokens_used)
-                    .min(phase_budget.saturating_sub(*prefill_tokens_used));
-                let scheduled_chunk_size = chunk_size.min(remaining_budget);
-                if scheduled_chunk_size == 0 {
-                    i += 1;
-                    continue;
-                }
-
                 // Get request info
                 let (model_id, req_params, kv_handle, execution_guard) = {
                     let req_opt = if pending.contains_key(&req_id) {
@@ -2165,7 +2341,15 @@ impl InferenceScheduler {
                             );
                             match alloc {
                                 Ok(a) => {
-                                    req.kv_handle = Some(a.handle);
+                                    if let Err(error) = self.prepare_allocated_prefill(req, a) {
+                                        batch_request_ids.push(req_id.clone());
+                                        drop(rate_limiter);
+                                        drop(active);
+                                        drop(pending);
+                                        drop(cp_queue);
+                                        self.fail_scheduled_requests(&batch_request_ids);
+                                        return Err(error);
+                                    }
                                 }
                                 Err(_) => {
                                     i += 1;
@@ -2188,6 +2372,25 @@ impl InferenceScheduler {
                         continue;
                     }
                 };
+
+                // A fallback allocation may discover a restored prefix, so
+                // derive the chunk and its budget only after preparation.
+                if state.filled_tokens == 0 {
+                    state.filled_tokens = self
+                        .prefill_reuse_for(&req_id)
+                        .min(state.prompt_tokens.len().saturating_sub(1));
+                }
+                let chunk_size = state.next_chunk_size();
+                let phase_budget = self.config.budget().prefill_tokens.min(self.max_num_tokens);
+                let remaining_budget = self
+                    .max_num_tokens
+                    .saturating_sub(*tokens_used)
+                    .min(phase_budget.saturating_sub(*prefill_tokens_used));
+                let scheduled_chunk_size = chunk_size.min(remaining_budget);
+                if scheduled_chunk_size == 0 {
+                    i += 1;
+                    continue;
+                }
 
                 // Check rate limiter
                 if self.config.rate_limiter.enabled {
@@ -2289,13 +2492,39 @@ impl InferenceScheduler {
         let mut rate_limiter = self.rate_limiter.lock().unwrap_or_else(|e| e.into_inner());
         let mut i = 0;
         while i < prefill.len() && batch_request_ids.len() < max_batch {
-            let req = &prefill[i];
+            let req = &mut prefill[i];
             if preempted_ids.contains(&req.id) {
                 i += 1;
                 continue;
             }
+            if req.kv_handle.is_none() {
+                // Prepare before computing the suffix and its token budget.
+                match self.kv_pool.allocate_paged(
+                    &req.id,
+                    &req.prompt_tokens,
+                    req.params.max_tokens,
+                    req.multimodal_hash.as_deref(),
+                ) {
+                    Ok(allocation) => {
+                        if let Err(error) = self.prepare_allocated_prefill(req, allocation) {
+                            batch_request_ids.push(req.id.clone());
+                            drop(rate_limiter);
+                            drop(prefill);
+                            self.fail_scheduled_requests(&batch_request_ids);
+                            return Err(error);
+                        }
+                    }
+                    Err(_) => {
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
             let req_tokens = self.prefill_tokens_for(req);
-            let req_token_count = req_tokens.len();
+            let matched_tokens = self
+                .prefill_reuse_for(&req.id)
+                .min(req_tokens.len().saturating_sub(1));
+            let req_token_count = req_tokens.len().saturating_sub(matched_tokens);
             let phase_budget = self.config.budget().prefill_tokens.min(self.max_num_tokens);
             if !token_budget_allows(*tokens_used, req_token_count, self.max_num_tokens)
                 || !token_budget_allows(*prefill_tokens_used, req_token_count, phase_budget)
@@ -2319,27 +2548,6 @@ impl InferenceScheduler {
             let Some(mut req) = prefill.remove(i) else {
                 break;
             };
-            if req.kv_handle.is_none() {
-                // Fallback allocation when submit didn't allocate.
-                // Use `allocate_paged` so prefix caching and
-                // `free_paged` keep working with the real request_id.
-                match self.kv_pool.allocate_paged(
-                    &req.id,
-                    &req.prompt_tokens,
-                    req.params.max_tokens,
-                    req.multimodal_hash.as_deref(),
-                ) {
-                    Ok(a) => {
-                        req.kv_handle = Some(a.handle);
-                    }
-                    Err(_) => {
-                        prefill.insert(i, req);
-                        i += 1;
-                        continue;
-                    }
-                }
-            }
-
             let Some(kv_handle) = req.kv_handle else {
                 prefill.insert(i, req);
                 i += 1;
@@ -2350,10 +2558,10 @@ impl InferenceScheduler {
             *prefill_tokens_used += req_token_count;
             req.state = RequestState::Prefill;
             batch_request_ids.push(req.id.clone());
-            tokens.extend_from_slice(&req_tokens);
+            tokens.extend_from_slice(&req_tokens[matched_tokens..]);
             kv_handles.push(kv_handle);
             cu_seqlens.push(tokens.len());
-            start_positions.push(0);
+            start_positions.push(matched_tokens);
             params.push(req.params.clone());
             is_final_vec.push(true);
             generated_tokens.push(req.generated_tokens.clone());
@@ -2478,8 +2686,15 @@ impl InferenceScheduler {
             tokens.push(last_token);
             kv_handles.push(kv_handle);
             cu_seqlens.push(tokens.len());
-            // Real start position: prompt_len + generated_so_far
-            start_positions.push(req.prompt_tokens.len() + req.generated_tokens.len());
+            // The first generated token is sampled from the prompt logits and
+            // is fed into the model on the first decode step.  It therefore
+            // occupies `prompt_len`, while `generated_tokens.len()` already
+            // includes it in the scheduler bookkeeping.
+            let decode_start = req
+                .prompt_tokens
+                .len()
+                .saturating_add(req.generated_tokens.len().saturating_sub(1));
+            start_positions.push(decode_start);
             params.push(req.params.clone());
             is_final_vec.push(true);
             generated_tokens.push(req.generated_tokens.clone());
@@ -2552,6 +2767,7 @@ impl InferenceScheduler {
             }
 
             if let Some(mut req) = active.remove(id) {
+                self.clear_prefill_reuse(id);
                 req.generated_tokens.push(next_token);
                 req.last_accessed = Instant::now();
 

@@ -104,17 +104,22 @@ pub(super) fn build_scheduling_runtime(
             write_through_l3: args.cachemesh_write_through_l3,
         };
         let mesh = if args.enable_cachemesh_l3 {
-            let path = args
-                .cachemesh_l3_path
-                .as_ref()
-                .filter(|path| !path.as_os_str().is_empty())
-                .ok_or_else(|| {
-                    anyhow!(
-                        "CacheMesh L3 requires a persistent directory configured with --cachemesh-l3-path"
-                    )
-                })?;
-            let remote: Arc<dyn bloomai_engine::RemoteCacheBackend> =
-                Arc::new(FileSystemRemoteCache::new(path)?);
+            let remote: Arc<dyn bloomai_engine::RemoteCacheBackend> = if let Some(remote) =
+                args.cachemesh_remote.as_ref()
+            {
+                Arc::clone(remote)
+            } else {
+                let path = args
+                        .cachemesh_l3_path
+                        .as_ref()
+                        .filter(|path| !path.as_os_str().is_empty())
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "CacheMesh L3 requires a persistent directory configured with --cachemesh-l3-path"
+                            )
+                        })?;
+                Arc::new(FileSystemRemoteCache::new(path)?)
+            };
             CacheMesh::with_remote(config, remote)
         } else {
             CacheMesh::new(config)

@@ -8,7 +8,7 @@ mod tests {
         ResourcePriority, ResourceTicket, ThermalState,
     };
     use std::sync::{
-        Arc, Weak,
+        Arc, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
         mpsc,
     };
@@ -24,6 +24,35 @@ mod tests {
         }
         fn max_batch_size(&self, _phase: ExecutionPhase) -> usize {
             4
+        }
+    }
+
+    struct RecordingExecutor {
+        batches: Mutex<Vec<(Vec<u32>, Vec<usize>)>>,
+        prepared: Mutex<usize>,
+    }
+
+    impl EngineExecutor for RecordingExecutor {
+        fn execute(&self, batch: ExecutionBatch) -> Result<BatchResult> {
+            self.batches
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push((batch.tokens, batch.start_positions));
+            Ok(BatchResult {
+                next_tokens: vec![42; batch.request_ids.len()],
+                speculative_tokens: None,
+            })
+        }
+
+        fn max_batch_size(&self, _phase: ExecutionPhase) -> usize {
+            4
+        }
+
+        fn prepare_prefill(&self, _handle: usize, _prompt_len: usize) -> Result<usize> {
+            let mut prepared = self.prepared.lock().unwrap();
+            let reuse = if *prepared == 0 { 0 } else { 4 };
+            *prepared += 1;
+            Ok(reuse)
         }
     }
 
@@ -162,6 +191,98 @@ mod tests {
                 .unwrap_or_else(|e| e.into_inner());
             assert_eq!(decoding[0].generated_tokens, vec![42, 42]);
         }
+    }
+
+    #[test]
+    fn decode_start_position_accounts_for_prefill_sampled_token() {
+        let executor = Arc::new(RecordingExecutor {
+            batches: Mutex::new(Vec::new()),
+            prepared: Mutex::new(0),
+        });
+        let batches = Arc::clone(&executor);
+        let kv_pool = Arc::new(MockKvPool::new(2));
+        let scheduler = InferenceScheduler::new(executor as Arc<dyn EngineExecutor>, kv_pool);
+
+        scheduler
+            .submit(Request {
+                id: "decode-position".into(),
+                model_id: "m1".into(),
+                prompt_tokens: vec![1, 2, 3],
+                generated_tokens: Vec::new(),
+                params: GenerationParams {
+                    max_tokens: 2,
+                    ..Default::default()
+                },
+                state: RequestState::Pending,
+                priority: 1,
+                kv_handle: None,
+                created_at: std::time::Instant::now(),
+                last_accessed: std::time::Instant::now(),
+                preemption_count: 0,
+                decode_started_at: None,
+                last_scheduled_at: None,
+                multimodal_hash: None,
+            })
+            .unwrap();
+
+        scheduler.step().unwrap(); // prefill emits the first token
+        scheduler.step().unwrap(); // decode consumes that token at prompt_len
+
+        let recorded = batches
+            .batches
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[1].0, vec![42]);
+        assert_eq!(recorded[1].1, vec![3]);
+    }
+
+    #[test]
+    fn scheduler_prefill_uses_cached_prefix_suffix_and_start_position() {
+        let executor = Arc::new(RecordingExecutor {
+            batches: Mutex::new(Vec::new()),
+            prepared: Mutex::new(0),
+        });
+        let kv_pool = Arc::new(BloomKvCachePool::new(4, 8));
+        let scheduler = InferenceScheduler::new(
+            Arc::clone(&executor) as Arc<dyn EngineExecutor>,
+            Arc::clone(&kv_pool) as Arc<dyn KvCachePool>,
+        );
+
+        let request = |id: &str| Request {
+            id: id.to_string(),
+            model_id: "m1".to_string(),
+            prompt_tokens: vec![1, 2, 3, 4, 5],
+            generated_tokens: Vec::new(),
+            params: GenerationParams {
+                max_tokens: 1,
+                ..Default::default()
+            },
+            state: RequestState::Pending,
+            priority: 1,
+            kv_handle: None,
+            created_at: std::time::Instant::now(),
+            last_accessed: std::time::Instant::now(),
+            preemption_count: 0,
+            decode_started_at: None,
+            last_scheduled_at: None,
+            multimodal_hash: None,
+        };
+
+        scheduler.submit(request("prefix-first")).unwrap();
+        scheduler.step().unwrap();
+        scheduler.submit(request("prefix-second")).unwrap();
+        scheduler.step().unwrap();
+
+        let batches = executor
+            .batches
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(batches.len(), 2);
+        // A complete four-token block hit leaves one token to execute so the
+        // model can produce logits for the next generated token.
+        assert_eq!(batches[1].0, vec![5]);
+        assert_eq!(batches[1].1, vec![4]);
     }
 
     #[test]
@@ -382,6 +503,128 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .is_empty()
+        );
+        assert_eq!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        );
+        assert!(weak_probe.upgrade().is_none());
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    struct PrepareFailExecutor;
+
+    impl EngineExecutor for PrepareFailExecutor {
+        fn execute(&self, _batch: ExecutionBatch) -> Result<BatchResult> {
+            unreachable!("prepare failure must prevent execution")
+        }
+
+        fn max_batch_size(&self, _phase: ExecutionPhase) -> usize {
+            1
+        }
+
+        fn prepare_prefill(&self, _handle: usize, _prompt_len: usize) -> Result<usize> {
+            Err(anyhow::anyhow!("prefix restore failed"))
+        }
+    }
+
+    fn request_for_cleanup(id: &str) -> Request {
+        Request {
+            id: id.to_string(),
+            model_id: "m1".to_string(),
+            prompt_tokens: vec![1, 2],
+            generated_tokens: Vec::new(),
+            params: GenerationParams {
+                max_tokens: 1,
+                ..Default::default()
+            },
+            state: RequestState::Pending,
+            priority: 1,
+            kv_handle: None,
+            created_at: std::time::Instant::now(),
+            last_accessed: std::time::Instant::now(),
+            preemption_count: 0,
+            decode_started_at: None,
+            last_scheduled_at: None,
+            multimodal_hash: None,
+        }
+    }
+
+    #[test]
+    fn submit_prepare_failure_frees_allocation_and_guard() {
+        let kv_pool = Arc::new(MockKvPool::new(1));
+        let scheduler = InferenceScheduler::new(Arc::new(PrepareFailExecutor), kv_pool.clone());
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        scheduler
+            .token_senders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("prepare-failure".to_string(), sender);
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let probe = Arc::new(DropProbe {
+            dropped: Arc::clone(&dropped),
+        });
+        let weak_probe = Arc::downgrade(&probe);
+        let guard: ExecutionGuard = probe.clone();
+        drop(probe);
+
+        let error = scheduler
+            .submit_with_execution_guard(request_for_cleanup("prepare-failure"), guard)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("prefix restore failed"));
+        assert_eq!(kv_pool.free_slots.lock().unwrap().len(), 1);
+        assert_eq!(scheduler.queue_stats(), (0, 0, 0));
+        assert!(
+            scheduler
+                .token_senders
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        );
+        assert_eq!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        );
+        assert!(weak_probe.upgrade().is_none());
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn fallback_prepare_failure_cleans_queued_request() {
+        let kv_pool = Arc::new(MockKvPool::new(1));
+        let scheduler = InferenceScheduler::new(Arc::new(PrepareFailExecutor), kv_pool.clone());
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        scheduler
+            .token_senders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("fallback-prepare-failure".to_string(), sender);
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let probe = Arc::new(DropProbe {
+            dropped: Arc::clone(&dropped),
+        });
+        let weak_probe = Arc::downgrade(&probe);
+        let guard: ExecutionGuard = probe.clone();
+        drop(probe);
+        scheduler
+            .prefill_queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(ScheduledRequest {
+                request: request_for_cleanup("fallback-prepare-failure"),
+                execution_guard: Some(guard),
+            });
+
+        let error = scheduler.step().unwrap_err();
+        assert!(error.to_string().contains("prefix restore failed"));
+        assert_eq!(kv_pool.free_slots.lock().unwrap().len(), 1);
+        assert_eq!(scheduler.queue_stats(), (0, 0, 0));
+        assert_eq!(
+            receiver.try_recv(),
+            Ok(Err(EXECUTION_FAILED_CLIENT_MESSAGE.to_string()))
         );
         assert_eq!(
             receiver.try_recv(),

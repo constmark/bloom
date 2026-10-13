@@ -46,6 +46,8 @@ pub trait KvHook: Send + Sync {
     /// Extract KV state for tokens `[start_pos, start_pos + seq_len)` from
     /// layer `layer_idx` of the model bound to `handle`. Returns flat f32
     /// vectors of length `seq_len * kv_dim()` for keys and values respectively.
+    /// Vectors use token-major `[token, kv_head, head_dim]` order. Tensor
+    /// hooks use Candle attention order `[1, kv_head, token, head_dim]`.
     ///
     /// Called by the batch executor after prefill so the paged cache can be
     /// populated with the model's freshly computed KV. Returning an error
@@ -72,7 +74,8 @@ pub trait KvHook: Send + Sync {
 
     /// Inject KV state into layer `layer_idx` at tokens
     /// `[start_pos, start_pos + seq_len)` of the model bound to `handle`.
-    /// `keys` and `values` are flat f32 vectors of length `seq_len * kv_dim()`.
+    /// `keys` and `values` are flat f32 vectors of length `seq_len * kv_dim()`
+    /// in token-major `[token, kv_head, head_dim]` order.
     ///
     /// Called by the batch executor before decode when the paged cache holds
     /// KV that the model's internal cache does not — for example after an

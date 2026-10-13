@@ -335,7 +335,11 @@ pub(crate) fn should_use_config(matches: &ArgMatches, id: &str) -> bool {
 }
 
 pub(crate) fn parse_args() -> Result<(Args, ArgMatches)> {
-    let matches = Args::command().get_matches();
+    parse_args_from(std::env::args().collect())
+}
+
+pub(crate) fn parse_args_from(argv: Vec<String>) -> Result<(Args, ArgMatches)> {
+    let matches = Args::command().get_matches_from(argv);
     let args = Args::from_arg_matches(&matches)?;
     Ok((args, matches))
 }
@@ -424,10 +428,18 @@ pub(crate) fn build_long_context_policy(args: &Args) -> Result<bloomai_engine::L
 
 impl Args {
     pub(crate) fn runtime_config(&self) -> Result<crate::application::config::RuntimeConfig> {
+        self.runtime_config_with_cachemesh_backend(None)
+    }
+
+    pub(crate) fn runtime_config_with_cachemesh_backend(
+        &self,
+        cachemesh_remote: Option<Arc<dyn bloomai_engine::RemoteCacheBackend>>,
+    ) -> Result<crate::application::config::RuntimeConfig> {
         Ok(crate::application::config::RuntimeConfig {
             backend: self.backend.clone(),
             cachemesh_l2_capacity_bytes: self.cachemesh_l2_capacity_bytes,
             cachemesh_l3_path: self.cachemesh_l3_path.clone(),
+            cachemesh_remote,
             cachemesh_write_through_l3: self.cachemesh_write_through_l3,
             context_size: self.context_size,
             disable_memory_prealloc: self.disable_memory_prealloc,

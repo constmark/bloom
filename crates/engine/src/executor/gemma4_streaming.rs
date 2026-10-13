@@ -848,8 +848,14 @@ impl Gemma4StreamingModel {
         }
         let k_slice = k.narrow(2, start_pos, seq_len)?;
         let v_slice = v.narrow(2, start_pos, seq_len)?;
-        let k_f32 = k_slice.to_dtype(DType::F32)?.flatten_all()?;
-        let v_f32 = v_slice.to_dtype(DType::F32)?.flatten_all()?;
+        let k_f32 = k_slice
+            .transpose(1, 2)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?;
+        let v_f32 = v_slice
+            .transpose(1, 2)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?;
         let k_vec = k_f32.to_vec1::<f32>()?;
         let v_vec = v_f32.to_vec1::<f32>()?;
         Ok((k_vec, v_vec))
@@ -876,11 +882,13 @@ impl Gemma4StreamingModel {
         if seq_len == 0 {
             return Ok(());
         }
-        let shape = (1usize, num_kv_heads, seq_len, head_dim);
+        let shape = (1usize, seq_len, num_kv_heads, head_dim);
         let k_tensor = Tensor::from_slice(keys, shape, &self.device)?
+            .transpose(1, 2)?
             .to_dtype(self.lm_head.dtype())?
             .contiguous()?;
         let v_tensor = Tensor::from_slice(values, shape, &self.device)?
+            .transpose(1, 2)?
             .to_dtype(self.lm_head.dtype())?
             .contiguous()?;
 

@@ -140,8 +140,22 @@ impl DoctorReport {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn validate_server_arguments(args: &Args) -> Result<()> {
-    let errors = server_argument_errors(args);
+    validate_server_arguments_with_cachemesh_backend(args, false)
+}
+
+/// Validate startup options for an embedding that supplies CacheMesh L3.
+///
+/// An injected backend replaces the directory-backed L3 store, so the path
+/// requirement is waived only for that explicit embedding path. Keeping this
+/// switch outside `Args` means the normal CLI and doctor behavior remains
+/// unchanged.
+pub(crate) fn validate_server_arguments_with_cachemesh_backend(
+    args: &Args,
+    cachemesh_backend_injected: bool,
+) -> Result<()> {
+    let errors = server_argument_errors_with_cachemesh_backend(args, cachemesh_backend_injected);
     if errors.is_empty() {
         Ok(())
     } else {
@@ -152,10 +166,20 @@ pub(crate) fn validate_server_arguments(args: &Args) -> Result<()> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn inspect_server(
     args: &Args,
     config_present: bool,
     models_root: &Path,
+) -> DoctorReport {
+    inspect_server_with_cachemesh_backend(args, config_present, models_root, false)
+}
+
+pub(crate) fn inspect_server_with_cachemesh_backend(
+    args: &Args,
+    config_present: bool,
+    models_root: &Path,
+    cachemesh_backend_injected: bool,
 ) -> DoctorReport {
     let mut checks = Vec::new();
     checks.push(if config_present {
@@ -170,7 +194,8 @@ pub(crate) fn inspect_server(
         )
     });
 
-    let argument_errors = server_argument_errors(args);
+    let argument_errors =
+        server_argument_errors_with_cachemesh_backend(args, cachemesh_backend_injected);
     checks.push(if argument_errors.is_empty() {
         DoctorCheck::pass(
             "arguments",
@@ -244,7 +269,15 @@ pub(crate) fn inspect_server(
     }
 }
 
+#[cfg(test)]
 fn server_argument_errors(args: &Args) -> Vec<String> {
+    server_argument_errors_with_cachemesh_backend(args, false)
+}
+
+fn server_argument_errors_with_cachemesh_backend(
+    args: &Args,
+    cachemesh_backend_injected: bool,
+) -> Vec<String> {
     let mut errors = Vec::new();
     match parse_browser_origin_policy(&args.cors_allow_origin) {
         Ok(BrowserOriginPolicy::Any) if args.strict_security => errors
@@ -435,6 +468,7 @@ fn server_argument_errors(args: &Args) -> Vec<String> {
         errors.push("CacheMesh L3 requires CacheMesh to be enabled.".to_string());
     }
     if args.enable_cachemesh_l3
+        && !cachemesh_backend_injected
         && args
             .cachemesh_l3_path
             .as_ref()
@@ -442,6 +476,16 @@ fn server_argument_errors(args: &Args) -> Vec<String> {
     {
         errors.push(
             "CacheMesh L3 requires a persistent directory configured with --cachemesh-l3-path."
+                .to_string(),
+        );
+    }
+    if cachemesh_backend_injected && !args.enable_cachemesh_l3 {
+        errors
+            .push("An injected CacheMesh backend requires CacheMesh L3 to be enabled.".to_string());
+    }
+    if cachemesh_backend_injected && args.cachemesh_l3_path.is_some() {
+        errors.push(
+            "An injected CacheMesh backend cannot be combined with --cachemesh-l3-path."
                 .to_string(),
         );
     }
@@ -1083,6 +1127,73 @@ mod tests {
 
         args.cachemesh_l3_path = Some(std::path::PathBuf::from("persistent-cachemesh"));
         assert!(validate_server_arguments(&args).is_ok());
+    }
+
+    #[test]
+    fn cachemesh_injected_backend_replaces_only_the_l3_directory_requirement() {
+        let mut args = default_args();
+        args.enable_ifb = true;
+        args.enable_cachemesh = true;
+        args.enable_cachemesh_l3 = true;
+
+        assert!(validate_server_arguments_with_cachemesh_backend(&args, true).is_ok());
+        assert!(validate_server_arguments_with_cachemesh_backend(&args, false).is_err());
+
+        args.enable_ifb = false;
+        let error = validate_server_arguments_with_cachemesh_backend(&args, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("in-flight batching"));
+
+        args.enable_ifb = true;
+        args.enable_cachemesh = false;
+        let error = validate_server_arguments_with_cachemesh_backend(&args, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("CacheMesh L3 requires CacheMesh"));
+
+        args.enable_cachemesh = true;
+        args.enable_cachemesh_l3 = false;
+        let error = validate_server_arguments_with_cachemesh_backend(&args, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("injected CacheMesh backend requires CacheMesh L3"));
+    }
+
+    #[test]
+    fn cachemesh_injected_backend_rejects_a_conflicting_directory() {
+        let mut args = default_args();
+        args.enable_ifb = true;
+        args.enable_cachemesh = true;
+        args.enable_cachemesh_l3 = true;
+        for path in [std::path::PathBuf::new(), std::path::PathBuf::from("cache")] {
+            args.cachemesh_l3_path = Some(path);
+            let error = validate_server_arguments_with_cachemesh_backend(&args, true)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("cannot be combined with --cachemesh-l3-path"));
+        }
+    }
+
+    #[test]
+    fn cachemesh_doctor_uses_the_embedding_backend_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut args = default_args();
+        args.enable_ifb = true;
+        args.enable_cachemesh = true;
+        args.enable_cachemesh_l3 = true;
+
+        let embedded = inspect_server_with_cachemesh_backend(&args, false, temp.path(), true);
+        let standard = inspect_server(&args, false, temp.path());
+        let arguments = |report: DoctorReport| {
+            report
+                .checks
+                .into_iter()
+                .find(|check| check.id == "arguments")
+                .unwrap()
+        };
+        assert_eq!(arguments(embedded).status, CheckStatus::Pass);
+        assert_eq!(arguments(standard).status, CheckStatus::Fail);
     }
 
     #[test]

@@ -145,6 +145,12 @@ impl PagedAttentionCache {
             cachemesh.clone(),
             config.clone(),
         );
+        install_cachemesh_allocation_hook(
+            &pool,
+            block_keys.clone(),
+            cachemesh.clone(),
+            config.clone(),
+        );
         Self {
             pool,
             config,
@@ -284,11 +290,49 @@ impl PagedAttentionCache {
             ));
         }
 
-        // Convert to F32 CPU vector for fallback compatibility
-        let keys_f32 = keys.to_dtype(candle_core::DType::F32)?.flatten_all()?;
-        let values_f32 = values.to_dtype(candle_core::DType::F32)?.flatten_all()?;
-        let keys_vec = keys_f32.to_vec1::<f32>()?;
-        let values_vec = values_f32.to_vec1::<f32>()?;
+        // Convert to F32 CPU vectors for fallback compatibility. Candle's
+        // attention layout is normally [B, H, T, D], while the paged-cache
+        // vector contract is token-major [T, H * D]. Flattening [B,H,T,D]
+        // directly would silently group all tokens by head whenever H > 1.
+        let tensor_to_token_major = |tensor: &Tensor| -> Result<Vec<f32>> {
+            let tensor = tensor.to_dtype(candle_core::DType::F32)?;
+            match tensor.dims() {
+                [1, heads, tokens, head_dim]
+                    if *tokens == num_tokens
+                        && heads.checked_mul(*head_dim) == Some(self.config.kv_dim) =>
+                {
+                    tensor
+                        .transpose(1, 2)?
+                        .contiguous()?
+                        .flatten_all()?
+                        .to_vec1::<f32>()
+                        .map_err(Into::into)
+                }
+                [tokens, width] if *tokens == num_tokens && *width == self.config.kv_dim => {
+                    tensor.flatten_all()?.to_vec1::<f32>().map_err(Into::into)
+                }
+                [heads, tokens, head_dim]
+                    if *tokens == num_tokens
+                        && heads.checked_mul(*head_dim) == Some(self.config.kv_dim) =>
+                {
+                    tensor
+                        .transpose(0, 1)?
+                        .contiguous()?
+                        .flatten_all()?
+                        .to_vec1::<f32>()
+                        .map_err(Into::into)
+                }
+                _ => Err(anyhow!(
+                    "KV tensor shape mismatch: expected [1,H,{},D] or [{},{}], got {:?}",
+                    num_tokens,
+                    num_tokens,
+                    self.config.kv_dim,
+                    tensor.dims()
+                )),
+            }
+        };
+        let keys_vec = tensor_to_token_major(&keys)?;
+        let values_vec = tensor_to_token_major(&values)?;
         let expected = num_tokens
             .checked_mul(self.config.kv_dim)
             .ok_or_else(|| anyhow!("KV tensor shape overflows usize"))?;
@@ -345,6 +389,15 @@ impl PagedAttentionCache {
         let layer_data = self.layer_data.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(block) = layer_data[layer_idx].get(&block_id)
             && let (Some(k), Some(v)) = (&block.keys_tensor, &block.values_tensor)
+            && k.dims().len() == 4
+            && v.dims().len() == 4
+            && k.dims()[0] == 1
+            && v.dims()[0] == 1
+            && k.dims()[2] == block.num_tokens
+            && v.dims()[2] == block.num_tokens
+            && k.dims()[1] == v.dims()[1]
+            && k.dims()[3] == v.dims()[3]
+            && k.dims()[1].checked_mul(k.dims()[3]) == Some(self.config.kv_dim)
         {
             return Ok(Some((k.clone(), v.clone())));
         }
@@ -353,7 +406,8 @@ impl PagedAttentionCache {
 
     /// Read KV data from blocks for a given layer, gathering into a contiguous tensor.
     ///
-    /// Returns `(keys, values)` as flat F32 vectors.
+    /// Returns `(keys, values)` as flat F32 vectors in token-major
+    /// `[token, kv_head, head_dim]` order.
     pub fn read_kv(&self, layer_idx: usize, block_ids: &[usize]) -> Result<(Vec<f32>, Vec<f32>)> {
         if layer_idx >= self.config.num_layers {
             return Err(anyhow!(
@@ -366,29 +420,58 @@ impl PagedAttentionCache {
         let mut all_keys = Vec::new();
         let mut all_values = Vec::new();
 
+        // Keep every physical block at block_size in the vector API. Partial
+        // prompt/decode writes leave unwritten slots zero-filled so paged
+        // attention can still address the block without shape ambiguity.
+        let append_block = |block: &BlockKvData| -> Result<(Vec<f32>, Vec<f32>)> {
+            let mut block_keys = Vec::new();
+            let mut block_values = Vec::new();
+            let expected = block
+                .num_tokens
+                .checked_mul(self.config.kv_dim)
+                .ok_or_else(|| anyhow!("KV block shape overflows usize"))?;
+            if block.num_tokens > self.config.block_size {
+                return Err(anyhow!("KV block contains too many tokens"));
+            }
+            if self.config.kv_dtype.needs_dequant() {
+                if let (Some(qk), Some(qv)) = (&block.quantized_keys, &block.quantized_values) {
+                    block_keys.extend(qk.dequantize_f32());
+                    block_values.extend(qv.dequantize_f32());
+                }
+            } else {
+                if block.keys.len() != expected || block.values.len() != expected {
+                    return Err(anyhow!("KV block vector shape mismatch"));
+                }
+                block_keys.extend(&block.keys);
+                block_values.extend(&block.values);
+            }
+            let padding = self
+                .config
+                .block_size
+                .saturating_sub(block.num_tokens)
+                .checked_mul(self.config.kv_dim)
+                .ok_or_else(|| anyhow!("KV block padding overflows usize"))?;
+            block_keys.extend(std::iter::repeat_n(0.0f32, padding));
+            block_values.extend(std::iter::repeat_n(0.0f32, padding));
+            Ok((block_keys, block_values))
+        };
+
         for &block_id in &self.visible_blocks(block_ids) {
             match self.get_l1_block(layer_idx, block_id) {
                 Some(block) => {
                     if let Some(mesh) = &self.cachemesh {
                         mesh.record_l1_lookup(true);
                     }
-                    if self.config.kv_dtype.needs_dequant() {
-                        // Dequantize on read
-                        if let (Some(qk), Some(qv)) =
-                            (&block.quantized_keys, &block.quantized_values)
-                        {
-                            all_keys.extend(qk.dequantize_f32());
-                            all_values.extend(qv.dequantize_f32());
-                        }
-                    } else {
-                        all_keys.extend(&block.keys);
-                        all_values.extend(&block.values);
-                    }
+                    let (block_keys, block_values) = append_block(&block)?;
+                    all_keys.extend(block_keys);
+                    all_values.extend(block_values);
                 }
                 _ => {
                     if let Some(block) = self.restore_from_cachemesh(layer_idx, block_id)? {
-                        all_keys.extend(&block.keys);
-                        all_values.extend(&block.values);
+                        let block_data = from_cachemesh_block(&block, &self.config);
+                        let (block_keys, block_values) = append_block(&block_data)?;
+                        all_keys.extend(block_keys);
+                        all_values.extend(block_values);
                     } else {
                         if let Some(mesh) = &self.cachemesh
                             && self.cachemesh_key(layer_idx, block_id).is_none()
@@ -528,6 +611,46 @@ impl PagedAttentionCache {
     /// leaking the pool's internal allocation table.
     pub fn block_for_handle(&self, handle: usize, token_pos: usize) -> Option<usize> {
         self.pool.block_for_handle(handle, token_pos)
+    }
+
+    pub fn has_cached_slot(&self, layer_idx: usize, block_id: usize, slot: usize) -> bool {
+        self.get_l1_block(layer_idx, block_id)
+            .is_some_and(|block| slot < block.num_tokens)
+    }
+
+    /// Find the contiguous full-block prefix available in L1 or CacheMesh.
+    /// Newly allocated physical blocks can still match L3 by their stable
+    /// token-derived identity, including after restarting the process.
+    pub fn prepare_prefill(&self, handle: usize, prompt_len: usize) -> Result<usize> {
+        let block_size = self.config.block_size;
+        if block_size == 0 {
+            return Ok(0);
+        }
+        // Keep at least one uncached token for first-token logits, and write
+        // the remaining suffix from a block boundary to avoid replacing a
+        // shared prefix block with a partial suffix.
+        let reusable_limit = prompt_len.saturating_sub(1) / block_size * block_size;
+        let mut restored_tokens = 0;
+        for token_pos in (0..reusable_limit).step_by(block_size) {
+            let Some(block_id) = self.block_for_handle(handle, token_pos) else {
+                break;
+            };
+            for layer_idx in 0..self.config.num_layers {
+                if self.get_l1_block(layer_idx, block_id).is_none()
+                    && self.restore_from_cachemesh(layer_idx, block_id)?.is_none()
+                {
+                    return Ok(restored_tokens);
+                }
+                let Some(block) = self.get_l1_block(layer_idx, block_id) else {
+                    return Ok(restored_tokens);
+                };
+                if block.num_tokens != block_size {
+                    return Ok(restored_tokens);
+                }
+            }
+            restored_tokens += block_size;
+        }
+        Ok(restored_tokens)
     }
 
     /// Return CacheMesh metrics when an L2/L3 backing store is configured.
@@ -762,9 +885,16 @@ impl PagedAttentionCache {
             if !got_tensor {
                 // Construct tensor on device from CPU fallback keys/values
                 let (keys_vec, values_vec) = self.read_kv(layer_idx, &[block_id])?;
-                let shape = (1usize, num_kv_heads, self.config.block_size, head_dim);
-                let k_t = Tensor::from_slice(&keys_vec, shape, device)?.to_dtype(dtype)?;
-                let v_t = Tensor::from_slice(&values_vec, shape, device)?.to_dtype(dtype)?;
+                let tokens = keys_vec.len() / self.config.kv_dim;
+                let shape = (1usize, tokens, num_kv_heads, head_dim);
+                let k_t = Tensor::from_slice(&keys_vec, shape, device)?
+                    .transpose(1, 2)?
+                    .contiguous()?
+                    .to_dtype(dtype)?;
+                let v_t = Tensor::from_slice(&values_vec, shape, device)?
+                    .transpose(1, 2)?
+                    .contiguous()?
+                    .to_dtype(dtype)?;
                 keys_tensors.push(k_t);
                 values_tensors.push(v_t);
             }
@@ -861,24 +991,16 @@ impl PagedAttentionCache {
             .map(|mesh| mesh.config().namespace.as_str())
             .unwrap_or("default");
         let mut block_keys = self.block_keys.lock().unwrap_or_else(|e| e.into_inner());
-        for (block_idx, &block_id) in block_ids.iter().enumerate() {
-            for layer_idx in 0..self.config.num_layers {
-                let prefix_len = block_idx
-                    .saturating_add(1)
-                    .saturating_mul(self.config.block_size);
-                let key = if prefix_len <= prompt_tokens.len() {
-                    CacheMeshKey::from_tokens_multimodal(
-                        namespace,
-                        layer_idx,
-                        &prompt_tokens[..prefix_len],
-                        multimodal_hash,
-                    )
-                } else {
-                    CacheMeshKey::from_request_block(namespace, layer_idx, request_id, block_idx)
-                };
-                block_keys.insert((layer_idx, block_id), key);
-            }
-        }
+        register_block_keys_into(
+            &mut block_keys,
+            namespace,
+            self.config.num_layers,
+            self.config.block_size,
+            request_id,
+            prompt_tokens,
+            block_ids,
+            multimodal_hash,
+        );
     }
 
     fn cachemesh_key(&self, layer_idx: usize, block_id: usize) -> Option<CacheMeshKey> {
@@ -912,6 +1034,11 @@ impl PagedAttentionCache {
             return Ok(None);
         };
         block.validate()?;
+        if block.block_size != self.config.block_size || block.kv_dim != self.config.kv_dim {
+            return Err(anyhow!(
+                "CacheMesh block layout does not match the current model"
+            ));
+        }
 
         let block_data = from_cachemesh_block(&block, &self.config);
         let mut layer_data = self.layer_data.lock().unwrap_or_else(|e| e.into_inner());
@@ -927,15 +1054,15 @@ fn install_cachemesh_eviction_hook(
     cachemesh: Option<Arc<CacheMesh>>,
     config: PagedCacheConfig,
 ) {
-    let Some(mesh) = cachemesh else {
-        return;
-    };
     pool.set_on_evict(move |block_ids| {
         let mut layer_data = layer_data.lock().unwrap_or_else(|e| e.into_inner());
         let block_keys = block_keys.lock().unwrap_or_else(|e| e.into_inner());
         for &block_id in block_ids {
             for layer_idx in 0..config.num_layers {
                 let Some(block) = layer_data[layer_idx].remove(&block_id) else {
+                    continue;
+                };
+                let Some(mesh) = cachemesh.as_ref() else {
                     continue;
                 };
                 let Some(key) = block_keys.get(&(layer_idx, block_id)).cloned() else {
@@ -945,6 +1072,65 @@ fn install_cachemesh_eviction_hook(
             }
         }
     });
+}
+
+/// Keep CacheMesh identities in sync with the pool's scheduler-owned
+/// allocations. The scheduler allocates directly from the shared pool rather
+/// than calling `PagedAttentionCache::allocate`, so this hook is the common
+/// registration path for both APIs.
+fn install_cachemesh_allocation_hook(
+    pool: &Arc<BloomKvCachePool>,
+    block_keys: Arc<Mutex<HashMap<(usize, usize), CacheMeshKey>>>,
+    cachemesh: Option<Arc<CacheMesh>>,
+    config: PagedCacheConfig,
+) {
+    let Some(mesh) = cachemesh else {
+        return;
+    };
+    let namespace = mesh.config().namespace.clone();
+    pool.set_on_allocate(
+        move |request_id, prompt_tokens, block_ids, multimodal_hash| {
+            let mut keys = block_keys.lock().unwrap_or_else(|error| error.into_inner());
+            register_block_keys_into(
+                &mut keys,
+                &namespace,
+                config.num_layers,
+                config.block_size,
+                request_id,
+                prompt_tokens,
+                block_ids,
+                multimodal_hash,
+            );
+        },
+    );
+}
+
+fn register_block_keys_into(
+    block_keys: &mut HashMap<(usize, usize), CacheMeshKey>,
+    namespace: &str,
+    num_layers: usize,
+    block_size: usize,
+    request_id: &str,
+    prompt_tokens: &[u32],
+    block_ids: &[usize],
+    multimodal_hash: Option<&str>,
+) {
+    for (block_idx, &block_id) in block_ids.iter().enumerate() {
+        for layer_idx in 0..num_layers {
+            let prefix_len = block_idx.saturating_add(1).saturating_mul(block_size);
+            let key = if prefix_len <= prompt_tokens.len() {
+                CacheMeshKey::from_tokens_multimodal(
+                    namespace,
+                    layer_idx,
+                    &prompt_tokens[..prefix_len],
+                    multimodal_hash,
+                )
+            } else {
+                CacheMeshKey::from_request_block(namespace, layer_idx, request_id, block_idx)
+            };
+            block_keys.insert((layer_idx, block_id), key);
+        }
+    }
 }
 
 fn to_cachemesh_block(
@@ -1124,6 +1310,39 @@ mod tests {
     }
 
     #[test]
+    fn tensor_write_reorders_multi_head_cache_to_token_major_vectors() {
+        let mut config = test_config();
+        config.block_size = 3;
+        config.kv_dim = 4; // two KV heads, head_dim=2
+        let cache = PagedAttentionCache::new(config);
+        let alloc = cache.allocate("multi-head", &[1, 2, 3], 0).unwrap();
+        let device = Device::Cpu;
+        // [batch=1, heads=2, tokens=3, head_dim=2]. Values identify both
+        // token and head so a head-major flatten cannot pass accidentally.
+        let keys = Tensor::from_vec(
+            vec![
+                10.0f32, 11.0, 20.0, 21.0, 30.0, 31.0, 12.0, 13.0, 22.0, 23.0, 32.0, 33.0,
+            ],
+            (1, 2, 3, 2),
+            &device,
+        )
+        .unwrap();
+        let values = keys.clone();
+        cache
+            .write_kv_tensor(0, alloc.allocated_blocks[0], keys, values, 3)
+            .unwrap();
+        let (stored, _) = cache.read_kv(0, &alloc.allocated_blocks[..1]).unwrap();
+        assert_eq!(
+            stored[..12],
+            [
+                10.0, 11.0, 12.0, 13.0, // token 0
+                20.0, 21.0, 22.0, 23.0, // token 1
+                30.0, 31.0, 32.0, 33.0, // token 2
+            ]
+        );
+    }
+
+    #[test]
     fn zero_block_size_is_rejected_without_panicking() {
         let pool = BloomKvCachePool::new(0, 4);
         let err = pool
@@ -1282,6 +1501,103 @@ mod tests {
         assert_eq!(metrics.l2.misses, 1);
         assert_eq!(metrics.l3.hits, 1);
         assert_eq!(metrics.l3.hit_rate, 1.0);
+    }
+
+    #[test]
+    fn test_scheduler_pool_allocation_registers_cachemesh_identity() {
+        let pool = Arc::new(BloomKvCachePool::new(4, 4));
+        let remote = Arc::new(InMemoryRemoteCache::new());
+        let mesh = Arc::new(CacheMesh::with_remote(
+            CacheMeshConfig {
+                enabled: true,
+                namespace: "scheduler-model".to_string(),
+                l2_capacity_bytes: 1,
+                l3_enabled: true,
+                write_through_l3: true,
+            },
+            remote,
+        ));
+        let cache = PagedAttentionCache::from_pool_and_cachemesh(
+            Arc::clone(&pool),
+            PagedCacheConfig {
+                block_size: 4,
+                total_blocks: 4,
+                num_layers: 1,
+                kv_dim: 2,
+                kv_dtype: KvCacheDtype::F16,
+                long_context_policy: LongContextPolicy::Full,
+            },
+            Some(Arc::clone(&mesh)),
+        );
+
+        // InferenceScheduler allocates directly from the shared pool. The
+        // allocation callback must still make the eviction key available.
+        let allocation = pool
+            .allocate_paged("scheduler-request", &[1, 2, 3, 4], 0, None)
+            .expect("allocate paged request");
+        let block_id = allocation.allocated_blocks[0];
+        cache
+            .write_kv(0, block_id, vec![1.0; 8], vec![2.0; 8], 4)
+            .expect("write KV block");
+        assert!(cache.offload_block(0, block_id).expect("offload block"));
+        assert_eq!(mesh.metrics().l3.items, 1);
+        assert_eq!(mesh.metrics().l3.offloads, 1);
+    }
+
+    #[test]
+    fn prefill_restores_remote_prefix_with_a_fresh_pool() {
+        let remote = Arc::new(InMemoryRemoteCache::new());
+        let make_cache = || {
+            let pool = Arc::new(BloomKvCachePool::new(4, 4));
+            let mesh = Arc::new(CacheMesh::with_remote(
+                CacheMeshConfig {
+                    enabled: true,
+                    namespace: "restart-model".to_string(),
+                    l2_capacity_bytes: 1,
+                    l3_enabled: true,
+                    write_through_l3: true,
+                },
+                remote.clone(),
+            ));
+            let cache = PagedAttentionCache::from_pool_and_cachemesh(
+                Arc::clone(&pool),
+                PagedCacheConfig {
+                    block_size: 4,
+                    total_blocks: 4,
+                    num_layers: 1,
+                    kv_dim: 2,
+                    kv_dtype: KvCacheDtype::F16,
+                    long_context_policy: LongContextPolicy::Full,
+                },
+                Some(Arc::clone(&mesh)),
+            );
+            (pool, cache, mesh)
+        };
+        let (first_pool, first_cache, _) = make_cache();
+        let first = first_pool
+            .allocate_paged("first", &[1, 2, 3, 4, 5], 1, None)
+            .unwrap();
+        first_cache
+            .write_kv(0, first.allocated_blocks[0], vec![3.0; 8], vec![4.0; 8], 4)
+            .unwrap();
+        first_pool.free(first.handle);
+        first_pool.compact_inactive(4);
+
+        let (second_pool, second_cache, mesh) = make_cache();
+        let second = second_pool
+            .allocate_paged("second", &[1, 2, 3, 4, 5], 1, None)
+            .unwrap();
+        assert_eq!(
+            second.matched_tokens, 0,
+            "the new pool has no local prefix metadata"
+        );
+        assert_eq!(second_cache.prepare_prefill(second.handle, 5).unwrap(), 4);
+        assert_eq!(mesh.metrics().l3.hits, 1);
+        let (keys, values) = second_cache
+            .read_kv(0, &[second.allocated_blocks[0]])
+            .unwrap();
+        assert_eq!(keys, vec![3.0; 8]);
+        assert_eq!(values, vec![4.0; 8]);
     }
 
     #[test]

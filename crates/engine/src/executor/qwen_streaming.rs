@@ -1,6 +1,10 @@
 // Streaming attention entry points mirror the model's separate state tensors.
 #![allow(clippy::too_many_arguments)]
 
+mod moe;
+pub(crate) use moe::MoeConfig;
+use moe::{FeedForward, SparseMoe};
+
 use bloomai_core::BloomError;
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{Activation, VarBuilder, kv_cache::ConcatKvCache};
@@ -477,6 +481,39 @@ pub struct StreamingQwenMLP {
 }
 
 impl StreamingQwenMLP {
+    fn new(
+        hidden: usize,
+        intermediate: usize,
+        act_fn: Activation,
+        vb: VarBuilder,
+        quantizer: Option<&Arc<super::metal_quant::MetalQuantizer>>,
+    ) -> Result<Self> {
+        Ok(Self {
+            gate_proj: StreamingLinear::new_with_quantizer(
+                hidden,
+                intermediate,
+                false,
+                vb.pp("gate_proj"),
+                quantizer,
+            )?,
+            up_proj: StreamingLinear::new_with_quantizer(
+                hidden,
+                intermediate,
+                false,
+                vb.pp("up_proj"),
+                quantizer,
+            )?,
+            down_proj: StreamingLinear::new_with_quantizer(
+                intermediate,
+                hidden,
+                false,
+                vb.pp("down_proj"),
+                quantizer,
+            )?,
+            act_fn,
+        })
+    }
+
     pub fn forward(&self, x: &Tensor, device: &Device) -> Result<Tensor> {
         let gate_out = self.gate_proj.forward(x, device)?;
         let lhs = gate_out.apply(&self.act_fn)?;
@@ -489,7 +526,7 @@ impl StreamingQwenMLP {
 #[derive(Debug, Clone)]
 pub struct StreamingDecoderLayer {
     self_attn: StreamingQwenAttention,
-    mlp: StreamingQwenMLP,
+    mlp: FeedForward,
     ln1: StreamingRmsNorm,
     ln2: StreamingRmsNorm,
 }
@@ -534,6 +571,16 @@ impl StreamingQwenModel {
         vb: VarBuilder,
         target_device: &Device,
         quantizer: Option<Arc<super::metal_quant::MetalQuantizer>>,
+    ) -> Result<Self> {
+        Self::new_with_moe(cfg, vb, target_device, quantizer, None)
+    }
+
+    fn new_with_moe(
+        cfg: &Config,
+        vb: VarBuilder,
+        target_device: &Device,
+        quantizer: Option<Arc<super::metal_quant::MetalQuantizer>>,
+        moe: Option<&MoeConfig>,
     ) -> Result<Self> {
         // Load embed_tokens weight on CPU and move immediately to CUDA device
         let embed_tokens_weight = vb
@@ -631,35 +678,21 @@ impl StreamingQwenModel {
                 }
             };
 
-            let mlp = {
-                let vb_mlp = vb_layer.pp("mlp");
-                let gate_proj = StreamingLinear::new_with_quantizer(
+            let mlp = match moe.filter(|config| config.sparse_layer(i)) {
+                Some(config) => FeedForward::Sparse(SparseMoe::new(
+                    config,
+                    cfg.hidden_size,
+                    cfg.hidden_act,
+                    vb_layer.pp("mlp"),
+                    quantizer.as_ref(),
+                )?),
+                None => FeedForward::Dense(StreamingQwenMLP::new(
                     cfg.hidden_size,
                     cfg.intermediate_size,
-                    false,
-                    vb_mlp.pp("gate_proj"),
+                    cfg.hidden_act,
+                    vb_layer.pp("mlp"),
                     quantizer.as_ref(),
-                )?;
-                let up_proj = StreamingLinear::new_with_quantizer(
-                    cfg.hidden_size,
-                    cfg.intermediate_size,
-                    false,
-                    vb_mlp.pp("up_proj"),
-                    quantizer.as_ref(),
-                )?;
-                let down_proj = StreamingLinear::new_with_quantizer(
-                    cfg.intermediate_size,
-                    cfg.hidden_size,
-                    false,
-                    vb_mlp.pp("down_proj"),
-                    quantizer.as_ref(),
-                )?;
-                StreamingQwenMLP {
-                    gate_proj,
-                    up_proj,
-                    down_proj,
-                    act_fn: cfg.hidden_act,
-                }
+                )?),
             };
 
             let ln1 = StreamingRmsNorm::new(
@@ -734,11 +767,23 @@ impl QwenStreamingModelForCausalLM {
         quantizer: Option<Arc<super::metal_quant::MetalQuantizer>>,
         offloaded_layers: Option<usize>,
     ) -> Result<Self> {
-        let base = StreamingQwenModel::new_with_quantizer(
+        Self::new_with_moe(cfg, vb, target_device, quantizer, offloaded_layers, None)
+    }
+
+    pub(crate) fn new_with_moe(
+        cfg: &Config,
+        vb: VarBuilder,
+        target_device: &Device,
+        quantizer: Option<Arc<super::metal_quant::MetalQuantizer>>,
+        offloaded_layers: Option<usize>,
+        moe: Option<&MoeConfig>,
+    ) -> Result<Self> {
+        let base = StreamingQwenModel::new_with_moe(
             cfg,
             vb.clone(),
             target_device,
             quantizer.clone(),
+            moe,
         )?;
         let lm_head = if cfg.tie_word_embeddings {
             let w = base.embed_tokens.clone();
@@ -831,7 +876,7 @@ impl QwenStreamingModelForCausalLM {
 
     /// Extract KV cache for `[start_pos, start_pos + seq_len)` from a given
     /// layer's `ConcatKvCache`, returning flat f32 vectors of length
-    /// `seq_len * kv_dim` each.
+    /// `seq_len * kv_dim` each in token-major `[T, H, D]` order.
     ///
     /// This is the per-layer read path shared by [`QwenKvHook`] and
     /// [`crate::executor::candle::PerRequestKvHook`]. Exposed publicly so
@@ -872,13 +917,23 @@ impl QwenStreamingModelForCausalLM {
         }
         let k_slice = k.narrow(2, start_pos, seq_len)?;
         let v_slice = v.narrow(2, start_pos, seq_len)?;
-        let k_f32 = k_slice.to_dtype(DType::F32)?.flatten_all()?;
-        let v_f32 = v_slice.to_dtype(DType::F32)?.flatten_all()?;
+        // The vector bridge is token-major [T, H * D], while attention
+        // tensors are [B, H, T, D]. Keep the layout explicit for GQA models.
+        let k_f32 = k_slice
+            .transpose(1, 2)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?;
+        let v_f32 = v_slice
+            .transpose(1, 2)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?;
         Ok((k_f32.to_vec1::<f32>()?, v_f32.to_vec1::<f32>()?))
     }
 
     /// Inject KV for `[start_pos, start_pos + seq_len)` into a given layer's
     /// `ConcatKvCache`.
+    /// The input vectors use token-major `[T, H, D]` order, matching the
+    /// scheduler's serialized block contract.
     ///
     /// Handles two layouts:
     /// 1. **Full restore** (`start_pos == 0` AND cache empty): calls `append`.
@@ -926,11 +981,13 @@ impl QwenStreamingModelForCausalLM {
 
         let device = self.base.device.clone();
         let dtype = self.base.dtype;
-        let shape = (1usize, num_kv_heads, seq_len, head_dim);
+        let shape = (1usize, seq_len, num_kv_heads, head_dim);
         let k_tensor = Tensor::from_slice(keys, shape, &device)?
+            .transpose(1, 2)?
             .to_dtype(dtype)?
             .contiguous()?;
         let v_tensor = Tensor::from_slice(values, shape, &device)?
+            .transpose(1, 2)?
             .to_dtype(dtype)?
             .contiguous()?;
 
@@ -1700,6 +1757,132 @@ mod qwen_kv_hook_tests {
                 "layer {} post-restore V mismatch",
                 layer
             );
+        }
+    }
+
+    #[test]
+    fn multi_head_nonzero_prefix_restores_from_cachemesh_into_native_attention() {
+        use crate::cachemesh::{CacheMesh, CacheMeshConfig, InMemoryRemoteCache};
+        use crate::executor::batch_executor::CandleBatchExecutor;
+        use crate::scheduler::paged_cache::{
+            LongContextPolicy, PagedAttentionCache, PagedCacheConfig,
+        };
+        use crate::scheduler::{EngineExecutor, ExecutionBatch, ExecutionPhase};
+        use bloomai_core::GenerationParams;
+
+        let device = Device::Cpu;
+        let cfg = Config {
+            vocab_size: 64,
+            hidden_size: 32,
+            intermediate_size: 64,
+            num_hidden_layers: 2,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            max_position_embeddings: 32,
+            rope_theta: 10000.0,
+            rms_norm_eps: 1e-6,
+            head_dim: 8,
+            hidden_act: Activation::Silu,
+            tie_word_embeddings: false,
+            use_sliding_window: false,
+            sliding_window: None,
+            max_window_layers: 0,
+            attention_bias: false,
+        };
+        let model = Arc::new(Mutex::new(
+            QwenStreamingModelForCausalLM::new(
+                &cfg,
+                build_zero_f32_varbuilder(&cfg, &device),
+                &device,
+            )
+            .unwrap(),
+        ));
+        let hook = Arc::new(QwenKvHook::new(Arc::clone(&model), 2, 2, 8));
+        let mesh = Arc::new(CacheMesh::with_remote(
+            CacheMeshConfig {
+                enabled: true,
+                namespace: "multi-head-native".into(),
+                l2_capacity_bytes: 1,
+                l3_enabled: true,
+                write_through_l3: true,
+            },
+            Arc::new(InMemoryRemoteCache::new()),
+        ));
+        let cache = Arc::new(PagedAttentionCache::with_cachemesh(
+            PagedCacheConfig {
+                block_size: 4,
+                total_blocks: 8,
+                num_layers: 2,
+                kv_dim: 16,
+                kv_dtype: crate::core::quantization::KvCacheDtype::F32,
+                long_context_policy: LongContextPolicy::Full,
+            },
+            Arc::clone(&mesh),
+        ));
+        let allocation = cache.allocate("restore", &[10, 20, 30, 40, 50], 2).unwrap();
+        let block_id = allocation.allocated_blocks[0];
+        // Distinct nonzero values for every head, token and dimension make
+        // accidental H/T transposition visible; constant/zero fixtures do not.
+        let expected: Vec<f32> = (0..64).map(|index| index as f32 + 1.0).collect();
+        let tensor = Tensor::from_vec(expected.clone(), (1, 2, 4, 8), &device).unwrap();
+        for layer in 0..2 {
+            cache
+                .write_kv_tensor(layer, block_id, tensor.clone(), tensor.clone(), 4)
+                .unwrap();
+            assert!(cache.offload_block(layer, block_id).unwrap());
+        }
+        assert_eq!(cache.layer_block_count(0), 0);
+        assert_eq!(cache.prepare_prefill(allocation.handle, 5).unwrap(), 4);
+        assert_eq!(mesh.metrics().l3.hits, 2);
+
+        let model_for_forward = Arc::clone(&model);
+        let expected_for_forward = expected.clone();
+        let forward = Box::new(move |input: &Tensor, start: usize, _handle| {
+            let mut model = model_for_forward.lock().unwrap();
+            for layer in 0..2 {
+                let (keys, values) = model.extract_kv_tensor(layer, 0, 4)?;
+                assert_eq!(keys.flatten_all()?.to_vec1::<f32>()?, expected_for_forward);
+                assert_eq!(
+                    values.flatten_all()?.to_vec1::<f32>()?,
+                    expected_for_forward
+                );
+            }
+            model.forward(input, start).map_err(Into::into)
+        });
+        let executor = CandleBatchExecutor::new(forward, device, 1, 1)
+            .with_cache(Arc::clone(&cache))
+            .with_kv_hook(hook as Arc<dyn KvHook>);
+        executor
+            .execute(ExecutionBatch {
+                phase: ExecutionPhase::Prefill,
+                request_ids: vec!["restore".into()],
+                tokens: vec![50],
+                cu_seqlens: vec![0, 1],
+                kv_handles: vec![allocation.handle],
+                start_positions: vec![4],
+                params: vec![GenerationParams {
+                    temperature: 0.0,
+                    ..Default::default()
+                }],
+                generated_tokens: vec![Vec::new()],
+            })
+            .unwrap();
+        // The vector extract side uses the same token-major contract as
+        // serialization, independently of the tensor comparison above.
+        let token_major = tensor
+            .transpose(1, 2)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        for layer in 0..2 {
+            let (keys, _) = model
+                .lock()
+                .unwrap()
+                .extract_kv_from_layer(layer, 0, 4)
+                .unwrap();
+            assert_eq!(keys, token_major);
         }
     }
 

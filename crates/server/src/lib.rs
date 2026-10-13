@@ -102,7 +102,9 @@ use application::runtime_service::{
 use catalog_lock::ModelCatalogLease;
 use chat_template::{ChatMessage, select_template_for_metadata};
 use cli::*;
-use doctor::{inspect_server, validate_server_arguments};
+use doctor::{
+    inspect_server_with_cachemesh_backend, validate_server_arguments_with_cachemesh_backend,
+};
 use embedding::*;
 use handlers::*;
 use helpers::*;
@@ -417,6 +419,50 @@ impl ApiError {
 /// read or write the process environment until this function has applied the
 /// configuration and created its Tokio runtime.
 pub unsafe fn run_cli() -> Result<()> {
+    unsafe { run_cli_inner(None, None) }
+}
+
+/// Run Bloom while embedding an application-provided CacheMesh L3 backend.
+///
+/// The backend is consumed by Bloom's engine-owned CacheMesh implementation.
+/// The caller must
+/// pass `--enable-ifb --enable-cachemesh --enable-cachemesh-l3` in the normal
+/// Bloom arguments. The injected backend replaces `--cachemesh-l3-path`.
+///
+/// # Safety
+///
+/// The caller must uphold [`run_cli`]'s single-threaded startup contract.
+/// Constructing the supplied backend must not start threads before calling
+/// this function; defer any background work until the backend is first used.
+pub unsafe fn run_cli_with_cachemesh_backend(
+    cachemesh_remote: Arc<dyn bloomai_engine::RemoteCacheBackend>,
+) -> Result<()> {
+    unsafe { run_cli_inner(Some(cachemesh_remote), None) }
+}
+
+/// Variant of [`run_cli_with_cachemesh_backend`] for embedding applications
+/// that need to provide an argument vector instead of using process argv.
+/// `argv` follows the usual clap convention and must include the binary name
+/// as its first element.
+///
+/// # Safety
+///
+/// The caller must uphold the single-threaded startup contract documented on
+/// [`run_cli_with_cachemesh_backend`], including backend construction.
+pub unsafe fn run_cli_with_cachemesh_backend_and_args(
+    cachemesh_remote: Arc<dyn bloomai_engine::RemoteCacheBackend>,
+    argv: Vec<String>,
+) -> Result<()> {
+    if argv.is_empty() {
+        return Err(anyhow!("Bloom argv must include the binary name"));
+    }
+    unsafe { run_cli_inner(Some(cachemesh_remote), Some(argv)) }
+}
+
+unsafe fn run_cli_inner(
+    cachemesh_remote: Option<Arc<dyn bloomai_engine::RemoteCacheBackend>>,
+    argv: Option<Vec<String>>,
+) -> Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -424,7 +470,10 @@ pub unsafe fn run_cli() -> Result<()> {
         )
         .init();
 
-    let (mut args, matches) = parse_args()?;
+    let (mut args, matches) = match argv {
+        Some(argv) => parse_args_from(argv)?,
+        None => parse_args()?,
+    };
     let config_path = bloomai_app::resolve_config_path(args.config.as_deref())?;
     if args.init_config {
         bloomai_app::write_default_config(&config_path)?;
@@ -443,7 +492,7 @@ pub unsafe fn run_cli() -> Result<()> {
         .enable_all()
         .build()
         .map_err(|error| anyhow!("failed to create the Bloom Tokio runtime: {error}"))?;
-    runtime.block_on(run_server(args, config_path))
+    runtime.block_on(run_server(args, config_path, cachemesh_remote))
 }
 
 fn configure_process_environment(args: &Args) {
@@ -477,13 +526,22 @@ fn configure_process_environment(args: &Args) {
     }
 }
 
-async fn run_server(args: Args, config_path: PathBuf) -> Result<()> {
+async fn run_server(
+    args: Args,
+    config_path: PathBuf,
+    cachemesh_remote: Option<Arc<dyn bloomai_engine::RemoteCacheBackend>>,
+) -> Result<()> {
     let models_root = args
         .models_dir
         .clone()
         .unwrap_or(bloomai_app::default_config_dir()?.join("models"));
     if let Some(format) = args.doctor {
-        let report = inspect_server(&args, config_path.exists(), &models_root);
+        let report = inspect_server_with_cachemesh_backend(
+            &args,
+            config_path.exists(),
+            &models_root,
+            cachemesh_remote.is_some(),
+        );
         print!("{}", report.render(format)?);
         if report.has_failures() {
             return Err(anyhow!(
@@ -492,7 +550,7 @@ async fn run_server(args: Args, config_path: PathBuf) -> Result<()> {
         }
         return Ok(());
     }
-    validate_server_arguments(&args)?;
+    validate_server_arguments_with_cachemesh_backend(&args, cachemesh_remote.is_some())?;
     let runtime_pool_capacity = NonZeroUsize::new(args.max_loaded_models)
         .ok_or_else(|| anyhow!("maximum loaded models must be at least 1"))?;
 
@@ -665,7 +723,7 @@ async fn run_server(args: Args, config_path: PathBuf) -> Result<()> {
     });
 
     let state_clone = Arc::clone(&state.app);
-    let runtime_config = args.runtime_config()?;
+    let runtime_config = args.runtime_config_with_cachemesh_backend(cachemesh_remote)?;
     tokio::spawn(model_loader_loop(
         state_clone,
         runtime_config,
