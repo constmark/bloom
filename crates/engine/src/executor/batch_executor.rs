@@ -23,7 +23,7 @@
 //! after prefill, writes it into the paged cache, and (on decode for restored
 //! blocks) injects KV back into the model before the forward pass.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
@@ -58,6 +58,13 @@ pub struct CandleBatchExecutor {
     /// Optional per-layer KV bridge. When absent the model's internal KV cache
     /// is the sole source of truth and the paged cache stays metadata-only.
     kv_hook: Option<Arc<dyn KvHook>>,
+    /// Ensure the per-request model exists before restoring a reused prefix.
+    prepare_request: Option<Box<dyn Fn(usize) -> Result<()> + Send + Sync>>,
+    /// Handles whose native model cache has already received its reusable
+    /// prefix. Chunked prefill invokes the prefill path repeatedly for the
+    /// same request; restoring the prefix on every chunk would try to read
+    /// partially written blocks and append the same KV range again.
+    restored_prefix_handles: Arc<Mutex<HashSet<usize>>>,
     /// Decoded vocabulary strings indexed by token id, used for token-level
     /// grammar constraints on the IFB hot path. Empty when no grammar
     /// support is configured.
@@ -94,6 +101,33 @@ pub struct BatchableModel {
 }
 
 impl CandleBatchExecutor {
+    /// Candle's CUDA context is thread-local. Model loading usually happens
+    /// on a different Tokio blocking worker than the long-lived scheduler,
+    /// while the first operation in a batch is often `Tensor::new` before any
+    /// model wrapper has a chance to call into cudarc. Bind the exact context
+    /// carried by the admitted device at every scheduler entry point so a
+    /// request cannot inherit a stale or unrelated CUDA context.
+    fn bind_device_context(&self) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        if let Device::Cuda(cuda) = &self.device {
+            let stream = cuda.cuda_stream();
+            let context = stream.context();
+            // Cudarc records errors from asynchronous CUDA event drops in a
+            // context-wide side channel. A tensor can be dropped on a helper
+            // thread after its work has completed, leaving a stale
+            // CUDA_ERROR_INVALID_CONTEXT that would make the next
+            // bind_to_thread fail before it even tries to bind. Consume that
+            // stale status, then bind the admitted context on this thread.
+            if let Err(error) = context.check_err() {
+                tracing::warn!(%error, "discarding stale CUDA context error before rebinding");
+            }
+            context.bind_to_thread().map_err(|error| {
+                anyhow!("failed to bind CUDA context for scheduler worker: {error}")
+            })?;
+        }
+        Ok(())
+    }
+
     /// Create a new batch executor with a model forward function.
     pub fn new(
         forward_fn: Box<dyn Fn(&Tensor, usize, Option<usize>) -> Result<Tensor> + Send + Sync>,
@@ -113,6 +147,8 @@ impl CandleBatchExecutor {
             max_decode_batch,
             cache: None,
             kv_hook: None,
+            prepare_request: None,
+            restored_prefix_handles: Arc::new(Mutex::new(HashSet::new())),
             vocab_strings: Vec::new(),
             eos_token_ids: Vec::new(),
             #[cfg(test)]
@@ -148,6 +184,22 @@ impl CandleBatchExecutor {
     /// `paged_attention_forward` has no real KV to gather.
     pub fn with_kv_hook(mut self, hook: Arc<dyn KvHook>) -> Self {
         self.kv_hook = Some(hook);
+        self
+    }
+
+    pub fn with_prepare_request(
+        mut self,
+        prepare: Box<dyn Fn(usize) -> Result<()> + Send + Sync>,
+    ) -> Self {
+        self.prepare_request = Some(prepare);
+        self
+    }
+
+    /// Share the lifecycle guard used to suppress repeated prefix restores
+    /// during chunked prefill. The cache pool clears it when a request handle
+    /// is freed and may be reused for another request.
+    pub fn with_restored_prefix_handles(mut self, handles: Arc<Mutex<HashSet<usize>>>) -> Self {
+        self.restored_prefix_handles = handles;
         self
     }
 
@@ -204,6 +256,8 @@ impl CandleBatchExecutor {
             max_decode_batch,
             cache: None,
             kv_hook: None,
+            prepare_request: None,
+            restored_prefix_handles: Arc::new(Mutex::new(HashSet::new())),
             vocab_strings: Vec::new(),
             eos_token_ids: Vec::new(),
             #[cfg(test)]
@@ -232,6 +286,10 @@ impl CandleBatchExecutor {
             .ok_or_else(|| anyhow!("model not loaded in batch executor"))?;
 
         if let Some(ref mut batch_forward) = model.forward_batch_fn {
+            for (index, &handle) in kv_handles.iter().enumerate() {
+                let start_pos = start_positions.get(index).copied().unwrap_or(0);
+                self.restore_request_kv_range(handle, start_pos)?;
+            }
             let input_tensor = Tensor::new(tokens, &self.device)?;
             let logits = (batch_forward)(&input_tensor, start_positions, kv_handles, cu_seqlens)?;
             let batch_size = kv_handles.len();
@@ -283,6 +341,8 @@ impl CandleBatchExecutor {
             let request_tokens = &tokens[start..end];
             let start_pos = start_positions.get(i).copied().unwrap_or(0);
             let seq_len = end - start;
+
+            self.restore_request_kv_range(handle, start_pos)?;
 
             let input_ids = Tensor::new(request_tokens.to_vec(), &self.device)?.unsqueeze(0)?;
             let logits = (model.forward_fn)(&input_ids, start_pos, Some(handle))?;
@@ -389,6 +449,17 @@ impl CandleBatchExecutor {
                 let results_ref = &results;
                 let speculative_mode_ref = &speculative_mode;
                 s.spawn(move || {
+                    // Candle CUDA allocations and their event-tracked drops
+                    // are context-local. Decode requests run in scoped helper
+                    // threads, so bind the admitted device before creating
+                    // tensors and keep that context active until all values
+                    // in this closure have been dropped.
+                    if let Err(error) = self.bind_device_context() {
+                        *results_ref[i]
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Err(error));
+                        return;
+                    }
                     let start_pos = if i < start_positions.len() {
                         start_positions[i]
                     } else {
@@ -691,79 +762,32 @@ impl CandleBatchExecutor {
             ));
         }
 
-        // Try tensor-based path first to keep tensors on GPU and avoid CPU round-trip
-        let mut tensor_path_succeeded = true;
-        for layer_idx in 0..config.num_layers {
-            match hook.extract_kv_tensor(handle, layer_idx, start_pos, seq_len) {
-                Ok(Some((k_tensor, v_tensor))) => {
-                    // Write block-by-block using tensor slicing (narrow along sequence dim 2)
-                    for offset in (0..seq_len).step_by(block_size) {
-                        let chunk = block_size.min(seq_len - offset);
-                        let block_token_idx = start_pos + offset;
-                        let Some(block_id) = cache.block_for_handle(handle, block_token_idx) else {
-                            continue;
-                        };
-                        match (
-                            k_tensor.narrow(2, offset, chunk),
-                            v_tensor.narrow(2, offset, chunk),
-                        ) {
-                            (Ok(k_chunk), Ok(v_chunk)) => {
-                                if let Err(e) = cache
-                                    .write_kv_tensor(layer_idx, block_id, k_chunk, v_chunk, chunk)
-                                {
-                                    tracing::warn!(
-                                        "Failed to write KV tensor for layer {} block {}: {:?}",
-                                        layer_idx,
-                                        block_id,
-                                        e
-                                    );
-                                    tensor_path_succeeded = false;
-                                    break;
-                                }
-                            }
-                            _ => {
-                                tensor_path_succeeded = false;
-                                break;
-                            }
-                        }
+        let end_pos = start_pos
+            .checked_add(seq_len)
+            .ok_or_else(|| anyhow!("KV write range overflows usize"))?;
+        if block_size == 0 {
+            return Err(anyhow!("KV cache block size must be greater than zero"));
+        }
+        // A decode or chunked-prefill write can start inside a block. Extract
+        // its complete computed prefix from the model so replacing the block
+        // retains the earlier slots and never crosses a physical boundary.
+        let first_block_start = start_pos / block_size * block_size;
+        for block_start in (first_block_start..end_pos).step_by(block_size) {
+            let block_tokens = block_size.min(end_pos - block_start);
+            let Some(block_id) = cache.block_for_handle(handle, block_start) else {
+                continue;
+            };
+            for layer_idx in 0..config.num_layers {
+                match hook.extract_kv_tensor(handle, layer_idx, block_start, block_tokens)? {
+                    Some((keys, values)) => {
+                        cache.write_kv_tensor(layer_idx, block_id, keys, values, block_tokens)?;
+                    }
+                    None => {
+                        let (keys, values) =
+                            hook.extract_kv(handle, layer_idx, block_start, block_tokens)?;
+                        cache.write_kv(layer_idx, block_id, keys, values, block_tokens)?;
                     }
                 }
-                _ => {
-                    tensor_path_succeeded = false;
-                    break;
-                }
-            }
-            if !tensor_path_succeeded {
-                break;
-            }
-        }
-
-        if tensor_path_succeeded {
-            return Ok(());
-        }
-
-        for layer_idx in 0..config.num_layers {
-            let (keys, values) = hook.extract_kv(handle, layer_idx, start_pos, seq_len)?;
-            // Write block-by-block so partial blocks are still persisted.
-            for offset in (0..seq_len).step_by(block_size) {
-                let chunk = block_size.min(seq_len - offset);
-                let block_token_idx = start_pos + offset;
-                let Some(block_id) = cache.block_for_handle(handle, block_token_idx) else {
-                    // Block not tracked for this handle at this position — skip
-                    // rather than failing the whole forward. The pool's metrics
-                    // already reflect the allocation.
-                    continue;
-                };
-                let k_start = offset * kv_dim;
-                let k_end = (offset + chunk) * kv_dim;
-                // write_kv expects `chunk * kv_dim` elements (not the full
-                // block_size * kv_dim) — partial writes only persist the
-                // actually-computed tokens.
-                let mut block_keys = vec![0.0; chunk * kv_dim];
-                let mut block_values = vec![0.0; chunk * kv_dim];
-                block_keys.copy_from_slice(&keys[k_start..k_end]);
-                block_values.copy_from_slice(&values[k_start..k_end]);
-                cache.write_kv(layer_idx, block_id, block_keys, block_values, chunk)?;
             }
         }
         Ok(())
@@ -787,6 +811,15 @@ impl CandleBatchExecutor {
         let Some(block_id) = cache.block_for_handle(handle, start_pos) else {
             return Ok(());
         };
+
+        // A decode position immediately after a prompt is not cached yet.
+        // Restore only an existing L1/L3 slot; injecting zero placeholders
+        // would prevent the model's native KV cache from appending that token.
+        for layer_idx in 0..config.num_layers {
+            if !cache.has_cached_slot(layer_idx, block_id, start_pos % block_size) {
+                return Ok(());
+            }
+        }
 
         // Try tensor-based path first to avoid host-device copying
         let mut tensor_path_succeeded = true;
@@ -842,10 +875,113 @@ impl CandleBatchExecutor {
         }
         Ok(())
     }
+
+    /// Restore every cached prefix position before a suffix prefill. Bloom's
+    /// scheduler supplies the reusable prefix length in `start_pos`; the
+    /// model then executes only the uncached suffix at that position.
+    fn restore_request_kv_range(&self, handle: usize, end_pos: usize) -> Result<()> {
+        let (Some(cache), Some(hook)) = (self.cache.as_ref(), self.kv_hook.as_ref()) else {
+            return Ok(());
+        };
+
+        // A single scheduler prefill may be split into several chunks. The
+        // first invocation restores the reusable prefix (or records that the
+        // request starts cold at position zero); later chunks must leave the
+        // model's native KV cache alone. A later chunk can still point into a
+        // partially written physical block, which is not a valid restore
+        // source yet.
+        let first_restore = self
+            .restored_prefix_handles
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(handle);
+        if !first_restore {
+            return Ok(());
+        }
+        if end_pos == 0 {
+            return Ok(());
+        }
+        if let Some(prepare) = &self.prepare_request {
+            if let Err(error) = prepare(handle) {
+                self.restored_prefix_handles
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&handle);
+                return Err(error);
+            }
+        }
+
+        // Restore each layer as one contiguous append. Calling the single-slot
+        // decode helper repeatedly cannot append after the first slot because
+        // it intentionally treats an unknown next position as a model-owned
+        // forward append. Prefix restoration has the stronger invariant that
+        // the model cache starts empty, so gather the complete range and use
+        // the hook's append path once per layer.
+        let config = cache.config();
+        let block_size = config.block_size;
+        let kv_dim = config.kv_dim;
+        for layer_idx in 0..config.num_layers {
+            let mut keys = vec![0.0f32; end_pos * kv_dim];
+            let mut values = vec![0.0f32; end_pos * kv_dim];
+            for position in 0..end_pos {
+                let Some(block_id) = cache.block_for_handle(handle, position) else {
+                    let error = anyhow!(
+                        "missing KV block for handle {} at prefix position {}",
+                        handle,
+                        position
+                    );
+                    self.restored_prefix_handles
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&handle);
+                    return Err(error);
+                };
+                let (block_keys, block_values) = cache.read_kv(layer_idx, &[block_id])?;
+                let slot = position % block_size;
+                let source_start = slot * kv_dim;
+                let source_end = source_start + kv_dim;
+                let target_start = position * kv_dim;
+                let target_end = target_start + kv_dim;
+                if source_end > block_keys.len() || source_end > block_values.len() {
+                    let error = anyhow!(
+                        "KV block {} is shorter than slot {} for prefix restore",
+                        block_id,
+                        slot
+                    );
+                    self.restored_prefix_handles
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&handle);
+                    return Err(error);
+                }
+                keys[target_start..target_end]
+                    .copy_from_slice(&block_keys[source_start..source_end]);
+                values[target_start..target_end]
+                    .copy_from_slice(&block_values[source_start..source_end]);
+            }
+            if let Err(error) = hook.inject_kv(handle, layer_idx, 0, &keys, &values, end_pos) {
+                self.restored_prefix_handles
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&handle);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl EngineExecutor for CandleBatchExecutor {
+    fn prepare_prefill(&self, handle: usize, prompt_len: usize) -> Result<usize> {
+        self.bind_device_context()?;
+        match (&self.cache, &self.kv_hook) {
+            (Some(cache), Some(_)) => cache.prepare_prefill(handle, prompt_len),
+            _ => Ok(0),
+        }
+    }
+
     fn execute(&self, batch: ExecutionBatch) -> Result<BatchResult> {
+        self.bind_device_context()?;
         match batch.phase {
             ExecutionPhase::Prefill => {
                 let next_tokens = self.forward_prefill(
@@ -865,7 +1001,7 @@ impl EngineExecutor for CandleBatchExecutor {
                 })
             }
             ExecutionPhase::Decode | ExecutionPhase::Decoding => {
-                // Use real start_positions from the batch (prompt_len + generated_tokens)
+                // Use the scheduler position of the last sampled token.
                 let start_positions = if !batch.start_positions.is_empty() {
                     batch.start_positions.clone()
                 } else {
@@ -1556,6 +1692,62 @@ mod tests {
     }
 
     #[test]
+    fn partial_prefill_write_preserves_existing_slots_in_same_block() {
+        let cache = Arc::new(PagedAttentionCache::new(PagedCacheConfig {
+            block_size: 4,
+            total_blocks: 4,
+            num_layers: 1,
+            kv_dim: 2,
+            kv_dtype: crate::core::quantization::KvCacheDtype::F16,
+            long_context_policy: LongContextPolicy::Full,
+        }));
+        let hook = Arc::new(InMemoryKvHook::new(1, 2));
+        let hook_for_forward = Arc::clone(&hook);
+        let forward = Box::new(
+            move |input: &Tensor, start: usize, handle: Option<usize>| -> Result<Tensor> {
+                let handle = handle.unwrap();
+                hook_for_forward.populate_deterministic(
+                    handle,
+                    0,
+                    start,
+                    input.dim(1)?,
+                    10.0 + start as f32,
+                    20.0 + start as f32,
+                );
+                Tensor::new(&[[[0.0f32]]], input.device()).map_err(Into::into)
+            },
+        );
+        let executor = CandleBatchExecutor::new(forward, Device::Cpu, 1, 1)
+            .with_cache(Arc::clone(&cache))
+            .with_kv_hook(Arc::clone(&hook) as Arc<dyn KvHook>);
+        let allocation = cache.allocate("partial", &[1, 2], 2).unwrap();
+        let params = vec![GenerationParams {
+            temperature: 0.0,
+            ..Default::default()
+        }];
+
+        for (token, start) in [(1u32, 0usize), (2u32, 1usize)] {
+            executor
+                .execute(ExecutionBatch {
+                    phase: ExecutionPhase::Prefill,
+                    request_ids: vec!["partial".into()],
+                    tokens: vec![token],
+                    cu_seqlens: vec![0, 1],
+                    kv_handles: vec![allocation.handle],
+                    start_positions: vec![start],
+                    params: params.clone(),
+                    generated_tokens: vec![Vec::new()],
+                })
+                .unwrap();
+        }
+        let (keys, values) = cache.read_kv(0, &allocation.allocated_blocks[..1]).unwrap();
+        assert_eq!(keys.len(), 8);
+        assert_eq!(values.len(), 8);
+        assert_eq!(&keys[..4], &[10.0, 10.0001, 11.0, 11.0001]);
+        assert_eq!(&values[..4], &[20.0, 20.0002, 21.0, 21.0002]);
+    }
+
+    #[test]
     fn test_batch_executor_true_batched_forward_prefill_and_decode() {
         let num_layers = 1;
         let kv_dim = 4;
@@ -2077,5 +2269,29 @@ mod tests {
 
         assert_eq!(result.next_tokens, vec![1]);
         assert_eq!(result.speculative_tokens, None);
+    }
+
+    /// CUDA contexts are thread-local even though Candle devices are Send +
+    /// Sync. The production scheduler runs on a different worker from model
+    /// loading, so exercise the same hand-off here when CUDA tests are
+    /// explicitly enabled.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_executor_rebinds_context_on_scheduler_thread() {
+        let device = Device::new_cuda(0).expect("CUDA device 0 is required");
+        let executor = CandleBatchExecutor::new(
+            Box::new(|_, _, _| -> Result<Tensor> { Err(anyhow!("test forward must not run")) }),
+            device.clone(),
+            1,
+            1,
+        );
+        std::thread::spawn(move || {
+            executor.bind_device_context()?;
+            let tensor = Tensor::new(vec![1.0f32], &device)?;
+            tensor.to_vec1::<f32>().map_err(anyhow::Error::from)
+        })
+        .join()
+        .expect("scheduler worker panicked")
+        .expect("CUDA context could not be rebound on scheduler worker");
     }
 }

@@ -75,6 +75,10 @@ impl EngineExecutor for PipelineBatchExecutor {
     fn max_batch_size(&self, phase: crate::scheduler::ExecutionPhase) -> usize {
         self.executor.max_batch_size(phase)
     }
+
+    fn prepare_prefill(&self, handle: usize, prompt_len: usize) -> Result<usize> {
+        self.executor.prepare_prefill(handle, prompt_len)
+    }
 }
 
 impl BatchExecutorConfig {

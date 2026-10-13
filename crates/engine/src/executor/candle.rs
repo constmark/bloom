@@ -29,6 +29,7 @@ use super::speculative::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelType {
     Qwen2,
+    Qwen2Moe,
     Qwen3,
     Gemma4,
     Llama,
@@ -42,6 +43,7 @@ impl ModelType {
             .and_then(|t| t.as_str())
             .and_then(|t| match t {
                 "qwen2" => Some(ModelType::Qwen2),
+                "qwen2_moe" | "upcycling-qwen2-moe" => Some(ModelType::Qwen2Moe),
                 "qwen3" => Some(ModelType::Qwen3),
                 "gemma4_unified" | "gemma4" => Some(ModelType::Gemma4),
                 "llama" => Some(ModelType::Llama),
@@ -53,6 +55,7 @@ impl ModelType {
     fn from_gguf_architecture(architecture: &str) -> Option<Self> {
         match architecture.to_lowercase().as_str() {
             "qwen" | "qwen2" => Some(Self::Qwen2),
+            "qwen2_moe" | "qwen2-moe" | "qwen2moe" => Some(Self::Qwen2Moe),
             "qwen3" => Some(Self::Qwen3),
             "gemma" | "gemma2" | "gemma4" => Some(Self::Gemma4),
             "llama" | "mistral" | "deepseek" => Some(Self::Llama),
@@ -63,6 +66,7 @@ impl ModelType {
     fn hf_model_type(self) -> &'static str {
         match self {
             Self::Qwen2 => "qwen2",
+            Self::Qwen2Moe => "qwen2_moe",
             Self::Qwen3 => "qwen3",
             Self::Gemma4 => "gemma4_unified",
             Self::Llama => "llama",
@@ -265,7 +269,16 @@ fn forward_bert_embedding_batch(
         .map_err(Into::into)
 }
 
-fn safetensors_dtype_for_device(device: &Device) -> Result<DType> {
+fn config_prefers_bf16(config: &serde_json::Value) -> bool {
+    ["dtype", "torch_dtype"].iter().any(|key| {
+        config
+            .get(*key)
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("bfloat16"))
+    })
+}
+
+fn safetensors_dtype_for_device(device: &Device, prefer_bf16: bool) -> Result<DType> {
     let requested = std::env::var("BLOOM_DTYPE").ok().and_then(|value| {
         match value.to_ascii_lowercase().as_str() {
             "f32" | "float32" => Some(DType::F32),
@@ -274,6 +287,13 @@ fn safetensors_dtype_for_device(device: &Device) -> Result<DType> {
             _ => None,
         }
     });
+    if prefer_bf16 && matches!(device, Device::Cuda(_)) && requested == Some(DType::F16) {
+        return Err(anyhow!(
+            "this Safetensors checkpoint declares native bfloat16 weights; FP16 conversion is unsafe on this GPU and can produce non-finite logits; use --dtype bf16"
+        ));
+    }
+    let requested = requested
+        .or_else(|| (prefer_bf16 && matches!(device, Device::Cuda(_))).then_some(DType::BF16));
     select_safetensors_dtype(device, requested)
 }
 
@@ -511,7 +531,7 @@ impl CandleEngine {
             })
             .ok_or_else(|| {
                 anyhow!(
-                    "unsupported model type, expected qwen2, qwen3, gemma4_unified, llama, or bert.\n\
+                    "unsupported model type, expected qwen2, qwen2_moe, qwen3, gemma4_unified, llama, or bert.\n\
                      [Diagnostic Tip] Check model_type in config.json or verify the GGUF file architecture."
                 )
             })?;
@@ -562,7 +582,7 @@ impl CandleEngine {
         if has_safetensors {
             // Validate precision before constructing a model that can only fail
             // later during its first CPU matmul.
-            safetensors_dtype_for_device(&device)?;
+            safetensors_dtype_for_device(&device, config_prefers_bf16(&config))?;
         } else if gguf_file_path.is_none() {
             gguf_file_path = find_gguf_file(model_path);
         }
@@ -611,7 +631,9 @@ impl CandleEngine {
             match model_type {
                 ModelType::Gemma4 => eos_token_ids = vec![1, 106],
                 ModelType::Llama => eos_token_ids = vec![128009, 128001, 2],
-                ModelType::Qwen2 | ModelType::Qwen3 => eos_token_ids = vec![151645],
+                ModelType::Qwen2 | ModelType::Qwen2Moe | ModelType::Qwen3 => {
+                    eos_token_ids = vec![151645]
+                }
                 ModelType::Bert => {}
             }
         }
@@ -1477,7 +1499,17 @@ impl CandleTextModel {
 
     fn reload(&self) -> Result<QwenModelWrapper> {
         self.weight_artifacts.verify()?;
-        let wrapper = self.reload_on_device(&self.device)?;
+        let wrapper = self.reload_on_device(&self.device, false)?;
+        self.weight_artifacts.verify()?;
+        Ok(wrapper)
+    }
+
+    /// CacheMesh needs an attention implementation whose KV can be extracted
+    /// and restored. The native streaming Qwen implementation supports that
+    /// contract on CPU as well as accelerators.
+    fn reload_with_paged_kv(&self) -> Result<QwenModelWrapper> {
+        self.weight_artifacts.verify()?;
+        let wrapper = self.reload_on_device(&self.device, true)?;
         self.weight_artifacts.verify()?;
         Ok(wrapper)
     }
@@ -1486,20 +1518,20 @@ impl CandleTextModel {
     /// variant for the current model + device combination.
     ///
     /// Mirrors the streaming-variant selection logic in `reload_on_device`:
-    /// the streaming path is only chosen when the model is large (>3.5 GB)
-    /// AND the device is CUDA AND the model type is Qwen2/Qwen3 (Gemma4 on
-    /// CUDA takes the `Gemma4Streaming` path instead, which does not yet
-    /// expose a `KvHook`).
+    /// Qwen2-MoE always uses the extractable-KV path, while dense Qwen2/Qwen3
+    /// use it for large CUDA weights or paged CacheMesh execution.
     fn uses_streaming_variant(&self) -> bool {
         let is_streaming =
             self.model_size > 3_500_000_000 && matches!(self.device, Device::Cuda(_));
-        is_streaming && matches!(self.model_type, ModelType::Qwen2 | ModelType::Qwen3)
+        self.model_type == ModelType::Qwen2Moe
+            || (is_streaming && matches!(self.model_type, ModelType::Qwen2 | ModelType::Qwen3))
     }
 
-    fn reload_on_device(&self, device: &Device) -> Result<QwenModelWrapper> {
+    fn reload_on_device(&self, device: &Device, paged_kv: bool) -> Result<QwenModelWrapper> {
         let is_large_cuda = self.model_size > 3_500_000_000 && matches!(device, Device::Cuda(_));
-        let is_streaming =
-            is_large_cuda && matches!(self.model_type, ModelType::Qwen2 | ModelType::Qwen3);
+        let is_streaming = self.model_type == ModelType::Qwen2Moe
+            || ((is_large_cuda || paged_kv)
+                && matches!(self.model_type, ModelType::Qwen2 | ModelType::Qwen3));
         let offloaded_layers = std::env::var("BLOOM_GPU_LAYERS")
             .ok()
             .and_then(|s| s.parse::<usize>().ok());
@@ -1549,6 +1581,11 @@ impl CandleTextModel {
 
         let safetensors_files =
             crate::core::manifest::resolve_hf_safetensors_files(&self.model_path)?;
+        if paged_kv && (!is_streaming || safetensors_files.is_empty()) {
+            return Err(anyhow!(
+                "CacheMesh requires a native Qwen2/Qwen3/Qwen2-MoE Safetensors model with an extractable KV cache"
+            ));
+        }
         if safetensors_files.is_empty() {
             if let Some(path) = gguf_path {
                 match self.model_type {
@@ -1592,6 +1629,11 @@ impl CandleTextModel {
                             )?;
                         return Ok(QwenModelWrapper::QuantizedQwen2(m));
                     }
+                    ModelType::Qwen2Moe => {
+                        return Err(anyhow!(
+                            "Qwen2-MoE GGUF checkpoints are not supported by the Candle quantized path; use the original Safetensors checkpoint"
+                        ));
+                    }
                     ModelType::Qwen3 => {
                         tracing::info!("GGUF Qwen3 model loading quantized weights...");
                         let mut file = std::fs::File::open(&path)
@@ -1617,7 +1659,7 @@ impl CandleTextModel {
             ));
         }
 
-        let dtype = safetensors_dtype_for_device(device)?;
+        let dtype = safetensors_dtype_for_device(device, config_prefers_bf16(&self.config))?;
 
         let vb_device = if is_streaming { &Device::Cpu } else { device };
 
@@ -1649,7 +1691,9 @@ impl CandleTextModel {
         };
 
         let model = if is_streaming {
-            tracing::info!("Initializing memory-efficient layer-wise weight streaming on CUDA...");
+            tracing::info!(
+                "Initializing native Qwen layer-wise model with extractable KV cache..."
+            );
             let mut cfg_val = self.config.clone();
             let obj = cfg_val
                 .as_object_mut()
@@ -1689,6 +1733,20 @@ impl CandleTextModel {
                     serde_json::Value::from(false),
                 );
             }
+            // Transformers 5.x Qwen2.5 checkpoints moved `rope_theta` into
+            // the nested `rope_parameters` object. Candle's Qwen3 config is
+            // shared by the native Qwen2-MoE streaming executor and still
+            // expects the scalar field, so normalize the newer spelling
+            // before deserialization.
+            if !obj.contains_key("rope_theta") {
+                if let Some(rope_theta) = obj
+                    .get("rope_parameters")
+                    .and_then(|value| value.get("rope_theta"))
+                    .cloned()
+                {
+                    obj.insert("rope_theta".to_string(), rope_theta);
+                }
+            }
             if !obj.contains_key("tie_word_embeddings") {
                 obj.insert(
                     "tie_word_embeddings".to_string(),
@@ -1699,15 +1757,22 @@ impl CandleTextModel {
             let cfg: candle_transformers::models::qwen3::Config =
                 serde_json::from_value(cfg_val)
                     .map_err(|e| anyhow!("failed to parse qwen config: {}", e))?;
-            let m =
-                crate::executor::qwen_streaming::QwenStreamingModelForCausalLM::new_with_offload(
-                    &cfg,
-                    vb,
-                    device,
-                    quantizer.clone(),
-                    offloaded_layers,
-                )
-                .map_err(|e| anyhow!("failed to build streaming model: {}", e))?;
+            let moe = if self.model_type == ModelType::Qwen2Moe {
+                Some(crate::executor::qwen_streaming::MoeConfig::from_json(
+                    &self.config,
+                )?)
+            } else {
+                None
+            };
+            let m = crate::executor::qwen_streaming::QwenStreamingModelForCausalLM::new_with_moe(
+                &cfg,
+                vb,
+                device,
+                quantizer.clone(),
+                offloaded_layers,
+                moe.as_ref(),
+            )
+            .map_err(|e| anyhow!("failed to build streaming model: {}", e))?;
             QwenModelWrapper::Streaming(m)
         } else {
             match self.model_type {
@@ -1719,6 +1784,7 @@ impl CandleTextModel {
                         .map_err(|e| anyhow!("failed to build qwen2 model: {}", e))?;
                     QwenModelWrapper::Qwen2(m)
                 }
+                ModelType::Qwen2Moe => unreachable!("MoE always uses the extractable KV runtime"),
                 ModelType::Qwen3 => {
                     let cfg: candle_transformers::models::qwen3::Config =
                         serde_json::from_value(self.config.clone())
@@ -3551,6 +3617,9 @@ mod tests {
         let v2 = serde_json::json!({ "model_type": "qwen2" });
         assert_eq!(ModelType::from_config(&v2), Some(ModelType::Qwen2));
 
+        let v2_moe = serde_json::json!({ "model_type": "qwen2_moe" });
+        assert_eq!(ModelType::from_config(&v2_moe), Some(ModelType::Qwen2Moe));
+
         let v3 = serde_json::json!({ "model_type": "qwen3" });
         assert_eq!(ModelType::from_config(&v3), Some(ModelType::Qwen3));
 
@@ -3596,7 +3665,12 @@ mod tests {
             ModelType::from_gguf_architecture("qwen3"),
             Some(ModelType::Qwen3)
         );
+        assert_eq!(
+            ModelType::from_gguf_architecture("qwen2_moe"),
+            Some(ModelType::Qwen2Moe)
+        );
         assert_eq!(ModelType::Qwen2.hf_model_type(), "qwen2");
+        assert_eq!(ModelType::Qwen2Moe.hf_model_type(), "qwen2_moe");
         assert_eq!(ModelType::Qwen3.hf_model_type(), "qwen3");
     }
 

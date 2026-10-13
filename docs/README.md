@@ -10,6 +10,7 @@ request.
 - [Release manifest](release-manifest.md)
 - [GGUF models](gguf.md)
 - [Pinned trained-model validation](trained-model-validation.md)
+- [Qwen2-MoE validation](qwen2-moe.md)
 - [HTTP workload evidence](http-workload.md)
 - [Model manifests](manifest.md)
 - [Signed model discovery index](model-index.md)

@@ -6,7 +6,8 @@ use crate::{BloomKvCachePool, CacheMesh, EngineExecutor};
 use anyhow::Result;
 use anyhow::anyhow;
 use bloomai_core::BloomError;
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 pub(super) fn build(
     model: Arc<CandleTextModel>,
@@ -26,14 +27,31 @@ pub(super) fn build(
     // same ordinal does not necessarily have the same Candle identity.
     let device = model.device.clone();
     let kv_dim = num_kv_heads * head_dim; // Checked by the capability entry point.
+    let use_paged_kv = cachemesh.is_some();
+    if use_paged_kv
+        && (!matches!(
+            model.model_type,
+            super::ModelType::Qwen2 | super::ModelType::Qwen3 | super::ModelType::Qwen2Moe
+        ) || crate::core::manifest::resolve_hf_safetensors_files(&model.model_path)?.is_empty())
+    {
+        anyhow::bail!(
+            "CacheMesh requires a native Qwen2/Qwen3/Qwen2-MoE Safetensors model with an extractable KV cache"
+        );
+    }
 
     let request_models = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
         usize,
         Arc<std::sync::Mutex<QwenModelWrapper>>,
     >::new()));
     let request_models_for_free = Arc::clone(&request_models);
+    let restored_prefix_handles = Arc::new(Mutex::new(HashSet::new()));
+    let restored_prefix_handles_for_free = Arc::clone(&restored_prefix_handles);
     kv_pool.set_on_free(move |handle| {
         request_models_for_free
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&handle);
+        restored_prefix_handles_for_free
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .remove(&handle);
@@ -57,7 +75,11 @@ pub(super) fn build(
                 Arc::clone(match models.entry(handle) {
                     Entry::Occupied(entry) => entry.into_mut(),
                     Entry::Vacant(entry) => {
-                        let model = model_for_forward.reload()?;
+                        let model = if use_paged_kv {
+                            model_for_forward.reload_with_paged_kv()?
+                        } else {
+                            model_for_forward.reload()?
+                        };
                         entry.insert(Arc::new(std::sync::Mutex::new(model)))
                     }
                 })
@@ -99,7 +121,11 @@ pub(super) fn build(
                     let model = match models.entry(handle) {
                         Entry::Occupied(entry) => entry.into_mut(),
                         Entry::Vacant(entry) => {
-                            let model = model_for_batch.reload()?;
+                            let model = if use_paged_kv {
+                                model_for_batch.reload_with_paged_kv()?
+                            } else {
+                                model_for_batch.reload()?
+                            };
                             entry.insert(Arc::new(std::sync::Mutex::new(model)))
                         }
                     };
@@ -127,6 +153,23 @@ pub(super) fn build(
         },
     );
 
+    let model_for_prepare = Arc::clone(&model);
+    let request_models_for_prepare = Arc::clone(&request_models);
+    let prepare_request = Box::new(move |handle| -> Result<()> {
+        let mut models = request_models_for_prepare
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let std::collections::hash_map::Entry::Vacant(entry) = models.entry(handle) {
+            let model = if use_paged_kv {
+                model_for_prepare.reload_with_paged_kv()?
+            } else {
+                model_for_prepare.reload()?
+            };
+            entry.insert(Arc::new(std::sync::Mutex::new(model)));
+        }
+        Ok(())
+    });
+
     let paged_cache = Arc::new(PagedAttentionCache::from_pool_and_cachemesh(
         Arc::clone(&kv_pool),
         PagedCacheConfig {
@@ -142,13 +185,15 @@ pub(super) fn build(
     let executor = Arc::new({
         let base = CandleBatchExecutor::new(forward_fn, device, 4, 32)
             .with_cache(Arc::clone(&paged_cache))
+            .with_prepare_request(prepare_request)
+            .with_restored_prefix_handles(Arc::clone(&restored_prefix_handles))
             .with_vocab_and_tokenizer(
                 model.vocab_strings.clone(),
                 model.eos_token_ids.clone(),
                 Some(model.tokenizer.clone()),
             )
             .with_forward_batch_fn(forward_batch_fn);
-        if model.uses_streaming_variant() {
+        if use_paged_kv || model.uses_streaming_variant() {
             let hook = Arc::new(CandleKvHook::new(
                 Arc::clone(&request_models),
                 num_layers,

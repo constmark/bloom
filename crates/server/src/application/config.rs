@@ -1,11 +1,14 @@
 //! Resolved runtime options. CLI parsing and environment merging stay at entry points.
 use std::path::PathBuf;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct RuntimeConfig {
     pub(crate) backend: String,
     pub(crate) cachemesh_l2_capacity_bytes: usize,
     pub(crate) cachemesh_l3_path: Option<PathBuf>,
+    /// Optional embedding-provided L3 backend. The engine owns the CacheMesh
+    /// semantics; the server only carries this backend into runtime startup.
+    pub(crate) cachemesh_remote: Option<std::sync::Arc<dyn bloomai_engine::RemoteCacheBackend>>,
     pub(crate) cachemesh_write_through_l3: bool,
     pub(crate) context_size: usize,
     pub(crate) disable_memory_prealloc: bool,
