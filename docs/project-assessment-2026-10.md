@@ -83,10 +83,11 @@ edge. Workspace Rust tests, no-default-feature checks, strict architecture
 tests, and Python SDK tests pass after these changes.
 
 This environment also completed the MLX gap: the M5/Metal 4 bridge loads a
-fixed Qwen2.5 0.5B MLX package, returns the expected `Bloom` response, and passes
-OpenAI/Ollama server smoke checks. The Safetensors resolver and package
-validator now accept a matching single-file index while continuing to reject
-ambiguous shard layouts. Metal has pinned Qwen2 Q4_0 trained-model and short
+fixed Qwen2.5 0.5B MLX package and passes model-backed OpenAI/Ollama server
+protocol smoke checks. The Safetensors resolver and package validator now
+accept a matching single-file index while continuing to reject ambiguous
+shard layouts. The MLX record does not claim an exact semantic answer for this
+checkpoint. Metal has pinned Qwen2 Q4_0 trained-model and short
 concurrency/disconnect evidence; these observations still do not replace a
 long soak or broader model matrix.
 

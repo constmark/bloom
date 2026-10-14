@@ -22,7 +22,7 @@ Qwen2.5 MLX package:
 | Runtime | `mlx 0.31.2` + `mlx-lm 0.31.2` |
 | Device | Apple M5 GPU / Metal 4 |
 | Bloom path | `bloom_infer --backend mlx --device gpu` |
-| Result | Exact `Bloom` response; OpenAI and Ollama smoke gates passed |
+| Result | Model-backed text response; OpenAI and Ollama protocol smoke gates passed (no exact semantic output claim) |
 
 The source package includes a single-file Safetensors index. Bloom validates
 that the index maps every tensor to that one file before accepting it, while
