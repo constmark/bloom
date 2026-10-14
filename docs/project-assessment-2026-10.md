@@ -65,3 +65,25 @@ remains experimental until real model/provider evidence is published; and a stab
 performance, cancellation, upgrade/rollback, and trained multimodal quality
 evidence. Those paths remain explicitly labelled experimental, external, or
 skeleton in the support matrix and in the GUI capability response.
+
+## 2026-10-14 follow-up
+
+The repository was fetched from `origin` and is current at `b277190`; the
+remote has no newer `main` commit or release tag. This follow-up closed two
+runtime correctness gaps in the CacheMesh/IFB path: both the shared Qwen KV
+hook and the production handle-keyed Candle hook now truncate model-owned KV
+state when speculative or structured decoding rolls back tokens. Regression
+coverage exercises the shared hook through extraction, CacheMesh restoration,
+batch execution, and rollback.
+
+The lockfiles now pin `quinn-proto` 0.11.18, and the architecture gate documents
+and tests the intentional `bloomai-app -> bloomai-backend` device-selection
+edge. Workspace Rust tests, no-default-feature checks, strict architecture
+tests, and Python SDK tests pass after these changes.
+
+The highest-value remaining work is still hardware- and evidence-bound: make
+one of CoreML, MLX, Vulkan, or TensorRT executable behind its vendor runtime;
+publish real ONNX/OpenVINO/ASR provider and model gates; add trained
+multimodal and cross-encoder evidence; then run the multi-hour deployment,
+cancellation, disk-failure, upgrade/rollback, and cross-platform wheel drills
+before promoting any experimental support label.

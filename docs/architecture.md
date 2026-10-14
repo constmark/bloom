@@ -16,6 +16,7 @@ flowchart TD
     Client["OpenAI / Ollama clients"] -->|HTTP| Server
     Server --> Engine["bloomai-engine (pipeline + scheduling)"]
     App["bloomai-app (process configuration + CLI)"] --> Engine
+    App --> Backend
     Server --> App
     FFI["bloomai-ffi"] --> Engine
     Engine --> Core["bloomai-core (contracts)"]
@@ -24,7 +25,10 @@ flowchart TD
     Backend --> Core
 ```
 
-`bloomai-app` owns process configuration and the native CLI entry points.
+`bloomai-app` owns process configuration and the native CLI entry points. Its
+CLI resolves the requested device and backend through `bloomai-backend` before
+constructing an engine pipeline; this keeps `--device auto` and capability
+reporting consistent with the server's backend selection policy.
 `bloomai-server` is the HTTP composition root: it owns configuration application,
 runtime lifecycle, model catalog services, protocol adapters, routing, and
 middleware. The Dioxus UI consumes only versioned HTTP contracts. It can be

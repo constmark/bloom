@@ -16,7 +16,11 @@ ALLOWED_INTERNAL = {
     "bloomai-backend": {"bloomai-core"},
     "bloomai-tilelang": set(),
     "bloomai-engine": {"bloomai-core", "bloomai-backend", "bloomai-tilelang"},
-    "bloomai-app": {"bloomai-core", "bloomai-engine"},
+    # Native CLI entry points select the effective device/backend before
+    # handing execution to the engine (for example, `--device auto` uses the
+    # backend registry). Keep this dependency explicit so the architecture
+    # gate reflects the actual application boundary.
+    "bloomai-app": {"bloomai-core", "bloomai-backend", "bloomai-engine"},
     "bloomai-server": {"bloomai-core", "bloomai-backend", "bloomai-engine", "bloomai-app"},
     "bloomai-ffi": {"bloomai-core", "bloomai-engine"},
     "bloom-ui": set(),

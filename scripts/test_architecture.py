@@ -26,6 +26,14 @@ class ArchitectureTests(unittest.TestCase):
         self.assertEqual(validate_packages(self.packages), [])
         self.assertEqual(validate_sources(ROOT), [])
 
+    def test_application_may_select_a_backend(self):
+        # The native CLI resolves `--device auto` through the backend registry
+        # before constructing the engine. Keep that intentional edge in the
+        # explicit layer map.
+        self.assertEqual(
+            self.add_dependency("bloomai-app", "bloomai-backend"), []
+        )
+
     def test_reverse_dependencies_include_optional_target_aliases(self):
         errors = self.add_dependency("bloomai-engine", "bloomai-server", rename="http", optional=True, target="cfg(windows)")
         self.assertTrue(any("forbidden layer" in error for error in errors))

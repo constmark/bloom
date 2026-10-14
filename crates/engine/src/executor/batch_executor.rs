@@ -901,14 +901,14 @@ impl CandleBatchExecutor {
         if end_pos == 0 {
             return Ok(());
         }
-        if let Some(prepare) = &self.prepare_request {
-            if let Err(error) = prepare(handle) {
-                self.restored_prefix_handles
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .remove(&handle);
-                return Err(error);
-            }
+        if let Some(prepare) = &self.prepare_request
+            && let Err(error) = prepare(handle)
+        {
+            self.restored_prefix_handles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&handle);
+            return Err(error);
         }
 
         // Restore each layer as one contiguous append. Calling the single-slot
