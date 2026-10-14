@@ -820,7 +820,15 @@ async fn run_server(
     let v1_routes = Router::new()
         .route("/observability", get(handle_observability))
         .route("/models", get(handle_models))
-        .route("/models/{model}", get(handle_model_retrieve))
+        .route(
+            "/models/{model}",
+            get(handle_model_retrieve)
+                .delete(handle_model_delete)
+                .layer(middleware::from_fn_with_state(
+                    Arc::clone(&state),
+                    require_operator_api_key,
+                )),
+        )
         .route(
             "/chat/completions",
             post(handle_chat_completions)
@@ -8390,6 +8398,92 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert!(!model.exists());
+    }
+
+    #[tokio::test]
+    async fn openai_model_delete_returns_standard_deleted_resource() {
+        let temp = tempfile::tempdir().unwrap();
+        let model = temp.path().join("openai-delete.gguf");
+        std::fs::write(&model, b"gguf").unwrap();
+        let (state, _receiver) = test_server_state(temp.path().to_path_buf());
+
+        let response = handle_model_delete(
+            State(state),
+            axum::extract::Path("openai-delete.gguf".to_string()),
+        )
+        .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "id": "openai-delete.gguf",
+                "object": "model",
+                "deleted": true
+            })
+        );
+        assert!(!model.exists());
+    }
+
+    #[tokio::test]
+    async fn openai_model_delete_requires_operator_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let model = temp.path().join("protected-delete.gguf");
+        std::fs::write(&model, b"gguf").unwrap();
+        let (mut state, _receiver) = test_server_state(temp.path().to_path_buf());
+        let mutable_state = Arc::get_mut(&mut state).unwrap();
+        mutable_state.api_key = Some("inference-secret".to_string());
+        mutable_state.operator_api_key = Some("operator-secret".to_string());
+        let app = Router::new()
+            .route(
+                "/models/{model}",
+                get(handle_model_retrieve)
+                    .delete(handle_model_delete)
+                    .layer(middleware::from_fn_with_state(
+                        Arc::clone(&state),
+                        require_operator_api_key,
+                    )),
+            )
+            .route_layer(middleware::from_fn_with_state(
+                Arc::clone(&state),
+                require_api_key,
+            ))
+            .with_state(state);
+
+        let rejected = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/models/protected-delete.gguf")
+                    .header(header::AUTHORIZATION, "Bearer inference-secret")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), axum::http::StatusCode::FORBIDDEN);
+        assert!(model.exists());
+
+        let removed = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/models/protected-delete.gguf")
+                    .header(header::AUTHORIZATION, "Bearer operator-secret")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(removed.status(), axum::http::StatusCode::OK);
         assert!(!model.exists());
     }
 

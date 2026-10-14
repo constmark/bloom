@@ -352,6 +352,42 @@ pub(crate) async fn handle_model_retrieve(
     Json(openai_model_resource(&runtime)).into_response()
 }
 
+/// Delete a locally acquired model through the OpenAI fine-tuned-model
+/// compatibility surface.  Bloom only exposes catalog-backed models for
+/// deletion; resident/external runtimes and active entries are rejected by
+/// the same guarded removal path used by the operator API.
+pub(crate) async fn handle_model_delete(
+    State(state): State<Arc<ServerState>>,
+    axum::extract::Path(model): axum::extract::Path<String>,
+) -> axum::response::Response {
+    match remove_catalog_model(&state, &model).await {
+        Ok(id) => Json(json!({
+            "id": id,
+            "object": "model",
+            "deleted": true
+        }))
+        .into_response(),
+        Err(ModelRemovalError::InvalidRequest(message)) => error_response(
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            message,
+        ),
+        Err(ModelRemovalError::NotFound(message)) => error_response(
+            axum::http::StatusCode::NOT_FOUND,
+            "model_not_found",
+            message,
+        ),
+        Err(ModelRemovalError::Conflict { code, message }) => {
+            error_response(axum::http::StatusCode::CONFLICT, code, message)
+        }
+        Err(ModelRemovalError::Internal(message)) => error_response(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            message,
+        ),
+    }
+}
+
 // ─── /v1/model-management ──────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
