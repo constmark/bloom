@@ -44,6 +44,7 @@ fn is_bundled_script(path: &Path) -> bool {
             | "openvino_llm_infer.py"
             | "npu_tts_infer.py"
             | "onnxruntime_infer.py"
+            | "mlx_lm_infer.py"
     ) {
         return false;
     }
@@ -96,6 +97,9 @@ pub fn validate_runner(path: &Path) -> Result<()> {
                 | "powershell"
                 | "ps"
                 | "vm_stat"
+                | "python"
+                | "python3"
+                | "py"
         )
     );
     validate_path(

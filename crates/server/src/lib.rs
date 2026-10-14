@@ -826,7 +826,7 @@ async fn run_server(
                 .delete(handle_model_delete)
                 .layer(middleware::from_fn_with_state(
                     Arc::clone(&state),
-                    require_operator_api_key,
+                    require_model_delete_api_key,
                 )),
         )
         .route(
@@ -8448,7 +8448,7 @@ mod tests {
                     .delete(handle_model_delete)
                     .layer(middleware::from_fn_with_state(
                         Arc::clone(&state),
-                        require_operator_api_key,
+                        require_model_delete_api_key,
                     )),
             )
             .route_layer(middleware::from_fn_with_state(
@@ -8456,6 +8456,20 @@ mod tests {
                 require_api_key,
             ))
             .with_state(state);
+
+        let retrieve = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/models/protected-delete.gguf")
+                    .header(header::AUTHORIZATION, "Bearer inference-secret")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(retrieve.status(), axum::http::StatusCode::FORBIDDEN);
 
         let rejected = app
             .clone()

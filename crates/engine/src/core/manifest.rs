@@ -2040,10 +2040,52 @@ pub fn resolve_hf_safetensors_files(model_path: &Path) -> Result<Vec<std::path::
     }
 
     if single_metadata.is_some() {
-        if index_metadata.is_some() || !shard_names.is_empty() {
+        if !shard_names.is_empty() {
             return Err(anyhow::anyhow!(
                 "model.safetensors cannot be combined with a sharded Safetensors checkpoint"
             ));
+        }
+        if let Some(index_metadata) = index_metadata {
+            if index_metadata.len() == 0 || index_metadata.len() > MAX_SAFETENSORS_INDEX_BYTES {
+                return Err(anyhow::anyhow!(
+                    "Safetensors index must contain between 1 and {MAX_SAFETENSORS_INDEX_BYTES} bytes"
+                ));
+            }
+            let index: HfSafetensorsIndex = serde_json::from_slice(&fs::read(&index_path)?)
+                .context("invalid model.safetensors.index.json")?;
+            if index.weight_map.is_empty()
+                || index
+                    .weight_map
+                    .values()
+                    .any(|name| name != "model.safetensors")
+            {
+                return Err(anyhow::anyhow!(
+                    "single-file Safetensors index must map every tensor to model.safetensors"
+                ));
+            }
+            let summary = read_safetensors_header(&single)?;
+            let indexed_names = index.weight_map.keys().cloned().collect::<BTreeSet<_>>();
+            if indexed_names != summary.tensor_names {
+                return Err(anyhow::anyhow!(
+                    "single-file Safetensors index weight_map does not match tensor headers"
+                ));
+            }
+            if let Some(metadata) = index.metadata {
+                let metadata = metadata.as_object().ok_or_else(|| {
+                    anyhow::anyhow!("Safetensors index metadata must be an object")
+                })?;
+                if let Some(total_size) = metadata.get("total_size") {
+                    let total_size = total_size.as_u64().ok_or_else(|| {
+                        anyhow::anyhow!("Safetensors index metadata.total_size must be an integer")
+                    })?;
+                    if total_size != summary.tensor_bytes {
+                        return Err(anyhow::anyhow!(
+                            "Safetensors index metadata.total_size is {total_size}, but tensor headers describe {} bytes",
+                            summary.tensor_bytes
+                        ));
+                    }
+                }
+            }
         }
         return Ok(vec![single]);
     }
@@ -3224,6 +3266,17 @@ mod tests {
                 .to_string()
                 .contains("cannot be combined with a sharded")
         );
+    }
+
+    #[test]
+    fn accepts_single_file_safetensors_with_a_matching_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let single = directory.path().join("model.safetensors");
+        write_test_safetensors(&single, &["weight"]);
+        write_test_safetensors_index(directory.path(), &[("weight", "model.safetensors")], 4);
+
+        let resolved = resolve_hf_safetensors_files(directory.path()).unwrap();
+        assert_eq!(resolved, [single]);
     }
 
     #[test]

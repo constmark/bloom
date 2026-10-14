@@ -514,6 +514,23 @@ pub(super) async fn require_operator_api_key(
     }
 }
 
+/// Protect only destructive model deletion with the operator credential while
+/// keeping the OpenAI model retrieval route available to inference clients.
+/// The route-level middleware is applied to both methods by Axum, so method
+/// dispatch must happen inside the boundary rather than by wrapping the whole
+/// `MethodRouter` with the operator guard.
+pub(super) async fn require_model_delete_api_key(
+    State(state): State<Arc<ServerState>>,
+    req: AxumRequest,
+    next: Next,
+) -> Response {
+    if req.method() == axum::http::Method::DELETE {
+        require_operator_api_key(State(state), req, next).await
+    } else {
+        require_api_key(State(state), req, next).await
+    }
+}
+
 pub(super) async fn require_ollama_api_key(
     State(state): State<Arc<ServerState>>,
     req: AxumRequest,

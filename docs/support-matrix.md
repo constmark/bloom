@@ -35,11 +35,12 @@ or file detection alone does not mean that inference works.
 | Backend | Device | Build or runtime requirement | Status |
 | --- | --- | --- | --- |
 | Candle CPU | CPU | Default features | `experimental` |
-| Candle Metal | Apple GPU | `--features metal` | `experimental` — Apple M5/Metal 4 has a repeatable native Qwen2 tiny-fixture OpenAI smoke and AWQ/GPTQ dequantization hardware gate (`cargo test -p bloomai-engine --features 'metal hardware-tests' --lib executor::metal_quant`); trained-model quality and wider quantized checkpoint coverage still need pinned evidence |
+| Candle Metal | Apple GPU | `--features metal` | `experimental` — Apple M5/Metal 4 has repeatable AWQ/GPTQ dequantization, tiny-fixture, and pinned Qwen2 Q4_0 trained-model OpenAI/Ollama smoke plus short concurrency/disconnect evidence; longer soak and wider quantized checkpoint coverage still need release evidence |
 | Candle CUDA | NVIDIA GPU | `--features cuda` and CUDA toolchain | `experimental` |
 | OpenVINO | Intel CPU, GPU, or NPU | OpenVINO runtime | `external-runtime` |
 | llama.cpp | CPU or GPU | Compatible `llama-server` | `external-runtime` |
-| CoreML, MLX, Vulkan | Platform-specific | Runtime implementation not connected | `skeleton` |
+| MLX | MLX-LM Python bridge | `experimental` | Text and text-only `Multi` generation runs through the bundled bridge on Apple Silicon CPU/GPU; install `requirements/mlx.txt`; vision/audio and wider trained-model evidence remain unsupported |
+| CoreML, Vulkan | Platform-specific | Runtime implementation not connected | `skeleton` |
 
 ## Server capabilities
 

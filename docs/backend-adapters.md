@@ -26,7 +26,7 @@ Every adapter must:
 | ONNX Runtime | Python `onnxruntime` bridge | `experimental` | Executes the first model input/output; text, audio, image bytes and numeric outputs are supported |
 | TensorRT | Vendor runtime | `skeleton` | Plan detection and diagnostics only |
 | CoreML | Apple framework | `skeleton` | Package probing and diagnostics only |
-| MLX | Apple runtime | `skeleton` | Weight probing and diagnostics only |
+| MLX | Apple runtime | `experimental` | Text generation through the bundled `mlx_lm` Python bridge; install `requirements/mlx.txt` and use an MLX-LM model package |
 | Vulkan | GPU runtime | `skeleton` | Shader probing and diagnostics only |
 
 The [support matrix](support-matrix.md) is authoritative when this table and
@@ -74,13 +74,14 @@ cargo run --release --bin bloom_infer -- \
 `--speculative mtp` selects this adapter automatically and requires a
 `llama-server` that advertises `draft-mtp` support.
 
-## Python-backed probes
+## Python-backed runtimes and probes
 
-MLX, Metal/MPS, and CoreML diagnostics use a Python interpreter only when the
-host platform supports that probe. Set `BLOOM_PYTHON` to an interpreter path
-when `python3` is not on `PATH` (for example, Windows `python.exe`, a virtual
-environment, or a non-default Python installation). Bloom falls back to
-`python3` then `python` on Unix, and `python` then the `py` launcher on Windows.
+MLX generation and Metal/MPS/CoreML diagnostics use a Python interpreter only
+when the host platform supports that path. Set `BLOOM_MLX_PYTHON` for MLX or
+`BLOOM_PYTHON` for shared probes when `python3` is not on `PATH` (for example,
+Windows `python.exe`, a virtual environment, or a non-default Python
+installation). Bloom falls back to `python3` then `python` on Unix, and
+`python` then the `py` launcher on Windows.
 
 ## Laya decision models
 

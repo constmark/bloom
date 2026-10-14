@@ -57,8 +57,9 @@ physical memory to runtime admission, and malformed EOS token metadata is
 rejected instead of being silently truncated.
 
 The remaining release blockers are evidence and vendor coverage rather than
-missing control flow: CoreML/MLX/Vulkan/TensorRT adapters still need
-executable runtime integrations; external OpenVINO/ASR/NPU paths now ship
+missing control flow: CoreML/Vulkan/TensorRT adapters still need executable
+runtime integrations; the MLX adapter now executes text generation through the
+installed MLX-LM bridge but remains experimental; external OpenVINO/ASR/NPU paths now ship
 their Python bridges but still require the corresponding packages and model
 profiles; ONNX now has an executable, packaged Python `onnxruntime` bridge but
 remains experimental until real model/provider evidence is published; and a stable deployment cell still needs target-hardware soak,
@@ -81,8 +82,23 @@ and tests the intentional `bloomai-app -> bloomai-backend` device-selection
 edge. Workspace Rust tests, no-default-feature checks, strict architecture
 tests, and Python SDK tests pass after these changes.
 
+This environment also completed the MLX gap: the M5/Metal 4 bridge loads a
+fixed Qwen2.5 0.5B MLX package, returns the expected `Bloom` response, and passes
+OpenAI/Ollama server smoke checks. The Safetensors resolver and package
+validator now accept a matching single-file index while continuing to reject
+ambiguous shard layouts. Metal has pinned Qwen2 Q4_0 trained-model and short
+concurrency/disconnect evidence; these observations still do not replace a
+long soak or broader model matrix.
+
+The Metal trained profile used the immutable Qwen2 Q4_0 file
+`aca679832ded61145239ce7f5c5ebddb1c57ada786c9c23733899c3888e0596f` (352,969,408
+bytes). A 1/2/4-concurrency workload completed 7 requests and 42 tokens,
+validated the semantic `Bloom` response, recovered from one accepted disconnect
+in 1.531 seconds, and measured a 6.199-second first-content p95 with 2.763 GB
+peak host RSS. This is a short M5 observation, not a long-term budget.
+
 The highest-value remaining work is still hardware- and evidence-bound: make
-one of CoreML, MLX, Vulkan, or TensorRT executable behind its vendor runtime;
+one of CoreML, Vulkan, or TensorRT executable behind its vendor runtime;
 publish real ONNX/OpenVINO/ASR provider and model gates; add trained
 multimodal and cross-encoder evidence; then run the multi-hour deployment,
 cancellation, disk-failure, upgrade/rollback, and cross-platform wheel drills

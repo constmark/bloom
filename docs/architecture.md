@@ -219,12 +219,12 @@ eligible for normal auto-routing.
   Manifest inference and execution share one fail-closed resolver for indexed
   Hugging Face Safetensors shards, so preflight accounting and mmap loading use
   the same ordered, complete, header-verified file set.
-- **External runtime:** OpenVINO, FunASR, llama.cpp, and vendor tools cross an
-  explicit process or SDK boundary.
+- **External runtime:** ONNX Runtime, MLX-LM, OpenVINO, FunASR, llama.cpp, and
+  vendor tools cross an explicit process or SDK boundary.
 - **Plugin:** third-party engines and backends declare capabilities through a
   manifest. Native plugins run as trusted in-process code.
-- **Skeleton:** ONNX Runtime, CoreML, MLX, Vulkan, and similar adapters may only
-  probe files and report missing runtime support until execution is connected.
+- **Skeleton:** CoreML, Vulkan, TensorRT, and similar adapters may only probe
+  files and report missing runtime support until execution is connected.
 
 The current maturity of each path is recorded in the
 [support matrix](support-matrix.md).
