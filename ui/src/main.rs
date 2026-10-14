@@ -6048,9 +6048,8 @@ fn SettingsDrawer(
                     input {
                         id: "operator-api-key",
                         role: "textbox",
-                        aria_labelledby: "operator-api-key-label",
                         r#type: "password",
-                        aria_label: "Operator API key (optional)",
+                        aria_label: "Operator credential (optional)",
                         value: "{operator_api_key}",
                         maxlength: "{MAX_API_KEY_CHARS}",
                         placeholder: "BLOOM_OPERATOR_API_KEY",
