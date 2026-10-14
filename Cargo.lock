@@ -241,7 +241,6 @@ name = "bloomai-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bloomai-backend",
  "bloomai-core",
  "bloomai-engine",
  "candle-core 0.10.2",
