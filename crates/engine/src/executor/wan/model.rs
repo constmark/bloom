@@ -154,12 +154,22 @@ impl WanVideoModel {
         // W' = W / spatial_stride
         let t_stride = self.vae.temporal_stride();
         let s_stride = self.vae.spatial_stride();
+        validate_video_params(
+            prompt,
+            width,
+            height,
+            num_frames,
+            fps,
+            guidance_scale,
+            num_steps,
+            s_stride,
+        )?;
         let latent_f = ((num_frames as usize) - 1) / t_stride + 1;
         let latent_h = height as usize / s_stride;
         let latent_w = width as usize / s_stride;
 
         // 1. Encode text
-        tracing::info!("Encoding text prompt: {}", &prompt[..prompt.len().min(80)]);
+        tracing::info!("Encoding text prompt: {}", prompt_preview(prompt));
         let texts = if guidance_scale > 1.0 {
             let neg = negative_prompt.unwrap_or("");
             vec![prompt.to_string(), neg.to_string()]
@@ -177,7 +187,7 @@ impl WanVideoModel {
         // 3. Set up scheduler
         let shift = 5.0; // Default shift for Wan2.1
         let mut scheduler = FlowUniPCScheduler::new(1000, shift, false);
-        scheduler.set_timesteps(num_steps, shift);
+        scheduler.set_timesteps(num_steps, shift)?;
         let total_steps = scheduler.num_steps();
 
         // 4. Load DiT model to GPU natively (lazy QMatMul ensures it fits in VRAM)
@@ -309,6 +319,67 @@ impl WanVideoModel {
         Tensor::from_vec(data, shape, &self.device)
             .map_err(|e| anyhow!("noise tensor error: {}", e))
     }
+}
+
+fn prompt_preview(prompt: &str) -> String {
+    prompt.chars().take(80).collect()
+}
+
+/// Validate public video-generation parameters before deriving latent shapes or
+/// constructing the diffusion schedule. Keeping this check at the model
+/// boundary makes direct engine callers fail with an actionable error instead
+/// of reaching integer underflow, zero-sized tensors, or non-finite sampling.
+fn validate_video_params(
+    prompt: &str,
+    width: u32,
+    height: u32,
+    num_frames: u32,
+    fps: f32,
+    guidance_scale: f64,
+    num_steps: u32,
+    spatial_stride: usize,
+) -> Result<()> {
+    if prompt.trim().is_empty() {
+        return Err(anyhow!("Wan video prompt must not be empty"));
+    }
+    if spatial_stride == 0 {
+        return Err(anyhow!("Wan VAE spatial stride must be positive"));
+    }
+    if width == 0 || height == 0 {
+        return Err(anyhow!("Wan video width and height must be positive"));
+    }
+    if width > 8192 || height > 8192 {
+        return Err(anyhow!(
+            "Wan video width and height must not exceed 8192 pixels"
+        ));
+    }
+    let spatial_stride = u32::try_from(spatial_stride)
+        .map_err(|_| anyhow!("Wan VAE spatial stride is too large"))?;
+    if spatial_stride == 0 {
+        return Err(anyhow!("Wan VAE spatial stride must be positive"));
+    }
+    if !width.is_multiple_of(spatial_stride) || !height.is_multiple_of(spatial_stride) {
+        return Err(anyhow!(
+            "Wan video width and height must be multiples of the VAE spatial stride ({spatial_stride})"
+        ));
+    }
+    if num_frames == 0 || num_frames > 4096 {
+        return Err(anyhow!("Wan video frame count must be between 1 and 4096"));
+    }
+    if !fps.is_finite() || !(0.0..=240.0).contains(&fps) || fps == 0.0 {
+        return Err(anyhow!(
+            "Wan video fps must be finite, greater than 0, and at most 240"
+        ));
+    }
+    if !guidance_scale.is_finite() || !(0.0..=100.0).contains(&guidance_scale) {
+        return Err(anyhow!(
+            "Wan guidance scale must be finite and between 0 and 100"
+        ));
+    }
+    if num_steps == 0 || num_steps > 1000 {
+        return Err(anyhow!("Wan diffusion steps must be between 1 and 1000"));
+    }
+    Ok(())
 }
 
 impl LoadedModel for WanVideoModel {
@@ -520,6 +591,29 @@ impl PcgRng {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_params_reject_zero_and_non_finite_values() {
+        assert!(validate_video_params("prompt", 832, 480, 0, 16.0, 5.0, 50, 8).is_err());
+        assert!(validate_video_params("prompt", 832, 480, 81, f32::NAN, 5.0, 50, 8).is_err());
+        assert!(validate_video_params("prompt", 832, 480, 81, 16.0, f64::INFINITY, 50, 8).is_err());
+        assert!(validate_video_params("prompt", 832, 480, 81, 16.0, 5.0, 0, 8).is_err());
+    }
+
+    #[test]
+    fn video_params_require_valid_dimensions_and_prompt() {
+        assert!(validate_video_params("  ", 832, 480, 81, 16.0, 5.0, 50, 8).is_err());
+        assert!(validate_video_params("prompt", 0, 480, 81, 16.0, 5.0, 50, 8).is_err());
+        assert!(validate_video_params("prompt", 831, 480, 81, 16.0, 5.0, 50, 8).is_err());
+        assert!(validate_video_params("prompt", 832, 480, 81, 16.0, 5.0, 50, 8).is_ok());
+    }
+
+    #[test]
+    fn prompt_preview_is_utf8_safe_and_bounded() {
+        let preview = prompt_preview(&"界".repeat(100));
+        assert_eq!(preview.chars().count(), 80);
+        assert_eq!(preview, "界".repeat(80));
+    }
 
     #[test]
     fn test_pcg_rng_deterministic() {

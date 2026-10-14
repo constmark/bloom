@@ -385,6 +385,11 @@ impl WanVAE {
     /// Input:  [batch, C=16, F', H', W'] latent tensor
     /// Output: [batch, 3, F, H, W] decoded video tensor
     pub fn decode(&self, latent: &Tensor) -> Result<Tensor> {
+        if latent.dim(2)? == 0 {
+            return Err(anyhow::anyhow!(
+                "Wan VAE cannot decode a latent tensor with zero frames"
+            ));
+        }
         match Self::try_load_decoder(&self.config, &self.model_path, &self.device) {
             Some(decoder) => {
                 let res = self.decode_with_model(&decoder, latent)?;
@@ -559,6 +564,9 @@ impl WanVAE {
         latent_w: usize,
     ) -> (usize, usize, usize) {
         let cfg = &self.config;
+        if latent_f == 0 {
+            return (0, 0, 0);
+        }
         let f = (latent_f - 1) * cfg.temporal_stride + 1;
         let h = latent_h * cfg.spatial_stride;
         let w = latent_w * cfg.spatial_stride;
@@ -625,6 +633,7 @@ mod tests {
         assert_eq!(f, 81); // (21-1)*4+1
         assert_eq!(h, 480); // 60*8
         assert_eq!(w, 832); // 104*8
+        assert_eq!(vae.output_dimensions(0, 60, 104), (0, 0, 0));
     }
 
     #[test]
