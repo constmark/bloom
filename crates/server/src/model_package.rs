@@ -96,7 +96,7 @@ pub(crate) fn validate_safetensors_layout_names(files: &[ModelPackageFile]) -> R
         .map(|filename| parse_safetensors_shard_name(filename).map(|position| (filename, position)))
         .collect::<Result<Vec<_>>>()?;
     if has_single {
-        if has_index || !shards.is_empty() {
+        if !shards.is_empty() {
             return Err(anyhow!(
                 "model.safetensors cannot be combined with a sharded Safetensors layout"
             ));
@@ -307,15 +307,28 @@ mod tests {
 
         let mut conflicting = package_files();
         conflicting.push(ModelPackageFile {
+            filename: "model-00001-of-00001.safetensors".to_string(),
+            size_bytes: 1,
+            sha256: "ef".repeat(32),
+        });
+        conflicting.push(ModelPackageFile {
             filename: "model.safetensors.index.json".to_string(),
             size_bytes: 1,
             sha256: "ef".repeat(32),
         });
         assert!(
-            normalize_package_files(conflicting, 11)
+            normalize_package_files(conflicting, 12)
                 .unwrap_err()
                 .to_string()
                 .contains("cannot be combined")
         );
+
+        let mut indexed_single = package_files();
+        indexed_single.push(ModelPackageFile {
+            filename: "model.safetensors.index.json".to_string(),
+            size_bytes: 1,
+            sha256: "ef".repeat(32),
+        });
+        assert!(normalize_package_files(indexed_single, 11).is_ok());
     }
 }

@@ -993,13 +993,15 @@ impl PagedAttentionCache {
         let mut block_keys = self.block_keys.lock().unwrap_or_else(|e| e.into_inner());
         register_block_keys_into(
             &mut block_keys,
-            namespace,
-            self.config.num_layers,
-            self.config.block_size,
-            request_id,
-            prompt_tokens,
-            block_ids,
-            multimodal_hash,
+            BlockKeyRegistration {
+                namespace,
+                num_layers: self.config.num_layers,
+                block_size: self.config.block_size,
+                request_id,
+                prompt_tokens,
+                block_ids,
+                multimodal_hash,
+            },
         );
     }
 
@@ -1093,41 +1095,53 @@ fn install_cachemesh_allocation_hook(
             let mut keys = block_keys.lock().unwrap_or_else(|error| error.into_inner());
             register_block_keys_into(
                 &mut keys,
-                &namespace,
-                config.num_layers,
-                config.block_size,
-                request_id,
-                prompt_tokens,
-                block_ids,
-                multimodal_hash,
+                BlockKeyRegistration {
+                    namespace: &namespace,
+                    num_layers: config.num_layers,
+                    block_size: config.block_size,
+                    request_id,
+                    prompt_tokens,
+                    block_ids,
+                    multimodal_hash,
+                },
             );
         },
     );
 }
 
-#[allow(clippy::too_many_arguments)]
-fn register_block_keys_into(
-    block_keys: &mut HashMap<(usize, usize), CacheMeshKey>,
-    namespace: &str,
+struct BlockKeyRegistration<'a> {
+    namespace: &'a str,
     num_layers: usize,
     block_size: usize,
-    request_id: &str,
-    prompt_tokens: &[u32],
-    block_ids: &[usize],
-    multimodal_hash: Option<&str>,
+    request_id: &'a str,
+    prompt_tokens: &'a [u32],
+    block_ids: &'a [usize],
+    multimodal_hash: Option<&'a str>,
+}
+
+fn register_block_keys_into(
+    block_keys: &mut HashMap<(usize, usize), CacheMeshKey>,
+    registration: BlockKeyRegistration<'_>,
 ) {
-    for (block_idx, &block_id) in block_ids.iter().enumerate() {
-        for layer_idx in 0..num_layers {
-            let prefix_len = block_idx.saturating_add(1).saturating_mul(block_size);
-            let key = if prefix_len <= prompt_tokens.len() {
+    for (block_idx, &block_id) in registration.block_ids.iter().enumerate() {
+        for layer_idx in 0..registration.num_layers {
+            let prefix_len = block_idx
+                .saturating_add(1)
+                .saturating_mul(registration.block_size);
+            let key = if prefix_len <= registration.prompt_tokens.len() {
                 CacheMeshKey::from_tokens_multimodal(
-                    namespace,
+                    registration.namespace,
                     layer_idx,
-                    &prompt_tokens[..prefix_len],
-                    multimodal_hash,
+                    &registration.prompt_tokens[..prefix_len],
+                    registration.multimodal_hash,
                 )
             } else {
-                CacheMeshKey::from_request_block(namespace, layer_idx, request_id, block_idx)
+                CacheMeshKey::from_request_block(
+                    registration.namespace,
+                    layer_idx,
+                    registration.request_id,
+                    block_idx,
+                )
             };
             block_keys.insert((layer_idx, block_id), key);
         }

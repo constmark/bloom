@@ -879,7 +879,7 @@ impl QwenStreamingModelForCausalLM {
     /// `seq_len * kv_dim` each in token-major `[T, H, D]` order.
     ///
     /// This is the per-layer read path shared by [`QwenKvHook`] and
-    /// [`crate::executor::candle::PerRequestKvHook`]. Exposed publicly so
+    /// [`crate::executor::candle::CandleKvHook`]. Exposed publicly so
     /// that handle-keyed hooks in other modules can read a streaming
     /// model's KV without duplicating the `ConcatKvCache` slicing logic.
     pub fn extract_kv_from_layer(
@@ -1027,7 +1027,7 @@ impl QwenStreamingModelForCausalLM {
 
     /// Wrapper around [`Self::inject_kv_to_layer`] preserving the legacy
     /// `inject_kv` name and candle `Result` return type. The `_kv_dim`
-    /// parameter is retained for callers (e.g. `PerRequestKvHook` in
+    /// parameter is retained for callers (e.g. `CandleKvHook` in
     /// `crate::executor::candle`) that pass the derived
     /// `kv_dim = num_kv_heads * head_dim`.
     pub fn inject_kv(
@@ -1153,8 +1153,8 @@ impl QwenStreamingModelForCausalLM {
 ///
 /// `handle` is ignored because this hook is bound to a single shared model
 /// instance. Production deployments that allocate one model per request
-/// must wrap each model with its own `QwenKvHook`, or use a handle-keyed
-/// variant (TODO: `PerRequestQwenKvHook`).
+/// must wrap each model with its own `QwenKvHook`, or use the production
+/// handle-keyed [`crate::executor::candle::CandleKvHook`] adapter.
 pub struct QwenKvHook {
     model: Arc<Mutex<QwenStreamingModelForCausalLM>>,
     num_layers: usize,
@@ -1264,6 +1264,15 @@ impl crate::scheduler::kv_hook::KvHook for QwenKvHook {
     fn clear_kv_cache(&self, _handle: usize) -> anyhow::Result<()> {
         let mut model = self.model.lock().unwrap_or_else(|e| e.into_inner());
         model.clear_kv_cache();
+        Ok(())
+    }
+
+    fn rollback_kv_cache(&self, _handle: usize, length: usize) -> anyhow::Result<()> {
+        // Speculative/structured decoding may reject tokens after they have
+        // already been appended to the model cache. Keep the model cache
+        // aligned with the scheduler history before the next forward pass.
+        let mut model = self.model.lock().unwrap_or_else(|e| e.into_inner());
+        model.truncate_kv_cache(length)?;
         Ok(())
     }
 }
@@ -1432,6 +1441,12 @@ mod qwen_kv_hook_tests {
         // Length mismatch must error.
         let bad_short = vec![0f32; 3];
         assert!(hook.inject_kv(0, 0, 0, &bad_short, &bad_short, 1).is_err());
+
+        // Rollback must truncate the model-owned cache, rather than the
+        // default no-op implementation leaving speculative tokens behind.
+        hook.rollback_kv_cache(0, 2).unwrap();
+        assert!(hook.extract_kv(0, 0, 0, 2).is_ok());
+        assert!(hook.extract_kv(0, 0, 0, 3).is_err());
     }
 
     /// Verify `inject_kv` round-trips through `extract_kv` after a full

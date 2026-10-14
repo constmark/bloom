@@ -1369,6 +1369,34 @@ impl crate::scheduler::kv_hook::KvHook for PerRequestKvHook {
             )),
         }
     }
+
+    fn rollback_kv_cache(&self, handle: usize, length: usize) -> anyhow::Result<()> {
+        let mut models = self
+            .request_models
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(wrapper) = models.get_mut(&handle) else {
+            return Err(anyhow!(
+                "PerRequestKvHook: handle {} not found in request_models map",
+                handle
+            ));
+        };
+        let Some(qw) = wrapper.downcast_mut::<QwenModelWrapper>() else {
+            return Err(anyhow!(
+                "PerRequestKvHook: model for handle {} is not a QwenModelWrapper",
+                handle
+            ));
+        };
+        match qw {
+            QwenModelWrapper::Streaming(model) => {
+                model.truncate_kv_cache(length).map_err(Into::into)
+            }
+            _ => Err(anyhow!(
+                "PerRequestKvHook: model variant {:?} does not support KV rollback (only Streaming is supported)",
+                qw.variant_name()
+            )),
+        }
+    }
 }
 
 struct CandleTextModel {

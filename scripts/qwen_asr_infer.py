@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -68,7 +69,12 @@ def resolve_dtype(dtype: str, device: str) -> Any:
 def load_model(args: argparse.Namespace):
     try:
         import torch
-        from qwen_asr import Qwen3ASRModel
+        # qwen-asr imports vLLM, whose platform probe writes an informational
+        # line to stdout. Bloom's daemon protocol reserves stdout for one JSON
+        # response per request, so keep third-party startup diagnostics on
+        # stderr where they cannot corrupt the protocol stream.
+        with contextlib.redirect_stdout(sys.stderr):
+            from qwen_asr import Qwen3ASRModel
     except ImportError as exc:
         raise SystemExit(
             "Missing Python dependency. Create the local environment with:\n"

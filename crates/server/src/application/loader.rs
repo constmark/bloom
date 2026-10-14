@@ -445,6 +445,7 @@ mod tests {
         assert!(validate_strict_runtime_backend("candle").is_ok());
         assert!(validate_strict_runtime_backend("qwen3_vl").is_ok());
         assert!(validate_strict_runtime_backend("onnxruntime").is_ok());
+        assert!(validate_strict_runtime_backend("mlx").is_ok());
         let error = validate_strict_runtime_backend("wan")
             .unwrap_err()
             .to_string();

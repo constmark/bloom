@@ -310,6 +310,7 @@ impl Engine for FunASREngine {
             return Ok(Box::new(FunASRModel {
                 _model_path: model_path.to_path_buf(),
                 _device: device_str.to_string(),
+                actual_device: device,
                 _runtime: runtime,
                 metadata,
                 processors,
@@ -332,6 +333,7 @@ impl Engine for FunASREngine {
         Ok(Box::new(FunASRModel {
             _model_path: model_path.to_path_buf(),
             _device: device_str.to_string(),
+            actual_device: device,
             _runtime: runtime,
             metadata,
             processors,
@@ -387,6 +389,7 @@ fn spawn_asr_daemon(command: &mut Command, timeout: std::time::Duration) -> Resu
 struct FunASRModel {
     _model_path: std::path::PathBuf,
     _device: String,
+    actual_device: DeviceKind,
     _runtime: AsrRuntime,
     metadata: ModelMetadata,
     processors: crate::processor::ProcessorRegistry,
@@ -396,6 +399,10 @@ struct FunASRModel {
 }
 
 impl LoadedModel for FunASRModel {
+    fn actual_device(&self) -> Option<DeviceKind> {
+        Some(self.actual_device)
+    }
+
     fn metadata(&self) -> &ModelMetadata {
         &self.metadata
     }
