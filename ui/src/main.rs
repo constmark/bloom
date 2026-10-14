@@ -6009,6 +6009,7 @@ fn SettingsDrawer(
                     label { r#for: "base-url", "Server address" }
                     input {
                         id: "base-url",
+                        aria_label: "Server address",
                         value: "{base_url}",
                         maxlength: "{MAX_BASE_URL_CHARS}",
                         placeholder: "http://127.0.0.1:3000",
