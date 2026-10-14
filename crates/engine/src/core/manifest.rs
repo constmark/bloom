@@ -1411,7 +1411,9 @@ fn infer_from_hf_config(model_path: &Path, config: serde_json::Value) -> Result<
         .to_string_lossy()
         .into_owned();
 
-    if arch.contains("qwen") {
+    if model_type.contains("asr") || arch.contains("asr") {
+        manifest.family = ModelFamily::FunAsr;
+    } else if arch.contains("qwen") {
         manifest.family = ModelFamily::Qwen;
     } else if arch.contains("llama") {
         manifest.family = ModelFamily::Llama;
@@ -1508,14 +1510,19 @@ fn infer_from_hf_config(model_path: &Path, config: serde_json::Value) -> Result<
     // The current Gemma-4 Candle path intentionally exposes its implemented
     // text subset rather than claiming unsupported image inference.
     let is_vl = model_type.contains("vl") || arch.contains("vl");
+    let is_asr = manifest.family == ModelFamily::FunAsr;
 
     manifest.io_schema = ModelIoSchema {
-        inputs: if is_longcat_edit || is_vl {
+        inputs: if is_asr {
+            vec![Modality::Audio]
+        } else if is_longcat_edit || is_vl {
             vec![Modality::Text, Modality::Vision]
         } else {
             vec![Modality::Text]
         },
-        outputs: if is_longcat_edit {
+        outputs: if is_asr {
+            vec![Modality::Text]
+        } else if is_longcat_edit {
             vec![Modality::Vision]
         } else {
             vec![Modality::Text]
