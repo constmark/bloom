@@ -6026,6 +6026,7 @@ fn SettingsDrawer(
                     label { r#for: "api-key", "API key (optional)" }
                     input {
                         id: "api-key",
+                        role: "textbox",
                         r#type: "password",
                         aria_label: "API key (optional)",
                         value: "{api_key}",
@@ -6044,6 +6045,7 @@ fn SettingsDrawer(
                     label { r#for: "operator-api-key", "Operator API key (optional)" }
                     input {
                         id: "operator-api-key",
+                        role: "textbox",
                         r#type: "password",
                         aria_label: "Operator API key (optional)",
                         value: "{operator_api_key}",
