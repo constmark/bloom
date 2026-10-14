@@ -10,6 +10,12 @@ called out in release notes.
 
 ### Reliability and distribution
 
+- Harden Wan video and diffusion boundaries: reject empty or oversized frame
+  dimensions, invalid stride alignment, non-finite sampling controls, and
+  zero-frame VAE inputs before tensor construction; validate per-sample grid
+  metadata and keep prompt previews UTF-8 safe. Candle and Qwen3-VL streaming
+  now derive deltas with prefix-safe text handling so multilingual output
+  cannot panic on a byte-boundary slice.
 - Bound Python streaming handoff to 64 chunks and 16 MiB, apply backpressure to
   slow consumers, reject oversized revision 2 callbacks before copying their
   memory, and release blocked callbacks on stream/pipeline close. Pipeline

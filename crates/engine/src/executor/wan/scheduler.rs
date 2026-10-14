@@ -10,6 +10,9 @@ use candle_core::{Result, Tensor};
 /// sigmas = shift * t / (1 + (shift - 1) * t)
 /// where t is linearly spaced from 1 to 1/num_steps.
 pub fn get_sampling_sigmas(num_steps: u32, shift: f64) -> Vec<f64> {
+    if num_steps == 0 || !shift.is_finite() || shift <= 0.0 {
+        return Vec::new();
+    }
     let sigmas: Vec<f64> = (0..=num_steps)
         .map(|i| {
             let t = 1.0 - (i as f64) / (num_steps as f64);
@@ -55,10 +58,16 @@ impl FlowUniPCScheduler {
     }
 
     /// Set timesteps for sampling.
-    pub fn set_timesteps(&mut self, num_steps: u32, shift: f64) {
+    pub fn set_timesteps(&mut self, num_steps: u32, shift: f64) -> Result<()> {
+        if num_steps == 0 || !shift.is_finite() || shift <= 0.0 {
+            return Err(candle_core::Error::Msg(
+                "Wan scheduler requires positive finite steps and shift".to_string(),
+            ));
+        }
         self.sigmas = get_sampling_sigmas(num_steps, shift);
         self.timesteps = retrieve_timesteps(&self.sigmas, self.num_train_timesteps);
         self.model_outputs.clear();
+        Ok(())
     }
 
     /// Single denoising step.
@@ -119,10 +128,16 @@ impl FlowDPMPlusPlusScheduler {
         }
     }
 
-    pub fn set_timesteps(&mut self, num_steps: u32, shift: f64) {
+    pub fn set_timesteps(&mut self, num_steps: u32, shift: f64) -> Result<()> {
+        if num_steps == 0 || !shift.is_finite() || shift <= 0.0 {
+            return Err(candle_core::Error::Msg(
+                "Wan scheduler requires positive finite steps and shift".to_string(),
+            ));
+        }
         self.sigmas = get_sampling_sigmas(num_steps, shift);
         self.timesteps = retrieve_timesteps(&self.sigmas, self.num_train_timesteps);
         self.model_outputs.clear();
+        Ok(())
     }
 
     /// DPM++ single step (simplified as Euler for flow matching).
@@ -183,7 +198,7 @@ mod tests {
     fn test_unipc_scheduler_step() {
         let device = Device::Cpu;
         let mut scheduler = FlowUniPCScheduler::new(1000, 5.0, false);
-        scheduler.set_timesteps(10, 5.0);
+        scheduler.set_timesteps(10, 5.0).unwrap();
 
         let sample = Tensor::randn(0f32, 1.0, (1, 16, 4, 4, 4), &device).unwrap();
         let model_output = Tensor::zeros_like(&sample).unwrap();
@@ -200,5 +215,16 @@ mod tests {
         // With shift > 1, middle sigmas should be larger (slower initial denoising)
         let mid = 25;
         assert!(sigmas_shifted[mid] > sigmas_no_shift[mid]);
+    }
+
+    #[test]
+    fn invalid_sampling_parameters_fail_closed() {
+        assert!(get_sampling_sigmas(0, 5.0).is_empty());
+        assert!(get_sampling_sigmas(10, 0.0).is_empty());
+        assert!(get_sampling_sigmas(10, f64::NAN).is_empty());
+
+        let mut scheduler = FlowUniPCScheduler::new(1000, 5.0, false);
+        assert!(scheduler.set_timesteps(0, 5.0).is_err());
+        assert!(scheduler.set_timesteps(10, f64::INFINITY).is_err());
     }
 }

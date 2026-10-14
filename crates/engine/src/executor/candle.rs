@@ -2009,9 +2009,11 @@ impl CandleTextModel {
             .tokenizer
             .decode(&all_tokens[prompt_len..], true)
             .map_err(|e| anyhow!("tokenizer decode error: {}", e))?;
-        if text.len() > prev_text.len() {
-            let new_text = &text[prev_text.len()..];
-            sink.on_chunk(crate::io::OutputChunk::TextDelta(new_text.to_string()))?;
+        if text != *prev_text {
+            let new_text = text.strip_prefix(prev_text.as_str()).unwrap_or(&text);
+            if !new_text.is_empty() {
+                sink.on_chunk(crate::io::OutputChunk::TextDelta(new_text.to_string()))?;
+            }
             *prev_text = text;
         }
         Ok(())
