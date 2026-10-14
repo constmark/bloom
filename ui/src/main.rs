@@ -5285,7 +5285,7 @@ fn MessageList(
                     div { class: "empty-state-eyebrow", "{copy.home_eyebrow}" }
                     h2 { "{copy.home_title}" }
                     p { class: "empty-state-lead", "{copy.home_body}" }
-                    h3 { class: "empty-state-status-title", "{view.title}" }
+                    h3 { class: "empty-state-status-title", role: "status", "{view.title}" }
                     p { class: "empty-state-status-body", "{view.body}" }
                     div { class: "empty-state-capabilities",
                         div { class: "empty-state-capability",
