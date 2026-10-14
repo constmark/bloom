@@ -3,6 +3,41 @@
 Bloom is pre-1.0. Work is prioritized by reliability and reproducible model
 support rather than fixed release dates.
 
+## Direction and delivery stages
+
+The long-term target is full user-visible capability parity with a pinned
+llama.cpp reference, a maintainable layered implementation, and one shared
+frontend across desktop and mobile browsers. See the
+[edge-engine goal](edge-engine-goal.md) and
+[parity matrix](llamacpp-parity.md) for acceptance requirements. The support
+matrix records delivered behavior; roadmap entries describe intended work.
+
+Deliver the goal in this order:
+
+1. **Establish a truthful baseline.** Pin the reference revision, inventory its
+   capabilities, reconcile advertised engine capabilities with implemented
+   operations, restore agreement between dependency declarations and the
+   architecture gate, and unify client readiness/version checks.
+2. **Validate the first native deployment cell.** Complete correctness,
+   measured comparison, sustained load, cancellation, failure recovery, and
+   release/rollback evidence for the maintained Qwen2 Q4_0 CPU profile. Keep
+   native results separate from external llama.cpp execution.
+3. **Expand capability and hardware parity.** Close model, quantization,
+   sampling, constrained-generation, scheduler/KV, accelerator, multimodal,
+   conversion, and embedding/reranking gaps against the reference inventory.
+   Promote each model/device/task combination from reproducible evidence.
+4. **Validate the shared cross-platform experience.** Exercise install,
+   first-model setup, streaming, stop, model switching, diagnostics, and
+   recovery on Windows/macOS/Linux and mobile browsers using common API
+   contracts; validate keyboard, accessibility, touch, and narrow layouts.
+5. **Close and maintain full parity.** Resolve every reference capability row,
+   publish performance and compatibility evidence, and re-run the inventory
+   and regression gates when advancing the pinned reference.
+
+Client usability and focused module extraction proceed throughout these
+stages. Completing the first deployment cell is an initial milestone, not the
+final parity claim.
+
 ## Current priorities
 
 - Complete the first candidate deployment cell: pinned Qwen2 0.5B Instruct

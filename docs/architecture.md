@@ -4,6 +4,11 @@ Bloom is a standalone inference engine. It owns model loading, preprocessing,
 execution, in-engine scheduling, KV-cache management, and streaming output.
 Cross-model orchestration belongs outside the engine.
 
+The [edge-engine goal](edge-engine-goal.md) defines the intended complete
+llama.cpp capability parity and cross-platform experience. This page describes
+the implementation boundaries; the [support matrix](support-matrix.md)
+describes current executable behavior.
+
 ## Layering and dependency direction
 
 The native workspace follows one-way dependencies. Transport and presentation
@@ -17,6 +22,7 @@ flowchart TD
     Server --> Engine["bloomai-engine (pipeline + scheduling)"]
     App["bloomai-app (process configuration + CLI)"] --> Engine
     Server --> App
+    App --> Backend
     FFI["bloomai-ffi"] --> Engine
     Engine --> Core["bloomai-core (contracts)"]
     Engine --> Backend["bloomai-backend (devices)"]

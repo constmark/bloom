@@ -12,6 +12,19 @@ Ollama-compatible HTTP APIs.
 
 Bloom can run on its own or serve as an inference engine integrated into larger runtime systems.
 
+## Project goal
+
+Bloom aims for full user-visible capability parity with a pinned llama.cpp
+reference, with Ollama and MLX LM as additional references for local usability
+and platform performance. It combines a maintainable, layered inference
+architecture with a shared frontend for Windows, macOS, Linux, and mobile
+browsers. This is a development target; current executable support remains
+defined by the support matrix.
+
+See the [edge-engine goal](docs/edge-engine-goal.md),
+[parity and acceptance matrix](docs/llamacpp-parity.md), and
+[roadmap](docs/roadmap.md) for scope, evidence requirements, and delivery stages.
+
 > [!IMPORTANT]
 > Bloom is pre-1.0 software. The default Candle paths are currently
 > **experimental**. Other backends may require external runtimes or may only

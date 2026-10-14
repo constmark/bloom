@@ -33,6 +33,8 @@ request.
 
 ## Understand and extend Bloom
 
+- [Edge-engine goal and delivery stages](edge-engine-goal.md)
+- [llama.cpp parity and acceptance matrix](llamacpp-parity.md)
 - [Architecture](architecture.md)
 - [Support matrix](support-matrix.md)
 - [Scheduler](scheduler.md)

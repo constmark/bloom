@@ -16,7 +16,9 @@ ALLOWED_INTERNAL = {
     "bloomai-backend": {"bloomai-core"},
     "bloomai-tilelang": set(),
     "bloomai-engine": {"bloomai-core", "bloomai-backend", "bloomai-tilelang"},
-    "bloomai-app": {"bloomai-core", "bloomai-engine"},
+    # Native binaries resolve a physical device through the backend registry;
+    # keep this dependency explicit so the layer map matches Cargo manifests.
+    "bloomai-app": {"bloomai-core", "bloomai-backend", "bloomai-engine"},
     "bloomai-server": {"bloomai-core", "bloomai-backend", "bloomai-engine", "bloomai-app"},
     "bloomai-ffi": {"bloomai-core", "bloomai-engine"},
     "bloom-ui": set(),
