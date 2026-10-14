@@ -415,7 +415,7 @@ fn select_backend_name(
 }
 
 fn parse_device(s: &str, supported_devices: &[DeviceKind]) -> Result<DeviceKind> {
-    bloomai_backend::BackendRegistry::default()
+    bloomai_engine::BackendRegistry::default()
         .resolve_device_selector(s, supported_devices)
         .map_err(|error| anyhow!("could not resolve device '{}': {error}", s))
 }

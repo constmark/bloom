@@ -68,6 +68,9 @@ pub use crate::executor::onnx::OnnxRuntimeEngine;
 pub use crate::executor::vulkan::VulkanEngine;
 
 pub use crate::batching::{BatchExecutorConfig, build_batch_executor};
+// Device selection is part of the engine-facing contract used by native
+// clients. Re-export the registry here so the application layer does not
+// need to depend on the lower-level backend crate directly.
 #[allow(deprecated)]
 pub use crate::executor::speculative::{
     DraftModelStrategy, NGramStrategy, SpeculativeMode, SpeculativeResult, SpeculativeStrategy,
@@ -94,6 +97,7 @@ pub use crate::world::{
     ActionSchema, MockPolicyEngine, MockWorldModel, PolicyEngine, StateCacheManager,
     WorldModelConstraints, WorldModelEngine, WorldModelLoop, WorldStateSchema,
 };
+pub use bloomai_backend::BackendRegistry;
 
 /// Shared process-environment isolation for unit tests.
 ///

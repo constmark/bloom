@@ -409,11 +409,7 @@ mod tests {
     }
 
     fn test_python() -> &'static str {
-        if cfg!(windows) {
-            "python"
-        } else {
-            "python3"
-        }
+        if cfg!(windows) { "python" } else { "python3" }
     }
 
     fn write_fake_bridge(dir: &Path) -> PathBuf {
