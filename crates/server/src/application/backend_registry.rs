@@ -119,10 +119,10 @@ pub(crate) fn validate_ifb_backend(enable_ifb: bool, backend_name: &str) -> Resu
 pub(crate) fn validate_strict_runtime_backend(backend_name: &str) -> Result<()> {
     // External bridges must report the exact selected physical device before
     // the server publishes their runtime and charges its manifest footprint.
-    // ONNX and MLX both satisfy this contract before spawning inference.
+    // ONNX, FunASR, and MLX satisfy this contract before spawning inference.
     if !matches!(
         backend_name,
-        "candle" | "qwen3_vl" | "laya" | "onnxruntime" | "mlx"
+        "candle" | "qwen3_vl" | "laya" | "onnxruntime" | "funasr" | "mlx"
     ) {
         return Err(anyhow!(
             "strict aggregate memory admission requires a backend that reports its verified physical device; selected backend '{backend_name}' does not yet provide that contract"

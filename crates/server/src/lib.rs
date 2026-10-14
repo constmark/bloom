@@ -550,7 +550,15 @@ async fn run_server(
         }
         return Ok(());
     }
-    validate_server_arguments_with_cachemesh_backend(&args, cachemesh_remote.is_some())?;
+    // An embedded remote is only an active CacheMesh backend when the
+    // corresponding L3 flag is enabled. External runtimes such as ASR keep
+    // the adapter process available for shared configuration, but do not
+    // publish token-cache scheduling and therefore must not be rejected as if
+    // a CacheMesh backend were active.
+    validate_server_arguments_with_cachemesh_backend(
+        &args,
+        cachemesh_remote.is_some() && args.enable_cachemesh_l3,
+    )?;
     let runtime_pool_capacity = NonZeroUsize::new(args.max_loaded_models)
         .ok_or_else(|| anyhow!("maximum loaded models must be at least 1"))?;
 
