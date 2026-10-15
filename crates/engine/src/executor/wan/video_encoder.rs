@@ -374,7 +374,8 @@ fn validate_video_frames(video: &VideoOutput) -> Result<()> {
     if expected_len == 0 {
         return Err(anyhow!(
             "video dimensions must be greater than zero ({}x{})",
-            video.width, video.height
+            video.width,
+            video.height
         ));
     }
 
