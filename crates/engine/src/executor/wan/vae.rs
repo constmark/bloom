@@ -586,7 +586,12 @@ pub fn tensor_to_rgb_frame(frame: &Tensor) -> Result<Vec<u8>> {
         frame.clone()
     };
 
-    let (_c, h, w) = frame.dims3()?;
+    let (c, h, w) = frame.dims3()?;
+    if c != 3 {
+        return Err(anyhow!(
+            "RGB frame must have exactly 3 channels, received {c}"
+        ));
+    }
 
     // Denormalize from [-1, 1] to [0, 255]
     let frame = frame
@@ -649,5 +654,12 @@ mod tests {
         let result = vae.decode(&latent).unwrap();
         assert_eq!(result.dim(0).unwrap(), 1); // batch
         assert_eq!(result.dim(1).unwrap(), 3); // channels
+    }
+
+    #[test]
+    fn tensor_to_rgb_frame_rejects_invalid_channel_count() {
+        let frame = Tensor::zeros((1, 2, 2), DType::F32, &Device::Cpu).unwrap();
+        let error = tensor_to_rgb_frame(&frame).unwrap_err();
+        assert!(error.to_string().contains("exactly 3 channels"));
     }
 }
