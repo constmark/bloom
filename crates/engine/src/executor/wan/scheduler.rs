@@ -221,7 +221,10 @@ mod tests {
 
         // sigma goes from 1 to 0, so x_next = 1 + (-1) * 2 = -1.
         let value = result.to_vec1::<f32>().unwrap()[0];
-        assert!((value + 1.0).abs() < 1e-6, "unexpected Euler update: {value}");
+        assert!(
+            (value + 1.0).abs() < 1e-6,
+            "unexpected Euler update: {value}"
+        );
     }
 
     #[test]
@@ -235,7 +238,10 @@ mod tests {
         let result = scheduler.step(&model_output, 0, &sample).unwrap();
 
         let value = result.to_vec1::<f32>().unwrap()[0];
-        assert!((value + 1.0).abs() < 1e-6, "unexpected Euler update: {value}");
+        assert!(
+            (value + 1.0).abs() < 1e-6,
+            "unexpected Euler update: {value}"
+        );
     }
 
     #[test]
