@@ -267,13 +267,17 @@ impl From<Vec<OutputChunk>> for ModelOutput {
                 _ => {}
             }
         }
-        let video = video_meta.map(|(w, h, fps, fc)| VideoOutput {
-            width: w,
-            height: h,
-            fps,
-            frame_count: fc,
-            frames: video_frames,
-        });
+        let video = video_meta
+            .filter(|(_, _, _, frame_count)| {
+                *frame_count > 0 && usize::try_from(*frame_count).ok() == Some(video_frames.len())
+            })
+            .map(|(w, h, fps, fc)| VideoOutput {
+                width: w,
+                height: h,
+                fps,
+                frame_count: fc,
+                frames: video_frames,
+            });
         Self {
             text: if text.is_empty() { None } else { Some(text) },
             logits: None,
@@ -419,5 +423,32 @@ mod tests {
         let output = ModelOutput::from(vec![OutputChunk::AudioDelta(vec![0.4, 0.5])]);
 
         assert_eq!(output.audio, Some((vec![0.4, 0.5], 0)));
+    }
+
+    #[test]
+    fn test_model_output_from_video_complete_without_frames_omits_video() {
+        let output = ModelOutput::from(vec![OutputChunk::VideoComplete {
+            width: 2,
+            height: 2,
+            fps: 8.0,
+            frame_count: 1,
+        }]);
+
+        assert!(output.video.is_none());
+    }
+
+    #[test]
+    fn test_model_output_from_video_complete_with_missing_frames_omits_video() {
+        let output = ModelOutput::from(vec![
+            OutputChunk::VideoFrame(vec![0, 1, 2]),
+            OutputChunk::VideoComplete {
+                width: 1,
+                height: 1,
+                fps: 8.0,
+                frame_count: 2,
+            },
+        ]);
+
+        assert!(output.video.is_none());
     }
 }
