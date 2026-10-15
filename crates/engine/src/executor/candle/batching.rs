@@ -1,6 +1,7 @@
 use super::{CandleKvHook, CandleTextModel, QwenModelWrapper};
 use crate::batching::BatchExecutorConfig;
 use crate::executor::batch_executor::CandleBatchExecutor;
+use crate::executor::qwen_streaming::QwenStreamingModelForCausalLM;
 use crate::scheduler::paged_cache::{PagedAttentionCache, PagedCacheConfig};
 use crate::{BloomKvCachePool, CacheMesh, EngineExecutor};
 use anyhow::Result;
@@ -39,6 +40,43 @@ pub(super) fn build(
         );
     }
 
+    // MoE weights already live in immutable Tensor storage, and its GPU expert
+    // cache has its own mutex/budget. Keep one empty-KV template for the executor
+    // lifetime instead of copying every CPU weight from disk for every request.
+    // Other architectures retain their existing reload behavior.
+    let moe_template = if model.model_type == super::ModelType::Qwen2Moe {
+        model.weight_artifacts.verify()?;
+        let loaded = {
+            let source = model
+                .model
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            match source.as_ref() {
+                Some(QwenModelWrapper::Streaming(streaming)) => {
+                    Some(streaming.fork_with_empty_kv())
+                }
+                Some(_) => anyhow::bail!("native Qwen2-MoE requires a Streaming wrapper"),
+                None => None,
+            }
+        };
+        let template = match loaded {
+            Some(template) => template,
+            // Callers can release the startup wrapper before constructing the
+            // executor. In that case reload once here, before accepting work.
+            None => match model.reload_with_paged_kv()? {
+                QwenModelWrapper::Streaming(streaming) => streaming.fork_with_empty_kv(),
+                _ => anyhow::bail!("native Qwen2-MoE requires a Streaming wrapper"),
+            },
+        };
+        model.weight_artifacts.verify()?;
+        tracing::info!(
+            "Sharing native Qwen2-MoE weights and expert cache across independent request KV caches"
+        );
+        Some(Arc::new(template))
+    } else {
+        None
+    };
+
     let request_models = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
         usize,
         Arc<std::sync::Mutex<QwenModelWrapper>>,
@@ -58,6 +96,7 @@ pub(super) fn build(
     });
 
     let model_for_forward = Arc::clone(&model);
+    let template_for_forward = moe_template.clone();
     let request_models_for_forward = Arc::clone(&request_models);
     let forward_fn = Box::new(
         move |input_ids: &candle_core::Tensor,
@@ -75,11 +114,11 @@ pub(super) fn build(
                 Arc::clone(match models.entry(handle) {
                     Entry::Occupied(entry) => entry.into_mut(),
                     Entry::Vacant(entry) => {
-                        let model = if use_paged_kv {
-                            model_for_forward.reload_with_paged_kv()?
-                        } else {
-                            model_for_forward.reload()?
-                        };
+                        let model = new_request_model(
+                            &model_for_forward,
+                            template_for_forward.as_deref(),
+                            use_paged_kv,
+                        )?;
                         entry.insert(Arc::new(std::sync::Mutex::new(model)))
                     }
                 })
@@ -93,6 +132,7 @@ pub(super) fn build(
     );
 
     let model_for_batch = Arc::clone(&model);
+    let template_for_batch = moe_template.clone();
     let request_models_for_batch = Arc::clone(&request_models);
     let forward_batch_fn = Box::new(
         move |input_ids: &candle_core::Tensor,
@@ -121,11 +161,11 @@ pub(super) fn build(
                     let model = match models.entry(handle) {
                         Entry::Occupied(entry) => entry.into_mut(),
                         Entry::Vacant(entry) => {
-                            let model = if use_paged_kv {
-                                model_for_batch.reload_with_paged_kv()?
-                            } else {
-                                model_for_batch.reload()?
-                            };
+                            let model = new_request_model(
+                                &model_for_batch,
+                                template_for_batch.as_deref(),
+                                use_paged_kv,
+                            )?;
                             entry.insert(Arc::new(std::sync::Mutex::new(model)))
                         }
                     };
@@ -154,17 +194,18 @@ pub(super) fn build(
     );
 
     let model_for_prepare = Arc::clone(&model);
+    let template_for_prepare = moe_template;
     let request_models_for_prepare = Arc::clone(&request_models);
     let prepare_request = Box::new(move |handle| -> Result<()> {
         let mut models = request_models_for_prepare
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if let std::collections::hash_map::Entry::Vacant(entry) = models.entry(handle) {
-            let model = if use_paged_kv {
-                model_for_prepare.reload_with_paged_kv()?
-            } else {
-                model_for_prepare.reload()?
-            };
+            let model = new_request_model(
+                &model_for_prepare,
+                template_for_prepare.as_deref(),
+                use_paged_kv,
+            )?;
             entry.insert(Arc::new(std::sync::Mutex::new(model)));
         }
         Ok(())
@@ -206,6 +247,25 @@ pub(super) fn build(
         }
     });
     Ok(executor)
+}
+
+fn new_request_model(
+    model: &CandleTextModel,
+    moe_template: Option<&QwenStreamingModelForCausalLM>,
+    use_paged_kv: bool,
+) -> Result<QwenModelWrapper> {
+    if let Some(template) = moe_template {
+        // Preserve the reload path's file identity checks for each request,
+        // even though immutable in-memory weights are now shared.
+        model.weight_artifacts.verify()?;
+        let wrapper = QwenModelWrapper::Streaming(template.fork_with_empty_kv());
+        model.weight_artifacts.verify()?;
+        Ok(wrapper)
+    } else if use_paged_kv {
+        model.reload_with_paged_kv()
+    } else {
+        model.reload()
+    }
 }
 
 pub(super) fn final_token_logits(logits: candle_core::Tensor) -> Result<candle_core::Tensor> {

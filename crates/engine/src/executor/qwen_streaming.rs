@@ -152,6 +152,45 @@ impl StreamingLinear {
         StreamingLinear::Standard { weight, bias }
     }
 
+    // Byte accounting is valid for the compact tensors produced by
+    // standard_to_device, including any bias. Quantized projections are left on
+    // their existing streaming/dequantization path.
+    fn standard_weight_bytes(&self) -> Option<usize> {
+        match self {
+            Self::Standard { weight, bias } => {
+                let weight_bytes = weight
+                    .elem_count()
+                    .checked_mul(weight.dtype().size_in_bytes())?;
+                let bias_bytes = match bias {
+                    Some(bias) => bias
+                        .elem_count()
+                        .checked_mul(bias.dtype().size_in_bytes())?,
+                    None => 0,
+                };
+                weight_bytes.checked_add(bias_bytes)
+            }
+            Self::Quantized { .. } => None,
+        }
+    }
+
+    fn standard_to_device(&self, device: &Device) -> Result<Self> {
+        match self {
+            Self::Standard { weight, bias } => Ok(Self::Standard {
+                // Candle to_device copies the whole backing storage, including
+                // storage outside a contiguous view. Force a compact allocation
+                // before uploading so the actual allocation matches the budget.
+                weight: weight.force_contiguous()?.to_device(device)?,
+                bias: bias
+                    .as_ref()
+                    .map(|bias| bias.force_contiguous()?.to_device(device))
+                    .transpose()?,
+            }),
+            Self::Quantized { .. } => Err(candle_core::Error::Msg(
+                "MoE expert cache only supports Standard projections".into(),
+            )),
+        }
+    }
+
     pub fn new_with_quantizer(
         in_dim: usize,
         out_dim: usize,
@@ -481,6 +520,22 @@ pub struct StreamingQwenMLP {
 }
 
 impl StreamingQwenMLP {
+    fn standard_weight_bytes(&self) -> Option<usize> {
+        self.gate_proj
+            .standard_weight_bytes()?
+            .checked_add(self.up_proj.standard_weight_bytes()?)?
+            .checked_add(self.down_proj.standard_weight_bytes()?)
+    }
+
+    fn standard_to_device(&self, device: &Device) -> Result<Self> {
+        Ok(Self {
+            gate_proj: self.gate_proj.standard_to_device(device)?,
+            up_proj: self.up_proj.standard_to_device(device)?,
+            down_proj: self.down_proj.standard_to_device(device)?,
+            act_fn: self.act_fn,
+        })
+    }
+
     fn new(
         hidden: usize,
         intermediate: usize,
@@ -681,6 +736,8 @@ impl StreamingQwenModel {
             let mlp = match moe.filter(|config| config.sparse_layer(i)) {
                 Some(config) => FeedForward::Sparse(SparseMoe::new(
                     config,
+                    i,
+                    cfg.num_hidden_layers,
                     cfg.hidden_size,
                     cfg.hidden_act,
                     vb_layer.pp("mlp"),
@@ -849,6 +906,15 @@ impl QwenStreamingModelForCausalLM {
         for l in &mut self.base.layers {
             l.clear_kv_cache();
         }
+    }
+
+    /// Share immutable weights and expert caches while starting with private,
+    /// empty attention state. Clearing a fork never resets the source's KV or
+    /// the layer's shared expert LRU.
+    pub(crate) fn fork_with_empty_kv(&self) -> Self {
+        let mut fork = self.clone();
+        fork.clear_kv_cache();
+        fork
     }
 
     pub fn truncate_kv_cache(&mut self, len: usize) -> Result<()> {
