@@ -100,7 +100,8 @@ impl FlowUniPCScheduler {
         // In flow matching, the model predicts v = x_0 - noise
         // The step is: x_{t-1} = x_t + dt * v where dt = sigma_next - sigma_t
         let dt = sigma_next - sigma_t;
-        sample.affine(1.0, dt)?.add(model_output)
+        let scaled_model_output = model_output.affine(dt, 0.0)?;
+        sample.add(&scaled_model_output)
     }
 
     /// Number of timesteps.
@@ -154,7 +155,8 @@ impl FlowDPMPlusPlusScheduler {
         let sigma_t = self.sigmas[step_index];
         let sigma_next = self.sigmas[step_index + 1];
         let dt = sigma_next - sigma_t;
-        sample.affine(1.0, dt)?.add(model_output)
+        let scaled_model_output = model_output.affine(dt, 0.0)?;
+        sample.add(&scaled_model_output)
     }
 
     pub fn num_steps(&self) -> usize {
@@ -205,6 +207,35 @@ mod tests {
 
         let result = scheduler.step(&model_output, 0, &sample).unwrap();
         assert_eq!(result.dims(), sample.dims());
+    }
+
+    #[test]
+    fn unipc_step_scales_model_output_by_sigma_delta() {
+        let device = Device::Cpu;
+        let mut scheduler = FlowUniPCScheduler::new(1000, 1.0, false);
+        scheduler.set_timesteps(1, 1.0).unwrap();
+
+        let sample = Tensor::new(&[1.0f32], &device).unwrap();
+        let model_output = Tensor::new(&[2.0f32], &device).unwrap();
+        let result = scheduler.step(&model_output, 0, &sample).unwrap();
+
+        // sigma goes from 1 to 0, so x_next = 1 + (-1) * 2 = -1.
+        let value = result.to_vec1::<f32>().unwrap()[0];
+        assert!((value + 1.0).abs() < 1e-6, "unexpected Euler update: {value}");
+    }
+
+    #[test]
+    fn dpmpp_step_scales_model_output_by_sigma_delta() {
+        let device = Device::Cpu;
+        let mut scheduler = FlowDPMPlusPlusScheduler::new(1000, 1.0, false);
+        scheduler.set_timesteps(1, 1.0).unwrap();
+
+        let sample = Tensor::new(&[1.0f32], &device).unwrap();
+        let model_output = Tensor::new(&[2.0f32], &device).unwrap();
+        let result = scheduler.step(&model_output, 0, &sample).unwrap();
+
+        let value = result.to_vec1::<f32>().unwrap()[0];
+        assert!((value + 1.0).abs() < 1e-6, "unexpected Euler update: {value}");
     }
 
     #[test]
