@@ -19,6 +19,8 @@ use crate::io::VideoOutput;
 /// - `.png`: Save first frame as PNG
 /// - `.jpg`/`.jpeg`: Save first frame as JPEG
 pub fn encode_video(video: &VideoOutput, output_path: &Path) -> Result<()> {
+    validate_video_frames(video)?;
+
     let ext = output_path
         .extension()
         .and_then(|s| s.to_str())
@@ -43,6 +45,8 @@ pub fn encode_video(video: &VideoOutput, output_path: &Path) -> Result<()> {
 pub fn encode_gif(video: &VideoOutput, output_path: &Path) -> Result<()> {
     use std::fs::File;
     use std::io::BufWriter;
+
+    validate_video_frames(video)?;
 
     let file = File::create(output_path)
         .map_err(|e| anyhow!("failed to create {}: {}", output_path.display(), e))?;
@@ -293,6 +297,8 @@ pub fn encode_video_ffmpeg(video: &VideoOutput, output_path: &Path) -> Result<()
     use std::io::Write;
     use std::process::{Command, Stdio};
 
+    validate_video_frames(video)?;
+
     let mut ffmpeg = Command::new("ffmpeg")
         .args([
             "-y",
@@ -355,6 +361,37 @@ pub fn encode_video_ffmpeg(video: &VideoOutput, output_path: &Path) -> Result<()
     Ok(())
 }
 
+/// Validate that every frame has the expected packed RGB8 dimensions.
+fn validate_video_frames(video: &VideoOutput) -> Result<()> {
+    if video.frames.is_empty() {
+        return Err(anyhow!("video output contains no frames"));
+    }
+
+    let expected_len = (video.width as usize)
+        .checked_mul(video.height as usize)
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| anyhow!("video dimensions are too large"))?;
+    if expected_len == 0 {
+        return Err(anyhow!(
+            "video dimensions must be greater than zero ({}x{})",
+            video.width, video.height
+        ));
+    }
+
+    for (index, frame) in video.frames.iter().enumerate() {
+        if frame.len() != expected_len {
+            return Err(anyhow!(
+                "video frame {index} has {} bytes; expected {expected_len} for {}x{} RGB",
+                frame.len(),
+                video.width,
+                video.height
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Save a single frame as PNG.
 fn encode_frame_png(rgb_data: &[u8], width: u32, height: u32, output_path: &Path) -> Result<()> {
     // Simple PPM output as fallback (universally viewable)
@@ -401,5 +438,49 @@ mod tests {
         let bits = vec![true, false, true, false, true, false, true, false];
         let bytes = bits_to_bytes(&bits);
         assert_eq!(bytes, vec![0b01010101]);
+    }
+
+    #[test]
+    fn test_validate_video_frames_rejects_empty_output() {
+        let video = VideoOutput {
+            width: 1,
+            height: 1,
+            fps: 1.0,
+            frame_count: 0,
+            frames: Vec::new(),
+        };
+
+        let error = validate_video_frames(&video).expect_err("empty output should be rejected");
+        assert!(error.to_string().contains("no frames"));
+    }
+
+    #[test]
+    fn test_encode_video_rejects_empty_output_before_indexing() {
+        let video = VideoOutput {
+            width: 1,
+            height: 1,
+            fps: 1.0,
+            frame_count: 0,
+            frames: Vec::new(),
+        };
+
+        let error = encode_video(&video, Path::new("unused.png"))
+            .expect_err("empty output should be rejected before indexing");
+        assert!(error.to_string().contains("no frames"));
+    }
+
+    #[test]
+    fn test_validate_video_frames_rejects_incomplete_rgb_frame() {
+        let video = VideoOutput {
+            width: 2,
+            height: 1,
+            fps: 1.0,
+            frame_count: 1,
+            frames: vec![vec![0; 5]],
+        };
+
+        let error =
+            validate_video_frames(&video).expect_err("incomplete RGB frame should be rejected");
+        assert!(error.to_string().contains("expected 6"));
     }
 }
