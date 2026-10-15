@@ -650,7 +650,9 @@ impl PagedAttentionCache {
                 pending.push((layer_idx, block_id, key));
             }
         }
-        if let Some(mesh) = &self.cachemesh && !pending.is_empty() {
+        if let Some(mesh) = &self.cachemesh
+            && !pending.is_empty()
+        {
             let keys: Vec<_> = pending.iter().map(|(_, _, key)| key.clone()).collect();
             for _ in &keys {
                 mesh.record_l1_lookup(false);
@@ -676,7 +678,9 @@ impl PagedAttentionCache {
                     ));
                 }
                 let block_data = from_cachemesh_block(&block, &self.config);
-                self.layer_data.lock().unwrap_or_else(|e| e.into_inner())[layer_idx]
+                self.layer_data
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())[layer_idx]
                     .insert(block_id, block_data);
             }
         }
