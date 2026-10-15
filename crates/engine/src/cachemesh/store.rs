@@ -665,7 +665,13 @@ impl CacheMesh {
         if block_bytes > self.config.l2_capacity_bytes {
             drop(state);
             if self.config.l3_enabled {
-                if let Err(err) = self.offload_to_l3(block) {
+                let result = self.offload_to_l3(block).and_then(|()| {
+                    if self.config.write_through_l3 {
+                        self.flush_pending_l3()?;
+                    }
+                    Ok(())
+                });
+                if let Err(err) = result {
                     self.l3_metrics
                         .failed_offloads
                         .fetch_add(1, Ordering::Relaxed);
