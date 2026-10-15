@@ -170,7 +170,28 @@ pub struct CacheMeshSnapshot {
 
 pub trait RemoteCacheBackend: Send + Sync {
     fn get(&self, key: &CacheMeshKey) -> Result<Option<CacheMeshBlock>>;
+
+    /// Fetch several blocks as one logical operation.
+    ///
+    /// The default keeps existing backends source-compatible. Network-backed
+    /// implementations should override this method to issue the requests in
+    /// parallel; CacheMesh uses it on the prefix-restore path where a model
+    /// layer otherwise turns into one round trip per block.
+    fn get_many(&self, keys: &[CacheMeshKey]) -> Result<Vec<Option<CacheMeshBlock>>> {
+        keys.iter().map(|key| self.get(key)).collect()
+    }
+
     fn put(&self, block: CacheMeshBlock) -> Result<()>;
+
+    /// Store several blocks as one logical operation. The sequential default
+    /// preserves the semantics of existing local backends.
+    fn put_many(&self, blocks: &[CacheMeshBlock]) -> Result<()> {
+        for block in blocks {
+            self.put(block.clone())?;
+        }
+        Ok(())
+    }
+
     fn remove(&self, key: &CacheMeshKey) -> Result<()>;
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool {
@@ -413,6 +434,10 @@ impl AtomicTierMetrics {
 pub struct CacheMesh {
     config: CacheMeshConfig,
     l2: Mutex<L2State>,
+    /// L3 writes are accumulated briefly so network-backed implementations
+    /// can use their bulk protocol. A restore flushes this queue before it
+    /// reads L3, preserving read-after-write visibility for the next request.
+    pending_l3: Mutex<Vec<CacheMeshBlock>>,
     remote: Option<Arc<dyn RemoteCacheBackend>>,
     l1_metrics: AtomicTierMetrics,
     l2_metrics: AtomicTierMetrics,
@@ -425,6 +450,7 @@ impl CacheMesh {
         Self {
             config,
             l2: Mutex::new(L2State::new()),
+            pending_l3: Mutex::new(Vec::new()),
             remote: None,
             l1_metrics: AtomicTierMetrics::default(),
             l2_metrics: AtomicTierMetrics::default(),
@@ -437,6 +463,7 @@ impl CacheMesh {
         Self {
             config,
             l2: Mutex::new(L2State::new()),
+            pending_l3: Mutex::new(Vec::new()),
             remote: Some(remote),
             l1_metrics: AtomicTierMetrics::default(),
             l2_metrics: AtomicTierMetrics::default(),
@@ -460,6 +487,177 @@ impl CacheMesh {
         if !self.config.enabled {
             return Ok(());
         }
+        self.cache_block_to_l2(block, true)
+    }
+
+    pub fn restore(&self, key: &CacheMeshKey) -> Result<Option<(CacheMeshTier, CacheMeshBlock)>> {
+        Ok(self
+            .restore_many(std::slice::from_ref(key))?
+            .pop()
+            .unwrap_or(None))
+    }
+
+    /// Restore several blocks while allowing the remote backend to overlap
+    /// network I/O. L2 accounting and insertion order remain deterministic;
+    /// only the independent L3 lookups are concurrent in an optimized
+    /// backend.
+    pub fn restore_many(
+        &self,
+        keys: &[CacheMeshKey],
+    ) -> Result<Vec<Option<(CacheMeshTier, CacheMeshBlock)>>> {
+        if !self.config.enabled {
+            return Ok(vec![None; keys.len()]);
+        }
+
+        let mut restored = vec![None; keys.len()];
+        let mut misses = Vec::new();
+        {
+            let mut state = lock_recover(&self.l2);
+            for (index, key) in keys.iter().enumerate() {
+                if let Some(block) = state.blocks.get(key).cloned() {
+                    state.touch(key);
+                    self.l2_metrics.hits.fetch_add(1, Ordering::Relaxed);
+                    self.l2_metrics.restores.fetch_add(1, Ordering::Relaxed);
+                    restored[index] = Some((CacheMeshTier::L2, block));
+                } else {
+                    misses.push((index, key.clone()));
+                }
+            }
+        }
+        self.l2_metrics
+            .misses
+            .fetch_add(misses.len() as u64, Ordering::Relaxed);
+
+        if self.config.l3_enabled && !misses.is_empty() {
+            self.flush_pending_l3()?;
+            let remote = self.remote.as_ref().ok_or_else(|| {
+                anyhow!("cachemesh L3 is enabled but no remote backend is configured")
+            })?;
+            let remote_keys: Vec<_> = misses.iter().map(|(_, key)| key.clone()).collect();
+            let remote_blocks = remote.get_many(&remote_keys)?;
+            if remote_blocks.len() != misses.len() {
+                bail!(
+                    "remote CacheMesh backend returned {} blocks for {} keys",
+                    remote_blocks.len(),
+                    misses.len()
+                );
+            }
+            for ((index, key), block) in misses.into_iter().zip(remote_blocks) {
+                if let Some(block) = block {
+                    if block.key != key {
+                        bail!("remote CacheMesh block key does not match requested key");
+                    }
+                    block.validate()?;
+                    self.l3_metrics.hits.fetch_add(1, Ordering::Relaxed);
+                    self.l3_metrics.restores.fetch_add(1, Ordering::Relaxed);
+                    // A restore already came from L3. Do not write it back to
+                    // L3 when write-through mode is enabled; doing so turns a
+                    // cache hit into another network round trip.
+                    self.cache_block_to_l2(block.clone(), false)?;
+                    restored[index] = Some((CacheMeshTier::L3, block));
+                } else {
+                    self.l3_metrics.misses.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        Ok(restored)
+    }
+
+    pub fn metrics(&self) -> CacheMeshMetrics {
+        let state = lock_recover(&self.l2);
+        let l3_items = self.remote.as_ref().map(|remote| remote.len()).unwrap_or(0);
+        let l3_bytes = self
+            .remote
+            .as_ref()
+            .and_then(|remote| remote.bytes())
+            .unwrap_or(0);
+        CacheMeshMetrics {
+            enabled: self.config.enabled,
+            l1: self.l1_metrics.snapshot(0, 0),
+            l2: self.l2_metrics.snapshot(state.bytes, state.blocks.len()),
+            l3: self.l3_metrics.snapshot(l3_bytes, l3_items),
+        }
+    }
+
+    pub fn snapshot(&self) -> CacheMeshSnapshot {
+        let l2_keys = lock_recover(&self.l2).blocks.len();
+        CacheMeshSnapshot {
+            metrics: self.metrics(),
+            l2_keys,
+        }
+    }
+
+    fn offload_to_l3(&self, block: CacheMeshBlock) -> Result<()> {
+        if !self.config.l3_enabled {
+            return Ok(());
+        }
+        block.validate()?;
+        if self.remote.is_none() {
+            return Err(anyhow!(
+                "cachemesh L3 is enabled but no remote backend is configured"
+            ));
+        }
+        // Non-write-through backends retain the original synchronous
+        // durability semantics. The ICMS adapter enables write-through and
+        // can safely coalesce its eviction stream because restore_many flushes
+        // the queue before any L3 read.
+        if !self.config.write_through_l3 {
+            let remote = self.remote.as_ref().expect("remote checked above");
+            remote.put(block)?;
+            self.l3_metrics.offloads.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        let batch = {
+            let mut pending = lock_recover(&self.pending_l3);
+            pending.push(block);
+            if pending.len() >= 32 {
+                Some(pending.drain(..).collect::<Vec<_>>())
+            } else {
+                None
+            }
+        };
+        if let Some(batch) = batch {
+            self.flush_l3_batch(batch)?;
+        }
+        Ok(())
+    }
+
+    fn flush_pending_l3(&self) -> Result<()> {
+        let batch = {
+            let mut pending = lock_recover(&self.pending_l3);
+            if pending.is_empty() {
+                return Ok(());
+            }
+            pending.drain(..).collect::<Vec<_>>()
+        };
+        self.flush_l3_batch(batch)
+    }
+
+    fn flush_l3_batch(&self, batch: Vec<CacheMeshBlock>) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let remote = self.remote.as_ref().ok_or_else(|| {
+            anyhow!("cachemesh L3 is enabled but no remote backend is configured")
+        })?;
+        if let Err(error) = remote.put_many(&batch) {
+            let mut pending = lock_recover(&self.pending_l3);
+            let mut retry = batch;
+            retry.append(&mut *pending);
+            *pending = retry;
+            self.l3_metrics
+                .failed_offloads
+                .fetch_add(pending.len() as u64, Ordering::Relaxed);
+            return Err(error);
+        }
+        self.l3_metrics
+            .offloads
+            .fetch_add(batch.len() as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn cache_block_to_l2(&self, block: CacheMeshBlock, write_through: bool) -> Result<()> {
         block.validate()?;
 
         let mut state = lock_recover(&self.l2);
@@ -479,7 +677,8 @@ impl CacheMesh {
             return Ok(());
         }
 
-        if self.config.write_through_l3
+        if write_through
+            && self.config.write_through_l3
             && let Err(err) = self.offload_to_l3(block.clone())
         {
             self.l3_metrics
@@ -519,75 +718,6 @@ impl CacheMesh {
             state = lock_recover(&self.l2);
         }
 
-        Ok(())
-    }
-
-    pub fn restore(&self, key: &CacheMeshKey) -> Result<Option<(CacheMeshTier, CacheMeshBlock)>> {
-        if !self.config.enabled {
-            return Ok(None);
-        }
-
-        {
-            let mut state = lock_recover(&self.l2);
-            if let Some(block) = state.blocks.get(key).cloned() {
-                state.touch(key);
-                self.l2_metrics.hits.fetch_add(1, Ordering::Relaxed);
-                self.l2_metrics.restores.fetch_add(1, Ordering::Relaxed);
-                return Ok(Some((CacheMeshTier::L2, block)));
-            }
-        }
-        self.l2_metrics.misses.fetch_add(1, Ordering::Relaxed);
-
-        if self.config.l3_enabled {
-            let remote = self.remote.as_ref().ok_or_else(|| {
-                anyhow!("cachemesh L3 is enabled but no remote backend is configured")
-            })?;
-            if let Some(block) = remote.get(key)? {
-                self.l3_metrics.hits.fetch_add(1, Ordering::Relaxed);
-                self.l3_metrics.restores.fetch_add(1, Ordering::Relaxed);
-                self.offload_to_l2(block.clone())?;
-                return Ok(Some((CacheMeshTier::L3, block)));
-            }
-            self.l3_metrics.misses.fetch_add(1, Ordering::Relaxed);
-        }
-
-        Ok(None)
-    }
-
-    pub fn metrics(&self) -> CacheMeshMetrics {
-        let state = lock_recover(&self.l2);
-        let l3_items = self.remote.as_ref().map(|remote| remote.len()).unwrap_or(0);
-        let l3_bytes = self
-            .remote
-            .as_ref()
-            .and_then(|remote| remote.bytes())
-            .unwrap_or(0);
-        CacheMeshMetrics {
-            enabled: self.config.enabled,
-            l1: self.l1_metrics.snapshot(0, 0),
-            l2: self.l2_metrics.snapshot(state.bytes, state.blocks.len()),
-            l3: self.l3_metrics.snapshot(l3_bytes, l3_items),
-        }
-    }
-
-    pub fn snapshot(&self) -> CacheMeshSnapshot {
-        let l2_keys = lock_recover(&self.l2).blocks.len();
-        CacheMeshSnapshot {
-            metrics: self.metrics(),
-            l2_keys,
-        }
-    }
-
-    fn offload_to_l3(&self, block: CacheMeshBlock) -> Result<()> {
-        if !self.config.l3_enabled {
-            return Ok(());
-        }
-        let remote = self.remote.as_ref().ok_or_else(|| {
-            anyhow!("cachemesh L3 is enabled but no remote backend is configured")
-        })?;
-        block.validate()?;
-        remote.put(block)?;
-        self.l3_metrics.offloads.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 }
