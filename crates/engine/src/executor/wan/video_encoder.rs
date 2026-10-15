@@ -19,6 +19,7 @@ use crate::io::VideoOutput;
 /// - `.png`: Save first frame as PNG
 /// - `.jpg`/`.jpeg`: Save first frame as JPEG
 pub fn encode_video(video: &VideoOutput, output_path: &Path) -> Result<()> {
+    validate_video(video)?;
     let ext = output_path
         .extension()
         .and_then(|s| s.to_str())
@@ -36,6 +37,40 @@ pub fn encode_video(video: &VideoOutput, output_path: &Path) -> Result<()> {
     }
 }
 
+fn expected_frame_len(width: u32, height: u32) -> Result<usize> {
+    let pixels = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| anyhow!("video dimensions overflow the pixel count"))?;
+    let bytes = pixels
+        .checked_mul(3)
+        .ok_or_else(|| anyhow!("video dimensions overflow the RGB byte count"))?;
+    usize::try_from(bytes).map_err(|_| anyhow!("video frame is too large for this platform"))
+}
+
+fn validate_video(video: &VideoOutput) -> Result<usize> {
+    if video.width == 0 || video.height == 0 {
+        return Err(anyhow!("video dimensions must be greater than zero"));
+    }
+    if !video.fps.is_finite() || video.fps <= 0.0 {
+        return Err(anyhow!("video fps must be finite and greater than zero"));
+    }
+    if video.frames.is_empty() {
+        return Err(anyhow!("video must contain at least one frame"));
+    }
+    let expected_len = expected_frame_len(video.width, video.height)?;
+    for (index, frame) in video.frames.iter().enumerate() {
+        if frame.len() != expected_len {
+            return Err(anyhow!(
+                "video frame {index} has {} bytes; expected {expected_len} for {}x{} RGB",
+                frame.len(),
+                video.width,
+                video.height
+            ));
+        }
+    }
+    Ok(expected_len)
+}
+
 /// Encode video as animated GIF.
 ///
 /// Uses the `gif` crate for pure-Rust GIF encoding.
@@ -43,6 +78,11 @@ pub fn encode_video(video: &VideoOutput, output_path: &Path) -> Result<()> {
 pub fn encode_gif(video: &VideoOutput, output_path: &Path) -> Result<()> {
     use std::fs::File;
     use std::io::BufWriter;
+
+    validate_video(video)?;
+    if video.width > u32::from(u16::MAX) || video.height > u32::from(u16::MAX) {
+        return Err(anyhow!("GIF dimensions cannot exceed 65535 pixels"));
+    }
 
     let file = File::create(output_path)
         .map_err(|e| anyhow!("failed to create {}: {}", output_path.display(), e))?;
@@ -293,6 +333,8 @@ pub fn encode_video_ffmpeg(video: &VideoOutput, output_path: &Path) -> Result<()
     use std::io::Write;
     use std::process::{Command, Stdio};
 
+    validate_video(video)?;
+
     let mut ffmpeg = Command::new("ffmpeg")
         .args([
             "-y",
@@ -357,31 +399,40 @@ pub fn encode_video_ffmpeg(video: &VideoOutput, output_path: &Path) -> Result<()
 
 /// Save a single frame as PNG.
 fn encode_frame_png(rgb_data: &[u8], width: u32, height: u32, output_path: &Path) -> Result<()> {
-    // Simple PPM output as fallback (universally viewable)
-    let ppm_path = output_path.with_extension("ppm");
-    let mut file = std::fs::File::create(&ppm_path)?;
-    use std::io::Write;
-    write!(file, "P6\n{} {}\n255\n", width, height)?;
-    file.write_all(rgb_data)?;
-    tracing::info!("Frame saved as PPM to {}", ppm_path.display());
+    let expected_len = expected_frame_len(width, height)?;
+    if rgb_data.len() != expected_len {
+        return Err(anyhow!(
+            "RGB frame has {} bytes; expected {expected_len} for {width}x{height}",
+            rgb_data.len()
+        ));
+    }
+    let image = image::RgbImage::from_raw(width, height, rgb_data.to_vec())
+        .ok_or_else(|| anyhow!("failed to construct RGB image from frame data"))?;
+    image.save_with_format(output_path, image::ImageFormat::Png)?;
+    tracing::info!("Frame saved as PNG to {}", output_path.display());
     Ok(())
 }
 
 /// Save a single frame as JPEG.
 fn encode_frame_jpeg(rgb_data: &[u8], width: u32, height: u32, output_path: &Path) -> Result<()> {
-    // Save as PPM (JPEG requires external crate)
-    let ppm_path = output_path.with_extension("ppm");
-    let mut file = std::fs::File::create(&ppm_path)?;
-    use std::io::Write;
-    write!(file, "P6\n{} {}\n255\n", width, height)?;
-    file.write_all(rgb_data)?;
-    tracing::info!("Frame saved as PPM to {}", ppm_path.display());
+    let expected_len = expected_frame_len(width, height)?;
+    if rgb_data.len() != expected_len {
+        return Err(anyhow!(
+            "RGB frame has {} bytes; expected {expected_len} for {width}x{height}",
+            rgb_data.len()
+        ));
+    }
+    let image = image::RgbImage::from_raw(width, height, rgb_data.to_vec())
+        .ok_or_else(|| anyhow!("failed to construct RGB image from frame data"))?;
+    image.save_with_format(output_path, image::ImageFormat::Jpeg)?;
+    tracing::info!("Frame saved as JPEG to {}", output_path.display());
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::GenericImageView;
 
     #[test]
     fn test_lzw_compress_empty() {
@@ -401,5 +452,50 @@ mod tests {
         let bits = vec![true, false, true, false, true, false, true, false];
         let bytes = bits_to_bytes(&bits);
         assert_eq!(bytes, vec![0b01010101]);
+    }
+
+    fn test_video() -> VideoOutput {
+        VideoOutput {
+            width: 2,
+            height: 1,
+            fps: 24.0,
+            frame_count: 1,
+            frames: vec![vec![255, 0, 0, 0, 255, 0]],
+        }
+    }
+
+    #[test]
+    fn png_and_jpeg_outputs_are_real_image_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("frame.png");
+        let jpeg = dir.path().join("frame.jpg");
+        let video = test_video();
+
+        encode_video(&video, &png).unwrap();
+        encode_video(&video, &jpeg).unwrap();
+
+        assert_eq!(image::open(&png).unwrap().dimensions(), (2, 1));
+        assert_eq!(image::open(&jpeg).unwrap().dimensions(), (2, 1));
+        assert!(png.exists());
+        assert!(jpeg.exists());
+        assert!(!dir.path().join("frame.ppm").exists());
+    }
+
+    #[test]
+    fn invalid_video_inputs_fail_without_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("frame.png");
+        let mut video = test_video();
+
+        video.frames.clear();
+        assert!(encode_video(&video, &output).is_err());
+
+        video = test_video();
+        video.frames[0].pop();
+        assert!(encode_video(&video, &output).is_err());
+
+        video = test_video();
+        video.fps = f32::NAN;
+        assert!(encode_video(&video, &output).is_err());
     }
 }
