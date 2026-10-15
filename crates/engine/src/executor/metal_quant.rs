@@ -173,7 +173,9 @@ impl MetalQuantizer {
         _z: &Tensor,
         _tot: usize,
     ) -> Result<Tensor> {
-        unreachable!()
+        Err(candle_core::Error::Msg(
+            "Metal AWQ dequantization requires the 'metal' feature".into(),
+        ))
     }
 
     /// Dequantize a GPTQ packed Int4 tensor to Float16 natively on the Metal GPU
@@ -294,7 +296,9 @@ impl MetalQuantizer {
         _g: &Tensor,
         _tot: usize,
     ) -> Result<Tensor> {
-        unreachable!()
+        Err(candle_core::Error::Msg(
+            "Metal GPTQ dequantization requires the 'metal' feature".into(),
+        ))
     }
 
     /// CPU fallback dequantization for AWQ Int4
@@ -556,6 +560,21 @@ mod tests {
         assert_eq!(res_vec.len(), 128);
         assert!((res_vec[0] - 10.0).abs() < 1e-3);
         assert!((res_vec[1] - 8.0).abs() < 1e-3);
+    }
+
+    #[cfg(not(feature = "metal"))]
+    #[test]
+    fn unavailable_metal_kernels_return_errors_instead_of_panicking() {
+        let quantizer = MetalQuantizer {};
+        let tensor = Tensor::zeros(1, DType::U32, &Device::Cpu).unwrap();
+
+        let awq = quantizer.dequantize_awq(&tensor, &tensor, &tensor, 1);
+        assert!(awq.is_err());
+        assert!(awq.unwrap_err().to_string().contains("'metal' feature"));
+
+        let gptq = quantizer.dequantize_gptq(&tensor, &tensor, &tensor, &tensor, 1);
+        assert!(gptq.is_err());
+        assert!(gptq.unwrap_err().to_string().contains("'metal' feature"));
     }
 
     // These tests intentionally require a real Apple GPU.  They catch ABI
