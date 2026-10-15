@@ -650,36 +650,35 @@ impl PagedAttentionCache {
                 pending.push((layer_idx, block_id, key));
             }
         }
-        if let Some(mesh) = &self.cachemesh {
-            if !pending.is_empty() {
-                let keys: Vec<_> = pending.iter().map(|(_, _, key)| key.clone()).collect();
-                for _ in &keys {
-                    mesh.record_l1_lookup(false);
-                }
-                let restored = mesh.restore_many(&keys)?;
-                if restored.len() != pending.len() {
+        if let Some(mesh) = &self.cachemesh
+            && !pending.is_empty()
+        {
+            let keys: Vec<_> = pending.iter().map(|(_, _, key)| key.clone()).collect();
+            for _ in &keys {
+                mesh.record_l1_lookup(false);
+            }
+            let restored = mesh.restore_many(&keys)?;
+            if restored.len() != pending.len() {
+                return Err(anyhow!(
+                    "CacheMesh returned {} blocks for {} requested keys",
+                    restored.len(),
+                    pending.len()
+                ));
+            }
+            for ((layer_idx, block_id, _), result) in pending.into_iter().zip(restored) {
+                let Some((_tier, block)) = result else {
+                    continue;
+                };
+                block.validate()?;
+                if block.block_size != self.config.block_size || block.kv_dim != self.config.kv_dim
+                {
                     return Err(anyhow!(
-                        "CacheMesh returned {} blocks for {} requested keys",
-                        restored.len(),
-                        pending.len()
+                        "CacheMesh block layout does not match the current model"
                     ));
                 }
-                for ((layer_idx, block_id, _), result) in pending.into_iter().zip(restored) {
-                    let Some((_tier, block)) = result else {
-                        continue;
-                    };
-                    block.validate()?;
-                    if block.block_size != self.config.block_size
-                        || block.kv_dim != self.config.kv_dim
-                    {
-                        return Err(anyhow!(
-                            "CacheMesh block layout does not match the current model"
-                        ));
-                    }
-                    let block_data = from_cachemesh_block(&block, &self.config);
-                    self.layer_data.lock().unwrap_or_else(|e| e.into_inner())[layer_idx]
-                        .insert(block_id, block_data);
-                }
+                let block_data = from_cachemesh_block(&block, &self.config);
+                self.layer_data.lock().unwrap_or_else(|e| e.into_inner())[layer_idx]
+                    .insert(block_id, block_data);
             }
         }
 
