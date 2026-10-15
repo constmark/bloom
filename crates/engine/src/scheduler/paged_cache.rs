@@ -670,17 +670,14 @@ impl PagedAttentionCache {
                     continue;
                 };
                 block.validate()?;
-                if block.block_size != self.config.block_size
-                    || block.kv_dim != self.config.kv_dim
+                if block.block_size != self.config.block_size || block.kv_dim != self.config.kv_dim
                 {
                     return Err(anyhow!(
                         "CacheMesh block layout does not match the current model"
                     ));
                 }
                 let block_data = from_cachemesh_block(&block, &self.config);
-                self.layer_data
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())[layer_idx]
+                self.layer_data.lock().unwrap_or_else(|e| e.into_inner())[layer_idx]
                     .insert(block_id, block_data);
             }
         }
