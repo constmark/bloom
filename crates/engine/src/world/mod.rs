@@ -96,8 +96,27 @@ impl StateCacheManager {
         let size = state.latent_bytes;
         let now = state.timestamp_ms;
 
+        if self.config.max_entries == 0 {
+            anyhow::bail!("state cache capacity must allow at least one entry");
+        }
+        if size > self.config.max_bytes {
+            anyhow::bail!(
+                "state cache entry is too large ({} bytes / {} max)",
+                size,
+                self.config.max_bytes
+            );
+        }
+
+        // Replacing an existing state must release its accounting before
+        // applying admission and eviction. Otherwise total_bytes grows on
+        // every update even though the cache still contains one entry.
+        if let Some(previous) = self.entries.remove(&state.state_id) {
+            self.total_bytes = self.total_bytes.saturating_sub(previous.size_bytes);
+            self.states.remove(&state.state_id);
+        }
+
         // Evict if over budget
-        while self.total_bytes + size > self.config.max_bytes
+        while size > self.config.max_bytes.saturating_sub(self.total_bytes)
             || self.entries.len() >= self.config.max_entries
         {
             if !self.evict_one(now) {
@@ -122,7 +141,10 @@ impl StateCacheManager {
             ttl_ms: self.config.default_ttl_ms,
         };
 
-        self.total_bytes += size;
+        self.total_bytes = self
+            .total_bytes
+            .checked_add(size)
+            .ok_or_else(|| anyhow::anyhow!("state cache byte accounting overflow"))?;
         self.entries.insert(state.state_id.clone(), entry);
         self.states.insert(state.state_id.clone(), state);
         Ok(())
@@ -559,9 +581,8 @@ impl WorldModelLoop {
         };
 
         // Cache the new state
-        let _ = self
-            .cache
-            .insert(new_state.clone(), StateCachePriority::Normal);
+        self.cache
+            .insert(new_state.clone(), StateCachePriority::Normal)?;
 
         // Predict futures
         let futures = self.world_model.predict(&new_state, effective_horizon)?;
@@ -850,6 +871,78 @@ mod tests {
         assert_eq!(cache.len(), 2);
         // s0 should have been evicted
         assert!(cache.get("s0").is_none());
+    }
+
+    #[test]
+    fn test_state_cache_replacement_reconciles_byte_accounting() {
+        let config = StateCacheConfig {
+            max_bytes: 300,
+            max_entries: 2,
+            default_ttl_ms: 0,
+            auto_compress: false,
+            compress_after_ms: u64::MAX,
+        };
+        let mut cache = StateCacheManager::new(config);
+        let state = |bytes, timestamp| WorldState {
+            state_id: "same".into(),
+            observations: vec![],
+            latent: Some(vec![0; bytes]),
+            step: timestamp,
+            timestamp_ms: timestamp,
+            latent_bytes: bytes,
+        };
+
+        cache
+            .insert(state(100, 1), StateCachePriority::Normal)
+            .unwrap();
+        cache
+            .insert(state(200, 2), StateCachePriority::High)
+            .unwrap();
+
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.total_bytes(), 200);
+        assert_eq!(cache.get("same").unwrap().step, 2);
+    }
+
+    #[test]
+    fn test_state_cache_rejects_oversized_entries_without_mutation() {
+        let config = StateCacheConfig {
+            max_bytes: 100,
+            max_entries: 2,
+            default_ttl_ms: 0,
+            auto_compress: false,
+            compress_after_ms: u64::MAX,
+        };
+        let mut cache = StateCacheManager::new(config);
+        let state = WorldState {
+            state_id: "too-large".into(),
+            observations: vec![],
+            latent: Some(vec![0; 101]),
+            step: 0,
+            timestamp_ms: 0,
+            latent_bytes: 101,
+        };
+
+        assert!(cache.insert(state, StateCachePriority::Normal).is_err());
+        assert!(cache.is_empty());
+        assert_eq!(cache.total_bytes(), 0);
+    }
+
+    #[test]
+    fn test_world_model_loop_propagates_cache_admission_failure() {
+        let wm = Box::new(MockWorldModel::new("mock-wm"));
+        let policy = Box::new(MockPolicyEngine::new("mock-policy", "discrete", 1));
+        let config = StateCacheConfig {
+            max_bytes: 1,
+            max_entries: 1,
+            default_ttl_ms: 0,
+            auto_compress: false,
+            compress_after_ms: u64::MAX,
+        };
+        let mut loop_ = WorldModelLoop::new(wm, policy, config);
+
+        assert!(loop_.step(vec![scalar_obs("x", 1.0)], 1).is_err());
+        assert!(loop_.cache().is_empty());
     }
 
     #[test]
