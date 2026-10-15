@@ -89,7 +89,7 @@ impl FlowUniPCScheduler {
         step_index: usize,
         sample: &Tensor,
     ) -> Result<Tensor> {
-        if step_index + 1 >= self.sigmas.len() {
+        if step_index >= self.sigmas.len().saturating_sub(1) {
             return Ok(sample.clone());
         }
 
@@ -148,7 +148,7 @@ impl FlowDPMPlusPlusScheduler {
         step_index: usize,
         sample: &Tensor,
     ) -> Result<Tensor> {
-        if step_index + 1 >= self.sigmas.len() {
+        if step_index >= self.sigmas.len().saturating_sub(1) {
             return Ok(sample.clone());
         }
 
@@ -242,6 +242,23 @@ mod tests {
             (value + 1.0).abs() < 1e-6,
             "unexpected Euler update: {value}"
         );
+    }
+
+    #[test]
+    fn out_of_range_step_indices_fail_closed_without_overflow() {
+        let device = Device::Cpu;
+        let sample = Tensor::zeros((1,), candle_core::DType::F32, &device).unwrap();
+        let model_output = Tensor::ones((1,), candle_core::DType::F32, &device).unwrap();
+
+        let mut unipc = FlowUniPCScheduler::new(1000, 1.0, false);
+        unipc.set_timesteps(1, 1.0).unwrap();
+        let result = unipc.step(&model_output, usize::MAX, &sample).unwrap();
+        assert_eq!(result.to_vec1::<f32>().unwrap(), vec![0.0]);
+
+        let mut dpmpp = FlowDPMPlusPlusScheduler::new(1000, 1.0, false);
+        dpmpp.set_timesteps(1, 1.0).unwrap();
+        let result = dpmpp.step(&model_output, usize::MAX, &sample).unwrap();
+        assert_eq!(result.to_vec1::<f32>().unwrap(), vec![0.0]);
     }
 
     #[test]
