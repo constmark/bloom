@@ -57,6 +57,15 @@ fn validate_video(video: &VideoOutput) -> Result<usize> {
     if video.frames.is_empty() {
         return Err(anyhow!("video must contain at least one frame"));
     }
+    let actual_frame_count = u32::try_from(video.frames.len())
+        .map_err(|_| anyhow!("video contains more frames than the metadata can represent"))?;
+    if video.frame_count != actual_frame_count {
+        return Err(anyhow!(
+            "video frame_count metadata ({}) does not match {} encoded frames",
+            video.frame_count,
+            actual_frame_count
+        ));
+    }
     let expected_len = expected_frame_len(video.width, video.height)?;
     for (index, frame) in video.frames.iter().enumerate() {
         if frame.len() != expected_len {
@@ -73,8 +82,7 @@ fn validate_video(video: &VideoOutput) -> Result<usize> {
 
 /// Encode video as animated GIF.
 ///
-/// Uses the `gif` crate for pure-Rust GIF encoding.
-/// Falls back to writing raw frames if gif crate is not available.
+/// Uses the in-tree pure-Rust GIF encoder.
 pub fn encode_gif(video: &VideoOutput, output_path: &Path) -> Result<()> {
     use std::fs::File;
     use std::io::BufWriter;
@@ -91,12 +99,6 @@ pub fn encode_gif(video: &VideoOutput, output_path: &Path) -> Result<()> {
     // GIF encoding using raw frame data
     // Frame delay in centiseconds (1/100th of a second)
     let delay = (100.0 / video.fps).max(1.0) as u16;
-
-    // Simple GIF encoder using raw LZW
-    // For simplicity, we write frames as PPM and note that a full GIF
-    // implementation would require a proper GIF encoder.
-    // Instead, write a multi-frame PPM sequence file for now.
-    // In production, integrate the `gif` crate or `image` crate.
 
     let mut gif_encoder =
         SimpleGifEncoder::new(&mut writer, video.width as u16, video.height as u16)?;
@@ -496,6 +498,10 @@ mod tests {
 
         video = test_video();
         video.fps = f32::NAN;
+        assert!(encode_video(&video, &output).is_err());
+
+        video = test_video();
+        video.frame_count = 2;
         assert!(encode_video(&video, &output).is_err());
     }
 }
