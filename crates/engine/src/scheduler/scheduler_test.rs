@@ -197,10 +197,8 @@ mod tests {
     fn scheduler_rejects_empty_prompts_before_allocating_cache() {
         let executor = Arc::new(MockExecutor);
         let kv_pool = Arc::new(MockKvPool::new(10));
-        let scheduler = InferenceScheduler::new(
-            executor,
-            Arc::clone(&kv_pool) as Arc<dyn KvCachePool>,
-        );
+        let scheduler =
+            InferenceScheduler::new(executor, Arc::clone(&kv_pool) as Arc<dyn KvCachePool>);
 
         let error = scheduler
             .submit(Request {
