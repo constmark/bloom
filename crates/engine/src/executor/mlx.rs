@@ -246,11 +246,8 @@ impl LoadedModel for MlxRuntimeModel {
             .command(false)
             .spawn()
             .map_err(|error| anyhow!("failed to launch MLX-LM bridge: {error}"))?;
-        child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("MLX-LM bridge stdin is unavailable"))?
-            .write_all(&request)?;
+        crate::core::process::write_stdin(&mut child, &request)
+            .map_err(|error| anyhow!("MLX-LM bridge stdin write failed: {error}"))?;
         let output = child
             .wait_with_output()
             .map_err(|error| anyhow!("failed waiting for MLX-LM bridge: {error}"))?;

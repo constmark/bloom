@@ -5,7 +5,6 @@
 //! environment, this adapter executes the model through the bundled bridge and
 //! returns text or numeric output using a small JSON protocol.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -233,11 +232,8 @@ impl LoadedModel for OnnxRuntimeModel {
         let mut child = command
             .spawn()
             .map_err(|error| anyhow!("failed to launch ONNX Runtime bridge: {error}"))?;
-        child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("ONNX Runtime bridge stdin is unavailable"))?
-            .write_all(&request)?;
+        crate::core::process::write_stdin(&mut child, &request)
+            .map_err(|error| anyhow!("ONNX Runtime bridge stdin write failed: {error}"))?;
         let output = child
             .wait_with_output()
             .map_err(|error| anyhow!("failed waiting for ONNX Runtime bridge: {error}"))?;
