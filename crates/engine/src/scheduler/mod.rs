@@ -1894,6 +1894,13 @@ impl InferenceScheduler {
     }
 
     fn submit_inner(&self, mut request: ScheduledRequest) -> Result<()> {
+        if request.prompt_tokens.is_empty() {
+            return Err(BloomError::InvalidInput(
+                "request prompt must contain at least one token".to_string(),
+            )
+            .into());
+        }
+
         // HBM Admission Control & Eviction
         if self.config.enabled {
             let metrics = self.kv_pool.get_metrics();
