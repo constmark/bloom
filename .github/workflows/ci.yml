@@ -3,7 +3,6 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
 
 permissions:
   contents: read
@@ -80,6 +79,8 @@ jobs:
           python3 scripts/test_generate_sbom.py
       - name: Check
         run: cargo check --workspace --all-targets --locked
+      - name: Compile workspace
+        run: cargo build --workspace --all-targets --locked
       - name: Check architecture boundaries
         run: |
           python3 scripts/check_architecture.py
