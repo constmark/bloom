@@ -4,7 +4,8 @@
 
 ```bash
 cargo fmt --all -- --check
-cargo check --workspace --locked
+cargo check --workspace --all-targets --locked
+cargo build --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings -A missing_docs
 cargo test --workspace --locked
 python3 -m unittest discover -s python/tests -v
