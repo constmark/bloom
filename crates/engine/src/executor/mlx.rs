@@ -322,9 +322,7 @@ impl LoadedModel for MlxRuntimeModel {
             .wait()
             .map_err(|error| anyhow!("failed waiting for MLX-LM streaming bridge: {error}"))?;
         if !status.success() {
-            return Err(anyhow!(
-                "MLX-LM streaming bridge failed ({status})"
-            ));
+            return Err(anyhow!("MLX-LM streaming bridge failed ({status})"));
         }
         if !saw_done {
             return Err(anyhow!(
