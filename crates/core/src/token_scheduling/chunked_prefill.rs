@@ -281,20 +281,25 @@ mod tests {
         // A 3-token request produces one chunk.
         queue.submit("r2".into(), vec![100, 200, 300]);
 
-        // With a budget of 6, only r1 chunk 1 (4 tokens) fits; adding r2 would require 7.
+        // Partial chunks are allowed when the remaining budget is smaller
+        // than the next request's configured chunk size.
         let chunks = queue.schedule_chunks(6);
-        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].request_id, "r1");
         assert_eq!(chunks[0].tokens.len(), 4);
         assert!(!chunks[0].is_final);
+        assert_eq!(chunks[1].request_id, "r2");
+        assert_eq!(chunks[1].tokens, vec![100, 200]);
+        assert!(!chunks[1].is_final);
 
-        // budget = 8: r1 chunk2(4) + r2(3) = 7 <= 8
+        // budget = 8: r1 chunk2(4) + r2's final token = 5 <= 8.
         let chunks2 = queue.schedule_chunks(8);
         assert_eq!(chunks2.len(), 2);
         assert_eq!(chunks2[0].request_id, "r1");
         assert_eq!(chunks2[0].tokens.len(), 4);
         assert!(!chunks2[0].is_final); // r1 still has two tokens in its third chunk.
         assert_eq!(chunks2[1].request_id, "r2");
+        assert_eq!(chunks2[1].tokens, vec![300]);
         assert!(chunks2[1].is_final);
     }
 
