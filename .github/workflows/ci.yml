@@ -7,6 +7,12 @@ on:
 permissions:
   contents: read
 
+# Push and pull_request events for the same branch share a group, so only the
+# newest full matrix consumes runners while preserving the latest commit check.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
 jobs:
   linux:
     name: Rust (Linux)
