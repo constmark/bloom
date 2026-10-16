@@ -332,12 +332,15 @@ fn bits_to_bytes(bits: &[bool]) -> Vec<u8> {
 ///
 /// Writes raw frames to a pipe and lets ffmpeg encode to MP4 (H.264).
 pub fn encode_video_ffmpeg(video: &VideoOutput, output_path: &Path) -> Result<()> {
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::process::{Command, Stdio};
+
+    use crate::core::process::ChildGuard;
 
     validate_video(video)?;
 
-    let mut ffmpeg = Command::new("ffmpeg")
+    let mut command = Command::new("ffmpeg");
+    command
         .args([
             "-y",
             "-f",
@@ -362,29 +365,39 @@ pub fn encode_video_ffmpeg(video: &VideoOutput, output_path: &Path) -> Result<()
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            anyhow!(
-                "failed to spawn ffmpeg: {}. Install ffmpeg or use .gif output.",
-                e
-            )
-        })?;
+        .stderr(Stdio::piped());
+    let mut ffmpeg = ChildGuard::spawn(&mut command).map_err(|e| {
+        anyhow!(
+            "failed to spawn ffmpeg: {}. Install ffmpeg or use .gif output.",
+            e
+        )
+    })?;
 
-    let stdin = ffmpeg
-        .stdin
-        .as_mut()
-        .ok_or_else(|| anyhow!("failed to open ffmpeg stdin"))?;
-
-    for frame in &video.frames {
-        stdin.write_all(frame)?;
+    {
+        let stdin = ffmpeg
+            .stdin
+            .as_mut()
+            .ok_or_else(|| anyhow!("failed to open ffmpeg stdin"))?;
+        for frame in &video.frames {
+            // ChildGuard reaps ffmpeg if a broken pipe or any other write
+            // error aborts this loop before stdin is closed.
+            stdin.write_all(frame)?;
+        }
     }
     // Close stdin by dropping it, then wait for ffmpeg to finish
     drop(ffmpeg.stdin.take());
 
-    let output = ffmpeg.wait_with_output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    // Drain stderr while ffmpeg runs so a verbose encoder cannot block on its
+    // pipe. If reading stderr fails, ChildGuard still terminates and reaps it.
+    let mut stderr = ffmpeg
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("ffmpeg stderr is unavailable"))?;
+    let mut stderr_bytes = Vec::new();
+    stderr.read_to_end(&mut stderr_bytes)?;
+    let status = ffmpeg.wait()?;
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
         return Err(anyhow!("ffmpeg encoding failed: {}", stderr));
     }
 
