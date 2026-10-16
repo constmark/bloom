@@ -1271,11 +1271,13 @@ mod tests {
 
         executor.clear_speculative_strategy(17);
 
-        assert!(!executor
-            .speculative_strategies
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .contains_key(&17));
+        assert!(
+            !executor
+                .speculative_strategies
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .contains_key(&17)
+        );
     }
 
     #[test]
