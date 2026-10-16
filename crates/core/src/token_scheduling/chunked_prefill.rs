@@ -86,17 +86,26 @@ impl ChunkedPrefillState {
         remaining.min(self.chunk_size)
     }
 
-    /// Mark the current chunk complete and advance `filled_tokens`.
-    /// Returns `true` when all prefill work is complete.
-    pub fn advance_chunk(&mut self) -> bool {
-        let chunk_len = self.next_chunk_size();
-        self.filled_tokens += chunk_len;
+    /// Advance by at most one configured chunk.
+    ///
+    /// The scheduler may provide a smaller token budget than the configured
+    /// chunk size. Advancing by the number of tokens actually scheduled keeps
+    /// long prompts making progress instead of waiting for a full chunk.
+    fn advance_tokens(&mut self, token_count: usize) -> bool {
+        let consumed = token_count.min(self.next_chunk_size());
+        self.filled_tokens += consumed;
         if self.filled_tokens >= self.prompt_tokens.len() {
             self.finished = true;
             true
         } else {
             false
         }
+    }
+
+    /// Mark the current chunk complete and advance `filled_tokens`.
+    /// Returns `true` when all prefill work is complete.
+    pub fn advance_chunk(&mut self) -> bool {
+        self.advance_tokens(self.next_chunk_size())
     }
 
     /// Number of tokens that remain to be prefetched.
@@ -153,33 +162,37 @@ impl ChunkedPrefillQueue {
         // Walk the queue and greedily fill chunks.
         let mut i = 0;
         while i < self.queue.len() && used < token_budget {
-            let state = &mut self.queue[i];
-            let chunk_size = state.next_chunk_size();
+            let chunk_size = self.queue[i].next_chunk_size();
             if chunk_size == 0 {
-                i += 1;
+                // Empty prompts have no work to schedule; retire them so they
+                // cannot remain queued forever.
+                self.queue[i].finished = true;
+                self.queue.remove(i);
                 continue;
             }
+
             let can_take = (token_budget - used).min(chunk_size);
-            // Schedule complete chunks only; partial chunks are not supported.
-            if can_take < chunk_size {
+            let Some((start, tokens)) = self.queue[i].next_chunk() else {
+                i += 1;
+                continue;
+            };
+            let request_id = self.queue[i].request_id.clone();
+            let take = can_take.min(tokens.len());
+            if take == 0 {
                 i += 1;
                 continue;
             }
 
-            let Some((start, tokens)) = state.next_chunk() else {
-                i += 1;
-                continue;
-            };
             let chunk = PrefillChunk {
-                request_id: state.request_id.clone(),
+                request_id,
                 chunk_start: start,
-                tokens: tokens.to_vec(),
-                is_final: state.filled_tokens + tokens.len() >= state.prompt_tokens.len(),
+                tokens: tokens[..take].to_vec(),
+                is_final: self.queue[i].filled_tokens + take >= self.queue[i].prompt_tokens.len(),
             };
             scheduled.push(chunk);
-            used += chunk_size;
+            used += take;
 
-            let finished = state.advance_chunk();
+            let finished = self.queue[i].advance_tokens(take);
             if finished {
                 self.queue.remove(i);
                 // Do not increment i; removal moves the next element into this slot.
@@ -268,23 +281,61 @@ mod tests {
         // A 3-token request produces one chunk.
         queue.submit("r2".into(), vec![100, 200, 300]);
 
-        // With a budget of 6, only r1 chunk 1 (4 tokens) fits; adding r2 would require 7.
+        // Partial chunks are allowed when the remaining budget is smaller
+        // than the next request's configured chunk size.
         let chunks = queue.schedule_chunks(6);
-        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].request_id, "r1");
         assert_eq!(chunks[0].tokens.len(), 4);
         assert!(!chunks[0].is_final);
+        assert_eq!(chunks[1].request_id, "r2");
+        assert_eq!(chunks[1].tokens, vec![100, 200]);
+        assert!(!chunks[1].is_final);
 
-        // budget = 8: r1 chunk2(4) + r2(3) = 7 <= 8
+        // budget = 8: r1 chunk2(4) + r2's final token = 5 <= 8.
         let chunks2 = queue.schedule_chunks(8);
         assert_eq!(chunks2.len(), 2);
         assert_eq!(chunks2[0].request_id, "r1");
         assert_eq!(chunks2[0].tokens.len(), 4);
         assert!(!chunks2[0].is_final); // r1 still has two tokens in its third chunk.
         assert_eq!(chunks2[1].request_id, "r2");
+        assert_eq!(chunks2[1].tokens, vec![300]);
         assert!(chunks2[1].is_final);
     }
 
+    #[test]
+    fn chunked_prefill_allows_partial_budget() {
+        let config = ChunkedPrefillConfig {
+            enabled: true,
+            chunk_size: 4,
+            ..Default::default()
+        };
+        let mut queue = ChunkedPrefillQueue::new(config);
+        queue.submit("r1".into(), vec![1, 2, 3, 4, 5, 6]);
+
+        let first = queue.schedule_chunks(2);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].chunk_start, 0);
+        assert_eq!(first[0].tokens, vec![1, 2]);
+        assert!(!first[0].is_final);
+        assert_eq!(queue.total_remaining_tokens(), 4);
+
+        let second = queue.schedule_chunks(4);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].chunk_start, 2);
+        assert_eq!(second[0].tokens, vec![3, 4, 5, 6]);
+        assert!(second[0].is_final);
+        assert_eq!(queue.pending_count(), 0);
+    }
+
+    #[test]
+    fn empty_prefill_requests_are_retired() {
+        let mut queue = ChunkedPrefillQueue::new(ChunkedPrefillConfig::default());
+        queue.submit("empty".into(), Vec::new());
+
+        assert!(queue.schedule_chunks(1).is_empty());
+        assert_eq!(queue.pending_count(), 0);
+    }
     #[test]
     fn chunked_prefill_queue_cancel() {
         let config = ChunkedPrefillConfig {
