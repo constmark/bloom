@@ -16,6 +16,7 @@ use bloomai_core::{
 
 use crate::{
     core::parallelism::ParallelStrategy,
+    core::process::ChildGuard,
     engine::{Engine, EngineCapability, SupportLevel, default_engine_supports},
     io::{ModelInput, ModelOutput, OutputChunk},
     model::{LoadedModel, ModelMetadata, OutputSink},
@@ -280,9 +281,16 @@ impl LoadedModel for MlxRuntimeModel {
         }))?;
         let script = script_path();
         crate::core::security::validate_external_script(&script)?;
-        let mut child = self
-            .command(true)
-            .spawn()
+        // Keep the bridge under the process guard for the full stream. A sink
+        // can reject a chunk (for example when the client disconnects), and
+        // dropping a raw Child in that path would leave the Python worker
+        // running after the request has already failed.
+        let mut command = self.command(true);
+        // The stream is consumed synchronously below, so inherit diagnostics
+        // instead of leaving a stderr pipe that could fill and block the
+        // worker before it closes stdout.
+        command.stderr(Stdio::inherit());
+        let mut child = ChildGuard::spawn(&mut command)
             .map_err(|error| anyhow!("failed to launch MLX-LM streaming bridge: {error}"))?;
         child
             .stdin
@@ -310,15 +318,11 @@ impl LoadedModel for MlxRuntimeModel {
                 saw_done = true;
             }
         }
-        let output = child
-            .wait_with_output()
+        let status = child
+            .wait()
             .map_err(|error| anyhow!("failed waiting for MLX-LM streaming bridge: {error}"))?;
-        if !output.status.success() {
-            return Err(anyhow!(
-                "MLX-LM streaming bridge failed ({}): {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
+        if !status.success() {
+            return Err(anyhow!("MLX-LM streaming bridge failed ({status})"));
         }
         if !saw_done {
             return Err(anyhow!(
@@ -451,5 +455,57 @@ mod tests {
             )
             .unwrap();
         assert_eq!(output.text.as_deref(), Some("fake output"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streaming_bridge_is_reaped_when_sink_rejects_output() {
+        use crate::test_env::{ENV_LOCK, EnvVarGuard};
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let model_file = dir.path().join("weights.safetensors");
+        std::fs::write(&model_file, b"placeholder").unwrap();
+        std::fs::write(dir.path().join("config.json"), b"{}").unwrap();
+        let pid_path = dir.path().join("stream.pid");
+        let script = dir.path().join("fake-mlx-stream.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncase \" $* \" in\n  *\" --probe \"*) printf '%s\\n' '{\"ok\":true,\"device\":\"CPU\",\"runtime\":\"mlx-lm\"}' ;;\n  *\" --stream \"*) printf '%s\\n' \"$$\" > \"$BLOOM_MLX_PID_FILE\"; cat >/dev/null; printf '%s\\n' '{\"text\":\"hello\"}'; exec sleep 30 ;;\n  *) cat >/dev/null; printf '%s\\n' '{\"text\":\"fake output\"}' ;;\nesac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _script = EnvVarGuard::set("BLOOM_MLX_SCRIPT", script.to_str().unwrap());
+        let _python = EnvVarGuard::set("BLOOM_MLX_PYTHON", "sh");
+        let _pid = EnvVarGuard::set("BLOOM_MLX_PID_FILE", pid_path.to_str().unwrap());
+
+        let model = MlxEngine.load(dir.path(), DeviceKind::Cpu).unwrap();
+        let error = model
+            .infer_stream(
+                ModelInput::Text {
+                    prompt: "hello".to_string(),
+                },
+                &bloomai_core::GenerationParams::default(),
+                &mut |_| anyhow::bail!("cancelled"),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+
+        let pid: libc::pid_t = std::fs::read_to_string(pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // ChildGuard must kill and reap the bridge on the sink's early error;
+        // otherwise this worker would keep running after the request failed.
+        assert_eq!(
+            unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
     }
 }
