@@ -194,6 +194,43 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_rejects_empty_prompts_before_allocating_cache() {
+        let executor = Arc::new(MockExecutor);
+        let kv_pool = Arc::new(MockKvPool::new(10));
+        let scheduler = InferenceScheduler::new(
+            executor,
+            Arc::clone(&kv_pool) as Arc<dyn KvCachePool>,
+        );
+
+        let error = scheduler
+            .submit(Request {
+                id: "empty-prompt".to_string(),
+                model_id: "m1".to_string(),
+                prompt_tokens: Vec::new(),
+                generated_tokens: Vec::new(),
+                params: GenerationParams {
+                    max_tokens: 5,
+                    ..Default::default()
+                },
+                state: RequestState::Pending,
+                priority: 1,
+                kv_handle: None,
+                created_at: std::time::Instant::now(),
+                last_accessed: std::time::Instant::now(),
+                preemption_count: 0,
+                decode_started_at: None,
+                last_scheduled_at: None,
+                multimodal_hash: None,
+            })
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("prompt must contain at least one token"));
+        assert_eq!(kv_pool.free_slots.lock().unwrap().len(), 10);
+        assert_eq!(scheduler.queue_stats(), (0, 0, 0));
+    }
+
+    #[test]
     fn decode_start_position_accounts_for_prefill_sampled_token() {
         let executor = Arc::new(RecordingExecutor {
             batches: Mutex::new(Vec::new()),
