@@ -84,16 +84,6 @@ pub(super) fn build(
     let request_models_for_free = Arc::clone(&request_models);
     let restored_prefix_handles = Arc::new(Mutex::new(HashSet::new()));
     let restored_prefix_handles_for_free = Arc::clone(&restored_prefix_handles);
-    kv_pool.set_on_free(move |handle| {
-        request_models_for_free
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(&handle);
-        restored_prefix_handles_for_free
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(&handle);
-    });
 
     let model_for_forward = Arc::clone(&model);
     let template_for_forward = moe_template.clone();
@@ -246,6 +236,25 @@ pub(super) fn build(
             base
         }
     });
+
+    // KV handles are recycled by the pool. Clear every per-request state store
+    // when a handle is released so stale speculative context (or a loaded
+    // draft model) cannot leak into the next request that reuses that handle.
+    let executor_for_free = Arc::downgrade(&executor);
+    kv_pool.set_on_free(move |handle| {
+        request_models_for_free
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&handle);
+        restored_prefix_handles_for_free
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&handle);
+        if let Some(executor) = executor_for_free.upgrade() {
+            executor.clear_speculative_strategy(handle);
+        }
+    });
+
     Ok(executor)
 }
 

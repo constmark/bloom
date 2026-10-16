@@ -203,6 +203,16 @@ impl CandleBatchExecutor {
         self
     }
 
+    /// Drop speculative decoding state for a request whose KV handle was
+    /// released. Handles are recycled by the KV pool, so retaining this state
+    /// would carry the previous request's context into a new request.
+    pub(crate) fn clear_speculative_strategy(&self, handle: usize) {
+        self.speculative_strategies
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&handle);
+    }
+
     /// Set vocabulary and tokenizer for structured generation / grammar filtering.
     pub fn with_vocab_and_tokenizer(
         mut self,
@@ -1243,6 +1253,31 @@ mod tests {
         let executor = CandleBatchExecutor::new(forward_fn, Device::Cpu, 4, 32);
         assert_eq!(executor.max_batch_size(ExecutionPhase::Prefill), 4);
         assert_eq!(executor.max_batch_size(ExecutionPhase::Decode), 32);
+    }
+
+    #[test]
+    fn released_handle_drops_speculative_strategy_state() {
+        let executor = CandleBatchExecutor::new(
+            Box::new(|_, _, _| unreachable!("forward callback is not used")),
+            Device::Cpu,
+            4,
+            32,
+        );
+        executor
+            .speculative_strategies
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(17, Box::new(NGramStrategy::new(3)));
+
+        executor.clear_speculative_strategy(17);
+
+        assert!(
+            !executor
+                .speculative_strategies
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .contains_key(&17)
+        );
     }
 
     #[test]
