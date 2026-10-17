@@ -67,9 +67,12 @@ impl Engine for LlamaCppEngine {
             supported_modalities: vec![Modality::Text],
             supports_streaming: true,
             supports_quantized_models: true,
-            supports_embeddings: true,
-            supports_rerank: true,
-            supports_structured_output: true,
+            // The external adapter currently forwards only `/completion`.
+            // Keep routing truthful until the corresponding llama-server
+            // operations and typed contracts are implemented.
+            supports_embeddings: false,
+            supports_rerank: false,
+            supports_structured_output: false,
             max_context_tokens: None,
             supported_quant_methods: vec![QuantMethod::Gguf],
             supported_parallel_strategies: vec![ParallelStrategy::None],
@@ -859,6 +862,15 @@ fn trim_ascii(bytes: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capability_matches_the_external_completion_surface() {
+        let capability = LlamaCppEngine.capability();
+        assert!(!capability.supports_embeddings);
+        assert!(!capability.supports_rerank);
+        assert!(!capability.supports_structured_output);
+        assert!(capability.supports_streaming);
+    }
 
     #[test]
     fn rejects_overflowing_chunks_bad_terminators_and_oversized_events() {
