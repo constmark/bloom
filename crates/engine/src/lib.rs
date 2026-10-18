@@ -28,7 +28,9 @@ pub use crate::executor as engines;
 // --- Direct re-exports at the crate root ---
 pub use crate::cachemesh::{
     CacheMesh, CacheMeshBlock, CacheMeshConfig, CacheMeshKey, CacheMeshMetrics, CacheMeshSnapshot,
-    CacheMeshTier, FileSystemRemoteCache, InMemoryRemoteCache, RemoteCacheBackend, TierMetrics,
+    CacheMeshTier, FileSystemLayeredCache, FileSystemRemoteCache, InMemoryRemoteCache,
+    LayeredBlockCache, LayeredCacheBackend, LayeredCacheConfig, LayeredCacheKey,
+    LayeredCacheMetrics, LayeredCacheTier, LayeredTierMetrics, RemoteCacheBackend, TierMetrics,
 };
 pub use crate::core::engine::{
     BackendMaturity, Engine, EngineCapability, EngineRegistry, EngineRouter, RoutingDecision,

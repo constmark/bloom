@@ -98,6 +98,9 @@ pub struct PagedAttentionCache {
     /// Per-layer, per-block KV data.
     /// Indexed as: layer_data[layer_idx][block_id] = BlockKvData
     layer_data: Arc<Mutex<Vec<HashMap<usize, BlockKvData>>>>,
+    /// Monotonic generations prevent an in-flight offload from deleting a
+    /// newer write to the same physical block.
+    block_generations: Arc<Mutex<HashMap<(usize, usize), u64>>>,
     /// Stable CacheMesh keys for each layer/block currently assigned by the pool.
     block_keys: Arc<Mutex<HashMap<(usize, usize), CacheMeshKey>>>,
     /// Optional L2/L3 cachemesh backing store.
@@ -138,6 +141,7 @@ impl PagedAttentionCache {
             (0..config.num_layers).map(|_| HashMap::new()).collect(),
         ));
         let block_keys = Arc::new(Mutex::new(HashMap::new()));
+        let block_generations = Arc::new(Mutex::new(HashMap::new()));
         install_cachemesh_eviction_hook(
             &pool,
             layer_data.clone(),
@@ -155,6 +159,7 @@ impl PagedAttentionCache {
             pool,
             config,
             layer_data,
+            block_generations,
             block_keys,
             cachemesh,
         }
@@ -256,6 +261,7 @@ impl PagedAttentionCache {
 
         let mut layer_data = self.layer_data.lock().unwrap_or_else(|e| e.into_inner());
         layer_data[layer_idx].insert(block_id, block_data);
+        self.bump_block_generation(layer_idx, block_id);
         Ok(())
     }
 
@@ -369,6 +375,7 @@ impl PagedAttentionCache {
 
         let mut layer_data = self.layer_data.lock().unwrap_or_else(|e| e.into_inner());
         layer_data[layer_idx].insert(block_id, block_data);
+        self.bump_block_generation(layer_idx, block_id);
         Ok(())
     }
 
@@ -666,8 +673,8 @@ impl PagedAttentionCache {
         let Some(key) = self.cachemesh_key(layer_idx, block_id) else {
             return Ok(false);
         };
-        let block = {
-            let mut layer_data = self.layer_data.lock().unwrap_or_else(|e| e.into_inner());
+        let (block, generation) = {
+            let layer_data = self.layer_data.lock().unwrap_or_else(|e| e.into_inner());
             if layer_idx >= layer_data.len() {
                 return Err(anyhow!(
                     "layer_idx {} >= num_layers {}",
@@ -675,12 +682,38 @@ impl PagedAttentionCache {
                     self.config.num_layers
                 ));
             }
-            layer_data[layer_idx].remove(&block_id)
+            let block = layer_data[layer_idx].get(&block_id).cloned();
+            let generation = self
+                .block_generations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&(layer_idx, block_id))
+                .copied()
+                .unwrap_or(0);
+            (block, generation)
         };
         let Some(block) = block else {
             return Ok(false);
         };
         mesh.offload_to_l2(to_cachemesh_block(key, &block, &self.config))?;
+        // Only release the resident copy after a successful offload. This
+        // keeps a transient L3/L2 failure from turning into a silent miss.
+        let mut layer_data = self.layer_data.lock().unwrap_or_else(|e| e.into_inner());
+        let generations = self
+            .block_generations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if generations
+            .get(&(layer_idx, block_id))
+            .copied()
+            .unwrap_or(0)
+            != generation
+        {
+            // The snapshot was superseded while the backend write was in
+            // flight. The newer resident value remains in L1.
+            return Ok(false);
+        }
+        layer_data[layer_idx].remove(&block_id);
         Ok(true)
     }
 
@@ -1043,7 +1076,17 @@ impl PagedAttentionCache {
         let block_data = from_cachemesh_block(&block, &self.config);
         let mut layer_data = self.layer_data.lock().unwrap_or_else(|e| e.into_inner());
         layer_data[layer_idx].insert(block_id, block_data);
+        self.bump_block_generation(layer_idx, block_id);
         Ok(Some(block))
+    }
+
+    fn bump_block_generation(&self, layer_idx: usize, block_id: usize) {
+        let mut generations = self
+            .block_generations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let generation = generations.entry((layer_idx, block_id)).or_insert(0);
+        *generation = generation.saturating_add(1);
     }
 }
 
@@ -1055,20 +1098,33 @@ fn install_cachemesh_eviction_hook(
     config: PagedCacheConfig,
 ) {
     pool.set_on_evict(move |block_ids| {
-        let mut layer_data = layer_data.lock().unwrap_or_else(|e| e.into_inner());
-        let block_keys = block_keys.lock().unwrap_or_else(|e| e.into_inner());
-        for &block_id in block_ids {
-            for layer_idx in 0..config.num_layers {
-                let Some(block) = layer_data[layer_idx].remove(&block_id) else {
-                    continue;
-                };
-                let Some(mesh) = cachemesh.as_ref() else {
-                    continue;
-                };
-                let Some(key) = block_keys.get(&(layer_idx, block_id)).cloned() else {
-                    continue;
-                };
-                let _ = mesh.offload_to_l2(to_cachemesh_block(key, &block, &config));
+        // Detach the evicted blocks while holding the local maps, then do
+        // backend I/O after releasing both locks. A slow filesystem or remote
+        // backend must not stall concurrent KV reads/writes.
+        let pending = {
+            let mut layer_data = layer_data.lock().unwrap_or_else(|e| e.into_inner());
+            let block_keys = block_keys.lock().unwrap_or_else(|e| e.into_inner());
+            let mut pending = Vec::new();
+            for &block_id in block_ids {
+                for layer_idx in 0..config.num_layers {
+                    let Some(block) = layer_data[layer_idx].remove(&block_id) else {
+                        continue;
+                    };
+                    let Some(mesh) = cachemesh.as_ref() else {
+                        continue;
+                    };
+                    let Some(key) = block_keys.get(&(layer_idx, block_id)).cloned() else {
+                        continue;
+                    };
+                    pending.push((mesh.clone(), key, block));
+                }
+            }
+            pending
+        };
+
+        for (mesh, key, block) in pending {
+            if let Err(error) = mesh.offload_to_l2(to_cachemesh_block(key, &block, &config)) {
+                tracing::warn!(%error, "failed to offload an evicted KV block to CacheMesh");
             }
         }
     });
@@ -1219,9 +1275,11 @@ fn tokens_to_blocks(tokens: usize, block_size: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cachemesh::{CacheMeshConfig, InMemoryRemoteCache};
+    use crate::cachemesh::{CacheMeshConfig, InMemoryRemoteCache, RemoteCacheBackend};
     use candle_core::Device;
-    use std::sync::Arc;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Barrier, Mutex};
 
     fn test_config() -> PagedCacheConfig {
         PagedCacheConfig {
@@ -1501,6 +1559,132 @@ mod tests {
         assert_eq!(metrics.l2.misses, 1);
         assert_eq!(metrics.l3.hits, 1);
         assert_eq!(metrics.l3.hit_rate, 1.0);
+    }
+
+    struct BlockingRemoteCache {
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+        block_first_put: AtomicBool,
+        blocks: Mutex<HashMap<CacheMeshKey, CacheMeshBlock>>,
+    }
+
+    impl BlockingRemoteCache {
+        fn new(entered: Arc<Barrier>, release: Arc<Barrier>) -> Self {
+            Self {
+                entered,
+                release,
+                block_first_put: AtomicBool::new(true),
+                blocks: Mutex::new(HashMap::new()),
+            }
+        }
+    }
+
+    impl RemoteCacheBackend for BlockingRemoteCache {
+        fn get(&self, key: &CacheMeshKey) -> Result<Option<CacheMeshBlock>> {
+            Ok(self
+                .blocks
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(key)
+                .cloned())
+        }
+
+        fn put(&self, block: CacheMeshBlock) -> Result<()> {
+            if self.block_first_put.swap(false, Ordering::SeqCst) {
+                self.entered.wait();
+                self.release.wait();
+            }
+            self.blocks
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(block.key.clone(), block);
+            Ok(())
+        }
+
+        fn remove(&self, key: &CacheMeshKey) -> Result<()> {
+            self.blocks
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(key);
+            Ok(())
+        }
+
+        fn len(&self) -> usize {
+            self.blocks
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .len()
+        }
+
+        fn bytes(&self) -> Option<usize> {
+            Some(
+                self.blocks
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .values()
+                    .map(CacheMeshBlock::bytes)
+                    .sum(),
+            )
+        }
+    }
+
+    #[test]
+    fn generation_guard_keeps_newer_kv_resident_during_slow_offload() {
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let remote = Arc::new(BlockingRemoteCache::new(
+            Arc::clone(&entered),
+            Arc::clone(&release),
+        ));
+        let mesh = Arc::new(CacheMesh::with_remote(
+            CacheMeshConfig {
+                enabled: true,
+                l2_capacity_bytes: 1024,
+                l3_enabled: true,
+                write_through_l3: true,
+                ..Default::default()
+            },
+            Arc::clone(&remote) as Arc<dyn RemoteCacheBackend>,
+        ));
+        let cache = Arc::new(PagedAttentionCache::with_cachemesh(
+            test_config(),
+            Arc::clone(&mesh),
+        ));
+        let allocation = cache.allocate("generation-race", &[1, 2, 3, 4], 0).unwrap();
+        let block_id = allocation.allocated_blocks[0];
+        let old_keys = vec![1.0; 32];
+        let old_values = vec![2.0; 32];
+        cache
+            .write_kv(0, block_id, old_keys.clone(), old_values.clone(), 4)
+            .unwrap();
+
+        let offloader = {
+            let cache = Arc::clone(&cache);
+            std::thread::spawn(move || cache.offload_block(0, block_id))
+        };
+        // Wait until the stale snapshot is inside the remote write. A newer
+        // write now increments the generation while that write is in flight.
+        entered.wait();
+        let new_keys = vec![7.0; 32];
+        let new_values = vec![8.0; 32];
+        cache
+            .write_kv(0, block_id, new_keys.clone(), new_values.clone(), 4)
+            .unwrap();
+        release.wait();
+
+        assert!(!offloader.join().unwrap().unwrap());
+        let (keys, values) = cache.read_kv(0, &[block_id]).unwrap();
+        assert_eq!(keys, new_keys);
+        assert_eq!(values, new_values);
+        assert_eq!(cache.layer_block_count(0), 1);
+
+        // The first, stale write is allowed to finish in L3, but a subsequent
+        // offload must publish the current generation before releasing L1.
+        let key = cache.cachemesh_key(0, block_id).unwrap();
+        assert_eq!(remote.get(&key).unwrap().unwrap().keys, old_keys);
+        assert!(cache.offload_block(0, block_id).unwrap());
+        assert_eq!(remote.get(&key).unwrap().unwrap().keys, new_keys);
+        assert_eq!(cache.layer_block_count(0), 0);
     }
 
     #[test]

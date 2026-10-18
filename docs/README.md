@@ -24,6 +24,7 @@ request.
 - [Readiness and UI/server compatibility](readiness-contract.md)
 - [Model load preflight](model-preflight.md)
 - [Runtime diagnostics](runtime-diagnostics.md)
+- [Tiered KV and block cache](cachemesh.md)
 - [Server doctor](server-doctor.md)
 - [Intel NPU setup](npu.md)
 - [Production checklist](production.md)

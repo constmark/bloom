@@ -321,6 +321,7 @@ impl RemoteCacheBackend for FileSystemRemoteCache {
         let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
         serde_json::to_writer(&mut temporary, &block)?;
         temporary.flush()?;
+        temporary.as_file().sync_all()?;
         temporary
             .persist(&path)
             .map_err(|error| error.error)
@@ -462,12 +463,23 @@ impl CacheMesh {
         }
         block.validate()?;
 
+        // Write-through persistence can be slow (filesystem or a remote
+        // backend). Complete it before taking the L2 mutex so cache readers
+        // and other offloaders remain responsive during backend I/O.
+        let wrote_through_l3 = self.config.write_through_l3 && self.config.l3_enabled;
+        if wrote_through_l3 && let Err(err) = self.offload_to_l3(block.clone()) {
+            self.l3_metrics
+                .failed_offloads
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(err);
+        }
+
         let mut state = lock_recover(&self.l2);
         let block_bytes = block.bytes();
         if block_bytes > self.config.l2_capacity_bytes {
             drop(state);
             if self.config.l3_enabled {
-                if let Err(err) = self.offload_to_l3(block) {
+                if !wrote_through_l3 && let Err(err) = self.offload_to_l3(block) {
                     self.l3_metrics
                         .failed_offloads
                         .fetch_add(1, Ordering::Relaxed);
@@ -477,15 +489,6 @@ impl CacheMesh {
                 self.l2_metrics.dropped.fetch_add(1, Ordering::Relaxed);
             }
             return Ok(());
-        }
-
-        if self.config.write_through_l3
-            && let Err(err) = self.offload_to_l3(block.clone())
-        {
-            self.l3_metrics
-                .failed_offloads
-                .fetch_add(1, Ordering::Relaxed);
-            return Err(err);
         }
 
         if let Some(old) = state.blocks.remove(&block.key) {
@@ -691,6 +694,24 @@ mod tests {
         assert!(cache.remove(&malicious).is_err());
     }
 
+    #[test]
+    fn filesystem_cache_rejects_corrupt_and_oversized_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileSystemRemoteCache::new(dir.path()).unwrap();
+        let key = CacheMeshKey::from_tokens("model", 0, &[1]);
+        let path = cache.path_for(&key).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        std::fs::write(&path, b"{ definitely not cachemesh json").unwrap();
+        assert!(cache.get(&key).is_err());
+
+        // `get` checks metadata before reading, so a sparse file exercises the
+        // bounded read guard without allocating hundreds of megabytes.
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(256 * 1024 * 1024 + 1).unwrap();
+        assert!(cache.get(&key).is_err());
+    }
+
     #[cfg(unix)]
     #[test]
     fn filesystem_cache_rejects_symlinks_and_does_not_recurse_into_them() {
@@ -714,6 +735,30 @@ mod tests {
             keys: vec![fill; 8],
             values: vec![fill + 1.0; 8],
             num_tokens: 4,
+        }
+    }
+
+    /// A deterministic backend used to prove that persistence failures remain
+    /// observable to callers and metrics.  Production deployments can provide
+    /// their own backend through `RemoteCacheBackend`; failures must never be
+    /// silently converted into cache hits.
+    struct FailingRemoteCache;
+
+    impl RemoteCacheBackend for FailingRemoteCache {
+        fn get(&self, _key: &CacheMeshKey) -> Result<Option<CacheMeshBlock>> {
+            Err(anyhow!("test remote get failure"))
+        }
+
+        fn put(&self, _block: CacheMeshBlock) -> Result<()> {
+            Err(anyhow!("test remote put failure"))
+        }
+
+        fn remove(&self, _key: &CacheMeshKey) -> Result<()> {
+            Ok(())
+        }
+
+        fn len(&self) -> usize {
+            0
         }
     }
 
@@ -773,6 +818,93 @@ mod tests {
         let metrics = mesh.metrics();
         assert_eq!(metrics.l2.items, 0);
         assert_eq!(metrics.l2.dropped, 1);
+    }
+
+    #[test]
+    fn disabled_cache_is_a_noop_and_does_not_validate_blocks() {
+        let mesh = CacheMesh::new(CacheMeshConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let key = CacheMeshKey::from_tokens("m", 0, &[1, 2, 3, 4]);
+        let mut malformed = block(key.clone(), 1.0);
+        malformed.values.pop();
+
+        // Disabled operation paths should not impose cache-only validation on
+        // callers that do not opt in to the feature.
+        mesh.offload_to_l2(malformed).unwrap();
+        assert!(mesh.restore(&key).unwrap().is_none());
+        let metrics = mesh.metrics();
+        assert!(!metrics.enabled);
+        assert_eq!(metrics.l2.hits, 0);
+        assert_eq!(metrics.l2.misses, 0);
+    }
+
+    #[test]
+    fn l3_put_failure_is_returned_and_counted_for_oversized_blocks() {
+        let mesh = CacheMesh::with_remote(
+            CacheMeshConfig {
+                enabled: true,
+                // The fixture is 64 bytes, so this exercises the direct L3
+                // path for blocks that cannot fit in L2 at all.
+                l2_capacity_bytes: 1,
+                l3_enabled: true,
+                ..Default::default()
+            },
+            Arc::new(FailingRemoteCache),
+        );
+        let key = CacheMeshKey::from_tokens("m", 0, &[1, 2, 3, 4]);
+
+        assert!(mesh.offload_to_l2(block(key, 1.0)).is_err());
+        let metrics = mesh.metrics();
+        assert_eq!(metrics.l3.failed_offloads, 1);
+        assert_eq!(metrics.l3.offloads, 0);
+        assert_eq!(metrics.l2.items, 0);
+    }
+
+    #[test]
+    fn l3_eviction_failure_is_visible_while_new_block_stays_in_l2() {
+        let mesh = CacheMesh::with_remote(
+            CacheMeshConfig {
+                enabled: true,
+                l2_capacity_bytes: 64,
+                l3_enabled: true,
+                ..Default::default()
+            },
+            Arc::new(FailingRemoteCache),
+        );
+        let first = CacheMeshKey::from_tokens("m", 0, &[1, 2, 3, 4]);
+        let second = CacheMeshKey::from_tokens("m", 0, &[5, 6, 7, 8]);
+        mesh.offload_to_l2(block(first.clone(), 1.0)).unwrap();
+
+        // The second insert evicts `first`; failed L3 persistence is returned
+        // to the caller, but the new L2 resident remains available.
+        assert!(mesh.offload_to_l2(block(second.clone(), 2.0)).is_err());
+        let metrics = mesh.metrics();
+        assert_eq!(metrics.l2.evictions, 1);
+        assert_eq!(metrics.l3.failed_offloads, 1);
+        assert!(mesh.restore(&second).unwrap().is_some());
+        // A miss falls through to the failing backend, so the caller gets a
+        // concrete error instead of an incorrect negative cache result.
+        assert!(mesh.restore(&first).is_err());
+    }
+
+    #[test]
+    fn cache_keys_keep_namespaces_isolated() {
+        let mesh = CacheMesh::new(CacheMeshConfig {
+            enabled: true,
+            l2_capacity_bytes: 1024,
+            ..Default::default()
+        });
+        let first = CacheMeshKey::from_tokens("model/revision-a", 0, &[10, 20]);
+        let second = CacheMeshKey::from_tokens("model/revision-b", 0, &[10, 20]);
+        mesh.offload_to_l2(block(first.clone(), 1.0)).unwrap();
+
+        assert!(mesh.restore(&first).unwrap().is_some());
+        assert!(mesh.restore(&second).unwrap().is_none());
+        let metrics = mesh.metrics();
+        assert_eq!(metrics.l2.hits, 1);
+        assert_eq!(metrics.l2.misses, 1);
     }
 
     #[test]

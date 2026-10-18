@@ -46,7 +46,8 @@ See the [edge-engine goal](docs/edge-engine-goal.md),
   pooling, and CPU-trained quality gates
 - Safe local model catalog with load preflight, portable inventory export, transactional lifecycle, verified downloads, and resumable browser imports
 - Pluggable engines, backends, processors, operators, and model packages
-- Memory estimation, KV-cache management, in-flight batching, and CacheMesh
+- Memory estimation, KV-cache management, in-flight batching, and tiered CacheMesh
+  / `LayeredBlockCache` caching ([deployment guide](docs/cachemesh.md))
 - Task-aware browser UI for streaming chat, embeddings, and bi-encoder reranking,
   with session-only credentials, keyboard-contained dialogs, and reduced-motion
   support, built with Dioxus and embedded in official release artifacts

@@ -199,6 +199,7 @@ Inside `bloomai-engine`:
 | `executor` | Candle models and adapters for external runtimes |
 | `processor` | Text, image, audio, and multimodal preprocessing |
 | `scheduler` | In-flight batching, preemption, paged KV cache, prefix reuse, and CacheMesh integration |
+| `cachemesh` | Model-specific CacheMesh adapter plus the independent byte-level `LayeredBlockCache` and persistent backends |
 | `plugin` | Manifest validation and native, subprocess, WASM, or remote entry-point boundaries |
 | `world` | Observation/action contracts for world-model workloads |
 
