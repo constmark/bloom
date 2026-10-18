@@ -19,10 +19,104 @@ use bloomai_engine::executor::vulkan::VulkanEngine;
 use bloomai_engine::executor::wan::WanEngine;
 use bloomai_engine::{EngineRegistry, speculative_mode_is_mtp};
 
+#[cfg(not(feature = "candle-engine"))]
+use anyhow::Result as AnyResult;
+#[cfg(not(feature = "candle-engine"))]
+use bloomai_core::{DeviceCapability, DeviceKind, Modality, ModelManifest};
+#[cfg(not(feature = "candle-engine"))]
+use bloomai_engine::{BackendMaturity, Engine, EngineCapability, LoadedModel, SupportLevel};
+#[cfg(not(feature = "candle-engine"))]
+use std::path::Path;
+
+/// Diagnostics-only placeholder kept in no-default-features binaries.
+///
+/// The server can still inspect manifests and return a useful preflight/doctor
+/// report when Candle was intentionally omitted from a small deployment build;
+/// a missing registration used to turn that expected incompatibility into a
+/// 500 response (and even an `unreachable!` panic in startup diagnostics).
+#[cfg(not(feature = "candle-engine"))]
+struct UnavailableCandleEngine;
+
+#[cfg(not(feature = "candle-engine"))]
+impl Engine for UnavailableCandleEngine {
+    fn name(&self) -> &'static str {
+        "candle"
+    }
+
+    fn supported_modalities(&self) -> Vec<Modality> {
+        vec![
+            Modality::Text,
+            Modality::Audio,
+            Modality::Vision,
+            Modality::Multi,
+        ]
+    }
+
+    fn supported_devices(&self) -> Vec<DeviceKind> {
+        vec![DeviceKind::Cpu, DeviceKind::Gpu, DeviceKind::Npu]
+    }
+
+    fn capability(&self) -> EngineCapability {
+        EngineCapability {
+            engine_name: self.name(),
+            supported_families: vec![bloomai_core::ModelFamily::Custom("*".to_string())],
+            supported_dtypes: vec![
+                bloomai_core::DType::F32,
+                bloomai_core::DType::F16,
+                bloomai_core::DType::BF16,
+                bloomai_core::DType::I8,
+                bloomai_core::DType::I4,
+                bloomai_core::DType::Q8,
+                bloomai_core::DType::Q4,
+            ],
+            supported_formats: vec![
+                bloomai_core::ModelFormat::Gguf,
+                bloomai_core::ModelFormat::Safetensors,
+            ],
+            supported_devices: vec![
+                bloomai_core::DeviceClass::Cpu,
+                bloomai_core::DeviceClass::IntegratedGpu,
+                bloomai_core::DeviceClass::DiscreteGpu,
+                bloomai_core::DeviceClass::Npu,
+            ],
+            supported_modalities: self.supported_modalities(),
+            supports_streaming: false,
+            supports_quantized_models: false,
+            supports_embeddings: false,
+            supports_rerank: false,
+            supports_structured_output: false,
+            max_context_tokens: None,
+            supported_quant_methods: Vec::new(),
+            supported_parallel_strategies: vec![bloomai_engine::ParallelStrategy::None],
+            maturity: BackendMaturity::Skeleton,
+            diagnostic_tips: vec![
+                "This binary was built without the candle-engine feature.".to_string(),
+                "Rebuild with the default features (or --features candle-engine) for native text inference.".to_string(),
+            ],
+            construction_guide:
+                "Enable the candle-engine Cargo feature when building the server.".to_string(),
+        }
+    }
+
+    fn supports(&self, _: &ModelManifest, _: &DeviceCapability) -> SupportLevel {
+        SupportLevel::Unsupported(
+            "Candle native inference is not compiled into this binary".to_string(),
+        )
+    }
+
+    fn load(&self, _: &Path, _: DeviceKind) -> AnyResult<Box<dyn LoadedModel>> {
+        Err(anyhow!(
+            "Candle engine is unavailable because this binary was built without the candle-engine feature"
+        ))
+    }
+}
+
 pub(crate) fn engine_registry() -> EngineRegistry {
     let mut registry = EngineRegistry::default();
     #[cfg(feature = "candle-engine")]
     registry.register("candle", Box::new(CandleEngine));
+    #[cfg(not(feature = "candle-engine"))]
+    registry.register("candle", Box::new(UnavailableCandleEngine));
     registry.register("openvino", Box::new(OpenVINOEngine));
     registry.register("funasr", Box::new(FunASREngine));
     registry.register("laya", Box::new(LayaEngine));

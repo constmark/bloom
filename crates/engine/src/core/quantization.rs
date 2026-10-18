@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use bloomai_core::DType as BloomDType;
+
 #[cfg(feature = "candle-engine")]
 use candle_core::{DType, Tensor};
 
@@ -113,6 +115,20 @@ impl QuantMethod {
             Self::Exl2 => "exl2",
             Self::Quanto => "quanto",
             Self::Torchao => "torchao",
+        }
+    }
+
+    /// Validate the effective bit width for this quantization method.
+    ///
+    /// The manifest may describe a method without a complete backend config;
+    /// keeping this check here lets loaders reject malformed metadata before
+    /// allocating tensors or selecting a kernel.
+    pub fn accepts_bits(&self, bits: u8) -> bool {
+        match self {
+            Self::None => (1..=16).contains(&bits),
+            Self::Fp8 | Self::Int8 | Self::Eetq => bits == 8,
+            Self::Aqlm => (1..=4).contains(&bits),
+            _ => (1..=8).contains(&bits),
         }
     }
 
@@ -396,6 +412,50 @@ impl QuantizationConfig {
         self.weight_method != QuantMethod::None
     }
 
+    /// Validate a config before it crosses an engine boundary.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.weight_method.accepts_bits(self.weight_bits) {
+            return Err(format!(
+                "{} quantization cannot use {}-bit weights",
+                self.weight_method, self.weight_bits
+            ));
+        }
+        if self.group_size > 1 << 20 {
+            return Err(format!(
+                "quantization group size {} is unreasonably large",
+                self.group_size
+            ));
+        }
+        if self.source_format.len() > 256 {
+            return Err("quantization source format is too long".into());
+        }
+        Ok(())
+    }
+
+    /// Check whether a manifest dtype can represent this quantization config.
+    /// This is deliberately conservative: callers can still convert to a
+    /// wider runtime dtype, but never silently treat a full precision tensor
+    /// as a sub-byte quantized tensor.
+    pub fn compatible_with_dtype(&self, dtype: BloomDType) -> bool {
+        match self.weight_method {
+            QuantMethod::None => {
+                matches!(dtype, BloomDType::F32 | BloomDType::F16 | BloomDType::BF16)
+            }
+            QuantMethod::Nf4 => matches!(dtype, BloomDType::NF4 | BloomDType::I4 | BloomDType::Q4),
+            QuantMethod::Fp8 => matches!(
+                dtype,
+                BloomDType::F16 | BloomDType::BF16 | BloomDType::I8 | BloomDType::Q8
+            ),
+            QuantMethod::Int8 | QuantMethod::Eetq => {
+                matches!(dtype, BloomDType::I8 | BloomDType::Q8)
+            }
+            _ if self.weight_bits <= 4 => {
+                matches!(dtype, BloomDType::I4 | BloomDType::Q4 | BloomDType::NF4)
+            }
+            _ => matches!(dtype, BloomDType::I8 | BloomDType::Q8),
+        }
+    }
+
     /// Whether KV cache quantization is enabled.
     pub fn has_kv_cache_quant(&self) -> bool {
         self.kv_cache_dtype.needs_dequant()
@@ -424,6 +484,60 @@ pub struct Int8QuantizedKv {
 }
 
 impl Int8QuantizedKv {
+    /// Checked variant for callers handling untrusted or plugin supplied
+    /// dimensions. It avoids the historical `assert_eq!` panic in the hot
+    /// convenience method and rejects non-finite values before quantization.
+    pub fn try_quantize_f32(
+        data: &[f32],
+        num_rows: usize,
+        num_cols: usize,
+    ) -> Result<Self, String> {
+        let expected = num_rows
+            .checked_mul(num_cols)
+            .ok_or_else(|| "KV quantization shape overflows usize".to_string())?;
+        if data.len() != expected {
+            return Err(format!(
+                "KV quantization shape mismatch: expected {} values, got {}",
+                expected,
+                data.len()
+            ));
+        }
+        if data.iter().any(|value| !value.is_finite()) {
+            return Err("KV quantization input contains a non-finite value".into());
+        }
+        Ok(Self::quantize_f32(data, num_rows, num_cols))
+    }
+
+    /// Validate serialized quantized KV data before dequantization.
+    pub fn validate(&self) -> Result<(), String> {
+        let expected = self
+            .num_rows
+            .checked_mul(self.num_cols)
+            .ok_or_else(|| "quantized KV shape overflows usize".to_string())?;
+        if self.data.len() != expected || self.scales.len() != self.num_rows {
+            return Err(format!(
+                "quantized KV shape mismatch: data={}, scales={}, expected data={}, scales={}",
+                self.data.len(),
+                self.scales.len(),
+                expected,
+                self.num_rows
+            ));
+        }
+        if self
+            .scales
+            .iter()
+            .any(|scale| !scale.is_finite() || *scale <= 0.0)
+        {
+            return Err("quantized KV scales must be finite and positive".into());
+        }
+        Ok(())
+    }
+
+    pub fn try_dequantize_f32(&self) -> Result<Vec<f32>, String> {
+        self.validate()?;
+        Ok(self.dequantize_f32())
+    }
+
     /// Quantize an F16/F32 KV tensor row-by-row with symmetric INT8 quantization.
     pub fn quantize_f32(data: &[f32], num_rows: usize, num_cols: usize) -> Self {
         assert_eq!(data.len(), num_rows * num_cols);
@@ -719,6 +833,46 @@ mod tests {
         assert!(!KvCacheDtype::F16.needs_dequant());
         assert!(KvCacheDtype::Int8.needs_dequant());
         assert!(KvCacheDtype::Fp8.needs_dequant());
+    }
+
+    #[test]
+    fn quantization_config_validation_rejects_inconsistent_bits() {
+        let config = QuantizationConfig {
+            weight_method: QuantMethod::Fp8,
+            weight_bits: 4,
+            ..QuantizationConfig::default()
+        };
+        let error = config.validate().unwrap_err();
+        assert!(error.contains("4-bit"));
+
+        let valid = QuantizationConfig {
+            weight_method: QuantMethod::Awq,
+            weight_bits: 4,
+            ..QuantizationConfig::default()
+        };
+        assert!(valid.validate().is_ok());
+        assert!(valid.compatible_with_dtype(BloomDType::Q4));
+        assert!(!valid.compatible_with_dtype(BloomDType::F16));
+    }
+
+    #[test]
+    fn checked_kv_quantization_reports_shape_and_non_finite_errors() {
+        let shape_error = Int8QuantizedKv::try_quantize_f32(&[1.0, 2.0], 1, 3).unwrap_err();
+        assert!(shape_error.contains("shape mismatch"));
+        let non_finite = Int8QuantizedKv::try_quantize_f32(&[f32::NAN], 1, 1).unwrap_err();
+        assert!(non_finite.contains("non-finite"));
+
+        let quantized = Int8QuantizedKv::try_quantize_f32(&[1.0, -1.0], 1, 2).unwrap();
+        assert!(quantized.validate().is_ok());
+        assert_eq!(quantized.try_dequantize_f32().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn checked_kv_validation_rejects_corrupt_serialized_data() {
+        let mut quantized = Int8QuantizedKv::try_quantize_f32(&[1.0, -1.0], 1, 2).unwrap();
+        quantized.scales.clear();
+        let error = quantized.try_dequantize_f32().unwrap_err();
+        assert!(error.contains("shape mismatch"));
     }
 
     #[test]

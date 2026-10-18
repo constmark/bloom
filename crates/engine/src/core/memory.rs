@@ -81,6 +81,18 @@ impl MemoryReservation {
             });
         }
 
+        // `Vec` capacity is an `isize`-bounded allocation on supported Rust
+        // targets. Keep this guard in the low-level API as well as in the
+        // planner because callers may construct a reservation directly or
+        // deserialize a plan supplied by another process.
+        if bytes > isize::MAX as usize {
+            bail!(
+                "requested startup memory reservation {} exceeds the platform allocation limit {}",
+                format_bytes(bytes),
+                format_bytes(isize::MAX as usize)
+            );
+        }
+
         let mut chunks = Vec::new();
         let mut remaining = bytes;
         while remaining > 0 {
@@ -463,6 +475,12 @@ mod tests {
         let reservation = MemoryReservation::reserve(8192).unwrap();
         assert_eq!(reservation.bytes(), 8192);
         assert!(!reservation.is_empty());
+    }
+
+    #[test]
+    fn direct_reservation_rejects_unrepresentable_allocation() {
+        let error = MemoryReservation::reserve(usize::MAX).err().unwrap();
+        assert!(error.to_string().contains("platform allocation limit"));
     }
 
     #[test]

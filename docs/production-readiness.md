@@ -103,6 +103,33 @@ non-container macOS and Windows archive builders.
   isolated with their coupled resource lifetimes. The remaining request state,
   route composition, handler, UI, and Candle modules remain oversized.
 
+## Runtime hardening delivered in this iteration
+
+The engine now applies one bounded contract to embedded, FFI, plugin, and HTTP
+callers before backend execution. Text, token, audio, image, video, tensor,
+world-state, and action inputs reject oversized payloads, invalid MIME/path
+metadata, non-finite values, invalid sample rates, and impossible generation
+controls. Backend output is checked through the same contract; streaming sinks
+reject malformed events after a terminal event and model outputs reject
+non-finite vectors or inconsistent video metadata.
+
+Quantized KV writes and cache restores use checked shape/scale validation rather
+than assertion-based helpers. Quantization configurations reject impossible bit
+widths and incompatible manifest dtypes. Direct memory reservations reject
+allocations larger than the platform can represent. The ONNX external bridge
+now bounds retained stdout/stderr, closes stdin deterministically, drains noisy
+workers without deadlock, and kills hung workers at a bounded deadline
+(`BLOOM_ONNX_TIMEOUT_SECS`, capped at one hour).
+
+The core package also exposes a thread-safe operator registry with explicit
+dtype/layout/backend matching, deterministic priority selection, duplicate
+registration rejection, and cycle-checked fallbacks. A no-default-features
+server keeps a diagnostics-only Candle registration so doctor and preflight
+return an actionable incompatibility instead of a missing-engine 500 or a
+startup panic. These changes improve failure behavior and compatibility
+truthfulness; they do not promote a skeleton backend or an unmeasured hardware
+cell to production support.
+
 ## Operational boundaries
 
 Bloom intentionally delegates TLS, network rate limiting, health/metrics ACLs,

@@ -828,9 +828,15 @@ fn startup_model_check(
             );
         }
     };
-    let (_, device_backend_name) = match configured_device(args) {
-        Ok(configured) => configured,
-        Err(_) => unreachable!("device_kind was already validated"),
+    // `device_check` already resolved the selector and returned the exact
+    // admitted device. Re-resolving `auto` here can fail when a feature-gated
+    // engine is unavailable, and would make the startup diagnostic panic after
+    // the arguments had otherwise passed validation.
+    let device_backend_name = match device_kind {
+        DeviceKind::Cpu => "cpu",
+        DeviceKind::Gpu if cfg!(target_os = "macos") => "metal",
+        DeviceKind::Gpu => "cuda",
+        DeviceKind::Npu => "intel-npu",
     };
     let device_registry = BackendRegistry::default();
     let device_capability = match device_registry.get(device_backend_name) {
@@ -844,6 +850,13 @@ fn startup_model_check(
         }
     };
     let selected_engine = select_backend_name(&args.backend, &args.speculative, &manifest);
+    if let Err(error) = validate_ifb_backend(args.enable_ifb, &selected_engine) {
+        return DoctorCheck::fail(
+            "startup_model",
+            format!("The selected model route is incompatible with in-flight batching: {error}."),
+            "Disable in-flight batching or choose a model that resolves to the Candle engine.",
+        );
+    }
     let engines = engine_registry();
     let engine = match engines.get(&selected_engine) {
         Ok(engine) => engine,
@@ -872,13 +885,6 @@ fn startup_model_check(
                 "The selected '{selected_engine}' engine cannot report a verified physical device for strict aggregate memory admission."
             ),
             "Choose the Candle or Qwen3-VL backend until this engine exposes verified placement telemetry.",
-        );
-    }
-    if let Err(error) = validate_ifb_backend(args.enable_ifb, &selected_engine) {
-        return DoctorCheck::fail(
-            "startup_model",
-            format!("The selected model route is incompatible with in-flight batching: {error}."),
-            "Disable in-flight batching or choose a model that resolves to the Candle engine.",
         );
     }
     let memory_admission = (|| {

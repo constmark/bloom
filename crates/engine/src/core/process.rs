@@ -27,6 +27,19 @@ impl ChildGuard {
         self.reaped = true;
         Ok(status)
     }
+
+    /// Poll the child without blocking, recording ownership when the process
+    /// has already been reaped by the platform.  Callers that use bounded
+    /// subprocess runners need this instead of calling `Child::try_wait`
+    /// through the `Deref` implementation; otherwise `Drop` would attempt a
+    /// second wait after a successful poll.
+    pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        let status = self.child.try_wait()?;
+        if status.is_some() {
+            self.reaped = true;
+        }
+        Ok(status)
+    }
 }
 
 impl Deref for ChildGuard {

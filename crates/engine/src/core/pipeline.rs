@@ -8,7 +8,30 @@ use bloomai_core::{
 };
 
 use crate::core::memory::{available_system_memory, error_text_indicates_oom};
-use crate::{Engine, InferenceRequest, LoadedModel, ModelInput, ModelOutput, model::OutputSink};
+use crate::{
+    Engine, InferenceRequest, LoadedModel, ModelInput, ModelOutput, OutputChunk, model::OutputSink,
+};
+
+struct ValidatingOutputSink<'a> {
+    inner: &'a mut dyn OutputSink,
+    ended: bool,
+}
+
+impl OutputSink for ValidatingOutputSink<'_> {
+    fn on_chunk(&mut self, chunk: OutputChunk) -> Result<()> {
+        chunk.validate().map_err(BloomError::InvalidInput)?;
+        if self.ended {
+            return Err(BloomError::Engine(
+                "backend emitted output after the terminal event".to_string(),
+            )
+            .into());
+        }
+        if matches!(chunk, OutputChunk::End) {
+            self.ended = true;
+        }
+        self.inner.on_chunk(chunk)
+    }
+}
 
 /// Default context size used for memory pre-checks when none is specified.
 const DEFAULT_CONTEXT_SIZE: usize = 2048;
@@ -376,7 +399,10 @@ impl InferencePipeline {
     pub fn run(&self, input: ModelInput, params: &GenerationParams) -> Result<ModelOutput> {
         let _span = tracing::info_span!("pipeline.run").entered();
         params.validate().map_err(BloomError::InvalidInput)?;
-        self.model.infer(input, params)
+        input.validate().map_err(BloomError::InvalidInput)?;
+        let output = self.model.infer(input, params)?;
+        output.validate().map_err(BloomError::InvalidInput)?;
+        Ok(output)
     }
 
     pub fn run_stream(
@@ -387,7 +413,12 @@ impl InferencePipeline {
     ) -> Result<()> {
         let _span = tracing::info_span!("pipeline.run_stream").entered();
         params.validate().map_err(BloomError::InvalidInput)?;
-        self.model.infer_stream(input, params, sink)
+        input.validate().map_err(BloomError::InvalidInput)?;
+        let mut validating_sink = ValidatingOutputSink {
+            inner: sink,
+            ended: false,
+        };
+        self.model.infer_stream(input, params, &mut validating_sink)
     }
 
     /// Whether the loaded model has a native embedding-batch execution path.
@@ -404,6 +435,7 @@ impl InferencePipeline {
 
     pub fn run_request(&self, request: InferenceRequest, sink: &mut dyn OutputSink) -> Result<()> {
         let _span = tracing::info_span!("pipeline.run_request").entered();
+        request.validate().map_err(BloomError::InvalidInput)?;
         let params = GenerationParams {
             max_tokens: request.params.max_tokens,
             temperature: request.params.temperature,
@@ -412,7 +444,11 @@ impl InferencePipeline {
             response_format: request.params.response_format.clone(),
         };
         params.validate().map_err(BloomError::InvalidInput)?;
-        self.model.infer_request(request, sink)
+        let mut validating_sink = ValidatingOutputSink {
+            inner: sink,
+            ended: false,
+        };
+        self.model.infer_request(request, &mut validating_sink)
     }
 
     pub fn metadata(&self) -> &crate::ModelMetadata {

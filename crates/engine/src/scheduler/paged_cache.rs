@@ -242,8 +242,10 @@ impl PagedAttentionCache {
         let (stored_keys, stored_values, quant_keys, quant_values) =
             if self.config.kv_dtype.needs_dequant() {
                 // Quantize before storing
-                let qk = Int8QuantizedKv::quantize_f32(&keys, num_tokens, self.config.kv_dim);
-                let qv = Int8QuantizedKv::quantize_f32(&values, num_tokens, self.config.kv_dim);
+                let qk = Int8QuantizedKv::try_quantize_f32(&keys, num_tokens, self.config.kv_dim)
+                    .map_err(|error| anyhow!(error))?;
+                let qv = Int8QuantizedKv::try_quantize_f32(&values, num_tokens, self.config.kv_dim)
+                    .map_err(|error| anyhow!(error))?;
                 (Vec::new(), Vec::new(), Some(qk), Some(qv))
             } else {
                 (keys, values, None, None)
@@ -356,8 +358,12 @@ impl PagedAttentionCache {
         // `read_kv` intentionally consults the quantized fields for INT8/FP8.
         let (stored_keys, stored_values, quantized_keys, quantized_values) =
             if self.config.kv_dtype.needs_dequant() {
-                let qk = Int8QuantizedKv::quantize_f32(&keys_vec, num_tokens, self.config.kv_dim);
-                let qv = Int8QuantizedKv::quantize_f32(&values_vec, num_tokens, self.config.kv_dim);
+                let qk =
+                    Int8QuantizedKv::try_quantize_f32(&keys_vec, num_tokens, self.config.kv_dim)
+                        .map_err(|error| anyhow!(error))?;
+                let qv =
+                    Int8QuantizedKv::try_quantize_f32(&values_vec, num_tokens, self.config.kv_dim)
+                        .map_err(|error| anyhow!(error))?;
                 (Vec::new(), Vec::new(), Some(qk), Some(qv))
             } else {
                 (keys_vec, values_vec, None, None)
@@ -442,8 +448,10 @@ impl PagedAttentionCache {
             }
             if self.config.kv_dtype.needs_dequant() {
                 if let (Some(qk), Some(qv)) = (&block.quantized_keys, &block.quantized_values) {
-                    block_keys.extend(qk.dequantize_f32());
-                    block_values.extend(qv.dequantize_f32());
+                    block_keys.extend(qk.try_dequantize_f32().map_err(|error| anyhow!(error))?);
+                    block_values.extend(qv.try_dequantize_f32().map_err(|error| anyhow!(error))?);
+                } else {
+                    return Err(anyhow!("quantized KV block is missing key/value payload"));
                 }
             } else {
                 if block.keys.len() != expected || block.values.len() != expected {
@@ -475,7 +483,7 @@ impl PagedAttentionCache {
                 }
                 _ => {
                     if let Some(block) = self.restore_from_cachemesh(layer_idx, block_id)? {
-                        let block_data = from_cachemesh_block(&block, &self.config);
+                        let block_data = from_cachemesh_block(&block, &self.config)?;
                         let (block_keys, block_values) = append_block(&block_data)?;
                         all_keys.extend(block_keys);
                         all_values.extend(block_values);
@@ -1073,7 +1081,7 @@ impl PagedAttentionCache {
             ));
         }
 
-        let block_data = from_cachemesh_block(&block, &self.config);
+        let block_data = from_cachemesh_block(&block, &self.config)?;
         let mut layer_data = self.layer_data.lock().unwrap_or_else(|e| e.into_inner());
         layer_data[layer_idx].insert(block_id, block_data);
         self.bump_block_generation(layer_idx, block_id);
@@ -1220,27 +1228,25 @@ fn to_cachemesh_block(
     }
 }
 
-fn from_cachemesh_block(block: &CacheMeshBlock, config: &PagedCacheConfig) -> BlockKvData {
+fn from_cachemesh_block(block: &CacheMeshBlock, config: &PagedCacheConfig) -> Result<BlockKvData> {
     if config.kv_dtype.needs_dequant() {
-        BlockKvData {
+        Ok(BlockKvData {
             keys: Vec::new(),
             values: Vec::new(),
-            quantized_keys: Some(Int8QuantizedKv::quantize_f32(
-                &block.keys,
-                block.num_tokens,
-                config.kv_dim,
-            )),
-            quantized_values: Some(Int8QuantizedKv::quantize_f32(
-                &block.values,
-                block.num_tokens,
-                config.kv_dim,
-            )),
+            quantized_keys: Some(
+                Int8QuantizedKv::try_quantize_f32(&block.keys, block.num_tokens, config.kv_dim)
+                    .map_err(|error| anyhow!(error))?,
+            ),
+            quantized_values: Some(
+                Int8QuantizedKv::try_quantize_f32(&block.values, block.num_tokens, config.kv_dim)
+                    .map_err(|error| anyhow!(error))?,
+            ),
             num_tokens: block.num_tokens,
             keys_tensor: None,
             values_tensor: None,
-        }
+        })
     } else {
-        BlockKvData {
+        Ok(BlockKvData {
             keys: block.keys.clone(),
             values: block.values.clone(),
             quantized_keys: None,
@@ -1248,7 +1254,7 @@ fn from_cachemesh_block(block: &CacheMeshBlock, config: &PagedCacheConfig) -> Bl
             num_tokens: block.num_tokens,
             keys_tensor: None,
             values_tensor: None,
-        }
+        })
     }
 }
 

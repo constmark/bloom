@@ -73,6 +73,7 @@ pub trait LoadedModel: Send + Sync {
         sink: &mut dyn OutputSink,
     ) -> Result<()> {
         let output = self.infer(input, params)?;
+        output.validate().map_err(BloomError::InvalidInput)?;
         if let Some(text) = output.text {
             sink.on_chunk(OutputChunk::TextDelta(text))?;
         }
@@ -196,6 +197,7 @@ pub trait LoadedModel: Send + Sync {
     }
 
     fn infer_request(&self, request: InferenceRequest, sink: &mut dyn OutputSink) -> Result<()> {
+        request.validate().map_err(BloomError::InvalidInput)?;
         let mut blocks = request.blocks;
         if let Some(registry) = self.processors() {
             for spec in &self.metadata().manifest.processors {

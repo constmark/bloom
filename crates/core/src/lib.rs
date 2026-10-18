@@ -8,6 +8,7 @@ pub mod error;
 pub mod kv_overlay;
 pub mod manifest;
 pub mod online_switching;
+pub mod operator;
 pub mod plugin;
 pub mod resource;
 pub mod runtime;
@@ -28,6 +29,10 @@ pub use manifest::{
 pub use online_switching::{
     ModelSwitchCandidate, OnlineSwitchingConfig, OnlineSwitchingPolicy, SwitchDecision,
     SwitchPolicy,
+};
+pub use operator::{
+    OperatorDescriptor, OperatorKernel, OperatorRegistry, OperatorRegistryError, OperatorTensor,
+    TensorLayout,
 };
 pub use plugin::{
     BackendPluginManifest, EnginePluginManifest, ModelPackageFile, ModelPackageManifest,

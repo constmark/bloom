@@ -37,7 +37,9 @@ pub use crate::core::engine::{
     SupportLevel, default_engine_supports, device_kind_from_capability,
 };
 pub use crate::core::io::{
-    DataBlock, InferenceParams, InferenceRequest, ModelInput, ModelOutput, OutputChunk,
+    DataBlock, InferenceParams, InferenceRequest, MAX_AUDIO_SAMPLES, MAX_FRAME_BYTES,
+    MAX_IMAGE_BYTES, MAX_STATE_ID_BYTES, MAX_TENSOR_VALUES, MAX_TEXT_BYTES, MAX_TOKEN_COUNT,
+    MAX_VIDEO_FRAMES, ModelInput, ModelOutput, OutputChunk,
 };
 pub use crate::core::manifest::{
     MemoryEstimate, estimate_memory, estimate_memory_for_device, format_bytes, infer_quantization,
@@ -68,6 +70,10 @@ pub use crate::executor::mlx::MlxEngine;
 pub use crate::executor::npu_tts::NpuTtsEngine;
 pub use crate::executor::onnx::OnnxRuntimeEngine;
 pub use crate::executor::vulkan::VulkanEngine;
+pub use bloomai_core::{
+    OperatorDescriptor, OperatorKernel, OperatorRegistry, OperatorRegistryError, OperatorTensor,
+    TensorLayout,
+};
 
 pub use crate::batching::{BatchExecutorConfig, build_batch_executor};
 #[allow(deprecated)]

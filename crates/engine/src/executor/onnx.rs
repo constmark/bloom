@@ -5,9 +5,11 @@
 //! environment, this adapter executes the model through the bundled bridge and
 //! returns text or numeric output using a small JSON protocol.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use bloomai_core::{
@@ -22,6 +24,20 @@ use crate::{
 };
 
 pub struct OnnxRuntimeEngine;
+
+const DEFAULT_BRIDGE_TIMEOUT: Duration = Duration::from_secs(600);
+const MAX_BRIDGE_TIMEOUT_SECS: u64 = 3_600;
+const MAX_BRIDGE_STDOUT_BYTES: usize = 64 * 1024 * 1024;
+const MAX_BRIDGE_STDERR_BYTES: usize = 64 * 1024;
+
+#[derive(Debug)]
+struct BridgeOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_exceeded: bool,
+    stderr_exceeded: bool,
+}
 
 #[derive(Debug, serde::Deserialize)]
 struct OnnxProbe {
@@ -230,17 +246,19 @@ impl LoadedModel for OnnxRuntimeModel {
             .stderr(Stdio::piped());
         let script = script_path();
         crate::core::security::validate_external_script(&script)?;
-        let mut child = command
-            .spawn()
-            .map_err(|error| anyhow!("failed to launch ONNX Runtime bridge: {error}"))?;
-        child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("ONNX Runtime bridge stdin is unavailable"))?
-            .write_all(&request)?;
-        let output = child
-            .wait_with_output()
-            .map_err(|error| anyhow!("failed waiting for ONNX Runtime bridge: {error}"))?;
+        let output = run_bridge(&mut command, &request)?;
+        if output.stdout_exceeded {
+            return Err(anyhow!(
+                "ONNX Runtime bridge stdout exceeded the {} MiB limit",
+                MAX_BRIDGE_STDOUT_BYTES / (1024 * 1024)
+            ));
+        }
+        if output.stderr_exceeded {
+            return Err(anyhow!(
+                "ONNX Runtime bridge stderr exceeded the {} KiB limit",
+                MAX_BRIDGE_STDERR_BYTES / 1024
+            ));
+        }
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(anyhow!(
@@ -327,18 +345,18 @@ fn run_probe(python: &Path, script: &Path, model: &Path, device: DeviceKind) -> 
         .arg(device_label(device))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let output = command
-        .output()
-        .map_err(|error| anyhow!("failed to launch ONNX Runtime probe: {error}"))?;
+    let output = run_bridge(&mut command, &[])?;
+    if output.stdout_exceeded || output.stderr_exceeded {
+        return Err(anyhow!(
+            "ONNX Runtime probe output exceeded the 64 KiB limit"
+        ));
+    }
     if !output.status.success() {
         return Err(anyhow!(
             "ONNX Runtime probe failed ({}): {}",
             output.status,
             String::from_utf8_lossy(&output.stderr).trim()
         ));
-    }
-    if output.stdout.len() > 64 * 1024 || output.stderr.len() > 64 * 1024 {
-        return Err(anyhow!("ONNX Runtime probe output exceeded 64 KiB"));
     }
     let probe: OnnxProbe = serde_json::from_slice(&output.stdout).map_err(|error| {
         anyhow!(
@@ -350,6 +368,122 @@ fn run_probe(python: &Path, script: &Path, model: &Path, device: DeviceKind) -> 
         return Err(anyhow!("ONNX Runtime probe reported failure"));
     }
     Ok(probe)
+}
+
+fn bridge_timeout() -> Result<Duration> {
+    let Some(value) = std::env::var_os("BLOOM_ONNX_TIMEOUT_SECS") else {
+        return Ok(DEFAULT_BRIDGE_TIMEOUT);
+    };
+    let value = value
+        .to_str()
+        .ok_or_else(|| anyhow!("BLOOM_ONNX_TIMEOUT_SECS must be valid UTF-8"))?;
+    let seconds = value.parse::<u64>().map_err(|_| {
+        anyhow!(
+            "BLOOM_ONNX_TIMEOUT_SECS must be an integer between 1 and {MAX_BRIDGE_TIMEOUT_SECS}"
+        )
+    })?;
+    if !(1..=MAX_BRIDGE_TIMEOUT_SECS).contains(&seconds) {
+        return Err(anyhow!(
+            "BLOOM_ONNX_TIMEOUT_SECS must be between 1 and {MAX_BRIDGE_TIMEOUT_SECS}"
+        ));
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
+/// Execute a Python bridge with bounded output buffers and a hard wall-clock
+/// deadline. The readers drain beyond the retained limit so a noisy bridge
+/// cannot deadlock while the parent waits for it to exit.
+fn run_bridge(command: &mut Command, request: &[u8]) -> Result<BridgeOutput> {
+    let timeout = bridge_timeout()?;
+    let mut child = crate::core::process::ChildGuard::spawn(command)
+        .map_err(|error| anyhow!("failed to launch ONNX Runtime bridge: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("ONNX Runtime bridge has no stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("ONNX Runtime bridge has no stderr"))?;
+
+    let stdout_reader = thread::spawn(|| read_bounded(stdout, MAX_BRIDGE_STDOUT_BYTES));
+    let stderr_reader = thread::spawn(|| read_bounded(stderr, MAX_BRIDGE_STDERR_BYTES));
+
+    // Always take stdin so a probe with an empty request still sends EOF to
+    // the Python bridge. Keep nonempty writes off the polling thread: a
+    // bridge that stops reading before consuming a large multimodal request
+    // must still be interruptible by the wall-clock deadline.
+    let stdin_writer = if request.is_empty() {
+        // Probe commands generally inherit stdin because they never consume
+        // a request body. There is no pipe to close in that case.
+        drop(child.stdin.take());
+        None
+    } else {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("ONNX Runtime bridge stdin is unavailable"))?;
+        let request = request.to_vec();
+        Some(thread::spawn(move || stdin.write_all(&request)))
+    };
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            let _ = stdin_writer.map(|writer| writer.join()).transpose();
+            return Err(anyhow!(
+                "ONNX Runtime bridge timed out after {} seconds",
+                timeout.as_secs()
+            ));
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+
+    let (stdout, stdout_exceeded) = stdout_reader
+        .join()
+        .map_err(|_| anyhow!("ONNX Runtime bridge stdout reader panicked"))??;
+    let (stderr, stderr_exceeded) = stderr_reader
+        .join()
+        .map_err(|_| anyhow!("ONNX Runtime bridge stderr reader panicked"))??;
+    if let Some(writer) = stdin_writer {
+        writer
+            .join()
+            .map_err(|_| anyhow!("ONNX Runtime bridge stdin writer panicked"))??;
+    }
+    Ok(BridgeOutput {
+        stdout,
+        stderr,
+        stdout_exceeded,
+        stderr_exceeded,
+        status,
+    })
+}
+
+fn read_bounded(mut reader: impl Read, limit: usize) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut retained = Vec::with_capacity(limit.min(8192));
+    let mut buffer = [0u8; 8192];
+    let mut exceeded = false;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        if retained.len() < limit {
+            let keep = (limit - retained.len()).min(read);
+            retained.extend_from_slice(&buffer[..keep]);
+            exceeded |= keep < read;
+        } else {
+            exceeded = true;
+        }
+    }
+    Ok((retained, exceeded))
 }
 
 #[cfg(test)]
@@ -490,5 +624,34 @@ mod tests {
             )
             .unwrap();
         assert_eq!(output.text.as_deref(), Some("fake output"));
+    }
+
+    #[test]
+    fn bridge_reader_retains_only_the_configured_limit() {
+        let (bytes, exceeded) = read_bounded("abcdef".as_bytes(), 3).unwrap();
+        assert_eq!(bytes, b"abc");
+        assert!(exceeded);
+
+        let (bytes, exceeded) = read_bounded("abc".as_bytes(), 3).unwrap();
+        assert_eq!(bytes, b"abc");
+        assert!(!exceeded);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bridge_timeout_kills_a_hung_worker() {
+        use crate::test_env::{ENV_LOCK, EnvVarGuard};
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _timeout = EnvVarGuard::set("BLOOM_ONNX_TIMEOUT_SECS", "1");
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let started = Instant::now();
+        let error = run_bridge(&mut command, &[]).unwrap_err().to_string();
+        assert!(error.contains("timed out after 1 seconds"));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }
