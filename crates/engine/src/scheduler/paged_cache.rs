@@ -1161,6 +1161,7 @@ fn install_cachemesh_allocation_hook(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn register_block_keys_into(
     block_keys: &mut HashMap<(usize, usize), CacheMeshKey>,
     namespace: &str,

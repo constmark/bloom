@@ -1738,14 +1738,13 @@ impl CandleTextModel {
             // shared by the native Qwen2-MoE streaming executor and still
             // expects the scalar field, so normalize the newer spelling
             // before deserialization.
-            if !obj.contains_key("rope_theta") {
-                if let Some(rope_theta) = obj
+            if !obj.contains_key("rope_theta")
+                && let Some(rope_theta) = obj
                     .get("rope_parameters")
                     .and_then(|value| value.get("rope_theta"))
                     .cloned()
-                {
-                    obj.insert("rope_theta".to_string(), rope_theta);
-                }
+            {
+                obj.insert("rope_theta".to_string(), rope_theta);
             }
             if !obj.contains_key("tie_word_embeddings") {
                 obj.insert(
