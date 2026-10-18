@@ -188,17 +188,24 @@ impl TokenBucketRateLimiter {
         }
 
         let now = Instant::now();
-        let bucket_config = self
-            .config
-            .per_model_overrides
-            .get(model_id)
-            .cloned()
-            .unwrap_or_else(|| self.config.default_bucket.clone());
-
+        // Existing buckets are by far the common path. Reuse them directly so
+        // acquiring a permit does not clone configuration or allocate a new
+        // model-id string on every call. Configuration is only needed when a
+        // model is first seen.
+        if !self.buckets.contains_key(model_id) {
+            let bucket_config = self
+                .config
+                .per_model_overrides
+                .get(model_id)
+                .cloned()
+                .unwrap_or_else(|| self.config.default_bucket.clone());
+            self.buckets
+                .insert(model_id.to_string(), TokenBucket::new(&bucket_config));
+        }
         let bucket = self
             .buckets
-            .entry(model_id.to_string())
-            .or_insert_with(|| TokenBucket::new(&bucket_config));
+            .get_mut(model_id)
+            .expect("bucket inserted or present");
 
         if bucket.try_consume(tokens, now) {
             RateLimitDecision::Allowed
@@ -359,6 +366,30 @@ mod tests {
             limiter.try_acquire("premium-model", 500),
             RateLimitDecision::Allowed
         );
+    }
+
+    #[test]
+    fn existing_bucket_keeps_state_when_configuration_changes() {
+        let mut limiter = TokenBucketRateLimiter::new(RateLimiterConfig {
+            enabled: true,
+            default_bucket: TokenBucketConfig {
+                burst: 2,
+                rate_per_second: 0.0,
+            },
+            ..Default::default()
+        });
+
+        assert_eq!(limiter.try_acquire("m1", 2), RateLimitDecision::Allowed);
+
+        // Updating the configuration must not recreate a bucket that is
+        // already serving requests. Its consumed tokens and original
+        // capacity remain in effect until reset_bucket is called.
+        limiter.config.default_bucket.burst = 100;
+        assert!(matches!(
+            limiter.try_acquire("m1", 1),
+            RateLimitDecision::Throttled { .. }
+        ));
+        assert_eq!(limiter.snapshot().get("m1"), Some(&0.0));
     }
 
     #[test]
