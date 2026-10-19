@@ -3,4 +3,4 @@
 # maintained Apple Silicon environment and ships the Qwen/Llama/Gemma loaders
 # used by scripts/mlx_lm_infer.py.
 mlx==0.31.2
-mlx-lm==0.31.2
+mlx-lm==0.32.2
