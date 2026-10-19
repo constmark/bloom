@@ -6583,8 +6583,15 @@ mod tests {
         assert!(residency.expiry_for(&second).is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn ollama_timed_keep_alive_expires_and_new_policy_cancels_the_timer() {
+        // Catalog inspection uses blocking I/O. Keep the executor runnable so
+        // paused time cannot auto-advance while an HTTP request awaits that I/O.
+        let clock_guard = tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
         let temp = tempfile::tempdir().unwrap();
         let state = test_server_state_with_text_runtime(
             temp.path().to_path_buf(),
@@ -6614,7 +6621,22 @@ mod tests {
 
         let timed = app.clone().oneshot(preload(json!("40ms"))).await.unwrap();
         assert_eq!(timed.status(), axum::http::StatusCode::OK);
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        // Let the spawned expiry task register its timer without advancing
+        // time. Wall-clock delays must not expire the model before cancellation.
+        for _ in 0..100 {
+            if state.ollama_residency.lock().await.runtimes[0]
+                .expiry
+                .is_some()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            state.ollama_residency.lock().await.runtimes[0]
+                .expiry
+                .is_some()
+        );
         let processes = app
             .clone()
             .oneshot(
@@ -6631,21 +6653,55 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
+        assert_eq!(processes["models"].as_array().unwrap().len(), 1);
+        assert!(processes["models"][0]["expires_at"].is_string());
         assert_ne!(processes["models"][0]["expires_at"], "9999-12-31T23:59:59Z");
 
+        let previous_timer = state.ollama_residency.lock().await.runtimes[0]
+            .timer_cancel
+            .clone();
         let indefinite = app.clone().oneshot(preload(json!(-1))).await.unwrap();
         assert_eq!(indefinite.status(), axum::http::StatusCode::OK);
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(previous_timer.is_cancelled());
+        assert!(
+            state.ollama_residency.lock().await.runtimes[0]
+                .expiry
+                .is_none()
+        );
+        tokio::time::advance(Duration::from_millis(80)).await;
+        tokio::task::yield_now().await;
         assert!(!state.app.runtime_pool.read().await.is_empty());
 
         let expiring = app.oneshot(preload(json!("20ms"))).await.unwrap();
         assert_eq!(expiring.status(), axum::http::StatusCode::OK);
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while !state.app.runtime_pool.read().await.is_empty() && Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        for _ in 0..100 {
+            if state.ollama_residency.lock().await.runtimes[0]
+                .expiry
+                .is_some()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            state.ollama_residency.lock().await.runtimes[0]
+                .expiry
+                .is_some()
+        );
+        tokio::time::advance(Duration::from_millis(19)).await;
+        tokio::task::yield_now().await;
+        assert!(!state.app.runtime_pool.read().await.is_empty());
+        tokio::time::advance(Duration::from_millis(2)).await;
+        // advance wakes timers but does not guarantee their tasks have run.
+        for _ in 0..100 {
+            if state.app.runtime_pool.read().await.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
         }
         assert!(state.app.runtime_pool.read().await.is_empty());
         assert!(!state.app.ready.load(Ordering::Acquire));
+        clock_guard.abort();
     }
 
     #[tokio::test]
