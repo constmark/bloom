@@ -2175,9 +2175,15 @@ dependencies = [
 
 [[package]]
 name = "laya-decision"
+<<<<<<< HEAD
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1a6260dbb8e1b21d5b87feb5847e3970bfb96bb81442548212a9a7374f2e2eb6"
+=======
+version = "0.2.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9092a49ab0fb8539a82a02cab509f736840cb9a7ff67129ae81511ac0fa4cb26"
+>>>>>>> b0e49d2 (chore(deps): bump laya-decision from 0.2.4 to 0.2.10)
 dependencies = [
  "candle-core 0.9.2",
  "candle-nn 0.9.2",
