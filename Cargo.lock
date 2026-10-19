@@ -309,6 +309,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokenizers 0.23.2",
+ "tokenizers 0.23.1",
  "tokio",
  "tracing",
 ]
@@ -431,6 +432,7 @@ dependencies = [
  "safetensors 0.7.0",
  "thiserror 2.0.21",
  "yoke 0.8.4",
+ "yoke 0.8.3",
  "zip",
 ]
 
