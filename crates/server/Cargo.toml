@@ -63,5 +63,6 @@ mime_guess = { version = "2", optional = true }
 windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
 
 [dev-dependencies]
+tokio = { version = "1.52.3", features = ["test-util"] }
 tempfile = "3"
 tower.workspace = true
