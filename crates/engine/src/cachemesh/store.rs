@@ -843,6 +843,37 @@ mod tests {
     }
 
     #[test]
+    fn restore_many_preserves_order_and_restores_remote_blocks() {
+        let remote = Arc::new(InMemoryRemoteCache::new());
+        let mesh = CacheMesh::with_remote(
+            CacheMeshConfig {
+                enabled: true,
+                l2_capacity_bytes: 1,
+                l3_enabled: true,
+                ..Default::default()
+            },
+            Arc::clone(&remote) as Arc<dyn RemoteCacheBackend>,
+        );
+        let first = CacheMeshKey::from_tokens("m", 0, &[1, 2, 3, 4]);
+        let second = CacheMeshKey::from_tokens("m", 0, &[5, 6, 7, 8]);
+        let missing = CacheMeshKey::from_tokens("m", 0, &[9, 10, 11, 12]);
+        remote.put(block(first.clone(), 1.0)).unwrap();
+        remote.put(block(second.clone(), 2.0)).unwrap();
+
+        let restored = mesh
+            .restore_many(&[second.clone(), missing, first.clone()])
+            .unwrap();
+        assert_eq!(restored.len(), 3);
+        assert!(matches!(restored[0], Some((CacheMeshTier::L3, _))));
+        assert!(restored[1].is_none());
+        assert!(matches!(restored[2], Some((CacheMeshTier::L3, _))));
+        assert_eq!(restored[0].as_ref().unwrap().1.keys[0], 2.0);
+        assert_eq!(restored[2].as_ref().unwrap().1.keys[0], 1.0);
+        assert_eq!(mesh.metrics().l3.hits, 2);
+        assert_eq!(mesh.metrics().l3.misses, 1);
+    }
+
+    #[test]
     fn l2_eviction_spills_to_l3() {
         let remote = Arc::new(InMemoryRemoteCache::new());
         let mesh = CacheMesh::with_remote(
