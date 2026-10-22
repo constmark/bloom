@@ -21,6 +21,7 @@ flowchart TD
     Client["OpenAI / Ollama clients"] -->|HTTP| Server
     Server --> Engine["bloomai-engine (pipeline + scheduling)"]
     App["bloomai-app (process configuration + CLI)"] --> Engine
+    App --> Backend
     Server --> App
     App --> Backend
     FFI["bloomai-ffi"] --> Engine
@@ -30,7 +31,10 @@ flowchart TD
     Backend --> Core
 ```
 
-`bloomai-app` owns process configuration and the native CLI entry points.
+`bloomai-app` owns process configuration and the native CLI entry points. Its
+CLI resolves the requested device and backend through `bloomai-backend` before
+constructing an engine pipeline; this keeps `--device auto` and capability
+reporting consistent with the server's backend selection policy.
 `bloomai-server` is the HTTP composition root: it owns configuration application,
 runtime lifecycle, model catalog services, protocol adapters, routing, and
 middleware. The Dioxus UI consumes only versioned HTTP contracts. It can be
@@ -222,12 +226,12 @@ eligible for normal auto-routing.
   Manifest inference and execution share one fail-closed resolver for indexed
   Hugging Face Safetensors shards, so preflight accounting and mmap loading use
   the same ordered, complete, header-verified file set.
-- **External runtime:** OpenVINO, FunASR, llama.cpp, and vendor tools cross an
-  explicit process or SDK boundary.
+- **External runtime:** ONNX Runtime, MLX-LM, OpenVINO, FunASR, llama.cpp, and
+  vendor tools cross an explicit process or SDK boundary.
 - **Plugin:** third-party engines and backends declare capabilities through a
   manifest. Native plugins run as trusted in-process code.
-- **Skeleton:** ONNX Runtime, CoreML, MLX, Vulkan, and similar adapters may only
-  probe files and report missing runtime support until execution is connected.
+- **Skeleton:** CoreML, Vulkan, TensorRT, and similar adapters may only probe
+  files and report missing runtime support until execution is connected.
 
 The current maturity of each path is recorded in the
 [support matrix](support-matrix.md).

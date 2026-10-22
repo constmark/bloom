@@ -296,7 +296,15 @@ async fn prepare_loaded_runtime(
             "loaded pipeline changed device from {device_kind:?} to {actual_device:?}; refusing to publish a runtime whose memory topology cannot be accounted safely"
         ));
     }
-    if args.enable_ifb {
+    let retain_moe_template = args.enable_ifb
+        && matches!(
+            loaded_manifest
+                .parameters
+                .get("model_type")
+                .and_then(serde_json::Value::as_str),
+            Some("qwen2_moe" | "upcycling-qwen2-moe")
+        );
+    if args.enable_ifb && !retain_moe_template {
         // IFB creates independently accounted execution wrappers. Do not keep
         // the startup verification wrapper as an untracked extra weight copy.
         pipeline.release_idle_weights();
@@ -339,6 +347,12 @@ async fn prepare_loaded_runtime(
             runtime_memory_permit: memory_permit.clone(),
         },
     )?;
+    if retain_moe_template {
+        // The Qwen2-MoE scheduler now owns a cleared template that shares the
+        // startup tensors and expert cache. Drop this wrapper only after the
+        // template has captured those weights; requests keep independent KV.
+        pipeline.release_idle_weights();
+    }
 
     state.load_progress.store(95, Ordering::Release);
     let model_architecture = loaded_manifest
@@ -445,6 +459,7 @@ mod tests {
         assert!(validate_strict_runtime_backend("candle").is_ok());
         assert!(validate_strict_runtime_backend("qwen3_vl").is_ok());
         assert!(validate_strict_runtime_backend("onnxruntime").is_ok());
+        assert!(validate_strict_runtime_backend("mlx").is_ok());
         let error = validate_strict_runtime_backend("wan")
             .unwrap_err()
             .to_string();

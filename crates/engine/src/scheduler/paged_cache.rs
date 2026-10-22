@@ -645,22 +645,70 @@ impl PagedAttentionCache {
         // the remaining suffix from a block boundary to avoid replacing a
         // shared prefix block with a partial suffix.
         let reusable_limit = prompt_len.saturating_sub(1) / block_size * block_size;
-        let mut restored_tokens = 0;
+        // Gather all missing layer/block identities first. A remote backend
+        // can then fetch them in one logical operation instead of paying one
+        // round trip per layer of every prefix block.
+        let mut pending = Vec::new();
         for token_pos in (0..reusable_limit).step_by(block_size) {
             let Some(block_id) = self.block_for_handle(handle, token_pos) else {
                 break;
             };
             for layer_idx in 0..self.config.num_layers {
-                if self.get_l1_block(layer_idx, block_id).is_none()
-                    && self.restore_from_cachemesh(layer_idx, block_id)?.is_none()
-                {
-                    return Ok(restored_tokens);
+                if self.get_l1_block(layer_idx, block_id).is_some() {
+                    continue;
                 }
+                let Some(key) = self.cachemesh_key(layer_idx, block_id) else {
+                    continue;
+                };
+                pending.push((layer_idx, block_id, key));
+            }
+        }
+        if let Some(mesh) = &self.cachemesh
+            && !pending.is_empty()
+        {
+            for _ in &pending {
+                mesh.record_l1_lookup(false);
+            }
+            let keys: Vec<_> = pending.iter().map(|(_, _, key)| key.clone()).collect();
+            let restored = mesh.restore_many(&keys)?;
+            if restored.len() != pending.len() {
+                return Err(anyhow!(
+                    "CacheMesh returned {} blocks for {} requested keys",
+                    restored.len(),
+                    pending.len()
+                ));
+            }
+            for ((layer_idx, block_id, _), result) in pending.into_iter().zip(restored) {
+                let Some((_tier, block)) = result else {
+                    continue;
+                };
+                block.validate()?;
+                if block.block_size != self.config.block_size || block.kv_dim != self.config.kv_dim
+                {
+                    return Err(anyhow!(
+                        "CacheMesh block layout does not match the current model"
+                    ));
+                }
+                let block_data = from_cachemesh_block(&block, &self.config)?;
+                self.layer_data.lock().unwrap_or_else(|e| e.into_inner())[layer_idx]
+                    .insert(block_id, block_data);
+                self.bump_block_generation(layer_idx, block_id);
+            }
+        }
+
+        // Only a contiguous sequence of complete blocks is reusable. A
+        // missing or partial layer stops the prefix at that block boundary.
+        let mut restored_tokens = 0;
+        'prefix: for token_pos in (0..reusable_limit).step_by(block_size) {
+            let Some(block_id) = self.block_for_handle(handle, token_pos) else {
+                break;
+            };
+            for layer_idx in 0..self.config.num_layers {
                 let Some(block) = self.get_l1_block(layer_idx, block_id) else {
-                    return Ok(restored_tokens);
+                    break 'prefix;
                 };
                 if block.num_tokens != block_size {
-                    return Ok(restored_tokens);
+                    break 'prefix;
                 }
             }
             restored_tokens += block_size;

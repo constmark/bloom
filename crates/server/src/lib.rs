@@ -550,7 +550,13 @@ async fn run_server(
         }
         return Ok(());
     }
-    validate_server_arguments_with_cachemesh_backend(&args, cachemesh_remote.is_some())?;
+    // External runtimes may share the remote adapter without enabling the
+    // token-cache L3. Only an active CacheMesh backend affects the server's
+    // cachemesh-specific argument validation.
+    validate_server_arguments_with_cachemesh_backend(
+        &args,
+        cachemesh_remote.is_some() && args.enable_cachemesh_l3,
+    )?;
     let runtime_pool_capacity = NonZeroUsize::new(args.max_loaded_models)
         .ok_or_else(|| anyhow!("maximum loaded models must be at least 1"))?;
 
@@ -820,7 +826,15 @@ async fn run_server(
     let v1_routes = Router::new()
         .route("/observability", get(handle_observability))
         .route("/models", get(handle_models))
-        .route("/models/{model}", get(handle_model_retrieve))
+        .route(
+            "/models/{model}",
+            get(handle_model_retrieve)
+                .delete(handle_model_delete)
+                .layer(middleware::from_fn_with_state(
+                    Arc::clone(&state),
+                    require_model_delete_api_key,
+                )),
+        )
         .route(
             "/chat/completions",
             post(handle_chat_completions)

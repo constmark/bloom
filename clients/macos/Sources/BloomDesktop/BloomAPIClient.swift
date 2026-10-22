@@ -1,6 +1,8 @@
 import Foundation
 
 struct BloomAPIClient {
+    private static let maxReadinessResponseBytes = 64 * 1024
+
     let serverURL: URL
     let apiKey: String
     private let session: URLSession
@@ -42,16 +44,18 @@ struct BloomAPIClient {
             throw BloomClientError.http(http.statusCode, Self.errorMessage(from: data))
         }
 
-        let readiness: BloomReadiness
+        guard data.count <= Self.maxReadinessResponseBytes else {
+            throw BloomClientError.incompatibleServer
+        }
         do {
-            readiness = try JSONDecoder().decode(BloomReadiness.self, from: data)
+            let readiness = try JSONDecoder().decode(BloomReadiness.self, from: data)
+            try readiness.validate()
+            return readiness
         } catch {
+            // A reachable endpoint with an incomplete or incompatible readiness
+            // document is not a Bloom server for this client.
             throw BloomClientError.incompatibleServer
         }
-        guard readiness.schemaVersion == 3, readiness.object == "bloom.readiness" else {
-            throw BloomClientError.incompatibleServer
-        }
-        return readiness
     }
 
     @MainActor

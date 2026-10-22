@@ -385,6 +385,11 @@ impl WanVAE {
     /// Input:  [batch, C=16, F', H', W'] latent tensor
     /// Output: [batch, 3, F, H, W] decoded video tensor
     pub fn decode(&self, latent: &Tensor) -> Result<Tensor> {
+        if latent.dim(2)? == 0 {
+            return Err(anyhow::anyhow!(
+                "Wan VAE cannot decode a latent tensor with zero frames"
+            ));
+        }
         match Self::try_load_decoder(&self.config, &self.model_path, &self.device) {
             Some(decoder) => {
                 let res = self.decode_with_model(&decoder, latent)?;
@@ -559,6 +564,9 @@ impl WanVAE {
         latent_w: usize,
     ) -> (usize, usize, usize) {
         let cfg = &self.config;
+        if latent_f == 0 {
+            return (0, 0, 0);
+        }
         let f = (latent_f - 1) * cfg.temporal_stride + 1;
         let h = latent_h * cfg.spatial_stride;
         let w = latent_w * cfg.spatial_stride;
@@ -578,7 +586,12 @@ pub fn tensor_to_rgb_frame(frame: &Tensor) -> Result<Vec<u8>> {
         frame.clone()
     };
 
-    let (_c, h, w) = frame.dims3()?;
+    let (c, h, w) = frame.dims3()?;
+    if c != 3 {
+        return Err(anyhow!(
+            "RGB frame must have exactly 3 channels, received {c}"
+        ));
+    }
 
     // Denormalize from [-1, 1] to [0, 255]
     let frame = frame
@@ -625,6 +638,7 @@ mod tests {
         assert_eq!(f, 81); // (21-1)*4+1
         assert_eq!(h, 480); // 60*8
         assert_eq!(w, 832); // 104*8
+        assert_eq!(vae.output_dimensions(0, 60, 104), (0, 0, 0));
     }
 
     #[test]
@@ -640,5 +654,12 @@ mod tests {
         let result = vae.decode(&latent).unwrap();
         assert_eq!(result.dim(0).unwrap(), 1); // batch
         assert_eq!(result.dim(1).unwrap(), 3); // channels
+    }
+
+    #[test]
+    fn tensor_to_rgb_frame_rejects_invalid_channel_count() {
+        let frame = Tensor::zeros((1, 2, 2), DType::F32, &Device::Cpu).unwrap();
+        let error = tensor_to_rgb_frame(&frame).unwrap_err();
+        assert!(error.to_string().contains("exactly 3 channels"));
     }
 }

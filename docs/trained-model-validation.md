@@ -2,7 +2,33 @@
 
 Bloom keeps model weights out of its source tree and release archives. Its
 trained-model gates download exact official checkpoints into external caches,
-verify them before execution, and exercise the release binaries on CPU.
+verify them before execution, and exercise the release binaries on CPU. The
+Apple Silicon MLX profile below is an environment evidence record; it remains
+separate from the CI CPU profiles until its license payload and release-cache
+workflow are pinned.
+
+## Apple Silicon MLX evidence
+
+The local M5/Metal 4 environment executed the MLX-LM bridge with a fixed
+Qwen2.5 MLX package:
+
+| Field | Observation |
+| --- | --- |
+| Repository | `mlx-community/Qwen2.5-0.5B-Instruct-4bit` |
+| Revision | `a5339a4131f135d0fdc6a5c8b5bbed2753bbe0f3` |
+| Weight file | `model.safetensors` |
+| Weight size | `278064920` bytes |
+| Weight SHA-256 | `ddffab9cbc7bf6dde941c6724841eeca8981fcfa81ca20ff8efff1396326d153` |
+| Runtime | `mlx 0.31.2` + `mlx-lm 0.31.2` |
+| Device | Apple M5 GPU / Metal 4 |
+| Bloom path | `bloom_infer --backend mlx --device gpu` |
+| Result | Model-backed text response; OpenAI and Ollama protocol smoke gates passed (no exact semantic output claim) |
+
+The source package includes a single-file Safetensors index. Bloom validates
+that the index maps every tensor to that one file before accepting it, while
+still rejecting an ambiguous single-file plus shard layout. The MLX bridge is
+available through `requirements/mlx.txt`; this record does not promote MLX to
+stable support or replace target-hardware soak and release provenance review.
 
 ## Pinned models
 

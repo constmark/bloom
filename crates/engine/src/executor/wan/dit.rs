@@ -209,6 +209,12 @@ pub fn rope_apply(
     let seq_len = x.dim(1)?;
     let num_heads = x.dim(2)?;
     let head_dim = x.dim(3)?;
+    if grid_sizes.len() != batch {
+        return Err(candle_core::Error::Msg(format!(
+            "Wan RoPE grid count ({}) must match tensor batch size ({batch})",
+            grid_sizes.len()
+        )));
+    }
 
     // Split head_dim into 3 parts: temporal, spatial_h, spatial_w
     let c_t = head_dim - 2 * (head_dim / 3);
@@ -218,8 +224,16 @@ pub fn rope_apply(
     let mut batch_outputs = Vec::new();
 
     for i in 0..batch {
-        let (f, h, w) = grid_sizes[i.min(grid_sizes.len() - 1)];
-        let spatial_seq = f * h * w;
+        let (f, h, w) = grid_sizes[i];
+        let spatial_seq = f
+            .checked_mul(h)
+            .and_then(|value| value.checked_mul(w))
+            .ok_or_else(|| candle_core::Error::Msg("Wan RoPE grid size overflows".into()))?;
+        if f == 0 || h == 0 || w == 0 || spatial_seq > seq_len {
+            return Err(candle_core::Error::Msg(
+                "Wan RoPE grid dimensions must be positive and fit the sequence".into(),
+            ));
+        }
 
         // Get this sample's tokens: [spatial_seq, num_heads, head_dim]
         let x_i = x.narrow(0, i, 1)?.squeeze(0)?; // [seq_len, num_heads, head_dim]
@@ -1007,11 +1021,27 @@ impl WanModel {
         let c = cfg.out_dim;
         let (pt, ph, pw) = cfg.patch_size;
         let b = x.dim(0)?;
+        if grid_sizes.len() != b {
+            return Err(candle_core::Error::Msg(format!(
+                "Wan unpatchify grid count ({}) must match tensor batch size ({b})",
+                grid_sizes.len()
+            )));
+        }
 
         let mut outputs = Vec::new();
         for i in 0..b {
             let (f, h, w) = grid_sizes[i];
-            let seq = f * h * w;
+            if f == 0 || h == 0 || w == 0 {
+                return Err(candle_core::Error::Msg(
+                    "Wan unpatchify grid dimensions must be positive".into(),
+                ));
+            }
+            let seq = f
+                .checked_mul(h)
+                .and_then(|value| value.checked_mul(w))
+                .ok_or_else(|| {
+                    candle_core::Error::Msg("Wan unpatchify grid size overflows".into())
+                })?;
             let x_i = x.narrow(0, i, 1)?.squeeze(0)?.narrow(0, 0, seq)?;
             // [seq, c*pt*ph*pw] -> [f*h*w, c, pt*ph*pw]
             let x_i = x_i.reshape((f * h * w, c, pt * ph * pw))?;
@@ -1051,6 +1081,14 @@ mod tests {
     fn test_rope_params_shape() {
         let freqs = rope_params(128, 32, 10000.0, &Device::Cpu).unwrap();
         assert_eq!(freqs.dims(), &[128, 16, 2]);
+    }
+
+    #[test]
+    fn rope_apply_rejects_missing_batch_grid_metadata() {
+        let device = Device::Cpu;
+        let x = Tensor::zeros((1, 1, 1, 6), DType::F32, &device).unwrap();
+        let freqs = Tensor::zeros((1, 1, 2), DType::F32, &device).unwrap();
+        assert!(rope_apply(&x, &[], &freqs, &freqs, &freqs).is_err());
     }
 
     #[test]

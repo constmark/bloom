@@ -414,8 +414,10 @@ async (page) => {
   await assertDialogContract(settingsDialog, 'Settings');
   assert(await page.getByRole('textbox', { name: 'Server address' }).count() === 1,
     'server address has no accessible name');
-  assert(await page.getByRole('textbox', { name: 'API key (optional)' }).count() === 1,
-    'API key has no accessible name');
+  // Password controls intentionally expose the native password semantics, so
+  // query their accessible label instead of forcing the generic textbox role.
+  assert(await page.getByLabel('API key (optional)', { exact: true }).count() === 1,
+    'API key has no accessible label');
   assert(await page.getByRole('checkbox', { name: 'Remember API key in this browser' }).count() === 1,
     'credential-persistence control has no accessible name');
   await assertFocusLoop(settingsDialog, 'Settings');

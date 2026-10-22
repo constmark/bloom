@@ -1,5 +1,6 @@
 mod batching;
 
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -1369,6 +1370,34 @@ impl crate::scheduler::kv_hook::KvHook for PerRequestKvHook {
             )),
         }
     }
+
+    fn rollback_kv_cache(&self, handle: usize, length: usize) -> anyhow::Result<()> {
+        let mut models = self
+            .request_models
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(wrapper) = models.get_mut(&handle) else {
+            return Err(anyhow!(
+                "PerRequestKvHook: handle {} not found in request_models map",
+                handle
+            ));
+        };
+        let Some(qw) = wrapper.downcast_mut::<QwenModelWrapper>() else {
+            return Err(anyhow!(
+                "PerRequestKvHook: model for handle {} is not a QwenModelWrapper",
+                handle
+            ));
+        };
+        match qw {
+            QwenModelWrapper::Streaming(model) => {
+                model.truncate_kv_cache(length).map_err(Into::into)
+            }
+            _ => Err(anyhow!(
+                "PerRequestKvHook: model variant {:?} does not support KV rollback (only Streaming is supported)",
+                qw.variant_name()
+            )),
+        }
+    }
 }
 
 struct CandleTextModel {
@@ -1389,6 +1418,53 @@ struct CandleTextModel {
     processors: crate::processor::ProcessorRegistry,
     current_prefix: Mutex<Vec<u32>>,
     kv_cache_pool: Arc<crate::scheduler::BloomKvCachePool>,
+}
+
+/// Keeps the logical prefix marker in sync with the physical model cache.
+///
+/// A streaming request can return early when tokenization, model execution, or
+/// the output sink fails. In that case the model cache may contain only a
+/// partial sequence, so retaining the prefix would make the next request
+/// attempt an invalid cache reuse. Clear the marker unless inference commits
+/// successfully.
+struct PrefixStateGuard<'a> {
+    guard: std::sync::MutexGuard<'a, Vec<u32>>,
+    committed: bool,
+}
+
+impl<'a> PrefixStateGuard<'a> {
+    fn new(guard: std::sync::MutexGuard<'a, Vec<u32>>) -> Self {
+        Self {
+            guard,
+            committed: false,
+        }
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Deref for PrefixStateGuard<'_> {
+    type Target = Vec<u32>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl DerefMut for PrefixStateGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl Drop for PrefixStateGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.guard.clear();
+        }
+    }
 }
 
 impl CandleTextModel {
@@ -1981,9 +2057,11 @@ impl CandleTextModel {
             .tokenizer
             .decode(&all_tokens[prompt_len..], true)
             .map_err(|e| anyhow!("tokenizer decode error: {}", e))?;
-        if text.len() > prev_text.len() {
-            let new_text = &text[prev_text.len()..];
-            sink.on_chunk(crate::io::OutputChunk::TextDelta(new_text.to_string()))?;
+        if text != *prev_text {
+            let new_text = text.strip_prefix(prev_text.as_str()).unwrap_or(&text);
+            if !new_text.is_empty() {
+                sink.on_chunk(crate::io::OutputChunk::TextDelta(new_text.to_string()))?;
+            }
             *prev_text = text;
         }
         Ok(())
@@ -2235,10 +2313,11 @@ impl CandleTextModel {
         let is_embedding = self.is_embedding_model();
 
         let mut start_pos = 0;
-        let mut current_prefix_guard = self
-            .current_prefix
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut current_prefix_guard = PrefixStateGuard::new(
+            self.current_prefix
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
         if !is_embedding {
             // Candle's causal caches can extend an existing sequence, but
             // these wrappers do not expose safe suffix truncation. Reuse is
@@ -2302,6 +2381,10 @@ impl CandleTextModel {
             *model_guard = Some(reloaded);
         }
         if is_embedding {
+            // Embedding requests reset the physical cache above and never
+            // establish a reusable causal prefix. Drop any marker left by a
+            // preceding generation before running the embedding forward pass.
+            current_prefix_guard.clear();
             let input_ids = Tensor::new(token_ids.clone(), &self.device)?.unsqueeze(0)?;
             let logits = model_guard
                 .as_mut()
@@ -2311,6 +2394,7 @@ impl CandleTextModel {
             let mean_vec = mean.squeeze(0)?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
             sink.on_chunk(crate::io::OutputChunk::Embedding(mean_vec))?;
             sink.on_chunk(crate::io::OutputChunk::End)?;
+            current_prefix_guard.commit();
             return Ok(());
         }
 
@@ -2695,6 +2779,7 @@ impl CandleTextModel {
                 self.residency_strategy
             );
         }
+        current_prefix_guard.commit();
         Ok(())
     }
 }
@@ -3609,6 +3694,27 @@ mod tests {
         let path = std::env::temp_dir().join(format!("bloom_candle_test_{}", now));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn prefix_state_guard_clears_uncommitted_updates() {
+        let prefix = Mutex::new(vec![1, 2, 3]);
+        {
+            let mut guard = PrefixStateGuard::new(prefix.lock().unwrap());
+            guard.push(4);
+        }
+        assert!(prefix.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn prefix_state_guard_preserves_committed_updates() {
+        let prefix = Mutex::new(vec![1, 2, 3]);
+        {
+            let mut guard = PrefixStateGuard::new(prefix.lock().unwrap());
+            guard.push(4);
+            guard.commit();
+        }
+        assert_eq!(*prefix.lock().unwrap(), vec![1, 2, 3, 4]);
     }
 
     #[test]

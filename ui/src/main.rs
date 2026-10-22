@@ -5285,7 +5285,7 @@ fn MessageList(
                     div { class: "empty-state-eyebrow", "{copy.home_eyebrow}" }
                     h2 { "{copy.home_title}" }
                     p { class: "empty-state-lead", "{copy.home_body}" }
-                    h3 { class: "empty-state-status-title", "{view.title}" }
+                    h3 { class: "empty-state-status-title", role: "status", "{view.title}" }
                     p { class: "empty-state-status-body", "{view.body}" }
                     div { class: "empty-state-capabilities",
                         div { class: "empty-state-capability",
@@ -6006,9 +6006,11 @@ fn SettingsDrawer(
                 div { id: "settings-description", class: "drawer-sub", "Connect to a running bloom_server instance." }
 
                 div { class: "field",
-                    label { r#for: "base-url", "Server address" }
+                    label { id: "base-url-label", r#for: "base-url", "Server address" }
                     input {
                         id: "base-url",
+                        aria_labelledby: "base-url-label",
+                        aria_label: "Server address",
                         value: "{base_url}",
                         maxlength: "{MAX_BASE_URL_CHARS}",
                         placeholder: "http://127.0.0.1:3000",
@@ -6022,10 +6024,13 @@ fn SettingsDrawer(
                     div { class: "help", "Defaults to the current origin when the UI is embedded in Bloom." }
                 }
                 div { class: "field",
-                    label { r#for: "api-key", "API key (optional)" }
+                    label { id: "api-key-label", r#for: "api-key", "API key (optional)" }
                     input {
                         id: "api-key",
+                        role: "textbox",
+                        aria_labelledby: "api-key-label",
                         r#type: "password",
+                        aria_label: "API key (optional)",
                         value: "{api_key}",
                         maxlength: "{MAX_API_KEY_CHARS}",
                         placeholder: "BLOOM_API_KEY",
@@ -6039,10 +6044,12 @@ fn SettingsDrawer(
                     div { class: "help", "Required when the server uses --api-key. Hidden from diagnostics and conversation exports." }
                 }
                 div { class: "field",
-                    label { r#for: "operator-api-key", "Operator API key (optional)" }
+                    label { id: "operator-api-key-label", r#for: "operator-api-key", "Operator API key (optional)" }
                     input {
                         id: "operator-api-key",
+                        role: "textbox",
                         r#type: "password",
+                        aria_label: "Operator credential (optional)",
                         value: "{operator_api_key}",
                         maxlength: "{MAX_API_KEY_CHARS}",
                         placeholder: "BLOOM_OPERATOR_API_KEY",

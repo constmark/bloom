@@ -1,5 +1,5 @@
 //! Ownership and decoding at external inference process boundaries.
-use std::io::{ErrorKind, Read};
+use std::io::{ErrorKind, Read, Write};
 use std::ops::{Deref, DerefMut};
 use std::process::{Child, Command, ExitStatus, Stdio};
 
@@ -10,6 +10,24 @@ use anyhow::{Context, Result, bail, ensure};
 pub(crate) struct ChildGuard {
     child: Child,
     reaped: bool,
+}
+
+/// Write a request to a spawned inference process while preserving ownership
+/// on error. A broken pipe (or a missing stdin handle) means the worker has
+/// already failed; explicitly kill and reap it before returning so callers do
+/// not leave a zombie behind on an early I/O error.
+pub(crate) fn write_stdin(child: &mut Child, request: &[u8]) -> Result<()> {
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("inference process has no stdin");
+    };
+    if let Err(error) = stdin.write_all(request) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error).context("failed to write inference request");
+    }
+    Ok(())
 }
 
 impl ChildGuard {
@@ -163,6 +181,25 @@ mod tests {
             .unwrap();
         // SAFETY: waitpid receives a valid PID and no output pointer; the child
         // must already have been reaped by the guard.
+        assert_eq!(
+            unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_stdin_kills_and_reaps_the_worker() {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        let mut child = command.spawn().unwrap();
+        let pid = child.id() as libc::pid_t;
+
+        assert!(write_stdin(&mut child, b"request").is_err());
         assert_eq!(
             unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
             -1

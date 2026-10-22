@@ -11,6 +11,7 @@ Install Rust using rustup, then run:
 python3 -m pip install -r requirements/schema-validation.txt
 cargo fmt --all -- --check
 cargo check --workspace --all-targets --locked
+cargo build --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
 python3 scripts/check_markdown_links.py

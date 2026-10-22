@@ -362,7 +362,7 @@ fn main() -> Result<()> {
             e
         )
     })?;
-    let device_kind = bloomai_backend::BackendRegistry::default()
+    let device_kind = bloomai_engine::BackendRegistry::default()
         .resolve_device_selector(&args.device, &engine.supported_devices())
         .map_err(|error| anyhow!("could not resolve device '{}': {error}", args.device))?;
 
