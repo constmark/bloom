@@ -1093,6 +1093,13 @@ pub trait EngineExecutor: Send + Sync {
     fn execute(&self, batch: ExecutionBatch) -> Result<BatchResult>;
     fn max_batch_size(&self, phase: ExecutionPhase) -> usize;
 
+    /// Release executor-local state associated with a scheduler KV handle.
+    ///
+    /// KV handles are recycled by the pool. Executors that retain request
+    /// state keyed by a handle must clear it when the scheduler releases the
+    /// allocation; stateless executors can keep the default no-op.
+    fn clear_request_state(&self, _handle: usize) {}
+
     /// Return a verified reusable prefix for a newly allocated request.
     /// Executors without a KV restore capability must recompute the prompt.
     fn prepare_prefill(&self, _handle: usize, _prompt_len: usize) -> Result<usize> {

@@ -1081,6 +1081,183 @@ pub(crate) async fn handle_model_inventory_restore(
     }
 }
 
+/// Queue a bounded set of exact-commit inventory restores.
+///
+/// The download manager intentionally runs one transfer at a time.  The
+/// batch endpoint therefore performs all validation synchronously and then
+/// owns a small background loop which starts each verified request after the
+/// previous one reaches a terminal state.  Existing single-item restore and
+/// normal model downloads keep their original behaviour.
+pub(crate) async fn handle_model_inventory_bulk_restore(
+    State(state): State<Arc<ServerState>>,
+    Json(expected): Json<model_inventory::ModelInventory>,
+) -> axum::response::Response {
+    let Some(manager) = state.app.model_downloads.as_ref() else {
+        return error_response(
+            axum::http::StatusCode::FORBIDDEN,
+            "model_downloads_disabled",
+            "Inventory restore requires verified model downloads. Start bloom_server with --enable-model-downloads.",
+        );
+    };
+    if let Err(message) = expected.validate_import() {
+        return error_response(
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid_model_inventory",
+            message,
+        );
+    }
+    if expected.models.len() > model_inventory::MAX_BULK_RESTORE_ENTRIES {
+        return error_response(
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+            "model_inventory_restore_too_many",
+            format!(
+                "Bulk inventory restore accepts at most {} entries.",
+                model_inventory::MAX_BULK_RESTORE_ENTRIES
+            ),
+        );
+    }
+    let (catalog, _) = match state.app.fresh_model_catalog_snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return api_error(ApiError::InternalError, error),
+    };
+    let current = model_inventory::ModelInventory::from_catalog(&catalog);
+    let current_ids = current
+        .models
+        .iter()
+        .map(|model| model.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut requests = Vec::new();
+    let mut queued = Vec::new();
+    let mut rejected = Vec::new();
+    for model in &expected.models {
+        if current_ids.contains(model.id.as_str()) {
+            rejected.push(json!({
+                "model": model.id,
+                "reason": "already_present"
+            }));
+            continue;
+        }
+        let candidate = match model_inventory::ModelInventory::restore_candidate(
+            &expected, &current, &model.id,
+        ) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                rejected.push(json!({
+                    "model": model.id,
+                    "reason": "not_restorable",
+                    "message": error.to_string()
+                }));
+                continue;
+            }
+        };
+        if candidate.size_bytes > manager.max_bytes() {
+            rejected.push(json!({
+                "model": candidate.filename,
+                "reason": "too_large"
+            }));
+            continue;
+        }
+        queued.push(candidate.filename.clone());
+        requests.push(ModelDownloadRequest {
+            url: candidate.url,
+            filename: candidate.filename,
+            sha256: candidate.sha256,
+            license: candidate.license,
+            expected_size_bytes: Some(candidate.size_bytes),
+            model_index_id: candidate.model_index_id,
+        });
+    }
+    let operation_id = next_request_id(&state, "restore-batch");
+    if !requests.is_empty() {
+        let manager = Arc::clone(manager);
+        let operation_id_for_task = operation_id.clone();
+        tokio::spawn(async move {
+            run_inventory_restore_batch(manager, requests, operation_id_for_task).await;
+        });
+    }
+    (
+        if queued.is_empty() {
+            axum::http::StatusCode::OK
+        } else {
+            axum::http::StatusCode::ACCEPTED
+        },
+        [(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        )],
+        Json(json!({
+            "object": "bloom.model_inventory_bulk_restore",
+            "accepted": !queued.is_empty(),
+            "operation_id": operation_id,
+            "queued": queued,
+            "rejected": rejected
+        })),
+    )
+        .into_response()
+}
+
+async fn run_inventory_restore_batch(
+    manager: Arc<ModelDownloadManager>,
+    requests: Vec<ModelDownloadRequest>,
+    operation_id: String,
+) {
+    for request in requests {
+        let wait_deadline = Instant::now() + Duration::from_secs(30);
+        let mut started = false;
+        while Instant::now() < wait_deadline {
+            match manager.start(request.clone()).await {
+                Ok(_) => {
+                    started = true;
+                    break;
+                }
+                Err(ModelDownloadStartError::Conflict(_)) => {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        operation_id = %operation_id,
+                        model = %request.filename,
+                        error = %error,
+                        "bulk inventory restore item was rejected by the download manager"
+                    );
+                    break;
+                }
+            }
+        }
+        if !started {
+            tracing::warn!(
+                operation_id = %operation_id,
+                model = %request.filename,
+                "bulk inventory restore item was not started before the admission deadline"
+            );
+            continue;
+        }
+        let completion_deadline = Instant::now() + Duration::from_secs(24 * 60 * 60);
+        loop {
+            let status = manager.status().await;
+            if status.filename.as_deref() == Some(request.filename.as_str())
+                && matches!(
+                    status.phase,
+                    model_download::ModelDownloadPhase::Complete
+                        | model_download::ModelDownloadPhase::Cancelled
+                        | model_download::ModelDownloadPhase::Error
+                )
+            {
+                break;
+            }
+            if Instant::now() >= completion_deadline {
+                tracing::warn!(
+                    operation_id = %operation_id,
+                    model = %request.filename,
+                    "bulk inventory restore item exceeded the completion deadline"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+}
+
 pub(crate) async fn handle_model_preflight(
     State(state): State<Arc<ServerState>>,
     Json(payload): Json<ModelPreflightRequest>,

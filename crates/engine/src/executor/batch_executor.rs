@@ -233,6 +233,20 @@ impl CandleBatchExecutor {
         self
     }
 
+    /// Drop speculative decoding state associated with a released KV handle.
+    ///
+    /// Handles are recycled by the paged KV pool. Keeping a strategy keyed by
+    /// a recycled handle would leak the previous request's n-gram/draft
+    /// history into the next request and retain a draft model longer than its
+    /// request lifetime. The pool's release callback calls this method after
+    /// removing the request model and prefix marker.
+    pub fn clear_speculative_strategy(&self, handle: usize) {
+        self.speculative_strategies
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&handle);
+    }
+
     #[cfg(test)]
     fn with_speculative_mode(mut self, mode: SpeculativeMode) -> Self {
         self.speculative_mode = Some(mode);
@@ -972,6 +986,10 @@ impl CandleBatchExecutor {
 }
 
 impl EngineExecutor for CandleBatchExecutor {
+    fn clear_request_state(&self, handle: usize) {
+        self.clear_speculative_strategy(handle);
+    }
+
     fn prepare_prefill(&self, handle: usize, prompt_len: usize) -> Result<usize> {
         self.bind_device_context()?;
         match (&self.cache, &self.kv_hook) {

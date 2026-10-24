@@ -696,6 +696,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accepts_legacy_v1_watermarks_and_advances_them_to_v2_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        fs::create_dir(&state).unwrap();
+        let source_id = "ab".repeat(32);
+        let legacy = WatermarkRecord {
+            schema_version: 1,
+            object: WATERMARK_OBJECT.to_string(),
+            source_id: source_id.clone(),
+            generated_at: 10,
+            generation_id: "a".repeat(64),
+            revocations: None,
+        };
+        fs::write(
+            state.join(record_filename(&legacy)),
+            format!("{}\n", serde_json::to_string_pretty(&legacy).unwrap()),
+        )
+        .unwrap();
+
+        // A restart against a pre-revocation (v1) state must remain readable,
+        // and a normal v2 publication must preserve that history rather than
+        // treating the legacy record as an untrusted or empty directory.
+        let store = ModelIndexWatermarkStore::new(state.clone(), source_id.clone()).unwrap();
+        assert!(store.revocations().unwrap().is_empty());
+        assert_eq!(
+            store.admit(candidate(20, "b")).await.unwrap(),
+            ModelIndexWatermarkAdmission::Accepted
+        );
+
+        let records = read_records(&state).unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().any(|record| record.schema_version == 1));
+        let current = latest_watermark(&records, &source_id).unwrap().unwrap();
+        assert_eq!(current.generated_at, 20);
+        assert!(current.revocations.is_empty());
+    }
+
+    #[tokio::test]
     async fn same_generation_conflicts_fail_closed_and_source_ids_are_isolated() {
         let temp = tempfile::tempdir().unwrap();
         let state = temp.path().join("state");

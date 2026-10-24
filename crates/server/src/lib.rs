@@ -463,12 +463,20 @@ unsafe fn run_cli_inner(
     cachemesh_remote: Option<Arc<dyn bloomai_engine::RemoteCacheBackend>>,
     argv: Option<Vec<String>>,
 ) -> Result<()> {
-    tracing_subscriber::fmt()
+    // `run_cli*` is also the public embedding entry point.  An embedding
+    // process may start and stop Bloom more than once (for example during a
+    // hot reload or an integration-test fixture), while tracing's global
+    // subscriber can only be installed once.  `init()` panics on the second
+    // invocation and turns a recoverable startup error into process abort.
+    // Ignore the already-installed subscriber and keep Bloom startup
+    // idempotent; applications remain free to install their own subscriber
+    // before calling us.
+    let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
-        .init();
+        .try_init();
 
     let (mut args, matches) = match argv {
         Some(argv) => parse_args_from(argv)?,
@@ -774,6 +782,12 @@ async fn run_server(
         .route(
             "/model-management/inventory/reconcile",
             post(handle_model_inventory_reconcile).layer(DefaultBodyLimit::max(
+                model_inventory::MAX_MODEL_INVENTORY_BYTES,
+            )),
+        )
+        .route(
+            "/model-management/inventory/restore",
+            post(handle_model_inventory_bulk_restore).layer(DefaultBodyLimit::max(
                 model_inventory::MAX_MODEL_INVENTORY_BYTES,
             )),
         )
@@ -8127,6 +8141,45 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn model_inventory_bulk_restore_is_explicitly_opt_in() {
+        let temp = tempfile::tempdir().unwrap();
+        let expected = model_inventory::ModelInventory::from_catalog(
+            &ModelCatalog::scan(temp.path(), None).unwrap(),
+        );
+        let (state, _receiver) = test_server_state(temp.path().to_path_buf());
+
+        let response = handle_model_inventory_bulk_restore(State(state), Json(expected)).await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn model_inventory_bulk_restore_honors_its_route_body_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = ModelStorageManager::new(temp.path().to_path_buf(), 0, 0);
+        let manager =
+            ModelDownloadManager::with_storage(temp.path().to_path_buf(), 1024, storage).unwrap();
+        let (state, _receiver) =
+            test_server_state_with_acquisitions(temp.path().to_path_buf(), Some(manager), None);
+        let app = Router::new()
+            .route(
+                "/",
+                post(handle_model_inventory_bulk_restore).layer(DefaultBodyLimit::max(32)),
+            )
+            .with_state(state);
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from("x".repeat(33)))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]

@@ -103,9 +103,12 @@ real-model and hardware validation.
 - Run the authenticated inventory reconciliation preview after restore or
   deployment. Treat blocking drift as a stop condition and remediate through
   normal verified acquisition or removal workflows; reconciliation itself does
-  not mutate the catalog. Inventory restore is intentionally per-model: inspect
-  the exact source and checksum in the saved inventory before confirmation, and
-  compare again after the verified download finishes.
+  not mutate the catalog. Use the per-model restore action for a targeted
+  repair, or the bounded bulk restore action for up to 32 missing entries. Bulk
+  restore validates every exact source/checksum before queueing, downloads one
+  model at a time, and reports per-entry admission rejection; its operation ID
+  is a correlation value for logs rather than a durable job history. Compare
+  again after the verified downloads finish.
 - Review the Models drawer preflight on the deployment host before switching.
   Treat its memory and capability verdict as an early admission check, not as
   real-model validation or a guarantee that an external runtime will start.

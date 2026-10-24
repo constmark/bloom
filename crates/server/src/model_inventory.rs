@@ -14,6 +14,13 @@ pub(crate) const MODEL_INVENTORY_OBJECT: &str = "bloom.model_inventory";
 pub(crate) const MODEL_INVENTORY_CONTENT_DISPOSITION: &str =
     "attachment; filename=\"bloom-model-inventory.json\"";
 pub(crate) const MAX_MODEL_INVENTORY_BYTES: usize = 16 * 1024 * 1024;
+/// Upper bound for one operator initiated restore batch.
+///
+/// A batch is deliberately small because the download manager serializes
+/// transfers and each item reserves storage before it starts.  Keeping the
+/// bound explicit prevents an inventory upload from becoming an unbounded
+/// background job while still making fleet/bootstrap restores practical.
+pub(crate) const MAX_BULK_RESTORE_ENTRIES: usize = 32;
 const MAX_MODEL_INVENTORY_ENTRIES: usize = 20_000;
 const MAX_RECONCILIATION_DRIFT_ENTRIES: usize = 200;
 
@@ -320,7 +327,7 @@ impl ModelInventory {
         })
     }
 
-    fn validate_import(&self) -> Result<(), String> {
+    pub(crate) fn validate_import(&self) -> Result<(), String> {
         if !(MIN_MODEL_INVENTORY_SCHEMA_VERSION..=MODEL_INVENTORY_SCHEMA_VERSION)
             .contains(&self.schema_version)
         {

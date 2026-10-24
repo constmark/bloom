@@ -1016,6 +1016,7 @@ pub struct ModelProvenance {
 pub const MODEL_INVENTORY_FILENAME: &str = "bloom-model-inventory.json";
 pub const MAX_MODEL_INVENTORY_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_MODEL_INVENTORY_DRIFT_ENTRIES: usize = 200;
+pub const MAX_MODEL_INVENTORY_RESTORE_ENTRIES: usize = 32;
 const MODEL_INVENTORY_SCHEMA_VERSION: u8 = 2;
 const MIN_MODEL_INVENTORY_SCHEMA_VERSION: u8 = 1;
 const MODEL_INVENTORY_RECONCILIATION_SCHEMA_VERSION: u8 = 1;
@@ -1102,6 +1103,26 @@ pub struct ModelInventoryDrift {
 pub struct ModelInventoryComparison {
     pub expected: ModelInventory,
     pub report: ModelInventoryReconciliation,
+}
+
+/// Bounded result returned by the operator bulk inventory restore endpoint.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ModelInventoryBulkRestore {
+    pub object: String,
+    pub accepted: bool,
+    pub operation_id: String,
+    pub queued: Vec<String>,
+    pub rejected: Vec<ModelInventoryRestoreRejection>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ModelInventoryRestoreRejection {
+    pub model: String,
+    pub reason: String,
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default, PartialEq)]
@@ -3508,6 +3529,169 @@ pub async fn restore_model_from_inventory(
         || response.get("model").and_then(serde_json::Value::as_str) != Some(model_id)
     {
         return Err("server returned an inconsistent model inventory restore response".to_string());
+    }
+    Ok(())
+}
+
+/// Queue all restorable entries from a validated inventory in one bounded
+/// operator operation. The server still downloads serially and reports
+/// per-entry rejections, so a partial restore never appears as an all-or-
+/// nothing success to the UI.
+pub async fn restore_models_from_inventory(
+    cfg: &ConnConfig,
+    inventory: &ModelInventory,
+) -> Result<ModelInventoryBulkRestore, String> {
+    validate_model_inventory(inventory)?;
+    if inventory.models.len() > MAX_MODEL_INVENTORY_RESTORE_ENTRIES {
+        return Err(format!(
+            "Bulk inventory restore accepts at most {} entries.",
+            MAX_MODEL_INVENTORY_RESTORE_ENTRIES
+        ));
+    }
+    let url = format!(
+        "{}/v1/model-management/inventory/restore",
+        cfg.base_url.trim_end_matches('/')
+    );
+    let body = serde_json::to_string(inventory)
+        .map_err(|error| format!("failed to encode model inventory: {error}"))?;
+    if body.len() as u64 > MAX_MODEL_INVENTORY_BYTES {
+        return Err("model inventory exceeds the supported restore size limit".to_string());
+    }
+    let response = operator_request(cfg, &url, "POST", Some(&body)).await?;
+    if !response.ok() {
+        return Err(read_response_error(&response).await);
+    }
+    let text = read_json_response_text(&response, MAX_MODEL_RESTORE_RESPONSE_BYTES).await?;
+    let result = serde_json::from_str::<ModelInventoryBulkRestore>(&text)
+        .map_err(|error| format!("invalid bulk model inventory restore response: {error}"))?;
+    validate_bulk_inventory_restore(&result, inventory)?;
+    Ok(result)
+}
+
+/// Select only the exact-commit entries identified as restorable by the latest
+/// reconciliation. The exported inventory can contain many already-present or
+/// non-restorable entries; sending those entries would consume the bounded
+/// bulk budget and make an otherwise valid "restore all" action fail closed.
+pub fn restorable_inventory_subset(
+    inventory: &ModelInventory,
+    report: &ModelInventoryReconciliation,
+) -> Result<ModelInventory, String> {
+    validate_model_inventory(inventory)?;
+    validate_model_inventory_reconciliation(report)?;
+    if report.truncated {
+        return Err(
+            "The reconciliation is truncated; restore models individually before retrying bulk restore."
+                .to_string(),
+        );
+    }
+    if report.summary.restorable_count > MAX_MODEL_INVENTORY_RESTORE_ENTRIES {
+        return Err(format!(
+            "Bulk inventory restore accepts at most {MAX_MODEL_INVENTORY_RESTORE_ENTRIES} restorable entries; restore the remainder individually."
+        ));
+    }
+    let restorable_ids = report
+        .drift
+        .iter()
+        .filter(|drift| drift.restore_available)
+        .map(|drift| drift.id.as_str())
+        .collect::<HashSet<_>>();
+    if restorable_ids.len() != report.summary.restorable_count {
+        return Err(
+            "The reconciliation did not identify every restorable inventory entry.".to_string(),
+        );
+    }
+    if restorable_ids
+        .iter()
+        .any(|id| !inventory.models.iter().any(|model| model.id == *id))
+    {
+        return Err(
+            "The reconciliation referenced a model absent from the expected inventory.".to_string(),
+        );
+    }
+    let mut subset = inventory.clone();
+    subset
+        .models
+        .retain(|model| restorable_ids.contains(model.id.as_str()));
+    subset.summary = ModelInventorySummary {
+        model_count: subset.models.len(),
+        provenance_count: subset
+            .models
+            .iter()
+            .filter(|model| model.provenance_status == "recorded")
+            .count(),
+        source_locked_count: subset
+            .models
+            .iter()
+            .filter(|model| model.source_locked)
+            .count(),
+        quarantined_count: subset
+            .models
+            .iter()
+            .filter(|model| model.integrity == "quarantined")
+            .count(),
+        invalid_provenance_count: subset
+            .models
+            .iter()
+            .filter(|model| model.provenance_status == "invalid")
+            .count(),
+    };
+    validate_model_inventory(&subset)?;
+    Ok(subset)
+}
+
+fn validate_bulk_inventory_restore(
+    result: &ModelInventoryBulkRestore,
+    inventory: &ModelInventory,
+) -> Result<(), String> {
+    if result.object != "bloom.model_inventory_bulk_restore" {
+        return Err("server returned an unexpected bulk inventory restore object".to_string());
+    }
+    validate_diagnostic_label(
+        "bulk inventory restore operation",
+        &result.operation_id,
+        128,
+        false,
+    )?;
+    if result.queued.len() > MAX_MODEL_INVENTORY_RESTORE_ENTRIES
+        || result.rejected.len() > MAX_MODEL_INVENTORY_RESTORE_ENTRIES
+    {
+        return Err("server returned too many bulk inventory restore entries".to_string());
+    }
+    let expected_ids = inventory
+        .models
+        .iter()
+        .map(|model| model.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut returned_ids = std::collections::BTreeSet::new();
+    for model in &result.queued {
+        validate_catalog_id("queued inventory model", model)?;
+        if !expected_ids.contains(model.as_str()) || !returned_ids.insert(model.as_str()) {
+            return Err(
+                "server returned an invalid or duplicate queued inventory model".to_string(),
+            );
+        }
+    }
+    for rejection in &result.rejected {
+        validate_catalog_id("rejected inventory model", &rejection.model)?;
+        validate_diagnostic_label(
+            "bulk inventory restore rejection reason",
+            &rejection.reason,
+            64,
+            false,
+        )?;
+        if let Some(message) = &rejection.message {
+            validate_diagnostic_label("bulk inventory restore rejection", message, 512, false)?;
+        }
+        if !expected_ids.contains(rejection.model.as_str())
+            || !returned_ids.insert(rejection.model.as_str())
+        {
+            return Err(
+                "server returned an invalid or duplicate rejected inventory model".to_string(),
+            );
+        }
+    }
+    if result.accepted != !result.queued.is_empty() {
+        return Err("server returned inconsistent bulk inventory restore acceptance".to_string());
     }
     Ok(())
 }
@@ -7780,5 +7964,43 @@ mod tests {
         .unwrap();
         assert_eq!(restorable.summary.restorable_count, 1);
         assert!(restorable.drift[0].restore_available);
+    }
+
+    #[test]
+    fn bulk_inventory_restore_response_is_bounded_and_fail_closed() {
+        let inventory = decode_model_inventory(
+            r#"{
+                "schema_version":2,
+                "object":"bloom.model_inventory",
+                "summary":{"model_count":1,"provenance_count":1,"source_locked_count":1,"quarantined_count":0,"invalid_provenance_count":0},
+                "models":[{
+                    "id":"tiny.gguf","kind":"file","format":"gguf","size_bytes":42,"size_complete":true,
+                    "provenance_status":"recorded","acquisition":"download","model_index_id":"tiny-q4",
+                    "source":{"url":"https://huggingface.co/acme/tiny/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/tiny.gguf","host":"huggingface.co","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","immutable_revision":true},
+                    "sha256":"abababababababababababababababababababababababababababababababab","license":"Apache-2.0","installed_at":1700000000,"last_verified_at":1700000100,"integrity":"verified","source_locked":true
+                }]
+            }"#,
+        )
+        .unwrap();
+        let result: ModelInventoryBulkRestore = serde_json::from_value(serde_json::json!({
+            "object":"bloom.model_inventory_bulk_restore",
+            "accepted":true,
+            "operation_id":"restore-batch-1",
+            "queued":["tiny.gguf"],
+            "rejected":[]
+        }))
+        .unwrap();
+        assert!(validate_bulk_inventory_restore(&result, &inventory).is_ok());
+
+        let mut duplicate = result.clone();
+        duplicate.rejected.push(ModelInventoryRestoreRejection {
+            model: "tiny.gguf".to_string(),
+            reason: "already_present".to_string(),
+            message: None,
+        });
+        assert_eq!(
+            validate_bulk_inventory_restore(&duplicate, &inventory),
+            Err("server returned an invalid or duplicate rejected inventory model".to_string())
+        );
     }
 }

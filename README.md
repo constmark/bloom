@@ -678,7 +678,7 @@ The server exposes:
 
 - `/health`, the versioned `/ready` UI/server handshake, and `/metrics`
 - `/v1/models`, `/v1/models/{model}`, and the versioned `/v1/observability` diagnostics snapshot
-- `/v1/model-management/models`, `/index*`, `/inventory`, `/inventory/reconcile`, `/inventory/restore/{id}`, `/preflight`, `/switch`, `/unload`, `/remove`, `/integrity`, `/downloads*`, and `/imports*`
+- `/v1/model-management/models`, `/index*`, `/inventory`, `/inventory/reconcile`, `/inventory/restore` (bounded bulk), `/inventory/restore/{id}`, `/preflight`, `/switch`, `/unload`, `/remove`, `/integrity`, `/downloads*`, and `/imports*`
 - `/v1/responses`, `/v1/responses/{response_id}`,
   `/v1/responses/{response_id}/input_items`, `/v1/chat/completions`, and
   `/v1/completions`

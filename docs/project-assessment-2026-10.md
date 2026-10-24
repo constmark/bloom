@@ -104,3 +104,30 @@ publish real ONNX/OpenVINO/ASR provider and model gates; add trained
 multimodal and cross-encoder evidence; then run the multi-hour deployment,
 cancellation, disk-failure, upgrade/rollback, and cross-platform wheel drills
 before promoting any experimental support label.
+
+## 2026-10-24 follow-up
+
+This pass closed the software-completable production gaps found in the runtime
+and model-management audit. Native Qwen2-MoE batching now shares immutable
+weights and bounded GPU expert storage across independent request KV state;
+eviction respects active leases and reports cache pressure. Request teardown
+also clears speculative-decoding state, preventing handle reuse from carrying
+strategy state into a later request. The embedded server's tracing setup is
+idempotent, so repeated in-process startup no longer panics.
+
+Model inventory restore now has an authenticated, bounded bulk endpoint for up
+to 32 exact source/checksum entries. Admission is fail-closed, transfers are
+serialized through the verified no-overwrite path, and each entry returns an
+explicit rejection when it cannot be restored. The GUI exposes the same action
+with busy-state and result feedback. Legacy v1 index watermarks have a
+regression test covering migration into the v2 history, and CI now compiles
+the embedded UI feature as a release-facing gate.
+
+Validation passed for the full workspace (including no-default-feature and
+WASM UI checks), UI tests, strict Clippy, formatting, architecture tests, JSON
+artifact validation, and the server/UI bulk-restore contracts. These changes
+improve correctness and operability but do not change the support labels:
+stable deployment still requires target-hardware multi-hour soak,
+failure-injection and upgrade/rollback drills, official multi-architecture
+container provenance, binary-wheel ABI matrices, executable CoreML/Vulkan or
+TensorRT adapters, and trained multimodal/tool-quality evidence.

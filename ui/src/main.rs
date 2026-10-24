@@ -2180,6 +2180,7 @@ fn ModelDrawer(config: Signal<ConnConfig>, on_close: EventHandler<()>, locale: L
     let mut inventory_pending = use_signal(|| false);
     let mut inventory_notice = use_signal(|| Option::<String>::None);
     let mut inventory_compare_pending = use_signal(|| false);
+    let mut inventory_bulk_pending = use_signal(|| false);
     let mut inventory_compare_input_key = use_signal(|| 0_u64);
     let mut inventory_reconciliation =
         use_signal(|| Option::<api::ModelInventoryReconciliation>::None);
@@ -2684,6 +2685,46 @@ fn ModelDrawer(config: Signal<ConnConfig>, on_close: EventHandler<()>, locale: L
         });
     };
 
+    let restore_all_inventory_models = move |_| {
+        let Some(expected) = inventory_expected() else {
+            operation_error.set(Some(
+                "Compare the inventory again before restoring models.".to_string(),
+            ));
+            return;
+        };
+        let Some(report) = inventory_reconciliation() else {
+            operation_error.set(Some(
+                "Compare the inventory again before restoring models.".to_string(),
+            ));
+            return;
+        };
+        if operation_pending() || inventory_bulk_pending() {
+            return;
+        }
+        let expected = match api::restorable_inventory_subset(&expected, &report) {
+            Ok(expected) => expected,
+            Err(message) => {
+                operation_error.set(Some(message));
+                return;
+            }
+        };
+        inventory_bulk_pending.set(true);
+        operation_error.set(None);
+        inventory_notice.set(None);
+        let cfg = config();
+        spawn(async move {
+            match api::restore_models_from_inventory(&cfg, &expected).await {
+                Ok(result) => inventory_notice.set(Some(format!(
+                    "Queued {} verified restore(s); {} skipped.",
+                    result.queued.len(),
+                    result.rejected.len()
+                ))),
+                Err(message) => operation_error.set(Some(message)),
+            }
+            inventory_bulk_pending.set(false);
+        });
+    };
+
     rsx! {
         div { class: "drawer-overlay", onclick: move |_| on_close.call(()),
             div {
@@ -2869,6 +2910,25 @@ fn ModelDrawer(config: Signal<ConnConfig>, on_close: EventHandler<()>, locale: L
                                             "Warnings"
                                         }
                                     }
+                                    if report.summary.restorable_count > 0
+                                        && report.summary.restorable_count
+                                            <= api::MAX_MODEL_INVENTORY_RESTORE_ENTRIES
+                                        && !report.truncated
+                                    {
+                                        button {
+                                            class: "btn-ghost compact",
+                                            disabled: inventory_bulk_pending()
+                                                || operation_pending()
+                                                || !snapshot.download.enabled,
+                                            title: if !snapshot.download.enabled {
+                                                "Start bloom_server with --enable-model-downloads to restore models"
+                                            } else {
+                                                "Restore all exact-commit entries with verified SHA-256"
+                                            },
+                                            onclick: restore_all_inventory_models,
+                                            if inventory_bulk_pending() { "Restoring…" } else { "Restore all" }
+                                        }
+                                    }
                                     button {
                                         class: "btn-ghost compact",
                                         onclick: move |_| {
@@ -2953,6 +3013,11 @@ fn ModelDrawer(config: Signal<ConnConfig>, on_close: EventHandler<()>, locale: L
                                 if report.summary.restorable_count > 0 && !snapshot.download.enabled {
                                     p { class: "inventory-restore-guidance",
                                         "Verified model downloads are disabled. Restart bloom_server with --enable-model-downloads to enable explicit restores."
+                                    }
+                                }
+                                if report.summary.restorable_count > api::MAX_MODEL_INVENTORY_RESTORE_ENTRIES {
+                                    p { class: "inventory-restore-guidance",
+                                        "Bulk restore is bounded to {api::MAX_MODEL_INVENTORY_RESTORE_ENTRIES} models. Use the per-model Restore action for the remaining entries."
                                     }
                                 }
                                 if report.truncated {
