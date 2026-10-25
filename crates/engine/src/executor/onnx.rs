@@ -341,6 +341,7 @@ fn run_probe(python: &Path, script: &Path, model: &Path, device: DeviceKind) -> 
         .arg(model)
         .arg("--device")
         .arg(device_label(device))
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let output = run_bridge(&mut command, &[])?;
