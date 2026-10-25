@@ -10,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use bloomai_core::{DeviceClass, DeviceKind, GenerationParams, Modality, ModelFamily, ModelFormat};
@@ -62,6 +63,24 @@ fn default_python() -> PathBuf {
         .into_iter()
         .find(|path| path.exists())
         .unwrap_or_else(|| PathBuf::from("python"))
+}
+
+fn tts_timeout(name: &str, default: Duration) -> Result<Duration> {
+    let Some(value) = std::env::var_os(name) else {
+        return Ok(default);
+    };
+    let value = value
+        .to_str()
+        .ok_or_else(|| anyhow!("{name} must be valid UTF-8"))?;
+    let seconds = value
+        .parse::<u64>()
+        .map_err(|_| anyhow!("{name} must be an integer between 1 and {MAX_TTS_TIMEOUT_SECS}"))?;
+    if !(1..=MAX_TTS_TIMEOUT_SECS).contains(&seconds) {
+        return Err(anyhow!(
+            "{name} must be between 1 and {MAX_TTS_TIMEOUT_SECS}"
+        ));
+    }
+    Ok(Duration::from_secs(seconds))
 }
 
 /// Default model root directory: the user's `models` directory on every
@@ -247,33 +266,54 @@ fn download_from_modelscope(repo_id: &str, model_root: &Path) -> Result<PathBuf>
         )
     })?;
 
-    // Download via modelscope snapshot_download
-    let download_script = format!(
-        "from modelscope import snapshot_download; \
-         path = snapshot_download('{}', cache_dir='{}'); \
-         print(path)",
-        repo_id,
-        model_root.display()
-    );
-
-    let output = Command::new(&python)
+    // Keep user-controlled repository/path values out of the Python source;
+    // pass them as argv so quotes and shell/Python metacharacters remain data.
+    let download_script = "import sys; from modelscope import snapshot_download; print(snapshot_download(sys.argv[1], cache_dir=sys.argv[2]))";
+    let mut command = Command::new(&python);
+    command
         .arg("-c")
-        .arg(&download_script)
+        .arg(download_script)
+        .arg(repo_id)
+        .arg(model_root)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .output()
-        .map_err(|e| anyhow!("failed to run modelscope download: {}", e))?;
+        .stderr(Stdio::piped());
+    let output = crate::core::process::run_bounded_output(
+        &mut command,
+        &[],
+        MAX_TTS_STDOUT_BYTES,
+        MAX_TTS_STDERR_BYTES,
+        tts_timeout(
+            "BLOOM_TTS_DOWNLOAD_TIMEOUT_SECS",
+            DEFAULT_TTS_DOWNLOAD_TIMEOUT,
+        )?,
+    )
+    .map_err(|e| anyhow!("failed to run modelscope download: {e}"))?;
 
-    if !output.status.success() {
+    if output.stdout_exceeded || output.stderr_exceeded {
         return Err(anyhow!(
-            "ModelScope download failed for '{}'. \
-             You can download manually and place in {}.",
-            repo_id,
-            model_root.display()
+            "ModelScope download diagnostics exceeded the configured output limits"
         ));
     }
 
-    let downloaded_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "ModelScope download failed for '{}'. \
+             You can download manually and place in {}. Diagnostics: {}",
+            repo_id,
+            model_root.display(),
+            stderr.trim()
+        ));
+    }
+
+    let downloaded_path = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .to_string();
     let result_path = PathBuf::from(&downloaded_path);
 
     if result_path.exists() {
@@ -300,6 +340,12 @@ fn download_from_modelscope(repo_id: &str, model_root: &Path) -> Result<PathBuf>
 /// Text-to-Speech engine targeting Intel NPU via OpenVINO GenAI,
 /// with fallback to CosyVoice/ChatTTS on CPU/GPU.
 pub struct NpuTtsEngine;
+
+const DEFAULT_TTS_TIMEOUT: Duration = Duration::from_secs(600);
+const DEFAULT_TTS_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(3_600);
+const MAX_TTS_TIMEOUT_SECS: u64 = 3_600;
+const MAX_TTS_STDOUT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_TTS_STDERR_BYTES: usize = 64 * 1024;
 
 impl Engine for NpuTtsEngine {
     fn name(&self) -> &'static str {
@@ -493,9 +539,20 @@ impl LoadedModel for NpuTtsModel {
             self.backend
         );
 
-        let output = command
-            .output()
-            .map_err(|e| anyhow!("failed to spawn TTS inference process: {}", e))?;
+        let output = crate::core::process::run_bounded_output(
+            &mut command,
+            &[],
+            MAX_TTS_STDOUT_BYTES,
+            MAX_TTS_STDERR_BYTES,
+            tts_timeout("BLOOM_TTS_TIMEOUT_SECS", DEFAULT_TTS_TIMEOUT)?,
+        )
+        .map_err(|e| anyhow!("failed to spawn TTS inference process: {e}"))?;
+
+        if output.stdout_exceeded || output.stderr_exceeded {
+            return Err(anyhow!(
+                "TTS inference diagnostics exceeded the configured output limits"
+            ));
+        }
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);

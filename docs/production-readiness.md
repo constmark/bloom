@@ -116,12 +116,18 @@ non-finite vectors or inconsistent video metadata.
 Quantized KV writes and cache restores use checked shape/scale validation rather
 than assertion-based helpers. Quantization configurations reject impossible bit
 widths and incompatible manifest dtypes. Direct memory reservations reject
-allocations larger than the platform can represent. The ONNX and MLX external
-bridges now share a bounded process runner: retained stdout/stderr are capped,
-stdin closes deterministically, noisy workers are drained without pipe
-deadlock, and hung workers are killed at a bounded deadline
-(`BLOOM_ONNX_TIMEOUT_SECS` or `BLOOM_MLX_TIMEOUT_SECS`, each capped at one
-hour).
+allocations larger than the platform can represent. The ONNX, MLX, and NPU TTS
+external bridges now share a bounded process runner: retained stdout/stderr
+are capped, stdin closes deterministically, noisy workers are drained without
+pipe deadlock, and hung workers are killed at a bounded deadline
+(`BLOOM_ONNX_TIMEOUT_SECS`, `BLOOM_MLX_TIMEOUT_SECS`, or
+`BLOOM_TTS_TIMEOUT_SECS`; TTS downloads use
+`BLOOM_TTS_DOWNLOAD_TIMEOUT_SECS`, each capped at one hour). ModelScope
+arguments are passed as process arguments instead of interpolated into Python
+source. The llama.cpp capability probe applies the same boundary with a
+64 KiB-per-stream cap and ten-second deadline. OpenVINO and Intel NPU
+auto-export workers use the boundary as well, with a one-hour conversion
+deadline.
 
 The core package also exposes a thread-safe operator registry with explicit
 dtype/layout/backend matching, deterministic priority selection, duplicate

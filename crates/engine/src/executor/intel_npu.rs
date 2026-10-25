@@ -11,6 +11,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use bloomai_core::{DeviceClass, DeviceKind, GenerationParams, Modality, ModelFamily, ModelFormat};
@@ -270,7 +271,8 @@ fn export_to_openvino_ir(model_path: &Path) -> Result<()> {
         weight_format
     );
 
-    let output = Command::new(&python)
+    let mut command = Command::new(&python);
+    command
         .arg("-m")
         .arg("optimum.intel.openvino.cli")
         .arg("export")
@@ -279,16 +281,29 @@ fn export_to_openvino_ir(model_path: &Path) -> Result<()> {
         .arg("--weight-format")
         .arg(&weight_format)
         .arg(model_path)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| {
-            anyhow!(
-                "failed to execute Python for OpenVINO IR export using {}: {}",
-                python.display(),
-                e
-            )
-        })?;
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = crate::core::process::run_bounded_output(
+        &mut command,
+        &[],
+        MAX_OPENVINO_EXPORT_OUTPUT_BYTES,
+        MAX_OPENVINO_EXPORT_OUTPUT_BYTES,
+        OPENVINO_EXPORT_TIMEOUT,
+    )
+    .map_err(|e| {
+        anyhow!(
+            "failed to execute Python for OpenVINO IR export using {}: {}",
+            python.display(),
+            e
+        )
+    })?;
+
+    if output.stdout_exceeded || output.stderr_exceeded {
+        return Err(anyhow!(
+            "OpenVINO IR export diagnostics exceeded 64 KiB per stream"
+        ));
+    }
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -321,6 +336,9 @@ fn export_to_openvino_ir(model_path: &Path) -> Result<()> {
 /// Wraps the OpenVINO GenAI Python bridge with NPU-first device selection,
 /// automatic model export, and hardware probing.
 pub struct IntelNpuEngine;
+
+const OPENVINO_EXPORT_TIMEOUT: Duration = Duration::from_secs(3_600);
+const MAX_OPENVINO_EXPORT_OUTPUT_BYTES: usize = 64 * 1024;
 
 impl Engine for IntelNpuEngine {
     fn name(&self) -> &'static str {

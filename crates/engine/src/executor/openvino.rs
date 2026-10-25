@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use bloomai_core::{DeviceClass, DeviceKind, GenerationParams, Modality, ModelFamily, ModelFormat};
@@ -11,6 +12,9 @@ use crate::{
 };
 
 pub struct OpenVINOEngine;
+
+const OPENVINO_EXPORT_TIMEOUT: Duration = Duration::from_secs(3_600);
+const MAX_OPENVINO_EXPORT_OUTPUT_BYTES: usize = 64 * 1024;
 
 fn repo_script_path(script_name: &str) -> PathBuf {
     if let Ok(executable) = std::env::current_exe()
@@ -126,7 +130,8 @@ fn maybe_export_awq(model_path: &Path) -> Result<()> {
 
     let python = default_python();
     crate::core::security::validate_runner(&python)?;
-    let output = Command::new(&python)
+    let mut command = Command::new(&python);
+    command
         .arg("-m")
         .arg("optimum.intel.openvino.cli")
         .arg("export")
@@ -135,14 +140,29 @@ fn maybe_export_awq(model_path: &Path) -> Result<()> {
         .arg("--weight-format")
         .arg("int4")
         .arg(model_path)
-        .output()
-        .map_err(|e| {
-            anyhow!(
-                "failed to execute Python for AWQ export using {}: {}",
-                python.display(),
-                e
-            )
-        })?;
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = crate::core::process::run_bounded_output(
+        &mut command,
+        &[],
+        MAX_OPENVINO_EXPORT_OUTPUT_BYTES,
+        MAX_OPENVINO_EXPORT_OUTPUT_BYTES,
+        OPENVINO_EXPORT_TIMEOUT,
+    )
+    .map_err(|e| {
+        anyhow!(
+            "failed to execute Python for AWQ export using {}: {}",
+            python.display(),
+            e
+        )
+    })?;
+
+    if output.stdout_exceeded || output.stderr_exceeded {
+        return Err(anyhow!(
+            "OpenVINO AWQ export diagnostics exceeded 64 KiB per stream"
+        ));
+    }
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

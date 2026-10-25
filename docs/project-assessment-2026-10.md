@@ -142,7 +142,7 @@ the Candle 0.29 transitive path remains explicit in `Cargo.lock`; the MLX,
 MLX-LM, and OpenAI compatibility pins now match the latest reviewed remote
 updates.
 
-The static audit also found three software-level reliability gaps. External
+The static audit also found six software-level reliability gaps. External
 process diagnostics had a reusable bounded reader only inside the ONNX
 adapter, while MLX used unbounded `wait_with_output`; the bounded runner now
 lives at the engine process boundary, applies a hard deadline to both Python
@@ -151,8 +151,15 @@ memory and drained it only after writing every frame; it now drains
 concurrently while retaining at most 64 KiB. Server metrics could wrap the
 in-flight gauge on a duplicate completion, admit NaN/negative latency
 observations, or underflow KV utilization when a malformed snapshot reported
-more free blocks than total; all three paths now fail closed and have
-regression coverage.
+more free blocks than total; all three metrics paths now fail closed and have
+regression coverage. The NPU TTS ModelScope helper also interpolated
+user-influenced values into Python source and captured bridge output without a
+deadline; it now passes values as argv and uses the same bounded runner.
+The llama.cpp capability probe also captured unbounded `--help` output; it now
+uses the shared 64 KiB, ten-second process boundary.
+OpenVINO and Intel NPU auto-export paths also captured subprocess diagnostics
+without a limit or deadline; they now use the shared boundary with a one-hour
+conversion deadline.
 
 No inference service, model loader, external bridge, browser workload, or
 hardware test was run in this pass. The unclosed release gaps therefore remain

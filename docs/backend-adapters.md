@@ -89,6 +89,9 @@ Non-streaming MLX inference and probing retain at most 16 MiB of stdout and
 64 KiB of stderr, drain both pipes concurrently, and stop after ten minutes by
 default. Set `BLOOM_MLX_TIMEOUT_SECS` to a value from 1 to 3600 to change that
 deadline.
+The NPU TTS bridge uses the same bounded runner. Inference defaults to ten
+minutes (`BLOOM_TTS_TIMEOUT_SECS`), while ModelScope downloads default to one
+hour (`BLOOM_TTS_DOWNLOAD_TIMEOUT_SECS`); both settings accept 1–3600 seconds.
 
 ## Laya decision models
 

@@ -18,6 +18,14 @@ called out in release notes.
   stdout/stderr. Apply a 64 KiB diagnostic cap to ffmpeg failures; ffmpeg
   stderr is drained concurrently with frame writes, so noisy encoders cannot
   deadlock on a full pipe or retain unbounded diagnostics in memory.
+- Harden the NPU TTS bridge: ModelScope download arguments are passed through
+  argv instead of interpolated Python source, and download/inference workers
+  now use bounded diagnostics with configurable deadlines.
+- Bound the llama.cpp `--help` capability probe to 64 KiB per output stream and
+  a ten-second deadline before accepting speculative decoding support.
+- Bound OpenVINO and Intel NPU auto-export workers to 64 KiB per diagnostic
+  stream and a one-hour deadline, so optional model conversion cannot retain
+  unbounded subprocess output.
 - Harden server metrics against duplicate lifecycle completion, non-finite or
   negative latency samples, and inconsistent KV free-block counters; exported
   gauges now remain finite and non-wrapping under malformed observations.

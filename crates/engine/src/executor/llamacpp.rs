@@ -25,6 +25,8 @@ const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_CONTEXT_SIZE: usize = 2048;
 const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(180);
 const DEFAULT_COMPLETION_TIMEOUT: Duration = Duration::from_secs(600);
+const LLAMA_HELP_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_LLAMA_HELP_BYTES: usize = 64 * 1024;
 
 pub struct LlamaCppEngine;
 
@@ -421,10 +423,26 @@ fn validate_llama_server_support(binary: &Path, spec_type: &str) -> Result<()> {
         return Ok(());
     }
 
-    let output = Command::new(binary)
+    let mut command = Command::new(binary);
+    command
         .arg("--help")
-        .output()
-        .with_context(|| format!("failed to inspect llama-server '{}'", binary.display()))?;
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = crate::core::process::run_bounded_output(
+        &mut command,
+        &[],
+        MAX_LLAMA_HELP_BYTES,
+        MAX_LLAMA_HELP_BYTES,
+        LLAMA_HELP_TIMEOUT,
+    )
+    .with_context(|| format!("failed to inspect llama-server '{}'", binary.display()))?;
+    if output.stdout_exceeded || output.stderr_exceeded {
+        bail!(
+            "llama-server '{}' emitted more than 64 KiB of --help output",
+            binary.display()
+        );
+    }
     if !output.status.success() {
         bail!(
             "failed to inspect llama-server '{}': --help exited with {}",
