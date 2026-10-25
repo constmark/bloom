@@ -102,6 +102,7 @@ test_*.rs
 !scripts/test_validate_release_artifact.py
 !scripts/test_ui_tool_version.py
 !scripts/test_ui_browser.py
+!scripts/test_compare_llamacpp.py
 !python/tests/test_*.py
 mock_wan.py
 dummy_wan/

@@ -265,7 +265,10 @@ impl PoolState {
         }
         self.metrics.free_blocks = self.free_blocks.len();
         self.metrics.active_blocks = active_set.len();
-        let allocated_count = total_blocks - self.free_blocks.len();
+        // Keep observability fail-closed if a malformed or concurrently
+        // recovered state ever contains duplicate free-block entries. Metrics
+        // must not turn a bookkeeping inconsistency into a release panic.
+        let allocated_count = total_blocks.saturating_sub(self.free_blocks.len());
         self.metrics.cached_blocks = allocated_count.saturating_sub(active_set.len());
     }
 }

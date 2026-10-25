@@ -78,6 +78,26 @@ pub struct ExtendedBenchmarkResult {
     /// Speculative decoding acceptance rate (0.0 to 1.0).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speculative_acceptance_rate: Option<f64>,
+    /// Number of measured generation runs represented by the distributions.
+    pub run_samples: usize,
+    /// Median time to first token across measured runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p50_ttft_ms: Option<f64>,
+    /// 95th percentile time to first token across measured runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p95_ttft_ms: Option<f64>,
+    /// Median time between generated tokens across measured runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p50_tbt_ms: Option<f64>,
+    /// 95th percentile time between generated tokens across measured runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p95_tbt_ms: Option<f64>,
+    /// Median decode throughput across measured runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p50_tokens_per_second: Option<f64>,
+    /// 95th percentile decode throughput across measured runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p95_tokens_per_second: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,6 +171,18 @@ struct Args {
     /// Maximum number of tokens to generate.
     #[arg(long, default_value_t = 128)]
     max_tokens: usize,
+
+    /// Sampling temperature shared by benchmark runs.
+    #[arg(long, default_value_t = 0.7)]
+    temperature: f64,
+
+    /// Nucleus sampling probability shared by benchmark runs.
+    #[arg(long, default_value_t = 0.9)]
+    top_p: f64,
+
+    /// Random seed shared by benchmark runs.
+    #[arg(long, default_value_t = 42)]
+    seed: u64,
 
     /// Number of repetition runs.
     #[arg(long, default_value_t = 3)]
@@ -387,9 +419,9 @@ fn main() -> Result<()> {
 
     let params = GenerationParams {
         max_tokens: args.max_tokens,
-        temperature: 0.7,
-        top_p: 0.9,
-        seed: Some(42),
+        temperature: args.temperature,
+        top_p: args.top_p,
+        seed: Some(args.seed),
         response_format: None,
     };
 
@@ -437,6 +469,9 @@ fn main() -> Result<()> {
     let mut all_speculative_draft: Vec<usize> = Vec::new();
     let mut all_speculative_accepted: Vec<usize> = Vec::new();
     let mut all_speculative_rates: Vec<f64> = Vec::new();
+    let mut run_ttft: Vec<f64> = Vec::new();
+    let mut run_tbt: Vec<f64> = Vec::new();
+    let mut run_speed: Vec<f64> = Vec::new();
 
     // The speculative mode requested by the user. We only surface speculative
     // fields when a non-`none` mode is requested, mirroring the `Metrics`
@@ -587,14 +622,17 @@ fn main() -> Result<()> {
                     ttft.map(|t| prompt_token_count.max(1) as f64 / (t / 1000.0));
 
                 prompt_speed.push(speed);
+                run_speed.push(speed);
                 prompt_latency.push(avg_lat);
                 all_generated_tokens.push(generated);
                 all_durations.push(duration.as_secs_f64());
                 if let Some(t) = ttft {
                     prompt_ttft.push(t);
+                    run_ttft.push(t);
                 }
                 if let Some(t) = tbt {
                     prompt_tbt.push(t);
+                    run_tbt.push(t);
                 }
                 if let Some(ps) = prompt_proc_speed {
                     all_prompt_speed.push(ps);
@@ -812,6 +850,13 @@ fn main() -> Result<()> {
         speculative_draft_tokens: spec_draft_total,
         speculative_accepted_tokens: spec_accepted_total,
         speculative_acceptance_rate: spec_rate,
+        run_samples: run_speed.len(),
+        p50_ttft_ms: percentile(&run_ttft, 0.50),
+        p95_ttft_ms: percentile(&run_ttft, 0.95),
+        p50_tbt_ms: percentile(&run_tbt, 0.50),
+        p95_tbt_ms: percentile(&run_tbt, 0.95),
+        p50_tokens_per_second: percentile(&run_speed, 0.50),
+        p95_tokens_per_second: percentile(&run_speed, 0.95),
     };
 
     println!("{}", serde_json::to_string_pretty(&result)?);
@@ -867,4 +912,52 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
+}
+
+/// Return a linearly interpolated percentile from finite non-negative samples.
+/// Keeping this calculation in the benchmark binary gives every report the
+/// same definition while empty data remains explicit.
+fn percentile(samples: &[f64], quantile: f64) -> Option<f64> {
+    if samples.is_empty() || !quantile.is_finite() || !(0.0..=1.0).contains(&quantile) {
+        return None;
+    }
+    let mut sorted: Vec<f64> = samples
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .collect();
+    if sorted.is_empty() {
+        return None;
+    }
+    sorted.sort_by(f64::total_cmp);
+    if sorted.len() == 1 {
+        return sorted.first().copied();
+    }
+    let position = quantile * (sorted.len() - 1) as f64;
+    let lower = position.floor() as usize;
+    let upper = position.ceil() as usize;
+    if lower == upper {
+        return sorted.get(lower).copied();
+    }
+    let fraction = position - lower as f64;
+    Some(sorted[lower] + (sorted[upper] - sorted[lower]) * fraction)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::percentile;
+
+    #[test]
+    fn percentile_interpolates_and_rejects_empty_samples() {
+        assert_eq!(percentile(&[], 0.5), None);
+        assert_eq!(percentile(&[1.0, 3.0, 2.0], 0.5), Some(2.0));
+        assert_eq!(percentile(&[1.0, 3.0], 0.25), Some(1.5));
+    }
+
+    #[test]
+    fn percentile_discards_non_finite_or_negative_samples() {
+        assert_eq!(percentile(&[-1.0, f64::NAN, 2.0], 0.5), Some(2.0));
+        assert_eq!(percentile(&[f64::INFINITY], 0.5), None);
+        assert_eq!(percentile(&[1.0], -0.1), None);
+    }
 }

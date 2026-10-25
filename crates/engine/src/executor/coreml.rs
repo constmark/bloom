@@ -41,6 +41,18 @@ impl CoreMlEngine {
             ));
         }
 
+        // `.mlpackage` is itself a directory. Accepting the package path
+        // directly is important because model catalogs store the package as a
+        // single artifact; searching only its parent would otherwise miss the
+        // package contents and report a misleading discovery failure.
+        if model_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("mlpackage"))
+        {
+            return Ok(model_path.to_path_buf());
+        }
+
         // Search for directories or files ending in .mlpackage or .mlmodel
         let mut candidates = Vec::new();
         for entry in std::fs::read_dir(model_path)?.flatten() {
@@ -159,6 +171,18 @@ mod tests {
 
         assert_eq!(CoreMlEngine::discover_model_file(&file).unwrap(), file);
         assert_eq!(CoreMlEngine::discover_model_file(dir.path()).unwrap(), file);
+    }
+
+    #[test]
+    fn discovers_a_package_directory_when_passed_directly() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("model.mlpackage");
+        std::fs::create_dir(&package).unwrap();
+
+        assert_eq!(
+            CoreMlEngine::discover_model_file(&package).unwrap(),
+            package
+        );
     }
 
     #[test]

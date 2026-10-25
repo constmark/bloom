@@ -41,6 +41,7 @@ request.
 - [Scheduler](scheduler.md)
 - [Backend adapters](backend-adapters.md)
 - [Edge inference project shortlist](edge-inference-options-2026-10.md)
+- [Bloom versus open-source edge engines](bloom-vs-edge-engines-2026-10.md)
 - [Plugins and processors](plugins.md)
 - [World-model schema](world-model.md)
 

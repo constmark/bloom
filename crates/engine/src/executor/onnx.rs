@@ -120,6 +120,20 @@ impl Engine for OnnxRuntimeEngine {
     }
 
     fn capability(&self) -> EngineCapability {
+        // Keep the public capability report aligned with the device selector.
+        // On macOS the bridge intentionally exposes CPU only: CoreML's
+        // CPUAndGPU/ALL execution policies cannot prove GPU-only placement.
+        // Reporting GPU/NPU here would make `/v1/backends` and preflight
+        // advertise devices that `supported_devices()` will never select.
+        let supported_devices = self
+            .supported_devices()
+            .into_iter()
+            .flat_map(|device| match device {
+                DeviceKind::Cpu => vec![DeviceClass::Cpu],
+                DeviceKind::Gpu => vec![DeviceClass::IntegratedGpu, DeviceClass::DiscreteGpu],
+                DeviceKind::Npu => vec![DeviceClass::Npu],
+            })
+            .collect();
         EngineCapability {
             engine_name: self.name(),
             supported_families: vec![ModelFamily::Custom("*".to_string())],
@@ -132,12 +146,7 @@ impl Engine for OnnxRuntimeEngine {
                 DType::Q8,
             ],
             supported_formats: vec![ModelFormat::Onnx],
-            supported_devices: vec![
-                DeviceClass::Cpu,
-                DeviceClass::IntegratedGpu,
-                DeviceClass::DiscreteGpu,
-                DeviceClass::Npu,
-            ],
+            supported_devices,
             supported_modalities: self.supported_modalities(),
             supports_streaming: false,
             supports_quantized_models: true,
@@ -476,6 +485,27 @@ mod tests {
         assert!(cap.supported_formats.contains(&ModelFormat::Onnx));
         assert!(cap.supported_modalities.contains(&Modality::Vision));
         assert!(cap.supports_quantized_models);
+    }
+
+    #[test]
+    fn capability_matches_selectable_devices() {
+        let expected = OnnxRuntimeEngine
+            .supported_devices()
+            .into_iter()
+            .flat_map(|device| match device {
+                DeviceKind::Cpu => vec![DeviceClass::Cpu],
+                DeviceKind::Gpu => vec![DeviceClass::IntegratedGpu, DeviceClass::DiscreteGpu],
+                DeviceKind::Npu => vec![DeviceClass::Npu],
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(OnnxRuntimeEngine.capability().supported_devices, expected);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_capability_does_not_advertise_unselectable_accelerators() {
+        let cap = OnnxRuntimeEngine.capability();
+        assert_eq!(cap.supported_devices, vec![DeviceClass::Cpu]);
     }
 
     #[test]

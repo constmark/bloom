@@ -142,6 +142,16 @@ mod tests {
     }
 
     #[test]
+    fn kv_metrics_clamp_malformed_free_block_count() {
+        let pool = BloomKvCachePool::new(4, 2);
+        let mut state = pool.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.free_blocks.push_back(99);
+        state.update_block_counts(pool.total_blocks);
+        assert_eq!(state.metrics.free_blocks, 3);
+        assert_eq!(state.metrics.cached_blocks, 0);
+    }
+
+    #[test]
     fn test_inference_scheduler_basic() {
         let executor = Arc::new(MockExecutor);
         let kv_pool = Arc::new(MockKvPool::new(10));

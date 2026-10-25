@@ -103,6 +103,26 @@ class BenchmarkBudgetTests(unittest.TestCase):
         self.assertIsNone(budget.classify_hardware({"device": "gpu", "os": "linux", "backend": "openvino"}))
         self.assertEqual(budget.classify_hardware({"device": "npu", "backend": "openvino"}), "intel_npu")
 
+    def test_percentile_metadata_is_validated_when_present(self):
+        valid = dict(VALID, run_samples=3, p50_ttft_ms=10.0,
+                     p95_ttft_ms=12.0, p50_tbt_ms=2.0, p95_tbt_ms=3.0,
+                     p50_tokens_per_second=4.0, p95_tokens_per_second=5.0)
+        self.assertEqual(self.run_checker(valid).returncode, 0)
+        for field, value in (
+            ("p95_ttft_ms", -1),
+            ("p95_tbt_ms", float("inf")),
+            ("p95_tokens_per_second", "fast"),
+            ("run_samples", True),
+            ("run_samples", -1),
+        ):
+            with self.subTest(field=field, value=value):
+                invalid = copy.deepcopy(valid)
+                invalid[field] = value
+                self.assertEqual(self.run_checker(invalid).returncode, 4)
+        invalid = copy.deepcopy(valid)
+        invalid["p50_ttft_ms"] = 13.0
+        self.assertEqual(self.run_checker(invalid).returncode, 4)
+
 
 if __name__ == "__main__":
     unittest.main()

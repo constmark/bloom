@@ -107,14 +107,34 @@ impl Engine for MlxEngine {
     }
 
     fn supported_devices(&self) -> Vec<DeviceKind> {
-        vec![DeviceKind::Cpu, DeviceKind::Gpu]
+        if cfg!(target_os = "macos") {
+            vec![DeviceKind::Cpu, DeviceKind::Gpu]
+        } else {
+            // MLX is an Apple Silicon runtime. Keep the CPU bridge available
+            // for diagnostics and test doubles on other hosts, but never let
+            // device selection or preflight advertise a non-existent GPU.
+            vec![DeviceKind::Cpu]
+        }
     }
 
     fn default_device(&self) -> DeviceKind {
-        DeviceKind::Gpu
+        if cfg!(target_os = "macos") {
+            DeviceKind::Gpu
+        } else {
+            DeviceKind::Cpu
+        }
     }
 
     fn capability(&self) -> EngineCapability {
+        let supported_devices = self
+            .supported_devices()
+            .into_iter()
+            .flat_map(|device| match device {
+                DeviceKind::Cpu => vec![DeviceClass::Cpu],
+                DeviceKind::Gpu => vec![DeviceClass::IntegratedGpu],
+                DeviceKind::Npu => vec![DeviceClass::Npu],
+            })
+            .collect();
         EngineCapability {
             engine_name: self.name(),
             supported_families: vec![
@@ -125,7 +145,7 @@ impl Engine for MlxEngine {
             ],
             supported_dtypes: vec![DType::F32, DType::F16, DType::BF16],
             supported_formats: vec![ModelFormat::Mlx],
-            supported_devices: vec![DeviceClass::Cpu, DeviceClass::IntegratedGpu],
+            supported_devices,
             supported_modalities: self.supported_modalities(),
             supports_streaming: true,
             supports_quantized_models: true,
@@ -454,7 +474,11 @@ mod tests {
         assert_eq!(cap.maturity, crate::engine::BackendMaturity::Experimental);
         assert_eq!(cap.supported_modalities, vec![Modality::Text]);
         assert!(cap.supported_formats.contains(&ModelFormat::Mlx));
+        assert!(cap.supported_devices.contains(&DeviceClass::Cpu));
+        #[cfg(target_os = "macos")]
         assert!(cap.supported_devices.contains(&DeviceClass::IntegratedGpu));
+        #[cfg(not(target_os = "macos"))]
+        assert!(!cap.supported_devices.contains(&DeviceClass::IntegratedGpu));
     }
 
     #[test]

@@ -215,7 +215,9 @@ jobs:
         run: ./scripts/ollama_compat_smoke.py --api-key bloom-ci-smoke --require-ollama-sdk
       - name: llama.cpp comparison smoke
         # Script SKIPs gracefully (exit 0) when model or llama.cpp is missing.
-        run: ./scripts/compare_llamacpp.py
+        run: |
+          python3 scripts/test_compare_llamacpp.py
+          ./scripts/compare_llamacpp.py
       - name: Docker build smoke
         # Bound image-build stalls while leaving room for a cold dependency build.
         timeout-minutes: 20

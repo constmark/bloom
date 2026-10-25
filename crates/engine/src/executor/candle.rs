@@ -7,8 +7,8 @@ use std::time::SystemTime;
 
 use anyhow::{Result, anyhow};
 use bloomai_core::{
-    DeviceClass, DeviceKind, GenerationParams, Modality, ModelFamily, ModelFormat,
-    ResidencyStrategy,
+    DeviceCapability, DeviceClass, DeviceKind, GenerationParams, Modality, ModelFamily,
+    ModelFormat, ModelManifest, ResidencyStrategy,
 };
 use candle_core::{DType, Device, Tensor};
 
@@ -16,7 +16,7 @@ use crate::core::parallelism::ParallelStrategy;
 use crate::core::quantization::{QuantMethod, QuantizationConfig};
 use crate::engine::BackendMaturity;
 use crate::{
-    engine::{Engine, EngineCapability},
+    engine::{Engine, EngineCapability, SupportLevel, default_engine_supports},
     io::{ModelInput, ModelOutput},
     model::{LoadedModel, ModelMetadata},
 };
@@ -329,6 +329,27 @@ fn find_gguf_file(model_path: &Path) -> Option<PathBuf> {
 
 pub struct CandleEngine;
 
+/// Return GGUF architectures that the Candle loader deliberately does not
+/// route yet. Manifest inference groups these families under `Llama`, but the
+/// quantized Candle loader does not have architecture-specific implementations
+/// for them. Keeping the check here prevents a late load failure and leaves
+/// them available to the external llama.cpp adapter.
+fn unsupported_candle_gguf_architecture(manifest: &ModelManifest) -> Option<String> {
+    let is_gguf = manifest
+        .files
+        .iter()
+        .any(|file| file.format == ModelFormat::Gguf);
+    if !is_gguf {
+        return None;
+    }
+    let architecture = manifest
+        .parameters
+        .get("gguf_architecture")
+        .and_then(serde_json::Value::as_str)
+        .map(|value| value.to_ascii_lowercase())?;
+    matches!(architecture.as_str(), "mistral" | "deepseek").then_some(architecture)
+}
+
 impl Engine for CandleEngine {
     fn name(&self) -> &'static str {
         "candle"
@@ -410,6 +431,20 @@ impl Engine for CandleEngine {
                 For GPU: cargo build --features metal (macOS) or --features cuda (NVIDIA)."
                 .to_string(),
         }
+    }
+
+    fn supports(&self, manifest: &ModelManifest, device_cap: &DeviceCapability) -> SupportLevel {
+        let base = default_engine_supports(&self.capability(), manifest, device_cap);
+        if !base.is_supported() {
+            return base;
+        }
+        if let Some(architecture) = unsupported_candle_gguf_architecture(manifest) {
+            return SupportLevel::Unsupported(format!(
+                "Candle GGUF loading for '{}' is not implemented; use the external llama.cpp adapter or a supported Qwen/Llama/Gemma GGUF architecture",
+                architecture
+            ));
+        }
+        base
     }
 
     fn load(&self, model_path: &Path, device_kind: DeviceKind) -> Result<Box<dyn LoadedModel>> {
@@ -3777,6 +3812,31 @@ mod tests {
         assert_eq!(ModelType::Qwen2.hf_model_type(), "qwen2");
         assert_eq!(ModelType::Qwen2Moe.hf_model_type(), "qwen2_moe");
         assert_eq!(ModelType::Qwen3.hf_model_type(), "qwen3");
+    }
+
+    #[test]
+    fn candle_does_not_route_unimplemented_gguf_architectures() {
+        let mut manifest = bloomai_core::ModelManifest::default();
+        manifest.files.push(bloomai_core::ModelFile {
+            name: "model.gguf".to_string(),
+            format: ModelFormat::Gguf,
+            size_bytes: 1,
+            hash_sha256: None,
+            required: true,
+        });
+        manifest.parameters.insert(
+            "gguf_architecture".to_string(),
+            serde_json::json!("mistral"),
+        );
+        assert_eq!(
+            unsupported_candle_gguf_architecture(&manifest).as_deref(),
+            Some("mistral")
+        );
+
+        manifest
+            .parameters
+            .insert("gguf_architecture".to_string(), serde_json::json!("qwen2"));
+        assert!(unsupported_candle_gguf_architecture(&manifest).is_none());
     }
 
     #[test]

@@ -435,7 +435,7 @@ impl EngineRouter {
         manifest: &ModelManifest,
         device_cap: &DeviceCapability,
     ) -> Result<RoutingDecision> {
-        let mut best_fallback: Option<RoutingDecision> = None;
+        let mut best_fallback: Option<(u8, RoutingDecision)> = None;
         let mut unsupported_reasons: Vec<String> = Vec::new();
 
         for engine_name in &self.engines {
@@ -461,15 +461,29 @@ impl EngineRouter {
                     });
                 }
                 SupportLevel::Fallback(ref reason) => {
-                    if best_fallback.is_none() {
-                        best_fallback = Some(RoutingDecision {
-                            explanation: format!(
-                                "engine '{}' can handle model '{}' with fallback: {}",
-                                engine_name, manifest.id, reason
-                            ),
-                            engine_name: engine_name.clone(),
-                            support_level: level,
-                        });
+                    // A fallback is already a degraded route. Prefer the
+                    // engine with the stronger maturity declaration when
+                    // several engines can provide one, while preserving the
+                    // explicit router order as the tie breaker. Native
+                    // support remains governed by that explicit order so an
+                    // external bridge cannot displace a native implementation
+                    // merely by declaring a higher maturity label.
+                    let maturity = engine_maturity_rank(engine.capability().maturity);
+                    if best_fallback
+                        .as_ref()
+                        .is_none_or(|(best_maturity, _)| maturity > *best_maturity)
+                    {
+                        best_fallback = Some((
+                            maturity,
+                            RoutingDecision {
+                                explanation: format!(
+                                    "engine '{}' can handle model '{}' with fallback: {}",
+                                    engine_name, manifest.id, reason
+                                ),
+                                engine_name: engine_name.clone(),
+                                support_level: level,
+                            },
+                        ));
                     }
                 }
                 SupportLevel::Unsupported(ref reason) => {
@@ -478,7 +492,7 @@ impl EngineRouter {
             }
         }
 
-        if let Some(decision) = best_fallback {
+        if let Some((_, decision)) = best_fallback {
             return Ok(decision);
         }
 
@@ -507,6 +521,15 @@ impl EngineRouter {
             Ok(decision) => decision.explanation,
             Err(e) => format!("routing failed: {}", e),
         }
+    }
+}
+
+fn engine_maturity_rank(maturity: BackendMaturity) -> u8 {
+    match maturity {
+        BackendMaturity::Production => 4,
+        BackendMaturity::Beta => 3,
+        BackendMaturity::Experimental => 2,
+        BackendMaturity::Skeleton => 1,
     }
 }
 
@@ -557,6 +580,33 @@ mod tests {
                 construction_guide: String::new(),
             }
         }
+        fn load(&self, _model_path: &Path, _device: DeviceKind) -> Result<Box<dyn LoadedModel>> {
+            Ok(Box::new(EchoTextModel::default()))
+        }
+    }
+
+    struct BetaFallbackEngine;
+
+    impl Engine for BetaFallbackEngine {
+        fn name(&self) -> &'static str {
+            "beta-fallback"
+        }
+
+        fn supported_modalities(&self) -> Vec<Modality> {
+            vec![Modality::Text]
+        }
+
+        fn supported_devices(&self) -> Vec<DeviceKind> {
+            vec![DeviceKind::Cpu]
+        }
+
+        fn capability(&self) -> EngineCapability {
+            let mut capability = <MockEngine as Engine>::capability(&MockEngine);
+            capability.engine_name = "beta-fallback";
+            capability.maturity = BackendMaturity::Beta;
+            capability
+        }
+
         fn load(&self, _model_path: &Path, _device: DeviceKind) -> Result<Box<dyn LoadedModel>> {
             Ok(Box::new(EchoTextModel::default()))
         }
@@ -815,6 +865,23 @@ mod tests {
             .select_engine(&registry, &manifest, &cpu_capability())
             .unwrap();
         assert_eq!(decision.engine_name, "mock");
+        assert!(matches!(decision.support_level, SupportLevel::Fallback(_)));
+    }
+
+    #[test]
+    fn test_engine_router_prefers_more_mature_fallback() {
+        let mut registry = EngineRegistry::default();
+        // Alphabetical order puts the experimental engine first. Fallback
+        // selection should still prefer the beta declaration.
+        registry.register("a-experimental", Box::new(MockEngine));
+        registry.register("z-beta", Box::new(BetaFallbackEngine));
+        let router = EngineRouter::from_registry(&registry);
+
+        let manifest = text_manifest(ModelFamily::Llama, DType::Q4);
+        let decision = router
+            .select_engine(&registry, &manifest, &cpu_capability())
+            .unwrap();
+        assert_eq!(decision.engine_name, "z-beta");
         assert!(matches!(decision.support_level, SupportLevel::Fallback(_)));
     }
 

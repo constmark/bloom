@@ -31,11 +31,14 @@ those capability flags must not be used for routing or support claims.
 
 ## Benchmark protocol
 
-`scripts/compare_llamacpp.py` is a smoke harness and currently compares a
-limited throughput result. It is useful for discovering a regression, but it
-does not by itself establish parity: Bloom is forced to CPU, context and
-threads are not fully normalized, and `llama-bench` does not use the same
-prompt. Release evidence must use the following protocol:
+`scripts/compare_llamacpp.py` is a smoke harness for a reproducible first
+comparison. It defaults to Bloom CPU for deterministic CI, and accepts explicit
+context, Bloom backend/device, warmup/repetition and thread settings. For
+`llama-cli`/`main` it also passes the shared context, seed, temperature and
+top-p values; `llama-bench` still measures a token-count workload and cannot
+receive the same prompt text. It does not by itself establish parity because device
+layers, power policy, runtime precision and queue behavior still need explicit
+normalization and evidence. Release evidence must use the following protocol:
 
 1. Use the same model file and SHA-256, tokenizer/template, prompt, context
    limit, generated-token limit, seed, temperature, top-p, batch settings,
@@ -50,6 +53,12 @@ prompt. Release evidence must use the following protocol:
 5. Compare native Bloom and the external `llama-server` bridge separately.
    A bridge result may validate protocol compatibility but cannot substitute for
    native backend evidence.
+
+`bloom_bench` now includes `run_samples` and p50/p95 TTFT, TBT, and decode
+throughput fields for the measured generation runs. These fields make the
+single-process benchmark useful for the latency distribution in a deployment
+report; they do not replace concurrent workload, device-memory, or long-soak
+evidence.
 
 Store reports under a versioned evidence directory with the benchmark schema;
 each report must include model digest, reference revision, build features,

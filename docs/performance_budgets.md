@@ -53,6 +53,15 @@ The checker returns:
 | `3` | Measurements are valid but hardware could not be classified |
 | `4` | Data is malformed, missing, negative, non-finite, or otherwise invalid |
 
+`bloom_bench` also emits `run_samples` plus p50/p95 TTFT, TBT, and decode
+throughput fields when measured generation runs produce tokens. The existing
+budget checker intentionally uses the average fields for backward-compatible
+regression gates; promotion reports should retain the percentile fields and
+use p95 latency for the release decision. When those optional fields are
+present, the checker still validates that they are finite, non-negative,
+ordered (`p50 <= p95`), and accompanied by a non-negative integer
+`run_samples`; malformed distribution metadata exits with code `4`.
+
 Set `BLOOM_REQUIRE_BUDGET=1` in environments where an unclassified result must
 fail the job.
 
@@ -87,5 +96,16 @@ Compare Bloom and llama.cpp on the same machine and model with:
 ```bash
 BLOOM_MODEL_PATH=/path/to/model.gguf \
 LLAMA_CPP_BIN=/path/to/llama-cli \
-./scripts/compare_llamacpp.py --max-tokens 64
+./scripts/compare_llamacpp.py \
+  --context-size 4096 --device cpu --backend candle \
+  --threads 8 --warmup 2 --repetitions 3 --max-tokens 64 \
+  --seed 42 --temperature 0.7 --top-p 0.9
 ```
+
+The comparison report records these workload settings and passes the context,
+seed, temperature and top-p to both `bloom_bench` and the llama.cpp CLI. Bloom
+receives the same backend/device, warmup and repetition settings.
+`llama-bench` accepts a token-count workload rather than prompt text; use
+`llama-cli` or `main` when exact prompt text parity is required. The harness
+remains a measurement aid; release promotion still requires the full protocol
+and raw artifacts described in [llama.cpp parity](llamacpp-parity.md).

@@ -235,6 +235,36 @@ def validate_metadata(bench: Any) -> None:
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise ValueError(f"cache_metrics.{name} must be a non-negative integer")
 
+    # Percentile fields are optional for older benchmark records, but a newer
+    # record must not carry malformed distribution data that a consumer could
+    # mistake for release evidence.  The budget gate still uses averages for
+    # compatibility; it validates the extra fields so invalid p95 values do
+    # not silently pass through an otherwise valid report.
+    percentile_names = (
+        "p50_ttft_ms",
+        "p95_ttft_ms",
+        "p50_tbt_ms",
+        "p95_tbt_ms",
+        "p50_tokens_per_second",
+        "p95_tokens_per_second",
+    )
+    for name in percentile_names:
+        if name in bench and bench[name] is not None:
+            validate_number(name, bench[name])
+    if "run_samples" in bench:
+        samples = bench["run_samples"]
+        if not isinstance(samples, int) or isinstance(samples, bool) or samples < 0:
+            raise ValueError("run_samples must be a non-negative integer")
+    for p50_name, p95_name in (
+        ("p50_ttft_ms", "p95_ttft_ms"),
+        ("p50_tbt_ms", "p95_tbt_ms"),
+        ("p50_tokens_per_second", "p95_tokens_per_second"),
+    ):
+        p50 = bench.get(p50_name)
+        p95 = bench.get(p95_name)
+        if p50 is not None and p95 is not None and p50 > p95:
+            raise ValueError(f"{p50_name} must not exceed {p95_name}")
+
 
 def reject_constant(value: str):
     raise ValueError(f"non-finite JSON constant: {value}")
