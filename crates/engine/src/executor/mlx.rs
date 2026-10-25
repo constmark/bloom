@@ -8,6 +8,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use bloomai_core::{
@@ -23,6 +24,11 @@ use crate::{
 };
 
 pub struct MlxEngine;
+
+const DEFAULT_MLX_TIMEOUT: Duration = Duration::from_secs(600);
+const MAX_MLX_TIMEOUT_SECS: u64 = 3_600;
+const MAX_MLX_STDOUT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_MLX_STDERR_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, serde::Deserialize)]
 struct MlxProbe {
@@ -242,15 +248,27 @@ impl LoadedModel for MlxRuntimeModel {
         }))?;
         let script = script_path();
         crate::core::security::validate_external_script(&script)?;
-        let mut child = self
-            .command(false)
-            .spawn()
-            .map_err(|error| anyhow!("failed to launch MLX-LM bridge: {error}"))?;
-        crate::core::process::write_stdin(&mut child, &request)
-            .map_err(|error| anyhow!("MLX-LM bridge stdin write failed: {error}"))?;
-        let output = child
-            .wait_with_output()
-            .map_err(|error| anyhow!("failed waiting for MLX-LM bridge: {error}"))?;
+        let mut command = self.command(false);
+        let output = crate::core::process::run_bounded_output(
+            &mut command,
+            &request,
+            MAX_MLX_STDOUT_BYTES,
+            MAX_MLX_STDERR_BYTES,
+            mlx_bridge_timeout()?,
+        )
+        .map_err(|error| anyhow!("MLX-LM bridge failed: {error}"))?;
+        if output.stdout_exceeded {
+            return Err(anyhow!(
+                "MLX-LM bridge stdout exceeded the {} MiB limit",
+                MAX_MLX_STDOUT_BYTES / (1024 * 1024)
+            ));
+        }
+        if output.stderr_exceeded {
+            return Err(anyhow!(
+                "MLX-LM bridge stderr exceeded the {} KiB limit",
+                MAX_MLX_STDERR_BYTES / 1024
+            ));
+        }
         if !output.status.success() {
             return Err(anyhow!(
                 "MLX-LM bridge failed ({}): {}",
@@ -369,7 +387,8 @@ fn device_label(device: DeviceKind) -> &'static str {
 }
 
 fn run_probe(python: &Path, script: &Path, model: &Path, device: DeviceKind) -> Result<MlxProbe> {
-    let output = Command::new(python)
+    let mut command = Command::new(python);
+    command
         .env("PYTHONIOENCODING", "utf-8")
         .arg(script)
         .arg("--probe")
@@ -377,8 +396,20 @@ fn run_probe(python: &Path, script: &Path, model: &Path, device: DeviceKind) -> 
         .arg(model)
         .arg("--device")
         .arg(device_label(device))
-        .output()
-        .map_err(|error| anyhow!("failed to launch MLX-LM probe: {error}"))?;
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = crate::core::process::run_bounded_output(
+        &mut command,
+        &[],
+        MAX_MLX_STDERR_BYTES,
+        MAX_MLX_STDERR_BYTES,
+        mlx_bridge_timeout()?,
+    )
+    .map_err(|error| anyhow!("failed to launch MLX-LM probe: {error}"))?;
+    if output.stdout_exceeded || output.stderr_exceeded {
+        return Err(anyhow!("MLX-LM probe output exceeded 64 KiB"));
+    }
     if !output.status.success() {
         return Err(anyhow!(
             "MLX-LM probe failed ({}): {}",
@@ -386,15 +417,30 @@ fn run_probe(python: &Path, script: &Path, model: &Path, device: DeviceKind) -> 
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    if output.stdout.len() > 64 * 1024 || output.stderr.len() > 64 * 1024 {
-        return Err(anyhow!("MLX-LM probe output exceeded 64 KiB"));
-    }
     let probe: MlxProbe = serde_json::from_slice(&output.stdout)
         .map_err(|error| anyhow!("MLX-LM probe returned invalid JSON: {error}"))?;
     if !probe.ok {
         return Err(anyhow!("MLX-LM probe reported failure"));
     }
     Ok(probe)
+}
+
+fn mlx_bridge_timeout() -> Result<Duration> {
+    let Some(value) = std::env::var_os("BLOOM_MLX_TIMEOUT_SECS") else {
+        return Ok(DEFAULT_MLX_TIMEOUT);
+    };
+    let value = value
+        .to_str()
+        .ok_or_else(|| anyhow!("BLOOM_MLX_TIMEOUT_SECS must be valid UTF-8"))?;
+    let seconds = value.parse::<u64>().map_err(|_| {
+        anyhow!("BLOOM_MLX_TIMEOUT_SECS must be an integer between 1 and {MAX_MLX_TIMEOUT_SECS}")
+    })?;
+    if !(1..=MAX_MLX_TIMEOUT_SECS).contains(&seconds) {
+        return Err(anyhow!(
+            "BLOOM_MLX_TIMEOUT_SECS must be between 1 and {MAX_MLX_TIMEOUT_SECS}"
+        ));
+    }
+    Ok(Duration::from_secs(seconds))
 }
 
 #[cfg(test)]

@@ -2,9 +2,11 @@
 use std::io::{ErrorKind, Read, Write};
 use std::ops::{Deref, DerefMut};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::{OutputChunk, model::OutputSink};
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 
 /// Every early return kills and reaps the process before releasing its runtime.
 pub(crate) struct ChildGuard {
@@ -121,6 +123,129 @@ pub(crate) fn read_bounded(
         }
     }
     Ok((retained, exceeded))
+}
+
+/// The retained result of a child process whose pipes were drained to EOF.
+///
+/// The limits apply only to the retained prefixes; reader threads continue to
+/// drain both pipes so a noisy worker cannot block on a full stdout/stderr
+/// pipe while the parent waits for it to exit.
+#[derive(Debug)]
+pub(crate) struct BoundedProcessOutput {
+    pub(crate) status: ExitStatus,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+    pub(crate) stdout_exceeded: bool,
+    pub(crate) stderr_exceeded: bool,
+}
+
+/// Run a short-lived external process with bounded output and a hard deadline.
+///
+/// If `request` is empty, stdin is closed before waiting. Otherwise it is
+/// written on a worker thread so a child that stops consuming input remains
+/// interruptible by `timeout`. The process is killed and reaped on timeout or
+/// polling failure, and all pipe readers are joined before returning.
+pub(crate) fn run_bounded_output(
+    command: &mut Command,
+    request: &[u8],
+    stdout_limit: usize,
+    stderr_limit: usize,
+    timeout: Duration,
+) -> Result<BoundedProcessOutput> {
+    let mut child = ChildGuard::spawn(command)?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("inference process has no stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("inference process has no stderr")?;
+    let stdin = child.stdin.take();
+    if !request.is_empty() && stdin.is_none() {
+        bail!("inference process has no stdin");
+    }
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| anyhow!("inference process timeout is too large"))?;
+
+    let stdout_reader = thread::spawn(move || read_bounded(stdout, stdout_limit));
+    let stderr_reader = thread::spawn(move || read_bounded(stderr, stderr_limit));
+    let stdin_writer = if request.is_empty() {
+        drop(stdin);
+        None
+    } else {
+        let mut stdin = stdin.expect("checked non-empty request has stdin");
+        let request = request.to_vec();
+        Some(thread::spawn(move || stdin.write_all(&request)))
+    };
+
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                discard_process_threads(stdout_reader, stderr_reader, stdin_writer);
+                return Err(anyhow!(
+                    "inference process timed out after {} seconds",
+                    timeout.as_secs()
+                ));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                discard_process_threads(stdout_reader, stderr_reader, stdin_writer);
+                return Err(error).context("failed to poll inference process");
+            }
+        }
+    };
+
+    let stdout_result = join_process_reader(stdout_reader, "stdout");
+    let stderr_result = join_process_reader(stderr_reader, "stderr");
+    let stdin_result = stdin_writer.map(|writer| {
+        writer
+            .join()
+            .map_err(|_| anyhow!("inference process stdin writer panicked"))
+    });
+    let (stdout, stdout_exceeded) = stdout_result?;
+    let (stderr, stderr_exceeded) = stderr_result?;
+    if let Some(writer) = stdin_result {
+        writer??;
+    }
+
+    Ok(BoundedProcessOutput {
+        status,
+        stdout,
+        stderr,
+        stdout_exceeded,
+        stderr_exceeded,
+    })
+}
+
+type ProcessReader = thread::JoinHandle<std::io::Result<(Vec<u8>, bool)>>;
+type ProcessWriter = thread::JoinHandle<std::io::Result<()>>;
+
+fn join_process_reader(reader: ProcessReader, stream: &str) -> Result<(Vec<u8>, bool)> {
+    reader
+        .join()
+        .map_err(|_| anyhow!("inference process {stream} reader panicked"))?
+        .with_context(|| format!("failed to read inference process {stream}"))
+}
+
+fn discard_process_threads(
+    stdout_reader: ProcessReader,
+    stderr_reader: ProcessReader,
+    stdin_writer: Option<ProcessWriter>,
+) {
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+    if let Some(writer) = stdin_writer {
+        let _ = writer.join();
+    }
 }
 
 fn stream_utf8(reader: &mut impl Read, sink: &mut dyn OutputSink) -> Result<()> {

@@ -116,10 +116,12 @@ non-finite vectors or inconsistent video metadata.
 Quantized KV writes and cache restores use checked shape/scale validation rather
 than assertion-based helpers. Quantization configurations reject impossible bit
 widths and incompatible manifest dtypes. Direct memory reservations reject
-allocations larger than the platform can represent. The ONNX external bridge
-now bounds retained stdout/stderr, closes stdin deterministically, drains noisy
-workers without deadlock, and kills hung workers at a bounded deadline
-(`BLOOM_ONNX_TIMEOUT_SECS`, capped at one hour).
+allocations larger than the platform can represent. The ONNX and MLX external
+bridges now share a bounded process runner: retained stdout/stderr are capped,
+stdin closes deterministically, noisy workers are drained without pipe
+deadlock, and hung workers are killed at a bounded deadline
+(`BLOOM_ONNX_TIMEOUT_SECS` or `BLOOM_MLX_TIMEOUT_SECS`, each capped at one
+hour).
 
 The core package also exposes a thread-safe operator registry with explicit
 dtype/layout/backend matching, deterministic priority selection, duplicate

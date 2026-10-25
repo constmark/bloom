@@ -142,12 +142,14 @@ the Candle 0.29 transitive path remains explicit in `Cargo.lock`; the MLX,
 MLX-LM, and OpenAI compatibility pins now match the latest reviewed remote
 updates.
 
-The static audit also found two software-level reliability gaps. External
+The static audit also found three software-level reliability gaps. External
 process diagnostics had a reusable bounded reader only inside the ONNX
-adapter, while ffmpeg retained all stderr in memory and drained it only after
-writing every frame; the reader now lives at the engine process boundary and
-ffmpeg drains concurrently while retaining at most 64 KiB. Server metrics could
-wrap the in-flight gauge on a duplicate completion, admit NaN/negative latency
+adapter, while MLX used unbounded `wait_with_output`; the bounded runner now
+lives at the engine process boundary, applies a hard deadline to both Python
+bridges, and drains noisy pipes concurrently. ffmpeg retained all stderr in
+memory and drained it only after writing every frame; it now drains
+concurrently while retaining at most 64 KiB. Server metrics could wrap the
+in-flight gauge on a duplicate completion, admit NaN/negative latency
 observations, or underflow KV utilization when a malformed snapshot reported
 more free blocks than total; all three paths now fail closed and have
 regression coverage.

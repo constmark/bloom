@@ -58,6 +58,9 @@ serialized `ModelInput` object to stdin and expects one `ModelOutput` object on
 stdout (at minimum, `text` and `logits`; omitted optional fields default to
 `null`). Models that require a tokenizer or multiple named inputs should
 provide a custom `BLOOM_ONNX_SCRIPT` implementing both parts of this contract.
+The bridge retains at most 64 MiB of stdout and 64 KiB of stderr while
+draining both pipes, and aborts after ten minutes by default. Set
+`BLOOM_ONNX_TIMEOUT_SECS` to a value from 1 to 3600 to change the deadline.
 
 ## llama.cpp
 
@@ -82,6 +85,10 @@ when the host platform supports that path. Set `BLOOM_MLX_PYTHON` for MLX or
 Windows `python.exe`, a virtual environment, or a non-default Python
 installation). Bloom falls back to `python3` then `python` on Unix, and
 `python` then the `py` launcher on Windows.
+Non-streaming MLX inference and probing retain at most 16 MiB of stdout and
+64 KiB of stderr, drain both pipes concurrently, and stop after ten minutes by
+default. Set `BLOOM_MLX_TIMEOUT_SECS` to a value from 1 to 3600 to change that
+deadline.
 
 ## Laya decision models
 

@@ -5,11 +5,9 @@
 //! environment, this adapter executes the model through the bundled bridge and
 //! returns text or numeric output using a small JSON protocol.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use bloomai_core::{
@@ -395,76 +393,20 @@ fn bridge_timeout() -> Result<Duration> {
 /// cannot deadlock while the parent waits for it to exit.
 fn run_bridge(command: &mut Command, request: &[u8]) -> Result<BridgeOutput> {
     let timeout = bridge_timeout()?;
-    let mut child = crate::core::process::ChildGuard::spawn(command)
-        .map_err(|error| anyhow!("failed to launch ONNX Runtime bridge: {error}"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow!("ONNX Runtime bridge has no stdout"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow!("ONNX Runtime bridge has no stderr"))?;
-
-    let stdout_reader =
-        thread::spawn(|| crate::core::process::read_bounded(stdout, MAX_BRIDGE_STDOUT_BYTES));
-    let stderr_reader =
-        thread::spawn(|| crate::core::process::read_bounded(stderr, MAX_BRIDGE_STDERR_BYTES));
-
-    // Always take stdin so a probe with an empty request still sends EOF to
-    // the Python bridge. Keep nonempty writes off the polling thread: a
-    // bridge that stops reading before consuming a large multimodal request
-    // must still be interruptible by the wall-clock deadline.
-    let stdin_writer = if request.is_empty() {
-        // Probe commands generally inherit stdin because they never consume
-        // a request body. There is no pipe to close in that case.
-        drop(child.stdin.take());
-        None
-    } else {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("ONNX Runtime bridge stdin is unavailable"))?;
-        let request = request.to_vec();
-        Some(thread::spawn(move || stdin.write_all(&request)))
-    };
-
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
-            let _ = stdin_writer.map(|writer| writer.join()).transpose();
-            return Err(anyhow!(
-                "ONNX Runtime bridge timed out after {} seconds",
-                timeout.as_secs()
-            ));
-        }
-        thread::sleep(Duration::from_millis(10));
-    };
-
-    let (stdout, stdout_exceeded) = stdout_reader
-        .join()
-        .map_err(|_| anyhow!("ONNX Runtime bridge stdout reader panicked"))??;
-    let (stderr, stderr_exceeded) = stderr_reader
-        .join()
-        .map_err(|_| anyhow!("ONNX Runtime bridge stderr reader panicked"))??;
-    if let Some(writer) = stdin_writer {
-        writer
-            .join()
-            .map_err(|_| anyhow!("ONNX Runtime bridge stdin writer panicked"))??;
-    }
+    let output = crate::core::process::run_bounded_output(
+        command,
+        request,
+        MAX_BRIDGE_STDOUT_BYTES,
+        MAX_BRIDGE_STDERR_BYTES,
+        timeout,
+    )
+    .map_err(|error| anyhow!("ONNX Runtime bridge process failed: {error}"))?;
     Ok(BridgeOutput {
-        stdout,
-        stderr,
-        stdout_exceeded,
-        stderr_exceeded,
-        status,
+        status: output.status,
+        stdout: output.stdout,
+        stderr: output.stderr,
+        stdout_exceeded: output.stdout_exceeded,
+        stderr_exceeded: output.stderr_exceeded,
     })
 }
 
@@ -475,6 +417,7 @@ mod tests {
         DeviceCapability, MemoryTopology, ModelFile, ModelIoSchema, ModelMemoryProfile, PowerState,
         RuntimeHints, ThermalState, constants::GIB,
     };
+    use std::time::Instant;
 
     fn cpu_capability() -> DeviceCapability {
         DeviceCapability {
