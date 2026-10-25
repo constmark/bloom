@@ -5,7 +5,7 @@
 //! environment, this adapter executes the model through the bundled bridge and
 //! returns text or numeric output using a small JSON protocol.
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -406,8 +406,10 @@ fn run_bridge(command: &mut Command, request: &[u8]) -> Result<BridgeOutput> {
         .take()
         .ok_or_else(|| anyhow!("ONNX Runtime bridge has no stderr"))?;
 
-    let stdout_reader = thread::spawn(|| read_bounded(stdout, MAX_BRIDGE_STDOUT_BYTES));
-    let stderr_reader = thread::spawn(|| read_bounded(stderr, MAX_BRIDGE_STDERR_BYTES));
+    let stdout_reader =
+        thread::spawn(|| crate::core::process::read_bounded(stdout, MAX_BRIDGE_STDOUT_BYTES));
+    let stderr_reader =
+        thread::spawn(|| crate::core::process::read_bounded(stderr, MAX_BRIDGE_STDERR_BYTES));
 
     // Always take stdin so a probe with an empty request still sends EOF to
     // the Python bridge. Keep nonempty writes off the polling thread: a
@@ -464,26 +466,6 @@ fn run_bridge(command: &mut Command, request: &[u8]) -> Result<BridgeOutput> {
         stderr_exceeded,
         status,
     })
-}
-
-fn read_bounded(mut reader: impl Read, limit: usize) -> std::io::Result<(Vec<u8>, bool)> {
-    let mut retained = Vec::with_capacity(limit.min(8192));
-    let mut buffer = [0u8; 8192];
-    let mut exceeded = false;
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        if retained.len() < limit {
-            let keep = (limit - retained.len()).min(read);
-            retained.extend_from_slice(&buffer[..keep]);
-            exceeded |= keep < read;
-        } else {
-            exceeded = true;
-        }
-    }
-    Ok((retained, exceeded))
 }
 
 #[cfg(test)]
@@ -628,11 +610,11 @@ mod tests {
 
     #[test]
     fn bridge_reader_retains_only_the_configured_limit() {
-        let (bytes, exceeded) = read_bounded("abcdef".as_bytes(), 3).unwrap();
+        let (bytes, exceeded) = crate::core::process::read_bounded("abcdef".as_bytes(), 3).unwrap();
         assert_eq!(bytes, b"abc");
         assert!(exceeded);
 
-        let (bytes, exceeded) = read_bounded("abc".as_bytes(), 3).unwrap();
+        let (bytes, exceeded) = crate::core::process::read_bounded("abc".as_bytes(), 3).unwrap();
         assert_eq!(bytes, b"abc");
         assert!(!exceeded);
     }

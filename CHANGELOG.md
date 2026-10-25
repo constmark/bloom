@@ -10,6 +10,16 @@ called out in release notes.
 
 ### Reliability and distribution
 
+- Update the optional Metal adapter to 0.33.0 while retaining Candle's pinned
+  0.29 dependency as a separate lockfile entry; refresh the MLX/MLX-LM bridge
+  and OpenAI compatibility smoke pins to their current supported revisions.
+- Centralize bounded child-process pipe draining and apply a 64 KiB diagnostic
+  cap to ffmpeg failures. ffmpeg stderr is drained concurrently with frame
+  writes, so noisy encoders cannot deadlock on a full pipe or retain unbounded
+  diagnostics in memory.
+- Harden server metrics against duplicate lifecycle completion, non-finite or
+  negative latency samples, and inconsistent KV free-block counters; exported
+  gauges now remain finite and non-wrapping under malformed observations.
 - Harden Wan video and diffusion boundaries: reject empty or oversized frame
   dimensions, invalid stride alignment, non-finite sampling controls, and
   zero-frame VAE inputs before tensor construction; validate per-sample grid

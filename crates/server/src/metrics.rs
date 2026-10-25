@@ -71,7 +71,15 @@ impl ServerMetrics {
         tokens_generated: u64,
         prompt_tokens: u64,
     ) {
-        self.in_flight_requests.fetch_sub(1, Ordering::Release);
+        // A lifecycle guard normally pairs every end with a start, but keep
+        // the exported gauge fail-closed if a future caller reports a
+        // duplicate completion. An unsigned counter must never wrap to
+        // u64::MAX and poison dashboards or admission diagnostics.
+        let _ =
+            self.in_flight_requests
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    current.checked_sub(1)
+                });
         if success {
             self.requests_completed.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -81,29 +89,30 @@ impl ServerMetrics {
             .fetch_add(tokens_generated, Ordering::Relaxed);
         self.prompt_tokens_total
             .fetch_add(prompt_tokens, Ordering::Relaxed);
-        if let Ok(mut durations) = self.durations.lock() {
-            Self::push_observation(&mut durations, duration_secs);
-        }
+        self.record_observation(&self.durations, duration_secs);
     }
 
     /// Record an inference latency observation.
     pub fn record_inference_latency(&self, secs: f64) {
-        if let Ok(mut latencies) = self.inference_latencies.lock() {
-            Self::push_observation(&mut latencies, secs);
-        }
+        self.record_observation(&self.inference_latencies, secs);
     }
 
     /// Record a first-token latency (TTFT) observation in milliseconds.
     pub fn record_first_token_latency(&self, ms: f64) {
-        if let Ok(mut latencies) = self.first_token_latencies.lock() {
-            Self::push_observation(&mut latencies, ms);
-        }
+        self.record_observation(&self.first_token_latencies, ms);
     }
 
     /// Record an inter-token latency observation.
     pub fn record_inter_token_latency(&self, secs: f64) {
-        if let Ok(mut latencies) = self.inter_token_latencies.lock() {
-            Self::push_observation(&mut latencies, secs);
+        self.record_observation(&self.inter_token_latencies, secs);
+    }
+
+    fn record_observation(&self, target: &Mutex<Vec<f64>>, value: f64) {
+        if !value.is_finite() || value < 0.0 {
+            return;
+        }
+        if let Ok(mut observations) = target.lock() {
+            Self::push_observation(&mut observations, value);
         }
     }
 
@@ -235,8 +244,11 @@ impl ServerMetrics {
 
         // Utilization gauge
         let utilization = if kv_cache_metrics.total_blocks > 0 {
-            (kv_cache_metrics.total_blocks - kv_cache_metrics.free_blocks) as f64
-                / kv_cache_metrics.total_blocks as f64
+            let used_blocks = kv_cache_metrics
+                .total_blocks
+                .saturating_sub(kv_cache_metrics.free_blocks)
+                .min(kv_cache_metrics.total_blocks);
+            used_blocks as f64 / kv_cache_metrics.total_blocks as f64
         } else {
             0.0
         };
@@ -541,6 +553,26 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_completion_does_not_underflow_in_flight_gauge() {
+        let metrics = ServerMetrics::new();
+        metrics.record_request_end(false, 0.1, 0, 0);
+        assert_eq!(metrics.in_flight_requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn invalid_observations_are_ignored() {
+        let metrics = ServerMetrics::new();
+        metrics.record_inference_latency(f64::NAN);
+        metrics.record_first_token_latency(f64::INFINITY);
+        metrics.record_inter_token_latency(-1.0);
+        metrics.record_request_end(true, f64::NEG_INFINITY, 0, 0);
+        assert!(metrics.inference_latencies.lock().unwrap().is_empty());
+        assert!(metrics.first_token_latencies.lock().unwrap().is_empty());
+        assert!(metrics.inter_token_latencies.lock().unwrap().is_empty());
+        assert!(metrics.durations.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn test_prometheus_render() {
         let m = ServerMetrics::new();
         m.record_request_start();
@@ -565,6 +597,22 @@ mod tests {
         assert!(output.contains("bloom_request_duration_seconds_avg"));
         assert!(output.contains("bloom_system_memory_used_bytes"));
         assert!(output.contains("bloom_resource_ram_budget_bytes"));
+    }
+
+    #[test]
+    fn invalid_kv_free_count_cannot_underflow_utilization() {
+        let metrics = ServerMetrics::new();
+        let output = metrics.render_prometheus_inner(
+            &KvCacheMetrics {
+                total_blocks: 2,
+                free_blocks: 5,
+                ..KvCacheMetrics::default()
+            },
+            None,
+            (0, 0, 0),
+            None,
+        );
+        assert!(output.contains("bloom_kv_cache_utilization 0.0000"));
     }
 
     #[test]

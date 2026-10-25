@@ -131,3 +131,29 @@ stable deployment still requires target-hardware multi-hour soak,
 failure-injection and upgrade/rollback drills, official multi-architecture
 container provenance, binary-wheel ABI matrices, executable CoreML/Vulkan or
 TensorRT adapters, and trained multimodal/tool-quality evidence.
+
+## 2026-10-25 static follow-up
+
+The repository was refreshed against all advertised `origin` refs. `dev`
+already contains the current `origin/main` history and the 2026-10-24 runtime
+work. The remaining stale dependency declarations were reconciled without
+starting a model or server: the direct Metal integration now uses 0.33.0 while
+the Candle 0.29 transitive path remains explicit in `Cargo.lock`; the MLX,
+MLX-LM, and OpenAI compatibility pins now match the latest reviewed remote
+updates.
+
+The static audit also found two software-level reliability gaps. External
+process diagnostics had a reusable bounded reader only inside the ONNX
+adapter, while ffmpeg retained all stderr in memory and drained it only after
+writing every frame; the reader now lives at the engine process boundary and
+ffmpeg drains concurrently while retaining at most 64 KiB. Server metrics could
+wrap the in-flight gauge on a duplicate completion, admit NaN/negative latency
+observations, or underflow KV utilization when a malformed snapshot reported
+more free blocks than total; all three paths now fail closed and have
+regression coverage.
+
+No inference service, model loader, external bridge, browser workload, or
+hardware test was run in this pass. The unclosed release gaps therefore remain
+unchanged: a measured stable deployment cell, multi-hour and failure-injection
+evidence, official container provenance, binary-wheel compatibility matrices,
+and executable CoreML/Vulkan/TensorRT adapters.

@@ -1,6 +1,6 @@
 # Apple Silicon MLX-LM bridge used by Bloom's `mlx` engine.
-# mlx-lm 0.31.2 matches the Homebrew mlx 0.31.2 runtime available on the
+# mlx-lm 0.32.2 matches the maintained mlx 0.32.4 runtime available on the
 # maintained Apple Silicon environment and ships the Qwen/Llama/Gemma loaders
 # used by scripts/mlx_lm_infer.py.
-mlx==0.31.2
-mlx-lm==0.31.2
+mlx==0.32.4
+mlx-lm==0.32.2

@@ -95,6 +95,34 @@ pub(crate) fn stream_text_process(command: &mut Command, sink: &mut dyn OutputSi
     sink.on_chunk(OutputChunk::End)
 }
 
+/// Drain a child-process pipe while retaining only a bounded prefix.
+///
+/// The pipe is always drained to EOF so a noisy worker cannot block on a full
+/// stderr/stdout pipe, but callers never have to retain unbounded diagnostics
+/// in memory. The boolean reports whether bytes beyond `limit` were observed.
+pub(crate) fn read_bounded(
+    mut reader: impl Read,
+    limit: usize,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut retained = Vec::with_capacity(limit.min(8192));
+    let mut buffer = [0u8; 8192];
+    let mut exceeded = false;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        if retained.len() < limit {
+            let keep = (limit - retained.len()).min(read);
+            retained.extend_from_slice(&buffer[..keep]);
+            exceeded |= keep < read;
+        } else {
+            exceeded = true;
+        }
+    }
+    Ok((retained, exceeded))
+}
+
 fn stream_utf8(reader: &mut impl Read, sink: &mut dyn OutputSink) -> Result<()> {
     let mut pending = Vec::with_capacity(4);
     let mut byte = [0u8; 1];
@@ -140,6 +168,17 @@ mod tests {
         for bytes in [&[0xff][..], &[0xe4, 0xbd], &[0xe4, 0xff]] {
             assert!(stream_utf8(&mut &bytes[..], &mut |_| Ok(())).is_err());
         }
+    }
+
+    #[test]
+    fn bounded_reader_drains_input_and_retains_only_the_prefix() {
+        let (bytes, exceeded) = read_bounded("abcdef".as_bytes(), 3).unwrap();
+        assert_eq!(bytes, b"abc");
+        assert!(exceeded);
+
+        let (bytes, exceeded) = read_bounded("abc".as_bytes(), 3).unwrap();
+        assert_eq!(bytes, b"abc");
+        assert!(!exceeded);
     }
 
     #[cfg(unix)]
