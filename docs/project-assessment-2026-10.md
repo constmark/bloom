@@ -166,3 +166,28 @@ hardware test was run in this pass. The unclosed release gaps therefore remain
 unchanged: a measured stable deployment cell, multi-hour and failure-injection
 evidence, official container provenance, binary-wheel compatibility matrices,
 and executable CoreML/Vulkan/TensorRT adapters.
+
+## 2026-10-26 follow-up
+
+The remote `origin/main` history was already present in `dev`; the current
+remote delta was limited to reviewed Dependabot updates. Bloom now accepts a
+bounded `top_k` sampler control end to end: the core generation contract,
+Candle TopK/TopK+TopP selection, OpenAI Chat/Completions/Responses text
+adapters, Ollama `options.top_k`, standalone CLI, benchmark CLI, interactive
+configuration, and JSON prompt/config files use the same semantics. HTTP and
+Ollama adapters reject values outside 1–32,768, and omitted values preserve
+the previous defaults. The full workspace test suite and strict Clippy pass.
+
+The capability audit still finds gaps that require larger implementations or
+external evidence: native GGUF architecture and quantization breadth remains
+bounded; CoreML, Vulkan, and TensorRT are discovery-only skeletons; ONNX,
+OpenVINO, ASR, NPU, and vendor paths depend on external runtimes; MLX remains
+experimental; reranking is a normalized bi-encoder path rather than a native
+cross-encoder; the external llama.cpp adapter forwards text completion only;
+trained multimodal/tool-quality coverage is incomplete; and multiple choices,
+log probabilities, penalty/logit-bias sampling, custom/built-in tools,
+deprecated function fields, and batched legacy prompts remain explicitly
+unsupported. Stable promotion also still needs target-hardware performance,
+multi-hour soak, cancellation/failure injection, upgrade/rollback, container
+provenance, and binary-wheel ABI evidence. These are now documented as
+evidence-bound work rather than advertised as completed capabilities.
