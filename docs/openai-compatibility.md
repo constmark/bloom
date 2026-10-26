@@ -404,7 +404,8 @@ template:
 
 | Field | Accepted neutral value |
 | --- | --- |
-| `n`, `best_of` | `1` |
+| `n` | `1` by default; integers from 1 through 8 are supported for direct, non-streaming text Chat/Completion requests. |
+| `best_of` | `1` |
 | `functions` | `[]` |
 | `function_call` | `"none"` |
 | `logprobs`, `store`, `echo` | `false` |
@@ -438,8 +439,9 @@ used nor persisted.
 Any unsupported non-neutral value for these fields is rejected with HTTP 400 and an
 `invalid_request_error` before runtime availability, concurrency admission,
 tokenization, or inference. Examples include a non-empty deprecated `functions`
-array, a custom or built-in tool, `n` greater than one, requested log
-probabilities, and
+array, a custom or built-in tool, an out-of-range `n`, an `n` greater than one
+combined with streaming, continuous batching, tools, or structured output,
+requested log probabilities, and
 `echo: true`. Unknown non-null fields follow the same fail-closed rule. Error text
 reports at most eight bounded safe field names and never echoes arbitrary large
 or control-bearing names.
@@ -453,9 +455,11 @@ to the sampled token history and accept finite values from -2 through 2.
 `logit_bias` accepts up to 1,024 numeric token IDs from 0 through 1,000,000
 with finite values from -100 through 100.
 
-Multiple choices, token log probabilities, custom tools, and deprecated
-function fields are
-therefore explicitly unsupported today. Message content arrays accept text
+Streaming/continuous-batching multiple choices, token log probabilities, custom
+tools, and deprecated function fields are therefore explicitly unsupported
+today. Direct non-streaming text requests may return up to eight choices with
+`n`; each choice is generated independently and usage aggregates completion
+tokens across choices. Message content arrays accept text
 parts plus the bounded single-user `image_url` subset described above. Bloom
 rejects audio, file, refusal, malformed, empty, or over-limit part arrays with
 an HTTP 400 error; use Bloom's native multimodal endpoints for inline PCM and

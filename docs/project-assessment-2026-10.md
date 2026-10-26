@@ -183,11 +183,15 @@ external evidence: native GGUF architecture and quantization breadth remains
 bounded; CoreML, Vulkan, and TensorRT are discovery-only skeletons; ONNX,
 OpenVINO, ASR, NPU, and vendor paths depend on external runtimes; MLX remains
 experimental; reranking is a normalized bi-encoder path rather than a native
-cross-encoder; the external llama.cpp adapter forwards text completion only;
-trained multimodal/tool-quality coverage is incomplete; and multiple choices,
-log probabilities, custom/built-in tools,
-deprecated function fields, and batched legacy prompts remain explicitly
-unsupported. Stable promotion also still needs target-hardware performance,
+cross-encoder; Hugging Face `*ForSequenceClassification*` BERT packages are
+detected and fail closed with a clear 501 until a native classifier-head route
+is registered; the external llama.cpp adapter forwards text completion only;
+trained multimodal/tool-quality coverage is incomplete; and streaming or
+continuous-batching multiple choices, log probabilities, custom/built-in
+tools, deprecated function fields, and batched legacy prompts remain explicitly
+unsupported. Direct non-streaming text Chat/Completion requests now support
+bounded independent `n=1..8` choices. Stable promotion also still needs
+target-hardware performance,
 multi-hour soak, cancellation/failure injection, upgrade/rollback, container
 provenance, and binary-wheel ABI evidence. These are now documented as
 evidence-bound work rather than advertised as completed capabilities.

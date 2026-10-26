@@ -216,12 +216,17 @@ async fn execute_embedding_batch_inner(
     let model_id = runtime.model_id.clone();
     let pipeline = Arc::clone(&runtime.pipeline);
     if !model_supports_embeddings(&pipeline) {
+        let message = if bloomai_engine::model_manifest_is_cross_encoder(
+            &pipeline.metadata().manifest,
+        ) {
+            "The loaded model is a cross-encoder sequence classifier. Native classifier-head reranking is not available in this runtime yet; use a Sentence Transformers bi-encoder or an ONNX/OpenVINO reranker."
+        } else {
+            "The loaded model does not advertise embedding/rerank support. Load a supported encoder model or declare bloom_task=embedding in its trusted manifest metadata."
+        };
         return Err(EmbeddingExecutionError::new(
             axum::http::StatusCode::NOT_IMPLEMENTED,
             "unsupported_operation",
-            format!(
-                "Model '{model_id}' does not advertise embedding/rerank support. Load a supported encoder model or declare bloom_task=embedding in its trusted manifest metadata."
-            ),
+            format!("Model '{model_id}' cannot serve this request: {message}"),
         ));
     }
     let (inputs, prompt_tokens) = prepare_embedding_inputs(&pipeline, inputs, truncate_inputs)

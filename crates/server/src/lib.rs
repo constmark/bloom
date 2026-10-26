@@ -2963,9 +2963,11 @@ mod tests {
         }))
         .unwrap();
         let error = helpers::validate_chat_request_compatibility(&active).unwrap_err();
-        for field in ["n", "unknown_semantic"] {
-            assert!(error.contains(field));
-        }
+        assert!(error.contains("unknown_semantic"));
+        assert_eq!(
+            helpers::request_choice_count(&active.extensions).unwrap(),
+            2
+        );
         assert_eq!(
             helpers::request_penalties(&active.extensions).unwrap(),
             (0.0, 0.5)
@@ -2977,6 +2979,16 @@ mod tests {
             vec!["END"]
         );
         assert!(error.contains("instead of silently ignoring"));
+
+        for value in [json!(0), json!(9), json!("2")] {
+            let request = serde_json::from_value::<ChatRequest>(json!({
+                "messages": [{"role": "user", "content": "Hello"}],
+                "n": value
+            }))
+            .unwrap();
+            assert!(helpers::request_choice_count(&request.extensions).is_err());
+            assert!(helpers::validate_chat_request_compatibility(&request).is_err());
+        }
 
         let logprob_request = serde_json::from_value::<ChatRequest>(json!({
             "messages": [{"role": "user", "content": "Hello"}],
@@ -3079,6 +3091,18 @@ mod tests {
                 "model": "default",
                 "messages": [{"role": "user", "content": "Hello"}],
                 "response_format": {"type": "text", "future": true}
+            }),
+            json!({
+                "model": "default",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": true,
+                "n": 2
+            }),
+            json!({
+                "model": "default",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "n": 2,
+                "response_format": {"type": "json_object"}
             }),
             json!({
                 "model": "default",
@@ -9944,6 +9968,226 @@ mod tests {
         );
         assert_eq!(state.app.semaphore.available_permits(), 1);
         assert!(state.app.cancellations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn openai_non_streaming_n_returns_bounded_chat_and_completion_choices() {
+        let temp = tempfile::tempdir().unwrap();
+        let emitted_chunks = Arc::new(AtomicU64::new(0));
+        let state = test_server_state_with_text_runtime(
+            temp.path().to_path_buf(),
+            Arc::clone(&emitted_chunks),
+        )
+        .await;
+        let app = Router::new()
+            .route("/v1/chat/completions", post(handle_chat_completions))
+            .route("/v1/completions", post(handle_completions))
+            .with_state(state);
+
+        let chat_response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "test-text-model",
+                            "messages": [{"role": "user", "content": "Continue"}],
+                            "max_tokens": 8,
+                            "n": 2,
+                            "seed": 7
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(chat_response.status(), axum::http::StatusCode::OK);
+        let chat_body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(chat_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(chat_body["choices"].as_array().unwrap().len(), 2);
+        assert_eq!(chat_body["choices"][0]["index"], 0);
+        assert_eq!(chat_body["choices"][1]["index"], 1);
+        assert_eq!(
+            chat_body["choices"][0]["message"]["content"],
+            "visible STOP hidden never emitted"
+        );
+        assert!(chat_body["usage"]["completion_tokens"].as_u64().unwrap() > 0);
+
+        let completion_response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "test-text-model",
+                            "prompt": "Continue",
+                            "max_tokens": 8,
+                            "n": 2,
+                            "seed": 7
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(completion_response.status(), axum::http::StatusCode::OK);
+        let completion_body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(completion_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(completion_body["choices"].as_array().unwrap().len(), 2);
+        assert_eq!(completion_body["choices"][0]["index"], 0);
+        assert_eq!(completion_body["choices"][1]["index"], 1);
+        assert_eq!(
+            completion_body["choices"][0]["text"],
+            "visible STOP hidden never emitted"
+        );
+        assert!(
+            completion_body["usage"]["completion_tokens"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+
+        for body in [
+            json!({
+                "model": "test-text-model",
+                "messages": [{"role": "user", "content": "Continue"}],
+                "stream": true,
+                "n": 2
+            }),
+            json!({
+                "model": "test-text-model",
+                "messages": [{"role": "user", "content": "Continue"}],
+                "n": 2,
+                "tools": [{"type": "function", "function": {"name": "lookup"}}]
+            }),
+            json!({
+                "model": "test-text-model",
+                "messages": [{"role": "user", "content": "Continue"}],
+                "n": 2,
+                "response_format": {"type": "json_object"}
+            }),
+            json!({
+                "model": "test-text-model",
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+                        }
+                    }]
+                }],
+                "n": 2
+            }),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(axum::body::Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+            let response_body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(response_body["error"]["type"], "invalid_request_error");
+            assert!(
+                response_body["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("n greater than 1")
+            );
+        }
+        assert_eq!(emitted_chunks.load(Ordering::Relaxed), 12);
+    }
+
+    #[tokio::test]
+    async fn openai_n_greater_than_one_is_rejected_with_ifb() {
+        let temp = tempfile::tempdir().unwrap();
+        let execute_calls = Arc::new(AtomicU64::new(0));
+        let kv_pool = Arc::new(TestIfbKvPool::immediate(true));
+        let (state, _scheduler) = test_server_state_with_ifb_runtime(
+            temp.path().to_path_buf(),
+            Arc::new(TestIfbExecutor {
+                execute_calls: Arc::clone(&execute_calls),
+            }),
+            kv_pool,
+        )
+        .await;
+        let app = Router::new()
+            .route("/v1/chat/completions", post(handle_chat_completions))
+            .route("/v1/completions", post(handle_completions))
+            .with_state(state);
+        for (uri, body) in [
+            (
+                "/v1/chat/completions",
+                json!({
+                    "model": "test-ifb-model",
+                    "messages": [{"role": "user", "content": "Continue"}],
+                    "n": 2
+                }),
+            ),
+            (
+                "/v1/completions",
+                json!({
+                    "model": "test-ifb-model",
+                    "prompt": "Continue",
+                    "n": 2
+                }),
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(axum::body::Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+            let response_body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(
+                response_body["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("continuous batching")
+            );
+        }
+        assert_eq!(execute_calls.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

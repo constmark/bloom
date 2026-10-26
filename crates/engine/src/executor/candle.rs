@@ -435,6 +435,12 @@ impl Engine for CandleEngine {
     }
 
     fn supports(&self, manifest: &ModelManifest, device_cap: &DeviceCapability) -> SupportLevel {
+        if crate::core::manifest::model_manifest_is_cross_encoder(manifest) {
+            return SupportLevel::Unsupported(
+                "Candle detects a BERT cross-encoder sequence classifier, but its classifier-head rerank route is not implemented; use a Sentence Transformers bi-encoder or ONNX/OpenVINO reranker"
+                    .to_string(),
+            );
+        }
         let base = default_engine_supports(&self.capability(), manifest, device_cap);
         if !base.is_supported() {
             return base;

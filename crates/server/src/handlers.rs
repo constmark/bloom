@@ -10,12 +10,12 @@ async fn model_unavailable_response(state: &ServerState) -> axum::response::Resp
     )
 }
 
-fn embedding_model_generation_response(model_id: &str) -> axum::response::Response {
+fn encoder_model_generation_response(model_id: &str) -> axum::response::Response {
     error_response(
         axum::http::StatusCode::UNPROCESSABLE_ENTITY,
         "unsupported_operation",
         format!(
-            "Model '{model_id}' is an embedding encoder and cannot serve text-generation requests. Use /v1/embeddings, /v1/rerank, /api/embed, or /api/embeddings."
+            "Model '{model_id}' is an encoder-only model and cannot serve text-generation requests. Use /v1/embeddings, /v1/rerank, /api/embed, or /api/embeddings when the loaded encoder supports that route."
         ),
     )
 }
@@ -2172,6 +2172,36 @@ fn run_cancellable_text_inference(
     })
 }
 
+/// Run a bounded set of independent generations for OpenAI's `n` option.
+///
+/// Each candidate gets its own parameter clone. When a seed is supplied, the
+/// first candidate keeps it and later candidates receive deterministic,
+/// non-overlapping seed values so `n > 1` does not return identical samples.
+fn run_cancellable_text_choices(
+    pipeline: &InferencePipeline,
+    input: ModelInput,
+    params: &GenerationParams,
+    cancel_token: &CancellationToken,
+    stop_sequences: &[String],
+    choice_count: usize,
+) -> Result<Vec<GeneratedText>> {
+    let mut outputs = Vec::with_capacity(choice_count);
+    for index in 0..choice_count {
+        let mut choice_params = params.clone();
+        if let Some(seed) = choice_params.seed {
+            choice_params.seed = Some(seed.wrapping_add(index as u64));
+        }
+        outputs.push(run_cancellable_text_inference(
+            pipeline,
+            input.clone(),
+            &choice_params,
+            cancel_token,
+            stop_sequences.to_vec(),
+        )?);
+    }
+    Ok(outputs)
+}
+
 pub(crate) async fn handle_chat_completions(
     State(state): State<Arc<ServerState>>,
     Json(payload): Json<ChatRequest>,
@@ -2202,6 +2232,23 @@ async fn handle_chat_completions_inner(
             message,
         );
     }
+    let choice_count = match request_choice_count(&payload.extensions) {
+        Ok(count) => count,
+        Err(message) => {
+            return error_response(
+                axum::http::StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                message,
+            );
+        }
+    };
+    if choice_count > 1 && (payload.stream || state.app.enable_ifb) {
+        return error_response(
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "n greater than 1 is currently supported only for non-streaming text Chat Completions without continuous batching.",
+        );
+    }
     let vision_request = match prepare_openai_vision_request(&payload) {
         Ok(request) => request,
         Err(message) => {
@@ -2213,6 +2260,13 @@ async fn handle_chat_completions_inner(
         }
     };
     if let Some(vision_request) = vision_request {
+        if choice_count > 1 {
+            return error_response(
+                axum::http::StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "n greater than 1 is currently supported only for direct text Chat Completions; multimodal requests are not supported.",
+            );
+        }
         let stream = payload.stream;
         let response = match exact_runtime {
             Some(runtime) => {
@@ -2274,6 +2328,15 @@ async fn handle_chat_completions_inner(
             axum::http::StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "response_format cannot be combined with active function tools in Bloom. Tool arguments are validated against each function's parameters schema.",
+        );
+    }
+    if choice_count > 1
+        && (tool_config.is_some() || !matches!(response_format, ResponseFormatMode::Text))
+    {
+        return error_response(
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "n greater than 1 is currently supported only for non-streaming text Chat Completions without tools or structured output.",
         );
     }
     let core_response_format = match (&tool_config, &response_format) {
@@ -2360,8 +2423,8 @@ async fn handle_chat_completions_inner(
     };
     let runtime = Arc::clone(runtime_lease.runtime());
     let model_id = runtime.model_id.clone();
-    if model_supports_embeddings(&runtime.pipeline) {
-        return embedding_model_generation_response(&model_id);
+    if model_is_non_generation(&runtime.pipeline) {
+        return encoder_model_generation_response(&model_id);
     }
     let pipeline = Arc::clone(&runtime.pipeline);
     let model_family = runtime.model_family.clone();
@@ -2925,15 +2988,17 @@ async fn handle_chat_completions_inner(
         let pipeline_for_run = Arc::clone(&pipeline);
         let cancel_token_for_run = cancel_token.clone();
         let stop_sequences_for_run = stop_sequences.clone();
+        let choice_count_for_run = choice_count;
         let inference_start = std::time::Instant::now();
         let res = task::spawn_blocking(move || {
             let _worker_lifecycle = worker_lifecycle;
-            run_cancellable_text_inference(
+            run_cancellable_text_choices(
                 &pipeline_for_run,
                 input,
                 &params,
                 &cancel_token_for_run,
-                stop_sequences_for_run,
+                &stop_sequences_for_run,
+                choice_count_for_run,
             )
         })
         .await;
@@ -2942,8 +3007,8 @@ async fn handle_chat_completions_inner(
             .metrics
             .record_inference_latency(inference_start.elapsed().as_secs_f64());
 
-        let generated_output = match res {
-            Ok(Ok(output)) => output,
+        let generated_outputs = match res {
+            Ok(Ok(outputs)) => outputs,
             Ok(Err(e)) => {
                 client_guard.finish(false);
                 if cancel_token.is_cancelled() {
@@ -2969,54 +3034,59 @@ async fn handle_chat_completions_inner(
             }
         };
 
-        let generated_text = generated_output.text;
-        let parsed_output =
-            match parse_chat_output(&generated_text, &response_format, tool_config.as_ref()) {
-                Ok(output) => output,
-                Err(message) => {
+        let mut completion_tokens = 0_usize;
+        let mut choices = Vec::with_capacity(generated_outputs.len());
+        for (index, generated_output) in generated_outputs.into_iter().enumerate() {
+            let generated_text = generated_output.text;
+            let parsed_output =
+                match parse_chat_output(&generated_text, &response_format, tool_config.as_ref()) {
+                    Ok(output) => output,
+                    Err(message) => {
+                        client_guard.finish(false);
+                        return error_response(
+                            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                            if tool_config.is_some() {
+                                "invalid_tool_call"
+                            } else {
+                                "invalid_response_format"
+                            },
+                            message,
+                        );
+                    }
+                };
+            let output_tokens = match pipeline.tokenize(&generated_text) {
+                Ok(tokens) => tokens.len(),
+                Err(error) => {
                     client_guard.finish(false);
                     return error_response(
-                        axum::http::StatusCode::UNPROCESSABLE_ENTITY,
-                        if tool_config.is_some() {
-                            "invalid_tool_call"
-                        } else {
-                            "invalid_response_format"
-                        },
-                        message,
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        "tokenization_error",
+                        format!("Completion tokenization failed: {error}"),
                     );
                 }
             };
-        let completion_tokens = match pipeline.tokenize(&generated_text) {
-            Ok(tokens) => tokens.len(),
-            Err(error) => {
-                client_guard.finish(false);
-                return error_response(
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    "tokenization_error",
-                    format!("Completion tokenization failed: {error}"),
-                );
-            }
-        };
+            completion_tokens = completion_tokens.saturating_add(output_tokens);
+            let finish_reason = if generated_output.stopped {
+                "stop"
+            } else {
+                chat_output_finish_reason(&parsed_output, output_tokens, max_tokens)
+            };
+            choices.push(json!({
+                "index": index,
+                "message": chat_output_message(&request_id, &parsed_output),
+                "finish_reason": finish_reason
+            }));
+        }
         generated_count.store(completion_tokens as u64, Ordering::Relaxed);
 
         client_guard.finish(true);
-        let finish_reason = if generated_output.stopped {
-            "stop"
-        } else {
-            chat_output_finish_reason(&parsed_output, completion_tokens, max_tokens)
-        };
-        let message = chat_output_message(&request_id, &parsed_output);
 
         return Json(json!({
             "id": request_id,
             "object": "chat.completion",
             "created": created,
             "model": model_id.clone(),
-            "choices": [{
-                "index": 0,
-                "message": message,
-                "finish_reason": finish_reason
-            }],
+            "choices": choices,
             "usage": {
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
@@ -3931,6 +4001,23 @@ pub(crate) async fn handle_completions(
             message,
         );
     }
+    let choice_count = match request_choice_count(&payload.extensions) {
+        Ok(count) => count,
+        Err(message) => {
+            return error_response(
+                axum::http::StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                message,
+            );
+        }
+    };
+    if choice_count > 1 && (payload.stream || state.app.enable_ifb) {
+        return error_response(
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "n greater than 1 is currently supported only for non-streaming text Completions without continuous batching.",
+        );
+    }
     let stop_sequences = match normalize_stop_sequences(payload.stop.as_ref()) {
         Ok(sequences) => sequences,
         Err(message) => {
@@ -3991,6 +4078,13 @@ pub(crate) async fn handle_completions(
             );
         }
     };
+    if choice_count > 1 && !matches!(response_format, ResponseFormatMode::Text) {
+        return error_response(
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "n greater than 1 is currently supported only for non-streaming text Completions without structured output.",
+        );
+    }
     let prompt = match single_completion_prompt(&payload.prompt) {
         Ok(prompt) => prompt,
         Err(message) => {
@@ -4012,8 +4106,8 @@ pub(crate) async fn handle_completions(
     };
     let runtime = Arc::clone(runtime_lease.runtime());
     let model_id = runtime.model_id.clone();
-    if model_supports_embeddings(&runtime.pipeline) {
-        return embedding_model_generation_response(&model_id);
+    if model_is_non_generation(&runtime.pipeline) {
+        return encoder_model_generation_response(&model_id);
     }
     let pipeline = Arc::clone(&runtime.pipeline);
     let scheduler_opt = runtime.scheduler.clone();
@@ -4489,15 +4583,17 @@ pub(crate) async fn handle_completions(
         let pipeline_for_run = Arc::clone(&pipeline);
         let cancel_token_for_run = cancel_token.clone();
         let stop_sequences_for_run = stop_sequences.clone();
+        let choice_count_for_run = choice_count;
         let inference_start = std::time::Instant::now();
         let res = task::spawn_blocking(move || {
             let _worker_lifecycle = worker_lifecycle;
-            run_cancellable_text_inference(
+            run_cancellable_text_choices(
                 &pipeline_for_run,
                 input,
                 &params,
                 &cancel_token_for_run,
-                stop_sequences_for_run,
+                &stop_sequences_for_run,
+                choice_count_for_run,
             )
         })
         .await;
@@ -4506,8 +4602,8 @@ pub(crate) async fn handle_completions(
             .metrics
             .record_inference_latency(inference_start.elapsed().as_secs_f64());
 
-        let generated_output = match res {
-            Ok(Ok(output)) => output,
+        let generated_outputs = match res {
+            Ok(Ok(outputs)) => outputs,
             Ok(Err(e)) => {
                 client_guard.finish(false);
                 if cancel_token.is_cancelled() {
@@ -4532,46 +4628,51 @@ pub(crate) async fn handle_completions(
                 );
             }
         };
-
-        let generated_text = generated_output.text;
-        if let Err(message) = validate_structured_output(&generated_text, &response_format) {
-            client_guard.finish(false);
-            return error_response(
-                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
-                "invalid_response_format",
-                message,
-            );
-        }
-        let completion_tokens = match pipeline.tokenize(&generated_text) {
-            Ok(tokens) => tokens.len(),
-            Err(error) => {
+        let mut completion_tokens = 0_usize;
+        let mut choices = Vec::with_capacity(generated_outputs.len());
+        for (index, generated_output) in generated_outputs.into_iter().enumerate() {
+            let generated_text = generated_output.text;
+            if let Err(message) = validate_structured_output(&generated_text, &response_format) {
                 client_guard.finish(false);
                 return error_response(
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    "tokenization_error",
-                    format!("Completion tokenization failed: {error}"),
+                    axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                    "invalid_response_format",
+                    message,
                 );
             }
-        };
+            let output_tokens = match pipeline.tokenize(&generated_text) {
+                Ok(tokens) => tokens.len(),
+                Err(error) => {
+                    client_guard.finish(false);
+                    return error_response(
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        "tokenization_error",
+                        format!("Completion tokenization failed: {error}"),
+                    );
+                }
+            };
+            completion_tokens = completion_tokens.saturating_add(output_tokens);
+            let finish_reason = if generated_output.stopped {
+                "stop"
+            } else {
+                generation_finish_reason(output_tokens, max_tokens)
+            };
+            choices.push(json!({
+                "index": index,
+                "text": generated_text,
+                "finish_reason": finish_reason
+            }));
+        }
         generated_count.store(completion_tokens as u64, Ordering::Relaxed);
 
         client_guard.finish(true);
-        let finish_reason = if generated_output.stopped {
-            "stop"
-        } else {
-            generation_finish_reason(completion_tokens, max_tokens)
-        };
 
         return Json(json!({
             "id": request_id,
             "object": "text_completion",
             "created": unix_seconds(),
             "model": model_id.clone(),
-            "choices": [{
-                "index": 0,
-                "text": generated_text,
-                "finish_reason": finish_reason
-            }],
+            "choices": choices,
             "usage": {
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,

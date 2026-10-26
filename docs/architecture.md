@@ -560,8 +560,8 @@ modern request envelope. Admission permits JSON `null` and a documented set of
 exact no-op OpenAI defaults, then rejects every non-neutral or unknown field
 before readiness, concurrency, tokenization, or metrics admission. The error
 reports at most eight sanitized bounded field names. This boundary prevents
-clients from assuming that stored response state, multiple choices, log
-probabilities, custom tools, or unsupported sampling controls took effect when
+clients from assuming that stored response state, unsupported multiple-choice
+modes, log probabilities, custom tools, or unsupported sampling controls took effect when
 the current runtime cannot honor them. Supported Chat and legacy Completion
 stop sequences cross a separate bounded incremental filter. It retains only a
 suffix that could complete a configured marker, publishes confirmed-safe text,

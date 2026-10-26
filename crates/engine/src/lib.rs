@@ -43,8 +43,8 @@ pub use crate::core::io::{
 };
 pub use crate::core::manifest::{
     MemoryEstimate, estimate_memory, estimate_memory_for_device, format_bytes, infer_quantization,
-    load_manifest, model_manifest_supports_embeddings, model_manifest_tasks,
-    resolve_hf_safetensors_files,
+    load_manifest, model_manifest_is_cross_encoder, model_manifest_supports_embeddings,
+    model_manifest_tasks, resolve_hf_safetensors_files,
 };
 pub use crate::core::memory::{
     MemoryPreallocationConfig, MemoryPreallocationPlan, MemoryReservation, available_system_memory,

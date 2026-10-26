@@ -626,8 +626,9 @@ Chat and legacy completion requests also capture fields outside Bloom's
 supported OpenAI subset. Exact no-op defaults such as `n: 1`, empty `tools`,
 `tool_choice: "none"`, and zero penalties remain compatible; any
 unknown or unsupported semantics fail with HTTP 400 before runtime admission
-instead of being silently ignored. Multiple choices, log probabilities,
-custom tools, and the deprecated function-call
+instead of being silently ignored. Direct non-streaming text requests support
+bounded independent choices through `n: 1..8`; streaming/continuous-batching
+multiple choices, log probabilities, custom tools, and deprecated function-call
 request fields are not yet implemented. See the
 [OpenAI compatibility guide](docs/openai-compatibility.md) for the precise field
 matrix and error behavior. The llama.cpp-compatible `top_k` extension is

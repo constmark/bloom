@@ -22,12 +22,19 @@ const VALIDATED_SAFETENSORS_ELEMENT_COUNT: &str = "_bloom_validated_safetensors_
 
 /// Return the inference tasks advertised by Bloom for a trusted model manifest.
 ///
-/// BERT packages are encoders by definition. Other families may opt into the
-/// encoder runtime through Bloom's trusted `bloom_task` manifest metadata.
-/// Encoder runtimes expose both embeddings and reranking because reranking is
-/// implemented from the same normalized embedding primitive.
+/// BERT packages are encoders by definition. Sequence-classification BERT
+/// packages are cross encoders and are kept out of the bi-encoder embedding
+/// route; until a classifier-head executor is registered they remain
+/// generation-only in readiness/preflight.
+/// Other families may opt into the encoder runtime through Bloom's trusted
+/// `bloom_task` manifest metadata.
 pub fn model_manifest_tasks(manifest: &ModelManifest) -> &'static [&'static str] {
-    if model_manifest_supports_embeddings(manifest) {
+    if model_manifest_is_cross_encoder(manifest) {
+        // A classifier head is detected, but no native scorer route is
+        // registered by this runtime yet. Keep readiness/preflight from
+        // advertising a rerank capability that would return 501.
+        GENERATION_MODEL_TASKS
+    } else if model_manifest_supports_embeddings(manifest) {
         ENCODER_MODEL_TASKS
     } else {
         GENERATION_MODEL_TASKS
@@ -36,14 +43,32 @@ pub fn model_manifest_tasks(manifest: &ModelManifest) -> &'static [&'static str]
 
 /// Whether a trusted model manifest selects Bloom's embedding runtime.
 pub fn model_manifest_supports_embeddings(manifest: &ModelManifest) -> bool {
-    manifest.family == ModelFamily::Bert
+    !model_manifest_is_cross_encoder(manifest)
+        && (manifest.family == ModelFamily::Bert
+            || manifest
+                .parameters
+                .get("bloom_task")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|task| {
+                    task.eq_ignore_ascii_case("embedding") || task.eq_ignore_ascii_case("rerank")
+                }))
+}
+
+/// Whether a trusted manifest describes a pairwise sequence-classification
+/// encoder. Cross encoders consume `(query, document)` pairs and require a
+/// classifier head; they must never be routed through the bi-encoder mean
+/// pooling path.
+pub fn model_manifest_is_cross_encoder(manifest: &ModelManifest) -> bool {
+    manifest
+        .parameters
+        .get("bloom_encoder_kind")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("cross_encoder"))
         || manifest
             .parameters
-            .get("bloom_task")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|task| {
-                task.eq_ignore_ascii_case("embedding") || task.eq_ignore_ascii_case("rerank")
-            })
+            .get("bloom_cross_encoder")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
 }
 
 /// Pre-load memory estimation for a model.
@@ -1470,10 +1495,23 @@ fn infer_from_hf_config(model_path: &Path, config: serde_json::Value) -> Result<
     // incomplete shape instead of falling back to generic memory defaults.
     normalize_nested_text_config(&config, &mut manifest)?;
     if manifest.family == ModelFamily::Bert {
+        let cross_encoder = hf_config_is_cross_encoder(&config);
         manifest.parameters.insert(
             "bloom_task".to_string(),
-            serde_json::Value::String("embedding".to_string()),
+            serde_json::Value::String(
+                if cross_encoder { "rerank" } else { "embedding" }.to_string(),
+            ),
         );
+        if cross_encoder {
+            manifest.parameters.insert(
+                "bloom_encoder_kind".to_string(),
+                serde_json::Value::String("cross_encoder".to_string()),
+            );
+            manifest.parameters.insert(
+                "bloom_cross_encoder".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
         infer_sentence_transformer_config(model_path, &mut manifest)?;
     }
     if !manifest.parameters.contains_key("head_dim") {
@@ -1569,6 +1607,23 @@ fn infer_from_hf_config(model_path: &Path, config: serde_json::Value) -> Result<
     }
 
     Ok(manifest)
+}
+
+/// Detect Hugging Face sequence-classification checkpoints that score a
+/// `(query, document)` pair with a classifier head. Sentence Transformers
+/// packages use `BertModel`/`Bert` architectures and remain bi-encoders.
+fn hf_config_is_cross_encoder(config: &serde_json::Value) -> bool {
+    config
+        .get("architectures")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .any(|architecture| {
+            architecture.contains("forsequenceclassification")
+                || architecture.contains("forsequenceclassificationwithpooling")
+        })
 }
 
 fn infer_sentence_transformer_config(
@@ -3111,6 +3166,14 @@ mod tests {
             model_manifest_tasks(&declared_encoder),
             ["embedding", "rerank"]
         );
+
+        declared_encoder.parameters.insert(
+            "bloom_encoder_kind".to_string(),
+            serde_json::json!("cross_encoder"),
+        );
+        assert_eq!(model_manifest_tasks(&declared_encoder), ["generation"]);
+        assert!(!model_manifest_supports_embeddings(&declared_encoder));
+        assert!(model_manifest_is_cross_encoder(&declared_encoder));
     }
 
     #[test]
@@ -3930,6 +3993,29 @@ mod tests {
 
         let error = load_manifest(dir.path()).unwrap_err().to_string();
         assert!(error.contains("sentence_bert_config.json exceeds"));
+    }
+
+    #[test]
+    fn hf_sequence_classifier_is_classified_as_cross_encoder() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            br#"{"architectures":["BertForSequenceClassification"],"model_type":"bert","hidden_size":384}"#,
+        )
+        .unwrap();
+        write_test_safetensors(&dir.path().join("model.safetensors"), &["weight"]);
+
+        let manifest = load_manifest(dir.path()).unwrap();
+        assert_eq!(
+            manifest.parameters.get("bloom_encoder_kind"),
+            Some(&serde_json::json!("cross_encoder"))
+        );
+        assert_eq!(
+            manifest.parameters.get("bloom_task"),
+            Some(&serde_json::json!("rerank"))
+        );
+        assert_eq!(model_manifest_tasks(&manifest), ["generation"]);
+        assert!(!model_manifest_supports_embeddings(&manifest));
     }
 
     #[test]

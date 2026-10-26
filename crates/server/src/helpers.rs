@@ -277,7 +277,13 @@ fn neutral_request_extension(field: &str, value: &serde_json::Value) -> bool {
         return true;
     }
     match field {
-        "n" | "best_of" => value.as_u64() == Some(1),
+        // Multiple choices are admitted by the OpenAI handlers through the
+        // bounded `request_choice_count` parser below. `best_of` remains a
+        // neutral alias only for the single-choice path.
+        "n" => value
+            .as_u64()
+            .is_some_and(|count| (1..=MAX_CHOICE_COUNT as u64).contains(&count)),
+        "best_of" => value.as_u64() == Some(1),
         "top_k" => value.as_u64().is_some_and(|k| (1..=32_768).contains(&k)),
         "stop" | "tools" | "functions" => {
             value.as_array().is_some_and(|entries| entries.is_empty())
@@ -295,6 +301,33 @@ fn neutral_request_extension(field: &str, value: &serde_json::Value) -> bool {
         }),
         _ => false,
     }
+}
+
+/// Parse the OpenAI `n` option for Chat/Completion requests.
+///
+/// Running many independent generations can consume a large amount of
+/// memory and scheduler capacity, so Bloom deliberately keeps this bounded.
+/// The handlers currently support multiple choices only for direct,
+/// non-streaming text requests; callers enforce those mode constraints.
+pub(crate) const MAX_CHOICE_COUNT: usize = 8;
+
+pub(crate) fn request_choice_count(
+    extensions: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> std::result::Result<usize, String> {
+    let Some(value) = extensions.get("n").filter(|value| !value.is_null()) else {
+        return Ok(1);
+    };
+    let raw = value
+        .as_u64()
+        .ok_or_else(|| "n must be a positive integer.".to_string())?;
+    let count =
+        usize::try_from(raw).map_err(|_| "n is too large for this platform.".to_string())?;
+    if !(1..=MAX_CHOICE_COUNT).contains(&count) {
+        return Err(format!(
+            "n must be between 1 and {MAX_CHOICE_COUNT} when provided."
+        ));
+    }
+    Ok(count)
 }
 
 fn neutral_stream_option_extension(field: &str, value: &serde_json::Value) -> bool {
@@ -3111,6 +3144,15 @@ pub(crate) fn normalize_embedding_input(
 
 pub(crate) fn model_supports_embeddings(pipeline: &InferencePipeline) -> bool {
     bloomai_engine::model_manifest_supports_embeddings(&pipeline.metadata().manifest)
+}
+
+/// Whether the loaded manifest selects an encoder-only runtime. Cross encoders
+/// are detected early but have no native classifier-head route yet, so they
+/// must be rejected by generation handlers rather than sent through the text
+/// decoder path.
+pub(crate) fn model_is_non_generation(pipeline: &InferencePipeline) -> bool {
+    model_supports_embeddings(pipeline)
+        || bloomai_engine::model_manifest_is_cross_encoder(&pipeline.metadata().manifest)
 }
 
 pub(crate) fn collect_embedding(
