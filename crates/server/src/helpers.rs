@@ -39,6 +39,7 @@ const MAX_REPORTED_EXTENSION_FIELD_CHARS: usize = 64;
 pub(crate) fn validate_chat_request_compatibility(
     request: &ChatRequest,
 ) -> std::result::Result<(), String> {
+    reject_token_logprobs("chat completion request", &request.extensions)?;
     reject_non_neutral_extensions(
         "chat completion request",
         &request.extensions,
@@ -200,6 +201,7 @@ impl StopSequenceFilter {
 pub(crate) fn validate_completion_request_compatibility(
     request: &CompletionRequest,
 ) -> std::result::Result<(), String> {
+    reject_token_logprobs("completion request", &request.extensions)?;
     reject_non_neutral_extensions(
         "completion request",
         &request.extensions,
@@ -210,11 +212,37 @@ pub(crate) fn validate_completion_request_compatibility(
 pub(crate) fn validate_responses_request_compatibility(
     request: &ResponsesRequest,
 ) -> std::result::Result<(), String> {
+    reject_token_logprobs("responses request", &request.extensions)?;
     reject_non_neutral_extensions(
         "responses request",
         &request.extensions,
         neutral_responses_extension,
     )
+}
+
+/// Token-level log probabilities require a backend stream contract that
+/// exposes the sampled distribution and token text for every emitted token.
+/// Bloom's current `LoadedModel` contract intentionally exposes text/output
+/// chunks only, so fail closed with a typed diagnostic instead of silently
+/// dropping a requested field.
+fn reject_token_logprobs(
+    scope: &str,
+    extensions: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> std::result::Result<(), String> {
+    let requested = extensions
+        .get("logprobs")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        || extensions
+            .get("top_logprobs")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|value| value > 0);
+    if requested {
+        return Err(format!(
+            "{scope} requested token log probabilities, but the active engine contract does not expose token-level logits; use logprobs=false and top_logprobs=0 or a backend with token-logprob support."
+        ));
+    }
+    Ok(())
 }
 
 fn reject_non_neutral_extensions(

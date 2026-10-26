@@ -2978,6 +2978,17 @@ mod tests {
         );
         assert!(error.contains("instead of silently ignoring"));
 
+        let logprob_request = serde_json::from_value::<ChatRequest>(json!({
+            "messages": [{"role": "user", "content": "Hello"}],
+            "logprobs": true,
+            "top_logprobs": 2
+        }))
+        .unwrap();
+        let logprob_error =
+            helpers::validate_chat_request_compatibility(&logprob_request).unwrap_err();
+        assert!(logprob_error.contains("token log probabilities"));
+        assert!(logprob_error.contains("token-level logits"));
+
         let message_semantics = serde_json::from_value::<ChatRequest>(json!({
             "messages": [{
                 "role": "assistant",
