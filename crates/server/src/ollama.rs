@@ -668,6 +668,11 @@ pub(crate) async fn handle_ollama_show(
         .is_some_and(|runtime| model_supports_embeddings(&runtime.pipeline))
     {
         vec!["embedding"]
+    } else if matching_runtime
+        .as_ref()
+        .is_some_and(|runtime| model_supports_rerank(&runtime.pipeline))
+    {
+        vec!["rerank"]
     } else {
         vec!["completion", "tools"]
     };

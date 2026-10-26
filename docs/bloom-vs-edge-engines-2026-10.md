@@ -51,7 +51,7 @@ turning all of them into partially implemented default features.
 | Product-level model lifecycle | Signed index, SHA-256 verification, bounded downloads/imports, preflight, memory admission, atomic replacement, rollback and guarded deletion ([model index](model-index.md), [model catalog](model-catalog.md)) | Make lifecycle evidence part of every new backend cell: install, interruption, replacement, unload and recovery must be measured with inference. |
 | One client contract | OpenAI Responses/chat/completions/embeddings/reranking, Ollama compatibility, streaming, browser UI, C ABI and Python SDK | Preserve one typed application service and project it into protocols. Add a capability-aware client error when an engine cannot perform an operation. |
 | Edge resource controls | IFB, chunked prefill, paged KV, CacheMesh, speculative decoding, memory estimates, cancellation and request admission | Turn the current experimental mechanics into a measured curve: TTFT/TBT, fairness, memory, cache hit rate, cancellation recovery and long-context behavior. |
-| Multitask scope | Native text generation plus BERT embeddings and bi-encoder reranking, with multimodal and external adapters | Keep embeddings/reranking as first-class tasks and add a trained cross-encoder only after the current bi-encoder path has broader evidence. |
+| Multitask scope | Native text generation plus BERT embeddings and bi-encoder/cross-encoder reranking, with multimodal and external adapters | Keep ranking tasks first-class and expand trained cross-encoder quality evidence alongside multimodal coverage. |
 | Truthful failure behavior | Explicit `experimental`, `external-runtime` and `skeleton` statuses; capability routing rejects unsupported combinations before load | Treat every support promotion as a model/device/task evidence change, not an adapter declaration change. |
 | Rust and bounded process boundaries | Memory-safe native code, bounded external process output/deadlines, cross-platform path handling, doctor and diagnostics | Publish a small stable backend ABI and versioned plugin contract after the first deployment cell is stable. |
 
@@ -130,14 +130,14 @@ separately labelled kernel-throughput mode.
 ### 5. Multimodal and ranking breadth is incomplete
 
 Bloom accepts bounded text/image/audio protocol inputs and has native BERT
-embedding plus bi-encoder cosine reranking, but cross-encoder reranking and
-trained vision/audio/video task evidence remain incomplete. llama-server and
+embedding plus bi-encoder cosine and cross-encoder classifier-head reranking;
+trained cross-encoder and vision/audio/video task evidence remain incomplete. llama-server and
 ONNX Runtime GenAI provide useful references for grammar/tooling and multimodal
 generation; MNN and ExecuTorch provide stronger mobile encoder paths.
 
-**Action:** first publish one trained multimodal cell with exact image/audio
-limits, stream/error behavior and quality metrics. Then add a native
-cross-encoder interface with a separate task capability. Do not route a
+**Action:** publish one trained multimodal and cross-encoder quality cell with
+exact input limits, stream/error behavior and ranking metrics. Keep the native
+cross-encoder interface on its separate task capability and do not route a
 bi-encoder as if it were a cross-encoder.
 
 ### 6. Distribution and ecosystem are smaller
@@ -160,7 +160,7 @@ consume the same readiness and model-manifest contracts.
 | P1: native coverage | Llama 3/Mistral/Gemma/Qwen GGUF; Q4_K/Q5_K/Q6_K/Q8; tokenizer/template and quantization preflight | One fixture and one benchmark/quality record per family and quantization class | Closes the largest everyday gap against llama.cpp |
 | P2: one accelerator | Metal/MLX/Core ML for Apple, or CUDA/ONNX GenAI for cross-platform | Executable packaged runtime, provider/device diagnostics, cancellation, memory and target hardware report | Adds real speed or reach without multiplying skeletons |
 | P3: runtime behavior | IFB fairness, paged KV, prefix reuse, speculative decoding, long context and backpressure | Concurrency curves, cache hit/eviction data, recovery and long-context reports | Makes Bloom's scheduling/cache architecture a measurable advantage |
-| P4: tasks and mobile | Trained multimodal cell, cross-encoder rerank, then an MNN/ExecuTorch/LiteRT mobile package | Quality gates, per-task capability routing, mobile artifact and battery/memory report | Extends scope after the core runtime is dependable |
+| P4: tasks and mobile | Trained multimodal/cross-encoder quality cell, then an MNN/ExecuTorch/LiteRT mobile package | Quality gates, per-task capability routing, mobile artifact and battery/memory report | Extends scope after the core runtime is dependable |
 | P5: ecosystem | Stable C ABI/Python wheels, plugin ABI, conversion/import helpers and release provenance | Cross-version ABI matrix, clean-machine install, upgrade/rollback and signed artifacts | Lowers adoption cost after behavior is stable |
 
 ## Guardrails for implementation

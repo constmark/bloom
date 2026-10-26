@@ -127,6 +127,7 @@
         "model_tasks": {
           "oneOf": [
             { "const": ["generation"] },
+            { "const": ["rerank"] },
             { "const": ["embedding", "rerank"] }
           ]
         },

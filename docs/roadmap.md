@@ -56,8 +56,8 @@ final parity claim.
   BERT routing, attention-mask-aware variable-length batching, semantic
   separation, bi-encoder reranking, model-bounded context, and encoder-only task
   isolation. Wider Qwen, Llama, and embedding checkpoints, trained public
-  sharded Safetensors packages, quantizations, cross-encoder reranking, and
-  trained tool selection remain next. Deterministic untrained Qwen2 fixtures
+  sharded Safetensors packages, quantizations, cross-encoder quality evidence,
+  and trained tool selection remain next. Deterministic untrained Qwen2 fixtures
   remain the exhaustive mechanical gates for single-file and indexed sharded
   Safetensors, embeddings, reranking, structured output, and native function
   lifecycles.
@@ -72,9 +72,9 @@ final parity claim.
 
 - Expand native GGUF and Safetensors architecture coverage.
 - Improve quantized kernels and paged-attention integration on Metal and CUDA.
-- Expand trained embedding evidence beyond MiniLM and add a native
-  cross-encoder reranking path; current reranking is normalized bi-encoder
-  cosine similarity.
+- Expand trained embedding and cross-encoder evidence beyond the current CPU
+  gates; native cross-encoder reranking is implemented, while the established
+  quality cell remains normalized bi-encoder cosine similarity.
 - Extend the bounded C ABI/Python SDK and isolated sdist/wheel gate to platform
   binary wheels, cross-version ABI tests, and a declared compatibility window.
 

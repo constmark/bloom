@@ -4025,6 +4025,13 @@ mod tests {
             "one"
         );
         assert!(helpers::single_completion_prompt(&serde_json::json!(["one", "two"])).is_err());
+        assert_eq!(
+            helpers::completion_prompts(&serde_json::json!(["one", "two"])).unwrap(),
+            vec!["one".to_string(), "two".to_string()]
+        );
+        assert!(helpers::completion_prompts(&serde_json::json!([])).is_err());
+        assert!(helpers::completion_prompts(&serde_json::json!([1, 2])).is_err());
+        assert!(helpers::completion_prompts(&serde_json::json!(vec!["x"; 9])).is_err());
         assert!(helpers::single_completion_prompt(&serde_json::json!([1, 2])).is_err());
         assert!(helpers::single_completion_prompt(&serde_json::json!("   ")).is_err());
         assert!(
@@ -10160,6 +10167,13 @@ mod tests {
                     "n": 2
                 }),
             ),
+            (
+                "/v1/completions",
+                json!({
+                    "model": "test-ifb-model",
+                    "prompt": ["First", "Second"]
+                }),
+            ),
         ] {
             let response = app
                 .clone()
@@ -10188,6 +10202,90 @@ mod tests {
             );
         }
         assert_eq!(execute_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn openai_batched_completion_prompts_return_flattened_choices() {
+        let temp = tempfile::tempdir().unwrap();
+        let emitted_chunks = Arc::new(AtomicU64::new(0));
+        let state = test_server_state_with_text_runtime(
+            temp.path().to_path_buf(),
+            Arc::clone(&emitted_chunks),
+        )
+        .await;
+        let app = Router::new()
+            .route("/v1/completions", post(handle_completions))
+            .with_state(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "test-text-model",
+                            "prompt": ["First", "Second"],
+                            "max_tokens": 8,
+                            "n": 2,
+                            "seed": 17
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let choices = body["choices"].as_array().unwrap();
+        assert_eq!(choices.len(), 4);
+        assert_eq!(choices[0]["index"], 0);
+        assert_eq!(choices[1]["index"], 1);
+        assert_eq!(choices[2]["index"], 2);
+        assert_eq!(choices[3]["index"], 3);
+        assert!(body["usage"]["prompt_tokens"].as_u64().unwrap() >= 2);
+        assert!(body["usage"]["completion_tokens"].as_u64().unwrap() > 0);
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "test-text-model",
+                            "prompt": ["First", "Second"],
+                            "stream": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let error: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("batched prompts")
+        );
+        assert!(emitted_chunks.load(Ordering::Relaxed) > 0);
     }
 
     #[tokio::test]

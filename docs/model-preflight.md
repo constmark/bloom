@@ -41,7 +41,7 @@ A successful response has this identity:
 - the per-request and aggregate context plan, weight/KV/temporary allocation
   estimate, available budget, reserve, and resulting admission decision.
 
-The task set is exactly `generation` or `embedding` plus `rerank`. Bloom derives
+The task set is exactly `generation`, `rerank`, or `embedding` plus `rerank`. Bloom derives
 it from the parsed manifest family and trusted `bloom_task` metadata; filenames
 and directory names do not grant capabilities.
 
@@ -55,7 +55,7 @@ also caps the complete response at 256 KiB before decoding.
 Bloom's server and browser independently enforce these invariants:
 
 - `model_id` exactly matches the requested catalog ID;
-- the task set is one of the two supported ordered sets;
+- the task set is one of the three supported ordered sets;
 - `planned_context_tokens` equals `per_request_context_tokens` multiplied by
   `max_concurrent`;
 - `max_concurrent` is a positive u64 projection of the server value already

@@ -65,6 +65,8 @@ pub(crate) async fn handle_ready(
         .map(|runtime| {
             if model_supports_embeddings(&runtime.pipeline) {
                 vec!["embedding", "rerank"]
+            } else if model_supports_rerank(&runtime.pipeline) {
+                vec!["rerank"]
             } else {
                 vec!["generation"]
             }

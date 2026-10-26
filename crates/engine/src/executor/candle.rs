@@ -12,6 +12,7 @@ use bloomai_core::{
     ModelFormat, ModelManifest, ResidencyStrategy,
 };
 use candle_core::{DType, Device, Tensor};
+use candle_nn::Module;
 
 use crate::core::parallelism::ParallelStrategy;
 use crate::core::quantization::{QuantMethod, QuantizationConfig};
@@ -271,6 +272,66 @@ fn forward_bert_embedding_batch(
         .map_err(Into::into)
 }
 
+fn forward_bert_rerank_batch(
+    model: &candle_transformers::models::bert::BertModel,
+    classifier: &candle_nn::Linear,
+    pooler: &candle_nn::Linear,
+    sequences: &[(&[u32], &[u32])],
+    pad_token_id: u32,
+) -> Result<Vec<f32>> {
+    if sequences.is_empty()
+        || sequences
+            .iter()
+            .any(|(sequence, type_ids)| sequence.is_empty() || sequence.len() != type_ids.len())
+    {
+        return Err(anyhow!(
+            "BERT cross-encoder batches require non-empty, aligned token sequences"
+        ));
+    }
+    let batch_size = sequences.len();
+    let max_len = sequences
+        .iter()
+        .map(|(sequence, _)| sequence.len())
+        .max()
+        .unwrap_or_default();
+    let value_count = batch_size
+        .checked_mul(max_len)
+        .ok_or_else(|| anyhow!("BERT cross-encoder batch shape overflowed"))?;
+    let mut token_ids = Vec::with_capacity(value_count);
+    let mut token_types = Vec::with_capacity(value_count);
+    let mut attention = Vec::with_capacity(value_count);
+    for (sequence, type_ids) in sequences {
+        token_ids.extend_from_slice(sequence);
+        token_types.extend_from_slice(type_ids);
+        attention.extend(std::iter::repeat_n(1_u32, sequence.len()));
+        let padding = max_len - sequence.len();
+        token_ids.extend(std::iter::repeat_n(pad_token_id, padding));
+        token_types.extend(std::iter::repeat_n(0_u32, padding));
+        attention.extend(std::iter::repeat_n(0_u32, padding));
+    }
+
+    let input_ids = Tensor::from_vec(token_ids, (batch_size, max_len), &model.device)?;
+    let token_type_ids = Tensor::from_vec(token_types, (batch_size, max_len), &model.device)?;
+    let attention_mask = Tensor::from_vec(attention, (batch_size, max_len), &model.device)?;
+    let hidden_states = model.forward(&input_ids, &token_type_ids, Some(&attention_mask))?;
+    let cls = hidden_states.narrow(1, 0, 1)?.squeeze(1)?;
+    let pooled = pooler.forward(&cls)?.tanh()?;
+    let logits = classifier
+        .forward(&pooled)?
+        .to_dtype(DType::F32)?
+        .to_vec2::<f32>()?;
+    logits
+        .into_iter()
+        .map(|values| {
+            let index = if values.len() > 1 { 1 } else { 0 };
+            values
+                .get(index)
+                .copied()
+                .ok_or_else(|| anyhow!("cross-encoder classifier returned no logits"))
+        })
+        .collect()
+}
+
 fn config_prefers_bf16(config: &serde_json::Value) -> bool {
     ["dtype", "torch_dtype"].iter().any(|key| {
         config
@@ -435,12 +496,6 @@ impl Engine for CandleEngine {
     }
 
     fn supports(&self, manifest: &ModelManifest, device_cap: &DeviceCapability) -> SupportLevel {
-        if crate::core::manifest::model_manifest_is_cross_encoder(manifest) {
-            return SupportLevel::Unsupported(
-                "Candle detects a BERT cross-encoder sequence classifier, but its classifier-head rerank route is not implemented; use a Sentence Transformers bi-encoder or ONNX/OpenVINO reranker"
-                    .to_string(),
-            );
-        }
         let base = default_engine_supports(&self.capability(), manifest, device_cap);
         if !base.is_supported() {
             return base;
@@ -1188,7 +1243,11 @@ pub enum QwenModelWrapper {
         candle_transformers::models::llama::Llama,
         candle_transformers::models::llama::Cache,
     ),
-    Bert(candle_transformers::models::bert::BertModel),
+    Bert {
+        model: candle_transformers::models::bert::BertModel,
+        classifier: Option<candle_nn::Linear>,
+        pooler: Option<candle_nn::Linear>,
+    },
     Streaming(crate::executor::qwen_streaming::QwenStreamingModelForCausalLM),
     Gemma4Streaming(crate::executor::gemma4_streaming::Gemma4StreamingModel),
     QuantizedLlama(candle_transformers::models::quantized_llama::ModelWeights),
@@ -1205,7 +1264,7 @@ impl QwenModelWrapper {
             QwenModelWrapper::Llama(m, cache) => {
                 m.forward(input_ids, start_pos, cache).map_err(Into::into)
             }
-            QwenModelWrapper::Bert(m) => {
+            QwenModelWrapper::Bert { model: m, .. } => {
                 let token_type_ids = input_ids.zeros_like()?;
                 m.forward(input_ids, &token_type_ids, None)
                     .map_err(Into::into)
@@ -1234,7 +1293,7 @@ impl QwenModelWrapper {
             QwenModelWrapper::Streaming(m) => m.clear_kv_cache(),
             QwenModelWrapper::Gemma4Streaming(m) => m.clear_kv_cache(),
             QwenModelWrapper::QuantizedQwen3(m) => m.clear_kv_cache(),
-            QwenModelWrapper::Bert(_) => {}
+            QwenModelWrapper::Bert { .. } => {}
             QwenModelWrapper::Llama(_, _)
             | QwenModelWrapper::QuantizedLlama(_)
             | QwenModelWrapper::QuantizedQwen2(_) => {
@@ -1249,7 +1308,7 @@ impl QwenModelWrapper {
             QwenModelWrapper::Qwen2(_)
                 | QwenModelWrapper::Qwen3(_)
                 | QwenModelWrapper::Gemma4(_)
-                | QwenModelWrapper::Bert(_)
+                | QwenModelWrapper::Bert { .. }
                 | QwenModelWrapper::Streaming(_)
                 | QwenModelWrapper::Gemma4Streaming(_)
                 | QwenModelWrapper::QuantizedQwen3(_)
@@ -1263,7 +1322,7 @@ impl QwenModelWrapper {
             QwenModelWrapper::Qwen3(_) => "Qwen3",
             QwenModelWrapper::Gemma4(_) => "Gemma4",
             QwenModelWrapper::Llama(_, _) => "Llama",
-            QwenModelWrapper::Bert(_) => "Bert",
+            QwenModelWrapper::Bert { .. } => "Bert",
             QwenModelWrapper::Streaming(_) => "Streaming",
             QwenModelWrapper::Gemma4Streaming(_) => "Gemma4Streaming",
             QwenModelWrapper::QuantizedLlama(_) => "QuantizedLlama",
@@ -1581,17 +1640,24 @@ impl CandleTextModel {
         })?)
     }
 
-    fn is_embedding_model(&self) -> bool {
+    fn is_cross_encoder_model(&self) -> bool {
         self.model_type == ModelType::Bert
-            || self
-                .metadata
-                .manifest
-                .parameters
-                .get("bloom_task")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|task| {
-                    task.eq_ignore_ascii_case("embedding") || task.eq_ignore_ascii_case("rerank")
-                })
+            && crate::core::manifest::model_manifest_is_cross_encoder(&self.metadata.manifest)
+    }
+
+    fn is_embedding_model(&self) -> bool {
+        !self.is_cross_encoder_model()
+            && (self.model_type == ModelType::Bert
+                || self
+                    .metadata
+                    .manifest
+                    .parameters
+                    .get("bloom_task")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|task| {
+                        task.eq_ignore_ascii_case("embedding")
+                            || task.eq_ignore_ascii_case("rerank")
+                    }))
     }
 
     fn embed_bert_batch(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
@@ -1643,7 +1709,7 @@ impl CandleTextModel {
             *model_guard = Some(self.reload_for_generation()?);
         }
         let model = match model_guard.as_ref() {
-            Some(QwenModelWrapper::Bert(model)) => model,
+            Some(QwenModelWrapper::Bert { model, .. }) => model,
             Some(wrapper) => {
                 return Err(anyhow!(
                     "BERT embedding batch resolved to unexpected {} model wrapper",
@@ -1678,6 +1744,114 @@ impl CandleTextModel {
             .enumerate()
             .map(|(index, output)| {
                 output.ok_or_else(|| anyhow!("BERT embedding output {index} is missing"))
+            })
+            .collect()
+    }
+
+    fn rerank_bert_batch(&self, query: &str, documents: &[String]) -> Result<Vec<f32>> {
+        if self.model_type != ModelType::Bert
+            || !crate::core::manifest::model_manifest_is_cross_encoder(&self.metadata.manifest)
+        {
+            return Err(anyhow!(
+                "native reranking is only available for BERT cross-encoder models"
+            ));
+        }
+        if documents.is_empty() {
+            return Err(anyhow!("cross-encoder rerank batches must not be empty"));
+        }
+        let max_positions = self
+            .config
+            .get("max_position_embeddings")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .ok_or_else(|| anyhow!("BERT config has an invalid max_position_embeddings"))?;
+        let pad_token_id = self
+            .config
+            .get("pad_token_id")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| anyhow!("BERT config has an invalid pad_token_id"))?;
+
+        let mut sequences = Vec::with_capacity(documents.len());
+        for (index, document) in documents.iter().enumerate() {
+            let encoding = self
+                .tokenizer
+                .encode((query, document.as_str()), true)
+                .map_err(|error| anyhow!("failed to tokenize rerank pair {index}: {error}"))?;
+            let token_ids = encoding.get_ids().to_vec();
+            if token_ids.is_empty() {
+                return Err(anyhow!("rerank pair {index} produced no tokens"));
+            }
+            if token_ids.len() > max_positions {
+                return Err(anyhow!(
+                    "rerank pair {index} contains {} tokens and exceeds max_position_embeddings {max_positions}",
+                    token_ids.len()
+                ));
+            }
+            sequences.push((token_ids, encoding.get_type_ids().to_vec()));
+        }
+        let token_pairs = sequences
+            .iter()
+            .map(|(tokens, types)| (tokens.as_slice(), types.as_slice()))
+            .collect::<Vec<_>>();
+        let batches = plan_bert_embedding_batches(
+            &token_pairs
+                .iter()
+                .map(|(tokens, _)| tokens.to_vec())
+                .collect::<Vec<_>>(),
+        )?;
+
+        let mut model_guard = self.model.lock().unwrap_or_else(|error| error.into_inner());
+        if model_guard.is_none() {
+            *model_guard = Some(self.reload_for_generation()?);
+        }
+        let (model, classifier, pooler) = match model_guard.as_ref() {
+            Some(QwenModelWrapper::Bert {
+                model,
+                classifier: Some(classifier),
+                pooler: Some(pooler),
+            }) => (model, classifier, pooler),
+            Some(QwenModelWrapper::Bert { .. }) => {
+                return Err(anyhow!("BERT cross-encoder classifier head is not loaded"));
+            }
+            Some(wrapper) => {
+                return Err(anyhow!(
+                    "cross-encoder rerank resolved to unexpected {} model wrapper",
+                    wrapper.variant_name()
+                ));
+            }
+            None => return Err(anyhow!("BERT cross-encoder model is not loaded")),
+        };
+        let mut outputs = vec![None; documents.len()];
+        for indices in batches {
+            let batch_sequences = indices
+                .iter()
+                .map(|index| token_pairs[*index])
+                .collect::<Vec<_>>();
+            let batch_outputs = forward_bert_rerank_batch(
+                model,
+                classifier,
+                pooler,
+                &batch_sequences,
+                pad_token_id,
+            )?;
+            if batch_outputs.len() != indices.len() {
+                return Err(anyhow!(
+                    "BERT cross-encoder batch returned {} scores for {} pairs",
+                    batch_outputs.len(),
+                    indices.len()
+                ));
+            }
+            for (index, score) in indices.into_iter().zip(batch_outputs) {
+                outputs[index] = Some(score);
+            }
+        }
+        outputs
+            .into_iter()
+            .enumerate()
+            .map(|(index, output)| {
+                output.ok_or_else(|| anyhow!("cross-encoder output {index} is missing"))
             })
             .collect()
     }
@@ -2077,9 +2251,46 @@ impl CandleTextModel {
                     let cfg: candle_transformers::models::bert::Config =
                         serde_json::from_value(self.config.clone())
                             .map_err(|e| anyhow!("failed to parse bert config: {}", e))?;
-                    let m = candle_transformers::models::bert::BertModel::load(vb, &cfg)
-                        .map_err(|e| anyhow!("failed to build bert model: {}", e))?;
-                    QwenModelWrapper::Bert(m)
+                    if self.is_cross_encoder_model() {
+                        let m =
+                            candle_transformers::models::bert::BertModel::load(vb.pp("bert"), &cfg)
+                                .map_err(|e| {
+                                    anyhow!("failed to build BERT cross-encoder backbone: {e}")
+                                })?;
+                        let num_labels = self
+                            .config
+                            .get("num_labels")
+                            .and_then(serde_json::Value::as_u64)
+                            .and_then(|value| usize::try_from(value).ok())
+                            .filter(|value| *value > 0)
+                            .ok_or_else(|| {
+                                anyhow!("cross-encoder config must declare a positive num_labels")
+                            })?;
+                        let pooler = candle_nn::linear(
+                            cfg.hidden_size,
+                            cfg.hidden_size,
+                            vb.pp("bert.pooler.dense"),
+                        )
+                        .map_err(|e| anyhow!("failed to load BERT cross-encoder pooler: {e}"))?;
+                        let classifier =
+                            candle_nn::linear(cfg.hidden_size, num_labels, vb.pp("classifier"))
+                                .map_err(|e| {
+                                    anyhow!("failed to load BERT cross-encoder classifier: {e}")
+                                })?;
+                        QwenModelWrapper::Bert {
+                            model: m,
+                            classifier: Some(classifier),
+                            pooler: Some(pooler),
+                        }
+                    } else {
+                        let m = candle_transformers::models::bert::BertModel::load(vb, &cfg)
+                            .map_err(|e| anyhow!("failed to build bert model: {}", e))?;
+                        QwenModelWrapper::Bert {
+                            model: m,
+                            classifier: None,
+                            pooler: None,
+                        }
+                    }
                 }
             }
         };
@@ -2297,11 +2508,19 @@ impl LoadedModel for CandleTextModel {
     }
 
     fn supports_native_embedding_batch(&self) -> bool {
-        self.model_type == ModelType::Bert
+        self.model_type == ModelType::Bert && !self.is_cross_encoder_model()
     }
 
     fn embed_batch(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
         self.embed_bert_batch(inputs)
+    }
+
+    fn supports_native_rerank(&self) -> bool {
+        self.is_cross_encoder_model()
+    }
+
+    fn rerank_batch(&self, query: &str, documents: &[String]) -> Result<Vec<f32>> {
+        self.rerank_bert_batch(query, documents)
     }
 
     fn processors(&self) -> Option<&crate::processor::ProcessorRegistry> {
@@ -4146,6 +4365,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn bert_cross_encoder_batch_returns_one_score_per_pair() {
+        let config = candle_transformers::models::bert::Config {
+            vocab_size: 8,
+            hidden_size: 8,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            intermediate_size: 16,
+            hidden_dropout_prob: 0.0,
+            max_position_embeddings: 16,
+            type_vocab_size: 2,
+            pad_token_id: 0,
+            classifier_dropout: None,
+            model_type: None,
+            ..Default::default()
+        };
+        let variables = candle_nn::VarMap::new();
+        let builder = candle_nn::VarBuilder::from_varmap(&variables, DType::F32, &Device::Cpu);
+        let model = candle_transformers::models::bert::BertModel::load(builder.pp("bert"), &config)
+            .unwrap();
+        let pooler =
+            candle_nn::linear(config.hidden_size, config.hidden_size, builder.pp("pooler"))
+                .unwrap();
+        let classifier =
+            candle_nn::linear(config.hidden_size, 2, builder.pp("classifier")).unwrap();
+        let sequences = [
+            (vec![2_u32, 4, 3], vec![0_u32, 0, 0]),
+            (vec![2_u32, 5, 6, 3], vec![0_u32, 1, 1, 1]),
+        ];
+        let refs = sequences
+            .iter()
+            .map(|(tokens, types)| (tokens.as_slice(), types.as_slice()))
+            .collect::<Vec<_>>();
+        let scores = forward_bert_rerank_batch(&model, &classifier, &pooler, &refs, 0).unwrap();
+        assert_eq!(scores.len(), sequences.len());
+        assert!(scores.iter().all(|score| score.is_finite()));
     }
 
     #[test]

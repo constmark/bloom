@@ -49,7 +49,7 @@ protocol when backward behavior cannot be preserved.
 | `loading` | Whether a model lifecycle operation is in progress |
 | `load_error` | A bounded, path-free public failure summary or `null` |
 | `input_modalities` | Bounded active-model input capability labels |
-| `model_tasks` | Bounded active-model tasks: `generation`, or `embedding` plus `rerank` |
+| `model_tasks` | Bounded active-model tasks: `generation`, `rerank`, or `embedding` plus `rerank` |
 | `context_window` | Positive u64 active-model context limit or `null` |
 | `in_flight_requests` | Process-local admitted inference count as a u64 |
 | `available_permits` | Immediately available inference permits as a platform-independent u64 |

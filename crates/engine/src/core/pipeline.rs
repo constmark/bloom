@@ -433,6 +433,19 @@ impl InferencePipeline {
         self.model.embed_batch(inputs)
     }
 
+    pub fn supports_native_rerank(&self) -> bool {
+        self.model.supports_native_rerank()
+    }
+
+    pub fn run_rerank_batch(&self, query: &str, documents: &[String]) -> Result<Vec<f32>> {
+        let _span = tracing::info_span!(
+            "pipeline.run_rerank_batch",
+            document_count = documents.len()
+        )
+        .entered();
+        self.model.rerank_batch(query, documents)
+    }
+
     pub fn run_request(&self, request: InferenceRequest, sink: &mut dyn OutputSink) -> Result<()> {
         let _span = tracing::info_span!("pipeline.run_request").entered();
         request.validate().map_err(BloomError::InvalidInput)?;

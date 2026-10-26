@@ -8,7 +8,8 @@ use super::*;
 use crate::application::embedding::{
     EmbeddingBatchOutput, EmbeddingProjection, MAX_EMBEDDING_DIMENSIONS,
     MAX_NATIVE_EMBEDDING_MICROBATCH_ITEMS, collect_embedding, normalize_embedding_batch,
-    prepare_embedding_inputs, rank_embedding_documents, validate_embedding_output,
+    prepare_embedding_inputs, rank_embedding_documents, rank_native_rerank_scores,
+    validate_embedding_output,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
@@ -215,11 +216,13 @@ async fn execute_embedding_batch_inner(
     let runtime = runtime_lease.runtime();
     let model_id = runtime.model_id.clone();
     let pipeline = Arc::clone(&runtime.pipeline);
-    if !model_supports_embeddings(&pipeline) {
+    let native_rerank = matches!(projection, EmbeddingProjection::Rerank { .. })
+        && pipeline.supports_native_rerank();
+    if !model_supports_embeddings(&pipeline) && !native_rerank {
         let message = if bloomai_engine::model_manifest_is_cross_encoder(
             &pipeline.metadata().manifest,
         ) {
-            "The loaded model is a cross-encoder sequence classifier. Native classifier-head reranking is not available in this runtime yet; use a Sentence Transformers bi-encoder or an ONNX/OpenVINO reranker."
+            "The loaded model is a cross-encoder sequence classifier, but this runtime does not expose its classifier-head rerank path."
         } else {
             "The loaded model does not advertise embedding/rerank support. Load a supported encoder model or declare bloom_task=embedding in its trusted manifest metadata."
         };
@@ -282,6 +285,31 @@ async fn execute_embedding_batch_inner(
     let inference_started = Instant::now();
     let worker = task::spawn_blocking(move || {
         let _worker_guard = worker_guard;
+        if matches!(projection, EmbeddingProjection::Rerank { .. })
+            && pipeline.supports_native_rerank()
+        {
+            if inputs.len() < 2 {
+                return Err(EmbeddingWorkerError::InvalidRequest(
+                    "Native reranking requires one query and at least one document.".to_string(),
+                ));
+            }
+            let query = &inputs[0];
+            let documents = inputs[1..].to_vec();
+            let scores = pipeline
+                .run_rerank_batch(query, &documents)
+                .map_err(|error| EmbeddingWorkerError::Inference(error.to_string()))?;
+            if worker_token.is_cancelled() {
+                return Err(EmbeddingWorkerError::Cancelled);
+            }
+            let top_n = match projection {
+                EmbeddingProjection::Rerank { top_n } => top_n,
+                _ => unreachable!(),
+            };
+            return rank_native_rerank_scores(&scores, top_n)
+                .map(EmbeddingBatchOutput::Rerank)
+                .map_err(EmbeddingWorkerError::InvalidOutput);
+        }
+
         let mut embeddings = Vec::with_capacity(inputs.len());
         let mut expected_dimensions = None;
         let mut total_values = 0_usize;

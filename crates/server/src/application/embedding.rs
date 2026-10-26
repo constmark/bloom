@@ -276,6 +276,45 @@ pub(crate) fn rank_embedding_documents(
     Ok(scores)
 }
 
+pub(crate) fn rank_native_rerank_scores(
+    scores: &[f32],
+    top_n: usize,
+) -> std::result::Result<Vec<RerankScore>, String> {
+    if scores.is_empty() {
+        return Err("Native rerank returned no scores.".to_string());
+    }
+    if top_n == 0 || top_n > scores.len() {
+        return Err(format!(
+            "top_n must be between 1 and {} for native reranking.",
+            scores.len()
+        ));
+    }
+    let mut ranked = scores
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, score)| {
+            if !score.is_finite() {
+                return Err(format!(
+                    "Native rerank returned a non-finite score for document {index}."
+                ));
+            }
+            Ok(RerankScore {
+                index,
+                relevance_score: f64::from(score),
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, String>>()?;
+    ranked.sort_by(|left, right| {
+        right
+            .relevance_score
+            .total_cmp(&left.relevance_score)
+            .then_with(|| left.index.cmp(&right.index))
+    });
+    ranked.truncate(top_n);
+    Ok(ranked)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,5 +372,16 @@ mod tests {
         assert!(rank_embedding_documents(&[vec![1.0], vec![1.0]], 2).is_err());
         assert!(rank_embedding_documents(&[vec![1.0, 0.0], vec![1.0]], 1).is_err());
         assert!(rank_embedding_documents(&[vec![1.0, 0.0], vec![f32::NAN, 1.0]], 1).is_err());
+    }
+
+    #[test]
+    fn native_rerank_scores_are_finite_bounded_and_stable() {
+        let scores = rank_native_rerank_scores(&[0.1, 0.9, 0.9], 2).unwrap();
+        assert_eq!(scores[0].index, 1);
+        assert_eq!(scores[1].index, 2);
+        assert!((scores[0].relevance_score - 0.9_f64).abs() < 1e-6);
+        assert!(rank_native_rerank_scores(&[f32::NAN], 1).is_err());
+        assert!(rank_native_rerank_scores(&[], 1).is_err());
+        assert!(rank_native_rerank_scores(&[0.1], 0).is_err());
     }
 }

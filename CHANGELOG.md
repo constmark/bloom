@@ -14,12 +14,13 @@ called out in release notes.
   generation contract and Candle sampler, including history-aware greedy and
   temperature sampling paths. Add bounded OpenAI `logit_bias` support and
   forward all controls through the external llama.cpp adapter.
-- Add bounded OpenAI `n=1..8` independent choices for direct non-streaming text
-  Chat/Completion requests, with aggregate completion usage and explicit
+- Add bounded OpenAI `n=1..8` independent choices and up to eight legacy
+  completion prompts for direct non-streaming text Chat/Completion requests,
+  with prompt-major flattened choices and aggregate usage, plus explicit
   rejection for streaming, continuous batching, multimodal, tool, and
   structured-output combinations. Detect Hugging Face BERT sequence
-  classifiers during manifest preflight and fail closed with a diagnostic until
-  a native cross-encoder classifier-head route is available.
+  classifiers during manifest preflight and route them through Candle's native
+  pairwise classifier-head reranker.
 - Add bounded top-k sampling across the core generation contract, Candle
   TopK/TopK+TopP sampler, OpenAI text endpoints, Ollama `options.top_k`, and
   the standalone/benchmark CLIs. Omitted values preserve existing defaults;

@@ -657,8 +657,9 @@ non-finite, inconsistent, oversized, or over-aggregate vectors. Protocol
 projection inside that worker then produces normalized OpenAI and current
 Ollama vectors, optional reduced dimensions, the normalized legacy Ollama
 vector, or bounded rerank scores. Reranking normalizes the query and document
-batch, computes finite cosine scores, and applies descending score plus
-ascending input-index ordering before releasing lifecycle ownership.
+batch, computes finite cosine or native classifier-head scores, and applies
+descending score plus ascending input-index ordering before releasing lifecycle
+ownership.
 Current Ollama duration and prompt-token metadata come from this shared
 execution rather than an HTTP response reparse.
 

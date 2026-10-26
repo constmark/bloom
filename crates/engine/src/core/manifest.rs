@@ -12,6 +12,7 @@ use bloomai_core::{
 
 const GENERATION_MODEL_TASKS: &[&str] = &["generation"];
 const ENCODER_MODEL_TASKS: &[&str] = &["embedding", "rerank"];
+const CROSS_ENCODER_MODEL_TASKS: &[&str] = &["rerank"];
 const MAX_MODEL_DIRECTORY_ENTRIES: usize = 65_536;
 const MAX_SAFETENSORS_SHARDS: usize = 1_024;
 const MAX_SAFETENSORS_INDEX_BYTES: u64 = 8 * 1024 * 1024;
@@ -23,17 +24,13 @@ const VALIDATED_SAFETENSORS_ELEMENT_COUNT: &str = "_bloom_validated_safetensors_
 /// Return the inference tasks advertised by Bloom for a trusted model manifest.
 ///
 /// BERT packages are encoders by definition. Sequence-classification BERT
-/// packages are cross encoders and are kept out of the bi-encoder embedding
-/// route; until a classifier-head executor is registered they remain
-/// generation-only in readiness/preflight.
+/// packages are cross encoders and are routed to the classifier-head rerank
+/// task instead of the bi-encoder embedding route.
 /// Other families may opt into the encoder runtime through Bloom's trusted
 /// `bloom_task` manifest metadata.
 pub fn model_manifest_tasks(manifest: &ModelManifest) -> &'static [&'static str] {
     if model_manifest_is_cross_encoder(manifest) {
-        // A classifier head is detected, but no native scorer route is
-        // registered by this runtime yet. Keep readiness/preflight from
-        // advertising a rerank capability that would return 501.
-        GENERATION_MODEL_TASKS
+        CROSS_ENCODER_MODEL_TASKS
     } else if model_manifest_supports_embeddings(manifest) {
         ENCODER_MODEL_TASKS
     } else {
@@ -3171,7 +3168,7 @@ mod tests {
             "bloom_encoder_kind".to_string(),
             serde_json::json!("cross_encoder"),
         );
-        assert_eq!(model_manifest_tasks(&declared_encoder), ["generation"]);
+        assert_eq!(model_manifest_tasks(&declared_encoder), ["rerank"]);
         assert!(!model_manifest_supports_embeddings(&declared_encoder));
         assert!(model_manifest_is_cross_encoder(&declared_encoder));
     }
@@ -4014,7 +4011,7 @@ mod tests {
             manifest.parameters.get("bloom_task"),
             Some(&serde_json::json!("rerank"))
         );
-        assert_eq!(model_manifest_tasks(&manifest), ["generation"]);
+        assert_eq!(model_manifest_tasks(&manifest), ["rerank"]);
         assert!(!model_manifest_supports_embeddings(&manifest));
     }
 

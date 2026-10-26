@@ -2202,6 +2202,33 @@ fn run_cancellable_text_choices(
     Ok(outputs)
 }
 
+fn run_cancellable_text_prompt_choices(
+    pipeline: &InferencePipeline,
+    inputs: &[ModelInput],
+    params: &GenerationParams,
+    cancel_token: &CancellationToken,
+    stop_sequences: &[String],
+    choice_count: usize,
+) -> Result<Vec<GeneratedText>> {
+    let mut outputs = Vec::with_capacity(inputs.len().saturating_mul(choice_count));
+    for (prompt_index, input) in inputs.iter().cloned().enumerate() {
+        let mut prompt_params = params.clone();
+        if let Some(seed) = prompt_params.seed {
+            let offset = (prompt_index as u64).wrapping_mul(choice_count as u64);
+            prompt_params.seed = Some(seed.wrapping_add(offset));
+        }
+        outputs.extend(run_cancellable_text_choices(
+            pipeline,
+            input,
+            &prompt_params,
+            cancel_token,
+            stop_sequences,
+            choice_count,
+        )?);
+    }
+    Ok(outputs)
+}
+
 pub(crate) async fn handle_chat_completions(
     State(state): State<Arc<ServerState>>,
     Json(payload): Json<ChatRequest>,
@@ -4085,8 +4112,8 @@ pub(crate) async fn handle_completions(
             "n greater than 1 is currently supported only for non-streaming text Completions without structured output.",
         );
     }
-    let prompt = match single_completion_prompt(&payload.prompt) {
-        Ok(prompt) => prompt,
+    let prompts = match completion_prompts(&payload.prompt) {
+        Ok(prompts) => prompts,
         Err(message) => {
             return error_response(
                 axum::http::StatusCode::BAD_REQUEST,
@@ -4095,6 +4122,13 @@ pub(crate) async fn handle_completions(
             );
         }
     };
+    if prompts.len() > 1 && (payload.stream || state.app.enable_ifb) {
+        return error_response(
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "batched prompts are currently supported only for non-streaming text Completions without continuous batching.",
+        );
+    }
     if !state.app.ready.load(Ordering::Acquire) {
         return model_unavailable_response(&state).await;
     }
@@ -4149,9 +4183,15 @@ pub(crate) async fn handle_completions(
         },
     };
 
-    let prompt = apply_response_format_instruction(prompt, &response_format);
-
-    let prompt_tokens_vec = match pipeline.tokenize(&prompt) {
+    let prompts = prompts
+        .into_iter()
+        .map(|prompt| apply_response_format_instruction(prompt, &response_format))
+        .collect::<Vec<_>>();
+    let prompt_tokens_vecs = match prompts
+        .iter()
+        .map(|prompt| pipeline.tokenize(prompt))
+        .collect::<std::result::Result<Vec<_>, _>>()
+    {
         Ok(tokens) => tokens,
         Err(error) => {
             state.app.metrics.record_request_end(
@@ -4167,22 +4207,46 @@ pub(crate) async fn handle_completions(
             );
         }
     };
-    let prompt_tokens = prompt_tokens_vec.len();
-    if let Err(message) =
-        validate_context_budget(prompt_tokens, params.max_tokens, pipeline.context_size())
-    {
-        state.app.metrics.record_request_end(
-            false,
-            request_start.elapsed().as_secs_f64(),
-            0,
-            prompt_tokens as u64,
-        );
-        return error_response(
-            axum::http::StatusCode::BAD_REQUEST,
-            "context_length_exceeded",
-            message,
-        );
+    let prompt_token_counts = prompt_tokens_vecs.iter().map(Vec::len).collect::<Vec<_>>();
+    for &prompt_tokens in &prompt_token_counts {
+        if let Err(message) =
+            validate_context_budget(prompt_tokens, params.max_tokens, pipeline.context_size())
+        {
+            state.app.metrics.record_request_end(
+                false,
+                request_start.elapsed().as_secs_f64(),
+                0,
+                prompt_tokens as u64,
+            );
+            return error_response(
+                axum::http::StatusCode::BAD_REQUEST,
+                "context_length_exceeded",
+                message,
+            );
+        }
     }
+    let prompt_tokens = prompt_token_counts.iter().copied().sum::<usize>();
+    let (prompt, prompt_tokens_vec) = match (prompts.first(), prompt_tokens_vecs.first()) {
+        (Some(prompt), Some(tokens)) => (prompt.clone(), tokens.clone()),
+        _ => {
+            state.app.metrics.record_request_end(
+                false,
+                request_start.elapsed().as_secs_f64(),
+                0,
+                0,
+            );
+            return error_response(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "Completion prompt preparation produced no prompt.",
+            );
+        }
+    };
+    let inputs = prompts
+        .iter()
+        .cloned()
+        .map(|prompt| ModelInput::Text { prompt })
+        .collect::<Vec<_>>();
     let input = ModelInput::Text { prompt };
     let request_id = next_request_id(&state, "cmpl");
     let cancel_scheduler = if state.app.enable_ifb {
@@ -4583,13 +4647,14 @@ pub(crate) async fn handle_completions(
         let pipeline_for_run = Arc::clone(&pipeline);
         let cancel_token_for_run = cancel_token.clone();
         let stop_sequences_for_run = stop_sequences.clone();
+        let inputs_for_run = inputs.clone();
         let choice_count_for_run = choice_count;
         let inference_start = std::time::Instant::now();
         let res = task::spawn_blocking(move || {
             let _worker_lifecycle = worker_lifecycle;
-            run_cancellable_text_choices(
+            run_cancellable_text_prompt_choices(
                 &pipeline_for_run,
-                input,
+                &inputs_for_run,
                 &params,
                 &cancel_token_for_run,
                 &stop_sequences_for_run,

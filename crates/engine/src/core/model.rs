@@ -160,6 +160,19 @@ pub trait LoadedModel: Send + Sync {
         Ok(outputs)
     }
 
+    /// Whether this model exposes a native pairwise reranking head.
+    fn supports_native_rerank(&self) -> bool {
+        false
+    }
+
+    /// Score each document against the query with a native cross-encoder head.
+    fn rerank_batch(&self, _query: &str, _documents: &[String]) -> Result<Vec<f32>> {
+        Err(
+            BloomError::Engine("model does not provide a native cross-encoder rerank path".into())
+                .into(),
+        )
+    }
+
     fn processors(&self) -> Option<&crate::processor::ProcessorRegistry> {
         None
     }

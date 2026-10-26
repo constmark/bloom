@@ -474,6 +474,7 @@ fn validate_public_report(
             report.manifest.model_tasks.as_slice(),
             [embedding, rerank] if embedding == "embedding" && rerank == "rerank"
         )
+        && !matches!(report.manifest.model_tasks.as_slice(), [rerank] if rerank == "rerank")
     {
         return Err("Model preflight produced an invalid task identity.".to_string());
     }

@@ -698,7 +698,9 @@ impl Readiness {
                 !matches!(task.as_str(), "generation" | "embedding" | "rerank")
                     || !unique_tasks.insert(task.as_str())
             })
-            || (unique_tasks.contains("rerank") && !unique_tasks.contains("embedding"))
+            || (unique_tasks.contains("rerank")
+                && !unique_tasks.contains("embedding")
+                && !matches!(self.model_tasks.as_slice(), [task] if task == "rerank"))
         {
             return Err("readiness model tasks are invalid".to_string());
         }
@@ -1623,6 +1625,7 @@ impl ModelPreflightReport {
 
 fn validate_model_tasks(tasks: &[String]) -> Result<(), String> {
     let valid = matches!(tasks, [generation] if generation == "generation")
+        || matches!(tasks, [rerank] if rerank == "rerank")
         || matches!(tasks, [embedding, rerank] if embedding == "embedding" && rerank == "rerank");
     if valid {
         Ok(())
@@ -7175,12 +7178,18 @@ mod tests {
             serde_json::json!([]),
             serde_json::json!(["future"]),
             serde_json::json!(["generation", "generation"]),
-            serde_json::json!(["rerank"]),
         ] {
             let mut invalid = valid_readiness_value();
             invalid["model_tasks"] = tasks;
             assert!(decode_readiness(&invalid.to_string()).is_err());
         }
+
+        let mut rerank = valid_readiness_value();
+        rerank["model_tasks"] = serde_json::json!(["rerank"]);
+        assert_eq!(
+            decode_readiness(&rerank.to_string()).unwrap().model_tasks,
+            vec!["rerank"]
+        );
 
         let mut missing = valid_readiness_value();
         missing.as_object_mut().unwrap().remove("model_tasks");

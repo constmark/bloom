@@ -310,6 +310,7 @@ fn neutral_request_extension(field: &str, value: &serde_json::Value) -> bool {
 /// The handlers currently support multiple choices only for direct,
 /// non-streaming text requests; callers enforce those mode constraints.
 pub(crate) const MAX_CHOICE_COUNT: usize = 8;
+pub(crate) const MAX_COMPLETION_PROMPTS: usize = 8;
 
 pub(crate) fn request_choice_count(
     extensions: &std::collections::BTreeMap<String, serde_json::Value>,
@@ -2848,23 +2849,7 @@ pub(crate) fn request_logit_bias(
     Ok(Some(result))
 }
 
-pub(crate) fn single_completion_prompt(
-    prompt: &serde_json::Value,
-) -> std::result::Result<String, String> {
-    let prompt = match prompt {
-        serde_json::Value::String(prompt) => prompt,
-        serde_json::Value::Array(prompts) if prompts.len() == 1 => {
-            prompts[0].as_str().ok_or_else(|| {
-                "prompt must be a string or an array containing exactly one string.".to_string()
-            })?
-        }
-        _ => {
-            return Err(
-                "prompt must be a string or an array containing exactly one string; batched completions are not supported."
-                    .to_string(),
-            );
-        }
-    };
+fn validate_completion_prompt_text(prompt: &str) -> std::result::Result<String, String> {
     if prompt.trim().is_empty() {
         return Err("prompt must not be empty or whitespace-only.".to_string());
     }
@@ -2876,6 +2861,65 @@ pub(crate) fn single_completion_prompt(
         ));
     }
     Ok(prompt.to_string())
+}
+
+/// Parse one or more legacy completion prompts.
+///
+/// OpenAI accepts a string or an array of strings. Bloom bounds the array to
+/// the same eight-way fan-out as `n` and caps the aggregate UTF-8 payload to
+/// one prompt budget so a single request cannot amplify memory admission.
+pub(crate) fn completion_prompts(
+    prompt: &serde_json::Value,
+) -> std::result::Result<Vec<String>, String> {
+    let raw_prompts: Vec<&str> = match prompt {
+        serde_json::Value::String(prompt) => vec![prompt.as_str()],
+        serde_json::Value::Array(prompts) if !prompts.is_empty() => {
+            if prompts.len() > MAX_COMPLETION_PROMPTS {
+                return Err(format!(
+                    "prompt arrays may contain at most {MAX_COMPLETION_PROMPTS} strings."
+                ));
+            }
+            prompts
+                .iter()
+                .map(|prompt| {
+                    prompt.as_str().ok_or_else(|| {
+                        "prompt must be a string or an array of strings.".to_string()
+                    })
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        }
+        _ => return Err("prompt must be a string or a non-empty array of strings.".to_string()),
+    };
+    let mut total_bytes = 0_usize;
+    raw_prompts
+        .into_iter()
+        .map(|prompt| {
+            total_bytes = total_bytes
+                .checked_add(prompt.len())
+                .ok_or_else(|| "prompt byte count overflowed.".to_string())?;
+            if total_bytes > MAX_COMPLETION_PROMPT_BYTES {
+                return Err(format!(
+                    "batched prompts cannot exceed {MAX_COMPLETION_PROMPT_BYTES} combined bytes."
+                ));
+            }
+            validate_completion_prompt_text(prompt)
+        })
+        .collect()
+}
+
+pub(crate) fn single_completion_prompt(
+    prompt: &serde_json::Value,
+) -> std::result::Result<String, String> {
+    let mut prompts = completion_prompts(prompt)?;
+    if prompts.len() != 1 {
+        return Err(
+            "prompt must be a string or an array containing exactly one string; use completion_prompts for batched requests."
+                .to_string(),
+        );
+    }
+    prompts
+        .pop()
+        .ok_or_else(|| "prompt must contain one string.".to_string())
 }
 
 fn add_request_content_bytes(
@@ -3146,10 +3190,13 @@ pub(crate) fn model_supports_embeddings(pipeline: &InferencePipeline) -> bool {
     bloomai_engine::model_manifest_supports_embeddings(&pipeline.metadata().manifest)
 }
 
+pub(crate) fn model_supports_rerank(pipeline: &InferencePipeline) -> bool {
+    model_supports_embeddings(pipeline) || pipeline.supports_native_rerank()
+}
+
 /// Whether the loaded manifest selects an encoder-only runtime. Cross encoders
-/// are detected early but have no native classifier-head route yet, so they
-/// must be rejected by generation handlers rather than sent through the text
-/// decoder path.
+/// are routed to the reranking endpoint and must be rejected by generation
+/// handlers rather than sent through the text decoder path.
 pub(crate) fn model_is_non_generation(pipeline: &InferencePipeline) -> bool {
     model_supports_embeddings(pipeline)
         || bloomai_engine::model_manifest_is_cross_encoder(&pipeline.metadata().manifest)

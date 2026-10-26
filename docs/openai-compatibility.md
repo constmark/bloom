@@ -357,24 +357,28 @@ binding. Unknown non-null fields fail before runtime admission.
 
 Bloom tokenizes every input and rejects any query or document beyond the active
 context window. One blocking batch creates the query and document vectors using
-the same native BERT microbatch or scalar fallback described above, validates
-and normalizes them, computes finite cosine relevance scores from -1 through 1,
-and sorts descending. Equal scores retain original document-index order. `top_n`
+the same native BERT microbatch or scalar fallback described above. Sentence
+encoders produce finite cosine relevance scores from -1 through 1; detected
+BERT cross-encoders use their native classifier-head scores. Both paths sort
+descending, and equal scores retain original document-index order. `top_n`
 is enforced before response construction, response IDs are
 process-unique, and usage reports the tokenizer-backed total across the query
 and every document.
 
-This route performs bi-encoder cosine reranking; it does not emulate a
-cross-encoder reranker that requires joint query-document inference. Client
-disconnects retain the same worker-owned permit, cancellation registration,
-and exactly-once accounting guarantees as `/v1/embeddings`.
+This route performs bi-encoder cosine reranking for sentence encoders and uses
+the native classifier head for detected BERT cross-encoder packages. Cross
+encoder scores are returned in the same bounded ordering and response shape;
+client disconnects retain the same worker-owned permit, cancellation
+registration, and exactly-once accounting guarantees as `/v1/embeddings`.
 
 ## Legacy completions
 
 `POST /v1/completions` supports the same model selector, generation controls,
-streaming flag, and response formats. `prompt` must be one string or a one-item
-string array. Bloom rejects batched prompt arrays rather than returning a
-partial or misleading response.
+streaming flag, and response formats. `prompt` may be one string or an array of
+up to eight strings. Direct non-streaming text requests generate each prompt
+independently, flatten choices in prompt-major order, and aggregate prompt and
+completion usage. Streaming and continuous-batching requests with prompt arrays
+are rejected before runtime admission.
 
 ## Stop sequences
 

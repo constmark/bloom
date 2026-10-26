@@ -42,13 +42,13 @@ See the [edge-engine goal](docs/edge-engine-goal.md),
 - Streaming generation and an interactive terminal mode
 - CPU, Metal, and CUDA execution through Candle
 - GGUF and Hugging Face-style model package support
-- Native BERT sentence embeddings with mask-aware bounded batching, mean
-  pooling, and CPU-trained quality gates
+- Native BERT sentence embeddings plus classifier-head cross-encoder reranking,
+  with mask-aware bounded batching, mean pooling, and CPU-trained quality gates
 - Safe local model catalog with load preflight, portable inventory export, transactional lifecycle, verified downloads, and resumable browser imports
 - Pluggable engines, backends, processors, operators, and model packages
 - Memory estimation, KV-cache management, in-flight batching, and tiered CacheMesh
   / `LayeredBlockCache` caching ([deployment guide](docs/cachemesh.md))
-- Task-aware browser UI for streaming chat, embeddings, and bi-encoder reranking,
+- Task-aware browser UI for streaming chat, embeddings, and reranking,
   with session-only credentials, keyboard-contained dialogs, and reduced-motion
   support, built with Dioxus and embedded in official release artifacts
 - C ABI and a small Python SDK for downstream integrations
@@ -531,8 +531,9 @@ tools with `response_format` remain unsupported.
 
 All generation routes admit `max_tokens` from 1 through 32,768. Chat also
 accepts the current `max_completion_tokens` spelling; if both are sent, their
-values must match. The legacy completion route accepts one nonblank prompt of
-at most 262,144 characters and 768 KiB. Embeddings accept 1 through 256 nonblank
+values must match. The legacy completion route accepts up to eight nonblank
+prompts, each at most 262,144 characters and 768 KiB combined, for direct
+non-streaming requests. Embeddings accept 1 through 256 nonblank
 strings, each at most 262,144 characters and together at most 768 KiB; only
 finite, L2-normalized float output is currently supported, with optional
 dimensionality reduction from 1 through 16,384. Native BERT encoders execute
@@ -543,9 +544,9 @@ accounting until their blocking worker exits. Reranking accepts a nonblank query
 of at most 65,536 characters and 1 through 256 nonblank documents, each at most
 262,144 characters, with 768 KiB available to the query and documents together.
 If supplied, `top_n` must be between one and the submitted document count.
-Reranking shares the embedding worker lifecycle, returns finite cosine scores
-from -1 through 1, orders ties by original document index, and can include the
-selected source documents. These checks run before runtime availability,
+Reranking shares the embedding worker lifecycle, returns finite cosine or native
+classifier-head scores, orders ties by original document index, and can include
+the selected source documents. These checks run before runtime availability,
 inference admission, or request accounting.
 
 The public JSON multimodal route accepts 1 through 3 distinct inline blocks:
@@ -610,8 +611,11 @@ is loaded. Before chat or completion inference is admitted, Bloom validates
 sampling controls, tokenizes the fully formatted prompt, and requires the prompt
 plus `max_tokens` reservation to fit that window. An oversized request returns
 HTTP 400 with `context_length_exceeded`; Bloom does not silently discard earlier
-messages. The legacy completions endpoint currently accepts one string prompt
-or a one-item string array and explicitly rejects batched prompt arrays.
+messages. The legacy completions endpoint accepts one string or a bounded array of up
+to eight strings for direct non-streaming requests. Batched prompts are generated
+independently with prompt-major flattened choices and aggregate usage; stream and
+continuous-batching requests with prompt arrays are rejected before runtime
+admission.
 
 Text endpoints accept bounded `json_object` and fail-closed `json_schema`
 response formats through Chat/Completions `response_format` and Responses
