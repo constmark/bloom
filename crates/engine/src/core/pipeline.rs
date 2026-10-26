@@ -441,6 +441,8 @@ impl InferencePipeline {
             temperature: request.params.temperature,
             top_p: request.params.top_p,
             top_k: request.params.top_k,
+            presence_penalty: request.params.presence_penalty,
+            frequency_penalty: request.params.frequency_penalty,
             seed: request.params.seed,
             response_format: request.params.response_format.clone(),
         };

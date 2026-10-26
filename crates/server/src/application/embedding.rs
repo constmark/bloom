@@ -114,6 +114,8 @@ pub(crate) fn collect_embedding(
         temperature: 0.0,
         top_p: 1.0,
         top_k: None,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
         seed: None,
         response_format: None,
     };

@@ -1,5 +1,6 @@
 mod batching;
 
+use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -1503,6 +1504,57 @@ impl Drop for PrefixStateGuard<'_> {
 }
 
 impl CandleTextModel {
+    fn sample_with_penalties(
+        logits_processor: &mut candle_transformers::generation::LogitsProcessor,
+        logits: &Tensor,
+        params: &GenerationParams,
+        history: &[u32],
+    ) -> Result<u32> {
+        if params.presence_penalty == 0.0 && params.frequency_penalty == 0.0 {
+            return Ok(logits_processor.sample(logits)?);
+        }
+
+        let mut counts = HashMap::<u32, usize>::new();
+        for &token in history {
+            *counts.entry(token).or_default() += 1;
+        }
+        if params.temperature <= 1e-7 {
+            let mut adjusted = logits.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+            for (token, count) in counts {
+                if let Some(value) = adjusted.get_mut(token as usize) {
+                    *value -=
+                        (params.presence_penalty + params.frequency_penalty * count as f64) as f32;
+                }
+            }
+            let len = adjusted.len();
+            let adjusted = Tensor::from_vec(adjusted, len, logits.device())?;
+            return Ok(logits_processor.sample(&adjusted)?);
+        }
+        Ok(logits_processor.sample_f(logits, |probabilities| {
+            let mut total = 0.0_f32;
+            for (token, probability) in probabilities.iter_mut().enumerate() {
+                let count = counts.get(&(token as u32)).copied().unwrap_or(0);
+                if count > 0 {
+                    // Multiplying post-softmax probabilities by exp(-penalty)
+                    // is equivalent to subtracting the penalty from logits and
+                    // keeps the backend sampler's top-k/top-p ordering intact.
+                    let adjustment = -(params.presence_penalty
+                        + params.frequency_penalty * count as f64)
+                        .clamp(-20.0, 20.0);
+                    *probability *= adjustment.exp() as f32;
+                }
+                if probability.is_finite() && *probability > 0.0 {
+                    total += *probability;
+                }
+            }
+            if total > 0.0 && total.is_finite() {
+                for probability in probabilities {
+                    *probability /= total;
+                }
+            }
+        })?)
+    }
+
     fn is_embedding_model(&self) -> bool {
         self.model_type == ModelType::Bert
             || self
@@ -2318,6 +2370,8 @@ impl LoadedModel for CandleTextModel {
             temperature: request.params.temperature,
             top_p: request.params.top_p,
             top_k: request.params.top_k,
+            presence_penalty: request.params.presence_penalty,
+            frequency_penalty: request.params.frequency_penalty,
             seed: request.params.seed,
             response_format: request.params.response_format.clone(),
         };
@@ -2547,7 +2601,12 @@ impl CandleTextModel {
                 } else {
                     logits
                 };
-                next_token = logits_processor.sample(&filtered)?;
+                next_token = Self::sample_with_penalties(
+                    &mut logits_processor,
+                    &filtered,
+                    params,
+                    &all_tokens,
+                )?;
             }
             start_pos += suffix.len();
         } else {
@@ -2570,7 +2629,8 @@ impl CandleTextModel {
             } else {
                 logits
             };
-            next_token = logits_processor.sample(&filtered)?;
+            next_token =
+                Self::sample_with_penalties(&mut logits_processor, &filtered, params, &all_tokens)?;
             start_pos += token_ids.len();
         }
         drop(_span_prefill);
@@ -2745,7 +2805,12 @@ impl CandleTextModel {
                             } else {
                                 correction_logits.clone()
                             };
-                            logits_processor.sample(&filtered)?
+                            Self::sample_with_penalties(
+                                &mut logits_processor,
+                                &filtered,
+                                params,
+                                &all_tokens,
+                            )?
                         };
 
                         if self.eos_token_ids.contains(&next_tok) {
@@ -2789,7 +2854,12 @@ impl CandleTextModel {
                 } else {
                     logits
                 };
-                let next_tok = logits_processor.sample(&filtered)?;
+                let next_tok = Self::sample_with_penalties(
+                    &mut logits_processor,
+                    &filtered,
+                    params,
+                    &all_tokens,
+                )?;
                 start_pos += 1;
 
                 if self.eos_token_ids.contains(&next_tok) {

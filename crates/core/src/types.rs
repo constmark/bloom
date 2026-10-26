@@ -257,6 +257,14 @@ pub struct GenerationParams {
     /// participate in sampling before top-p is applied.
     #[serde(default)]
     pub top_k: Option<usize>,
+    /// Additive presence penalty applied to tokens already seen in the
+    /// generated context. OpenAI-compatible range is -2 through 2.
+    #[serde(default)]
+    pub presence_penalty: f64,
+    /// Frequency penalty scaled by the number of times a token was seen.
+    /// OpenAI-compatible range is -2 through 2.
+    #[serde(default)]
+    pub frequency_penalty: f64,
     pub seed: Option<u64>,
     #[serde(default)]
     pub response_format: Option<ResponseFormat>,
@@ -269,6 +277,8 @@ impl Default for GenerationParams {
             temperature: 0.7,
             top_p: 0.9,
             top_k: None,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
             seed: None,
             response_format: None,
         }
@@ -294,6 +304,14 @@ impl GenerationParams {
         }
         if self.top_k == Some(0) {
             return Err("top_k must be greater than zero when provided".to_string());
+        }
+        for (name, value) in [
+            ("presence_penalty", self.presence_penalty),
+            ("frequency_penalty", self.frequency_penalty),
+        ] {
+            if !value.is_finite() || !(-2.0..=2.0).contains(&value) {
+                return Err(format!("{name} must be finite and between -2 and 2"));
+            }
         }
         if let Some(ResponseFormat::JsonSchema(schema)) = &self.response_format
             && !schema.is_object()
@@ -443,6 +461,8 @@ mod tests {
         assert_eq!(params.temperature, 0.7);
         assert_eq!(params.top_p, 0.9);
         assert_eq!(params.top_k, None);
+        assert_eq!(params.presence_penalty, 0.0);
+        assert_eq!(params.frequency_penalty, 0.0);
         assert_eq!(params.seed, None);
     }
 
@@ -468,6 +488,12 @@ mod tests {
 
         params = GenerationParams {
             top_k: Some(0),
+            ..GenerationParams::default()
+        };
+        assert!(params.validate().is_err());
+
+        params = GenerationParams {
+            presence_penalty: 2.1,
             ..GenerationParams::default()
         };
         assert!(params.validate().is_err());

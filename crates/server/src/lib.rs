@@ -2962,9 +2962,13 @@ mod tests {
         }))
         .unwrap();
         let error = helpers::validate_chat_request_compatibility(&active).unwrap_err();
-        for field in ["frequency_penalty", "n", "unknown_semantic"] {
+        for field in ["n", "unknown_semantic"] {
             assert!(error.contains(field));
         }
+        assert_eq!(
+            helpers::request_penalties(&active.extensions).unwrap(),
+            (0.0, 0.5)
+        );
         assert_eq!(
             helpers::normalize_stop_sequences(active.stop.as_ref()).unwrap(),
             vec!["END"]

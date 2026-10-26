@@ -256,7 +256,9 @@ fn neutral_request_extension(field: &str, value: &serde_json::Value) -> bool {
         }
         "tool_choice" | "function_call" => value.as_str() == Some("none"),
         "parallel_tool_calls" | "logprobs" | "store" | "echo" => value.as_bool() == Some(false),
-        "frequency_penalty" | "presence_penalty" => value.as_f64() == Some(0.0),
+        "frequency_penalty" | "presence_penalty" => value
+            .as_f64()
+            .is_some_and(|penalty| penalty.is_finite() && (-2.0..=2.0).contains(&penalty)),
         "logit_bias" | "metadata" => value.as_object().is_some_and(|entries| entries.is_empty()),
         "top_logprobs" => value.as_u64() == Some(0),
         "user" => value.as_str().is_some_and(|user| {
@@ -285,6 +287,9 @@ fn neutral_responses_extension(field: &str, value: &serde_json::Value) -> bool {
         "tool_choice" => value.as_str() == Some("none"),
         "top_logprobs" => value.as_u64() == Some(0),
         "top_k" => value.as_u64().is_some_and(|k| (1..=32_768).contains(&k)),
+        "frequency_penalty" | "presence_penalty" => value
+            .as_f64()
+            .is_some_and(|penalty| penalty.is_finite() && (-2.0..=2.0).contains(&penalty)),
         "truncation" => value.as_str() == Some("disabled"),
         "service_tier" => matches!(value.as_str(), Some("auto" | "default")),
         "user" | "safety_identifier" => value.as_str().is_some_and(|identifier| {
@@ -2709,6 +2714,33 @@ pub(crate) fn request_top_k(
     Ok(Some(top_k))
 }
 
+/// Parse OpenAI-compatible frequency and presence penalties from flattened
+/// request extensions. Keeping these in one helper ensures Chat, Completion,
+/// Responses, and multimodal adapters apply identical bounds.
+pub(crate) fn request_penalties(
+    extensions: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> std::result::Result<(f64, f64), String> {
+    fn read(
+        extensions: &std::collections::BTreeMap<String, serde_json::Value>,
+        name: &str,
+    ) -> std::result::Result<f64, String> {
+        let Some(value) = extensions.get(name).filter(|value| !value.is_null()) else {
+            return Ok(0.0);
+        };
+        let penalty = value
+            .as_f64()
+            .ok_or_else(|| format!("{name} must be a number between -2 and 2."))?;
+        if !penalty.is_finite() || !(-2.0..=2.0).contains(&penalty) {
+            return Err(format!("{name} must be finite and between -2 and 2."));
+        }
+        Ok(penalty)
+    }
+    Ok((
+        read(extensions, "presence_penalty")?,
+        read(extensions, "frequency_penalty")?,
+    ))
+}
+
 pub(crate) fn single_completion_prompt(
     prompt: &serde_json::Value,
 ) -> std::result::Result<String, String> {
@@ -3018,6 +3050,8 @@ pub(crate) fn collect_embedding(
         temperature: 0.0,
         top_p: 1.0,
         top_k: None,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
         seed: None,
         response_format: None,
     };

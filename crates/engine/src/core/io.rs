@@ -187,6 +187,10 @@ pub struct InferenceParams {
     pub top_p: f64,
     #[serde(default)]
     pub top_k: Option<usize>,
+    #[serde(default)]
+    pub presence_penalty: f64,
+    #[serde(default)]
+    pub frequency_penalty: f64,
     pub seed: Option<u64>,
     #[serde(default)]
     pub response_format: Option<bloomai_core::ResponseFormat>,
@@ -199,6 +203,8 @@ impl Default for InferenceParams {
             temperature: 0.7,
             top_p: 0.9,
             top_k: None,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
             seed: None,
             response_format: None,
         }
@@ -212,6 +218,8 @@ impl InferenceParams {
             temperature: self.temperature,
             top_p: self.top_p,
             top_k: self.top_k,
+            presence_penalty: self.presence_penalty,
+            frequency_penalty: self.frequency_penalty,
             seed: self.seed,
             response_format: self.response_format.clone(),
         }

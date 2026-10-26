@@ -2332,6 +2332,8 @@ fn prepare_ollama_image_request(
         temperature: request.temperature.unwrap_or(0.7),
         top_p: request.top_p.unwrap_or(0.9),
         top_k: request_top_k(&request.extensions)?,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
         seed: request.seed,
         response_format: None,
     };

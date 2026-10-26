@@ -107,6 +107,8 @@ pub trait LoadedModel: Send + Sync {
             temperature: 0.0,
             top_p: 1.0,
             top_k: None,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
             seed: None,
             response_format: None,
         };
@@ -213,6 +215,8 @@ pub trait LoadedModel: Send + Sync {
             temperature: request.params.temperature,
             top_p: request.params.top_p,
             top_k: request.params.top_k,
+            presence_penalty: request.params.presence_penalty,
+            frequency_penalty: request.params.frequency_penalty,
             seed: request.params.seed,
             response_format: request.params.response_format.clone(),
         };

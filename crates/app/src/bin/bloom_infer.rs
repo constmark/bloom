@@ -911,6 +911,8 @@ fn main() -> Result<()> {
             temperature: args.temperature,
             top_p: args.top_p,
             top_k: args.top_k,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
             seed: args.seed,
             response_format: None,
         };
@@ -926,6 +928,8 @@ fn main() -> Result<()> {
         temperature: resolved_input.temperature,
         top_p: resolved_input.top_p,
         top_k: resolved_input.top_k,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
         seed: resolved_input.seed,
         response_format: None,
     };
@@ -1682,6 +1686,8 @@ fn run_bench(args: &Args, engine: &dyn Engine, model_path: &std::path::Path) -> 
         temperature: 0.7,
         top_p: 0.9,
         top_k: args.top_k,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
         seed: Some(42),
         response_format: None,
     };
