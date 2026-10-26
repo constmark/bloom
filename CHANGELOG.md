@@ -10,6 +10,10 @@ called out in release notes.
 
 ### Reliability and distribution
 
+- Add bounded top-k sampling across the core generation contract, Candle
+  TopK/TopK+TopP sampler, OpenAI text endpoints, Ollama `options.top_k`, and
+  the standalone/benchmark CLIs. Omitted values preserve existing defaults;
+  HTTP and Ollama adapters reject values outside 1–32,768.
 - Update the optional Metal adapter to 0.33.0 while retaining Candle's pinned
   0.29 dependency as a separate lockfile entry; refresh the MLX/MLX-LM bridge
   and OpenAI compatibility smoke pins to their current supported revisions.

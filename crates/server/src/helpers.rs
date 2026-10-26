@@ -250,6 +250,7 @@ fn neutral_request_extension(field: &str, value: &serde_json::Value) -> bool {
     }
     match field {
         "n" | "best_of" => value.as_u64() == Some(1),
+        "top_k" => value.as_u64().is_some_and(|k| (1..=32_768).contains(&k)),
         "stop" | "tools" | "functions" => {
             value.as_array().is_some_and(|entries| entries.is_empty())
         }
@@ -283,6 +284,7 @@ fn neutral_responses_extension(field: &str, value: &serde_json::Value) -> bool {
         "include" | "tools" => value.as_array().is_some_and(|entries| entries.is_empty()),
         "tool_choice" => value.as_str() == Some("none"),
         "top_logprobs" => value.as_u64() == Some(0),
+        "top_k" => value.as_u64().is_some_and(|k| (1..=32_768).contains(&k)),
         "truncation" => value.as_str() == Some("disabled"),
         "service_tier" => matches!(value.as_str(), Some("auto" | "default")),
         "user" | "safety_identifier" => value.as_str().is_some_and(|identifier| {
@@ -2690,6 +2692,23 @@ pub(crate) fn validate_generation_controls(
     Ok(())
 }
 
+pub(crate) fn request_top_k(
+    extensions: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> std::result::Result<Option<usize>, String> {
+    let Some(value) = extensions.get("top_k").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let raw = value
+        .as_u64()
+        .ok_or_else(|| "top_k must be a positive integer.".to_string())?;
+    let top_k =
+        usize::try_from(raw).map_err(|_| "top_k is too large for this platform.".to_string())?;
+    if !(1..=32_768).contains(&top_k) {
+        return Err("top_k must be between 1 and 32768 when provided.".to_string());
+    }
+    Ok(Some(top_k))
+}
+
 pub(crate) fn single_completion_prompt(
     prompt: &serde_json::Value,
 ) -> std::result::Result<String, String> {
@@ -2998,6 +3017,7 @@ pub(crate) fn collect_embedding(
         max_tokens: 1,
         temperature: 0.0,
         top_p: 1.0,
+        top_k: None,
         seed: None,
         response_format: None,
     };

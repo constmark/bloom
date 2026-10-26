@@ -2304,6 +2304,16 @@ async fn handle_chat_completions_inner(
             message,
         );
     }
+    let top_k = match request_top_k(&payload.extensions) {
+        Ok(top_k) => top_k,
+        Err(message) => {
+            return error_response(
+                axum::http::StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                message,
+            );
+        }
+    };
     if !state.app.ready.load(Ordering::Acquire) {
         return model_unavailable_response(&state).await;
     }
@@ -2360,6 +2370,7 @@ async fn handle_chat_completions_inner(
         max_tokens,
         temperature,
         top_p,
+        top_k,
         seed: payload.seed,
         response_format: match core_response_format {
             bloomai_core::ResponseFormat::Text => None,
@@ -3442,6 +3453,16 @@ pub(crate) async fn handle_responses(
             message,
         );
     }
+    let top_k = match request_top_k(&payload.extensions) {
+        Ok(top_k) => top_k,
+        Err(message) => {
+            return error_response(
+                axum::http::StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                message,
+            );
+        }
+    };
     let (response_format, response_text_format) = match responses_text_format(payload.text.as_ref())
     {
         Ok(format) => format,
@@ -3599,7 +3620,11 @@ pub(crate) async fn handle_responses(
         tool_choice: tool_bridge.chat_tool_choice,
         parallel_tool_calls: tool_bridge.parallel_tool_calls,
         internal_request_id: Some(response_request_id.clone()),
-        extensions: std::collections::BTreeMap::new(),
+        extensions: top_k
+            .map(|top_k| {
+                std::collections::BTreeMap::from([("top_k".to_string(), serde_json::json!(top_k))])
+            })
+            .unwrap_or_default(),
     };
     let response = handle_chat_completions(State(state), Json(chat_request))
         .await
@@ -3866,6 +3891,16 @@ pub(crate) async fn handle_completions(
             message,
         );
     }
+    let top_k = match request_top_k(&payload.extensions) {
+        Ok(top_k) => top_k,
+        Err(message) => {
+            return error_response(
+                axum::http::StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                message,
+            );
+        }
+    };
     let response_format = match response_format_mode(payload.response_format.as_ref()) {
         Ok(mode) => mode,
         Err(message) => {
@@ -3929,6 +3964,7 @@ pub(crate) async fn handle_completions(
         max_tokens,
         temperature,
         top_p,
+        top_k,
         seed: payload.seed,
         response_format: match core_response_format {
             bloomai_core::ResponseFormat::Text => None,

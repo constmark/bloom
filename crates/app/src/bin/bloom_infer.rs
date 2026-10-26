@@ -57,6 +57,7 @@ struct PromptJson {
     max_tokens: Option<usize>,
     temperature: Option<f64>,
     top_p: Option<f64>,
+    top_k: Option<usize>,
     seed: Option<u64>,
 }
 
@@ -66,6 +67,7 @@ struct ResolvedInput {
     max_tokens: usize,
     temperature: f64,
     top_p: f64,
+    top_k: Option<usize>,
     seed: Option<u64>,
 }
 
@@ -126,6 +128,10 @@ struct Args {
     /// Top-p (nucleus sampling) threshold.
     #[arg(long, default_value_t = 0.9)]
     top_p: f64,
+
+    /// Optional top-k sampling cap applied before top-p.
+    #[arg(long)]
+    top_k: Option<usize>,
 
     /// Random seed for reproducible generation.
     #[arg(long)]
@@ -331,6 +337,7 @@ fn apply_config(args: &mut Args, matches: &ArgMatches, config: &bloomai_app::Inf
     apply_config_value!(args, matches, config, max_tokens);
     apply_config_value!(args, matches, config, temperature);
     apply_config_value!(args, matches, config, top_p);
+    apply_config_option!(args, matches, config, top_k);
     apply_config_option!(args, matches, config, seed);
     apply_config_value!(args, matches, config, stream);
     apply_config_value!(args, matches, config, device);
@@ -631,6 +638,7 @@ fn resolve_and_parse_input(args: &Args, template: CliChatTemplate) -> Result<Res
                 max_tokens: args.max_tokens,
                 temperature: args.temperature,
                 top_p: args.top_p,
+                top_k: args.top_k,
                 seed: args.seed,
             });
         }
@@ -645,6 +653,7 @@ fn resolve_and_parse_input(args: &Args, template: CliChatTemplate) -> Result<Res
                 max_tokens: json_obj.max_tokens.unwrap_or(args.max_tokens),
                 temperature: json_obj.temperature.unwrap_or(args.temperature),
                 top_p: json_obj.top_p.unwrap_or(args.top_p),
+                top_k: json_obj.top_k.or(args.top_k),
                 seed: json_obj.seed.or(args.seed),
             });
         }
@@ -657,6 +666,7 @@ fn resolve_and_parse_input(args: &Args, template: CliChatTemplate) -> Result<Res
             max_tokens: args.max_tokens,
             temperature: args.temperature,
             top_p: args.top_p,
+            top_k: args.top_k,
             seed: args.seed,
         });
     }
@@ -667,6 +677,7 @@ fn resolve_and_parse_input(args: &Args, template: CliChatTemplate) -> Result<Res
         max_tokens: args.max_tokens,
         temperature: args.temperature,
         top_p: args.top_p,
+        top_k: args.top_k,
         seed: args.seed,
     })
 }
@@ -899,6 +910,7 @@ fn main() -> Result<()> {
             max_tokens: args.max_tokens,
             temperature: args.temperature,
             top_p: args.top_p,
+            top_k: args.top_k,
             seed: args.seed,
             response_format: None,
         };
@@ -913,6 +925,7 @@ fn main() -> Result<()> {
         max_tokens: resolved_input.max_tokens,
         temperature: resolved_input.temperature,
         top_p: resolved_input.top_p,
+        top_k: resolved_input.top_k,
         seed: resolved_input.seed,
         response_format: None,
     };
@@ -1525,6 +1538,7 @@ fn print_interactive_help() {
     println!("  /set max_tokens <n>           Set maximum generated tokens");
     println!("  /set temperature <n>          Set sampling temperature");
     println!("  /set top_p <n>                Set nucleus sampling threshold");
+    println!("  /set top_k <n|none>           Set or clear top-k sampling cap");
     println!("  /set seed <n|none>            Set or clear random seed");
     println!("  /set system <text|none>       Set or clear system prompt");
     println!("  /set stream <on|off>          Toggle streaming output");
@@ -1570,6 +1584,25 @@ fn set_interactive_option(
             params.top_p = value.parse()?;
             println!("top_p = {}", params.top_p);
         }
+        "top_k" | "top-k" => {
+            params.top_k =
+                if value.eq_ignore_ascii_case("none") || value.eq_ignore_ascii_case("off") {
+                    None
+                } else {
+                    let top_k: usize = value.parse()?;
+                    if top_k == 0 {
+                        anyhow::bail!("top_k must be greater than zero");
+                    }
+                    Some(top_k)
+                };
+            println!(
+                "top_k = {}",
+                params
+                    .top_k
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            );
+        }
         "seed" => {
             params.seed = parse_optional_seed(value)?;
             println!(
@@ -1593,7 +1626,9 @@ fn set_interactive_option(
             println!("system = {}", system_prompt.as_deref().unwrap_or("none"));
         }
         "" => {
-            eprintln!("Usage: /set <max_tokens|temperature|top_p|seed|system|stream> <value>");
+            eprintln!(
+                "Usage: /set <max_tokens|temperature|top_p|top_k|seed|system|stream> <value>"
+            );
         }
         other => {
             eprintln!("Unknown option: {}", other);
@@ -1646,6 +1681,7 @@ fn run_bench(args: &Args, engine: &dyn Engine, model_path: &std::path::Path) -> 
         max_tokens: args.max_tokens,
         temperature: 0.7,
         top_p: 0.9,
+        top_k: args.top_k,
         seed: Some(42),
         response_format: None,
     };

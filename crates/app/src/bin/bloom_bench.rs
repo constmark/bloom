@@ -180,6 +180,10 @@ struct Args {
     #[arg(long, default_value_t = 0.9)]
     top_p: f64,
 
+    /// Optional top-k sampling cap shared by benchmark runs.
+    #[arg(long)]
+    top_k: Option<usize>,
+
     /// Random seed shared by benchmark runs.
     #[arg(long, default_value_t = 42)]
     seed: u64,
@@ -257,6 +261,7 @@ fn apply_config(args: &mut Args, matches: &ArgMatches, config: &bloomai_app::Ben
     apply_config_value!(args, matches, config, device);
     apply_config_option!(args, matches, config, dtype);
     apply_config_value!(args, matches, config, max_tokens);
+    apply_config_option!(args, matches, config, top_k);
     apply_config_value!(args, matches, config, repetitions);
     apply_config_value!(args, matches, config, warmup);
     apply_config_value!(args, matches, config, context_size);
@@ -421,6 +426,7 @@ fn main() -> Result<()> {
         max_tokens: args.max_tokens,
         temperature: args.temperature,
         top_p: args.top_p,
+        top_k: args.top_k,
         seed: Some(args.seed),
         response_format: None,
     };

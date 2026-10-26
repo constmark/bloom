@@ -113,6 +113,7 @@ pub(crate) fn collect_embedding(
         max_tokens: 1,
         temperature: 0.0,
         top_p: 1.0,
+        top_k: None,
         seed: None,
         response_format: None,
     };

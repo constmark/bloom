@@ -18,6 +18,7 @@ pub(crate) struct ChildGuard {
 /// on error. A broken pipe (or a missing stdin handle) means the worker has
 /// already failed; explicitly kill and reap it before returning so callers do
 /// not leave a zombie behind on an early I/O error.
+#[cfg(test)]
 pub(crate) fn write_stdin(child: &mut Child, request: &[u8]) -> Result<()> {
     let Some(mut stdin) = child.stdin.take() else {
         let _ = child.kill();

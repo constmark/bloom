@@ -439,6 +439,7 @@ struct OllamaGenerationOptions {
     max_tokens: Option<usize>,
     temperature: Option<f64>,
     top_p: Option<f64>,
+    top_k: Option<usize>,
     seed: Option<u64>,
     stop: Vec<String>,
 }
@@ -2168,7 +2169,10 @@ fn ollama_chat_request(
             tool_choice: None,
             parallel_tool_calls: None,
             internal_request_id: None,
-            extensions: BTreeMap::new(),
+            extensions: options
+                .top_k
+                .map(|top_k| BTreeMap::from([("top_k".to_string(), json!(top_k))]))
+                .unwrap_or_default(),
         },
         image,
     ))
@@ -2235,7 +2239,10 @@ fn ollama_generate_request(
             tool_choice: None,
             parallel_tool_calls: None,
             internal_request_id: None,
-            extensions: BTreeMap::new(),
+            extensions: options
+                .top_k
+                .map(|top_k| BTreeMap::from([("top_k".to_string(), json!(top_k))]))
+                .unwrap_or_default(),
         },
         image,
     ))
@@ -2324,6 +2331,7 @@ fn prepare_ollama_image_request(
         max_tokens,
         temperature: request.temperature.unwrap_or(0.7),
         top_p: request.top_p.unwrap_or(0.9),
+        top_k: request_top_k(&request.extensions)?,
         seed: request.seed,
         response_format: None,
     };
@@ -2624,7 +2632,14 @@ fn parse_ollama_options(
         .ok_or_else(|| "options must be an object".to_string())?;
     reject_ollama_object_fields(
         options,
-        &["num_predict", "temperature", "top_p", "seed", "stop"],
+        &[
+            "num_predict",
+            "temperature",
+            "top_p",
+            "top_k",
+            "seed",
+            "stop",
+        ],
         "options",
     )?;
     let max_tokens = options
@@ -2642,6 +2657,19 @@ fn parse_ollama_options(
         .transpose()?;
     let temperature = optional_f64(options.get("temperature"), "options.temperature")?;
     let top_p = optional_f64(options.get("top_p"), "options.top_p")?;
+    let top_k = options
+        .get("top_k")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            let raw = value
+                .as_i64()
+                .ok_or_else(|| "options.top_k must be an integer".to_string())?;
+            usize::try_from(raw)
+                .ok()
+                .filter(|value| *value > 0 && *value <= 32_768)
+                .ok_or_else(|| "options.top_k must be between 1 and 32768".to_string())
+        })
+        .transpose()?;
     let seed = options
         .get("seed")
         .filter(|value| !value.is_null())
@@ -2664,6 +2692,7 @@ fn parse_ollama_options(
         max_tokens,
         temperature,
         top_p,
+        top_k,
         seed,
         stop,
     })
@@ -4314,19 +4343,21 @@ mod tests {
             "num_predict": 32,
             "temperature": 0.2,
             "top_p": 0.8,
+            "top_k": 40,
             "seed": 7,
             "stop": ["END"]
         })))
         .unwrap();
         assert_eq!(options.max_tokens, Some(32));
         assert_eq!(options.seed, Some(7));
+        assert_eq!(options.top_k, Some(40));
         assert_eq!(options.stop, vec!["END"]);
         for invalid in [
             json!({"num_predict": 0}),
             json!({"seed": -2}),
             json!({"stop": [""]}),
             json!({"stop": ["a", "b", "c", "d", "e"]}),
-            json!({"top_k": 40}),
+            json!({"top_k": 0}),
         ] {
             assert!(parse_ollama_options(Some(&invalid)).is_err());
         }

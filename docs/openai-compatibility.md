@@ -443,6 +443,11 @@ requested log probabilities, non-empty logit bias, and
 reports at most eight bounded safe field names and never echoes arbitrary large
 or control-bearing names.
 
+The llama.cpp-compatible `top_k` sampling extension is supported on Chat
+Completions, legacy Completions, Responses text requests, and Ollama
+`options.top_k`. It must be an integer from 1 through 32,768 and is applied
+before `top_p`; omitted values preserve the existing backend defaults.
+
 Multiple choices, token log probabilities, penalty/logit-bias sampling, custom
 tools, and deprecated function fields are
 therefore explicitly unsupported today. Message content arrays accept text

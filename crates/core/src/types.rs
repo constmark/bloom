@@ -252,6 +252,11 @@ pub struct GenerationParams {
     pub max_tokens: usize,
     pub temperature: f64,
     pub top_p: f64,
+    /// Optional top-k sampling cap. `None` keeps the backend's default
+    /// nucleus/greedy behavior; when present, only the k most likely tokens
+    /// participate in sampling before top-p is applied.
+    #[serde(default)]
+    pub top_k: Option<usize>,
     pub seed: Option<u64>,
     #[serde(default)]
     pub response_format: Option<ResponseFormat>,
@@ -263,6 +268,7 @@ impl Default for GenerationParams {
             max_tokens: 128,
             temperature: 0.7,
             top_p: 0.9,
+            top_k: None,
             seed: None,
             response_format: None,
         }
@@ -285,6 +291,9 @@ impl GenerationParams {
         }
         if !self.top_p.is_finite() || !(0.0 < self.top_p && self.top_p <= 1.0) {
             return Err("top_p must be finite, greater than 0, and at most 1".to_string());
+        }
+        if self.top_k == Some(0) {
+            return Err("top_k must be greater than zero when provided".to_string());
         }
         if let Some(ResponseFormat::JsonSchema(schema)) = &self.response_format
             && !schema.is_object()
@@ -433,6 +442,7 @@ mod tests {
         assert_eq!(params.max_tokens, 128);
         assert_eq!(params.temperature, 0.7);
         assert_eq!(params.top_p, 0.9);
+        assert_eq!(params.top_k, None);
         assert_eq!(params.seed, None);
     }
 
@@ -457,6 +467,12 @@ mod tests {
         assert!(params.validate().is_err());
 
         params = GenerationParams {
+            top_k: Some(0),
+            ..GenerationParams::default()
+        };
+        assert!(params.validate().is_err());
+
+        params = GenerationParams {
             response_format: Some(ResponseFormat::JsonSchema(serde_json::json!("schema"))),
             ..GenerationParams::default()
         };
@@ -466,6 +482,7 @@ mod tests {
     #[test]
     fn generation_params_validate_accepts_supported_controls() {
         let params = GenerationParams {
+            top_k: Some(40),
             response_format: Some(ResponseFormat::JsonSchema(serde_json::json!({
                 "type": "object",
                 "properties": {}

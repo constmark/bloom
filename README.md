@@ -630,7 +630,8 @@ instead of being silently ignored. Multiple choices, log probabilities,
 penalty/logit-bias sampling, custom tools, and the deprecated function-call
 request fields are not yet implemented. See the
 [OpenAI compatibility guide](docs/openai-compatibility.md) for the precise field
-matrix and error behavior.
+matrix and error behavior. The llama.cpp-compatible `top_k` extension is
+implemented for text generation and Ollama `options.top_k` (1–32,768).
 
 Bloom also provides an experimental, bounded Ollama-native surface at
 `/api/version`, `/api/tags`, `/api/ps`, `/api/show`, `/api/pull`,

@@ -3962,6 +3962,21 @@ mod tests {
         assert!(helpers::validate_generation_controls(MAX_GENERATED_TOKENS + 1, 0.7, 0.9).is_err());
         assert!(helpers::validate_generation_controls(128, f64::NAN, 0.9).is_err());
         assert!(helpers::validate_generation_controls(128, 0.7, 0.0).is_err());
+        assert_eq!(
+            helpers::request_top_k(&std::collections::BTreeMap::from([(
+                "top_k".to_string(),
+                serde_json::json!(40),
+            )]))
+            .unwrap(),
+            Some(40)
+        );
+        assert!(
+            helpers::request_top_k(&std::collections::BTreeMap::from([(
+                "top_k".to_string(),
+                serde_json::json!(0),
+            )]))
+            .is_err()
+        );
 
         assert_eq!(
             helpers::single_completion_prompt(&serde_json::json!(["one"])).unwrap(),
@@ -4889,7 +4904,7 @@ mod tests {
                     "model": "default",
                     "messages": [{"role": "user", "content": "Hello"}],
                     "stream": false,
-                    "options": {"top_k": 40}
+                    "options": {"top_k": 0}
                 }),
             ),
             (

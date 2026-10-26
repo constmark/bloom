@@ -106,6 +106,7 @@ pub trait LoadedModel: Send + Sync {
             max_tokens: 1,
             temperature: 0.0,
             top_p: 1.0,
+            top_k: None,
             seed: None,
             response_format: None,
         };
@@ -211,6 +212,7 @@ pub trait LoadedModel: Send + Sync {
             max_tokens: request.params.max_tokens,
             temperature: request.params.temperature,
             top_p: request.params.top_p,
+            top_k: request.params.top_k,
             seed: request.params.seed,
             response_format: request.params.response_format.clone(),
         };

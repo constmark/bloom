@@ -440,6 +440,7 @@ impl InferencePipeline {
             max_tokens: request.params.max_tokens,
             temperature: request.params.temperature,
             top_p: request.params.top_p,
+            top_k: request.params.top_k,
             seed: request.params.seed,
             response_format: request.params.response_format.clone(),
         };

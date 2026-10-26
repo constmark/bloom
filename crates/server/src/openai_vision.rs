@@ -54,6 +54,7 @@ pub(crate) fn prepare_openai_vision_request(
     let temperature = request.temperature.unwrap_or(0.7);
     let top_p = request.top_p.unwrap_or(0.9);
     validate_generation_controls(max_tokens, temperature, top_p)?;
+    let top_k = request_top_k(&request.extensions)?;
 
     let content = request.messages[0].content.as_array().ok_or_else(|| {
         "A user message with image input must use an array of text and image_url parts.".to_string()
@@ -128,6 +129,7 @@ pub(crate) fn prepare_openai_vision_request(
             max_tokens,
             temperature,
             top_p,
+            top_k,
             seed: request.seed,
             response_format: None,
         },

@@ -185,6 +185,8 @@ pub struct InferenceParams {
     pub max_tokens: usize,
     pub temperature: f64,
     pub top_p: f64,
+    #[serde(default)]
+    pub top_k: Option<usize>,
     pub seed: Option<u64>,
     #[serde(default)]
     pub response_format: Option<bloomai_core::ResponseFormat>,
@@ -196,6 +198,7 @@ impl Default for InferenceParams {
             max_tokens: 128,
             temperature: 0.7,
             top_p: 0.9,
+            top_k: None,
             seed: None,
             response_format: None,
         }
@@ -208,6 +211,7 @@ impl InferenceParams {
             max_tokens: self.max_tokens,
             temperature: self.temperature,
             top_p: self.top_p,
+            top_k: self.top_k,
             seed: self.seed,
             response_format: self.response_format.clone(),
         }

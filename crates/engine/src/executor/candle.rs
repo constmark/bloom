@@ -2317,6 +2317,7 @@ impl LoadedModel for CandleTextModel {
             max_tokens: request.params.max_tokens,
             temperature: request.params.temperature,
             top_p: request.params.top_p,
+            top_k: request.params.top_k,
             seed: request.params.seed,
             response_format: request.params.response_format.clone(),
         };
@@ -2433,11 +2434,38 @@ impl CandleTextModel {
             return Ok(());
         }
 
-        let mut logits_processor = candle_transformers::generation::LogitsProcessor::new(
-            params.seed.unwrap_or(42),
-            Some(params.temperature),
-            Some(params.top_p),
-        );
+        let mut logits_processor = {
+            use candle_transformers::generation::Sampling;
+            let sampling = if params.temperature <= 1e-7 {
+                Sampling::ArgMax
+            } else if let Some(top_k) = params.top_k {
+                if params.top_p < 1.0 {
+                    Sampling::TopKThenTopP {
+                        k: top_k,
+                        p: params.top_p,
+                        temperature: params.temperature,
+                    }
+                } else {
+                    Sampling::TopK {
+                        k: top_k,
+                        temperature: params.temperature,
+                    }
+                }
+            } else if params.top_p < 1.0 {
+                Sampling::TopP {
+                    p: params.top_p,
+                    temperature: params.temperature,
+                }
+            } else {
+                Sampling::All {
+                    temperature: params.temperature,
+                }
+            };
+            candle_transformers::generation::LogitsProcessor::from_sampling(
+                params.seed.unwrap_or(42),
+                sampling,
+            )
+        };
 
         *current_prefix_guard = token_ids.clone();
 
