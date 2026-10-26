@@ -2252,6 +2252,16 @@ async fn handle_chat_completions_inner(
     payload: ChatRequest,
     exact_runtime: Option<Arc<LoadedRuntime>>,
 ) -> axum::response::Response {
+    let payload = match normalize_legacy_function_fields(payload) {
+        Ok(payload) => payload,
+        Err(message) => {
+            return error_response(
+                axum::http::StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                message,
+            );
+        }
+    };
     if let Err(message) = validate_chat_request_compatibility(&payload) {
         return error_response(
             axum::http::StatusCode::BAD_REQUEST,

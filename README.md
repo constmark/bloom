@@ -525,9 +525,10 @@ tool-enabled streams until that envelope is complete, then validates every
 selected name and arguments object against the declared bounded JSON Schema
 before exposing it. Invalid model output fails with `invalid_tool_call` instead
 of becoming an executable call. Function quality therefore depends on the
-loaded model's instruction-following ability; custom and built-in tool types,
-the deprecated `functions`/`function_call` interface, and combining active
-tools with `response_format` remain unsupported.
+loaded model's instruction-following ability; custom and built-in tool types
+and combining active tools with `response_format` remain unsupported. Chat
+Completions normalize deprecated `functions`/`function_call` requests into the
+same bounded tool path; legacy Completions reject those fields.
 
 All generation routes admit `max_tokens` from 1 through 32,768. Chat also
 accepts the current `max_completion_tokens` spelling; if both are sent, their
@@ -633,7 +634,7 @@ unknown or unsupported semantics fail with HTTP 400 before runtime admission
 instead of being silently ignored. Direct non-streaming text requests support
 bounded independent choices through `n: 1..8`; streaming/continuous-batching
 multiple choices, log probabilities, custom tools, and deprecated function-call
-request fields are not yet implemented. See the
+fields on legacy Completions are not yet implemented. See the
 [OpenAI compatibility guide](docs/openai-compatibility.md) for the precise field
 matrix and error behavior. The llama.cpp-compatible `top_k` extension is
 implemented for text generation and Ollama `options.top_k` (1–32,768).

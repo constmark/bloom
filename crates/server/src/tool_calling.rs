@@ -73,6 +73,87 @@ pub(crate) fn chat_tool_config(
     )
 }
 
+/// Translate the legacy Chat Completions `functions`/`function_call` fields
+/// into the modern `tools`/`tool_choice` representation used by Bloom's
+/// bounded function-call protocol.
+///
+/// The translation happens before extension admission so legacy clients get
+/// the same schema validation, private protocol, and output checks as modern
+/// clients. Conflicting legacy and modern fields fail closed instead of
+/// choosing one silently.
+pub(crate) fn normalize_legacy_function_fields(
+    mut request: ChatRequest,
+) -> std::result::Result<ChatRequest, String> {
+    let legacy_functions = request
+        .extensions
+        .remove("functions")
+        .filter(|value| !value.is_null());
+    let legacy_choice = request
+        .extensions
+        .remove("function_call")
+        .filter(|value| !value.is_null());
+    if legacy_functions.is_none() && legacy_choice.is_none() {
+        return Ok(request);
+    }
+
+    let has_modern_tools = request.tools.as_ref().is_some_and(|value| {
+        !value.is_null() && value.as_array().is_none_or(|items| !items.is_empty())
+    });
+    if legacy_functions.is_some() && has_modern_tools {
+        return Err(
+            "functions cannot be combined with tools; send one function declaration format."
+                .to_string(),
+        );
+    }
+    if legacy_choice.is_some() && request.tool_choice.is_some() {
+        return Err(
+            "function_call cannot be combined with tool_choice; send one function selection format."
+                .to_string(),
+        );
+    }
+
+    if let Some(functions) = legacy_functions {
+        let functions = functions
+            .as_array()
+            .ok_or_else(|| "functions must be an array of function definitions.".to_string())?;
+        request.tools = Some(json!(
+            functions
+                .iter()
+                .map(|function| json!({"type": "function", "function": function}))
+                .collect::<Vec<_>>()
+        ));
+    }
+    if let Some(choice) = legacy_choice {
+        request.tool_choice = Some(legacy_function_call_to_tool_choice(&choice)?);
+    }
+    Ok(request)
+}
+
+fn legacy_function_call_to_tool_choice(
+    choice: &serde_json::Value,
+) -> std::result::Result<serde_json::Value, String> {
+    if let Some(value) = choice.as_str() {
+        return match value {
+            "none" | "auto" => Ok(json!(value)),
+            _ => Err(
+                "function_call must be `none`, `auto`, or an object containing a function name."
+                    .to_string(),
+            ),
+        };
+    }
+    let object = choice.as_object().ok_or_else(|| {
+        "function_call must be `none`, `auto`, or an object containing a function name.".to_string()
+    })?;
+    let name = object
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "function_call objects require a string `name`.".to_string())?;
+    if object.keys().any(|key| key != "name") {
+        return Err("function_call objects may contain only `name`.".to_string());
+    }
+    Ok(json!({"type": "function", "function": {"name": name}}))
+}
+
 fn tool_config_from_chat_fields(
     tools: Option<&serde_json::Value>,
     tool_choice: Option<&serde_json::Value>,
@@ -889,6 +970,62 @@ mod tests {
         let mut none = base;
         none["tool_choice"] = json!("none");
         assert!(chat_tool_config(&request(none)).unwrap().is_none());
+    }
+
+    #[test]
+    fn legacy_functions_are_normalized_to_modern_tools() {
+        let normalized = normalize_legacy_function_fields(request(json!({
+            "messages": [{"role": "user", "content": "Weather?"}],
+            "functions": [{
+                "name": "get_weather",
+                "description": "Get weather.",
+                "parameters": {"type": "object", "properties": {}}
+            }],
+            "function_call": {"name": "get_weather"}
+        })))
+        .unwrap();
+        assert!(!normalized.extensions.contains_key("functions"));
+        assert!(!normalized.extensions.contains_key("function_call"));
+        assert_eq!(
+            normalized.tools.as_ref().unwrap()[0]["function"]["name"],
+            "get_weather"
+        );
+        assert_eq!(
+            normalized.tool_choice.as_ref().unwrap(),
+            &json!({"type": "function", "function": {"name": "get_weather"}})
+        );
+        assert_eq!(
+            chat_tool_config(&normalized).unwrap().unwrap().choice,
+            ToolChoiceMode::Named("get_weather".to_string())
+        );
+    }
+
+    #[test]
+    fn legacy_function_fields_reject_conflicts_and_unsafe_choices() {
+        assert!(
+            normalize_legacy_function_fields(request(json!({
+                "messages": [],
+                "functions": [{"name": "lookup"}],
+                "tools": [{"type": "function", "function": {"name": "other"}}]
+            })))
+            .is_err()
+        );
+        assert!(
+            normalize_legacy_function_fields(request(json!({
+                "messages": [],
+                "functions": [{"name": "lookup"}],
+                "function_call": "required"
+            })))
+            .is_err()
+        );
+        assert!(
+            normalize_legacy_function_fields(request(json!({
+                "messages": [],
+                "functions": [{"name": "lookup"}],
+                "function_call": {"name": "lookup", "extra": true}
+            })))
+            .is_err()
+        );
     }
 
     #[test]

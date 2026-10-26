@@ -337,7 +337,7 @@ requests must retain their protocol JSON, no-store, and correlation headers.
   schema-invalid arguments; buffered streaming `delta.tool_calls`; and a full
   assistant-call, external-result, final-message continuation. Confirm Bloom
   never executes the function and never exposes its private control envelope.
-  Then activate a custom tool, deprecated `functions`, `n`, penalties, log
+  Then activate a custom tool, legacy Completion `functions`, `n`, penalties, log
   probabilities, an unknown field, a malformed or unpaired message
   `tool_calls`, and an unknown `stream_options` field. Each unsupported or
   malformed case must return a bounded HTTP 400 `invalid_request_error` before

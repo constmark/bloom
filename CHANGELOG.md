@@ -21,6 +21,9 @@ called out in release notes.
   structured-output combinations. Detect Hugging Face BERT sequence
   classifiers during manifest preflight and route them through Candle's native
   pairwise classifier-head reranker.
+- Normalize Chat Completions' deprecated `functions` and `function_call` fields
+  into the bounded modern function-tool path, with conflict and shape checks;
+  legacy Completions continue to reject those fields explicitly.
 - Add bounded top-k sampling across the core generation contract, Candle
   TopK/TopK+TopP sampler, OpenAI text endpoints, Ollama `options.top_k`, and
   the standalone/benchmark CLIs. Omitted values preserve existing defaults;

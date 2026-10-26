@@ -155,9 +155,11 @@ explicitly untrusted conversation context. The loaded model still determines
 whether a valid control object can be produced; small or non-instruction-tuned
 models may fail closed.
 
-Custom tools, hosted/built-in tools, namespaces, allowed-tool subsets, the
-deprecated `functions` and `function_call` request fields, and combining an
-active tool choice with `response_format` are not supported. The public shapes
+Custom tools, hosted/built-in tools, namespaces, allowed-tool subsets, and
+combining an active tool choice with `response_format` are not supported. Chat
+Completions normalize the deprecated `functions` and `function_call` request
+fields into the same bounded function tools; legacy Completions keep those
+fields fail-closed. The public shapes
 and call/result lifecycle follow the
 [OpenAI function-calling guide](https://developers.openai.com/api/docs/guides/function-calling)
 and
@@ -443,9 +445,9 @@ used nor persisted.
 Any unsupported non-neutral value for these fields is rejected with HTTP 400 and an
 `invalid_request_error` before runtime availability, concurrency admission,
 tokenization, or inference. Examples include a non-empty deprecated `functions`
-array, a custom or built-in tool, an out-of-range `n`, an `n` greater than one
-combined with streaming, continuous batching, tools, or structured output,
-requested log probabilities, and
+array on legacy Completions, a custom or built-in tool, an out-of-range `n`, an
+`n` greater than one combined with streaming, continuous batching, tools, or
+structured output, requested log probabilities, and
 `echo: true`. Unknown non-null fields follow the same fail-closed rule. Error text
 reports at most eight bounded safe field names and never echoes arbitrary large
 or control-bearing names.
@@ -460,8 +462,9 @@ to the sampled token history and accept finite values from -2 through 2.
 with finite values from -100 through 100.
 
 Streaming/continuous-batching multiple choices, token log probabilities, custom
-tools, and deprecated function fields are therefore explicitly unsupported
-today. Direct non-streaming text requests may return up to eight choices with
+tools, and deprecated function fields on legacy Completions are therefore
+explicitly unsupported today. Direct non-streaming text requests may return up
+to eight choices with
 `n`; each choice is generated independently and usage aggregates completion
 tokens across choices. Message content arrays accept text
 parts plus the bounded single-user `image_url` subset described above. Bloom

@@ -3242,7 +3242,30 @@ mod tests {
                 .to_string(),
             ))
             .unwrap();
-        let response = app.oneshot(admitted_tool).await.unwrap();
+        let response = app.clone().oneshot(admitted_tool).await.unwrap();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        let admitted_legacy = axum::http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(
+                json!({
+                    "model": "default",
+                    "messages": [{"role": "user", "content": "Look up Paris."}],
+                    "functions": [{
+                        "name": "lookup",
+                        "parameters": {"type": "object", "properties": {}}
+                    }],
+                    "function_call": "none"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(admitted_legacy).await.unwrap();
         assert_eq!(
             response.status(),
             axum::http::StatusCode::SERVICE_UNAVAILABLE

@@ -187,7 +187,8 @@ cross-encoder paths, while trained cross-encoder quality evidence remains
 incomplete; the external llama.cpp adapter forwards text completion only;
 trained multimodal/tool-quality coverage is incomplete; and streaming or
 continuous-batching multiple choices, log probabilities, custom/built-in
-tools, and deprecated function fields remain explicitly unsupported. Direct
+tools, and deprecated function fields on legacy Completions remain explicitly
+unsupported. Direct
 non-streaming text Chat/Completion requests now support bounded prompt arrays
 and independent `n=1..8` choices. Stable promotion also still needs
 target-hardware performance,
