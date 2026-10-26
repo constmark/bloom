@@ -116,6 +116,75 @@ fn is_awq_model(model_path: &Path) -> bool {
     model_path.to_string_lossy().to_lowercase().contains("awq")
 }
 
+/// Resolve and validate the OpenVINO IR pair before starting a Python worker.
+///
+/// OpenVINO GenAI accepts a directory, but a directory-only existence check
+/// used to let incomplete exports reach the external runtime and produce a
+/// vague provider error. Requiring the XML graph and its sibling BIN weights
+/// here makes preflight deterministic and prevents a false "loadable" result.
+fn discover_ir_files(model_path: &Path) -> Result<(PathBuf, PathBuf)> {
+    let xml = if model_path.is_file() {
+        if model_path.extension().and_then(|ext| ext.to_str()) != Some("xml") {
+            return Err(anyhow!(
+                "OpenVINO expects an IR .xml file or a directory containing one: {}",
+                model_path.display()
+            ));
+        }
+        model_path.to_path_buf()
+    } else if model_path.is_dir() {
+        let preferred = model_path.join("openvino_model.xml");
+        if preferred.is_file() {
+            preferred
+        } else {
+            let mut xml_files = std::fs::read_dir(model_path)?
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.extension()
+                        .and_then(|ext| ext.to_str())
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("xml"))
+                })
+                .collect::<Vec<_>>();
+            xml_files.sort();
+            xml_files.into_iter().next().ok_or_else(|| {
+                anyhow!(
+                    "OpenVINO IR XML graph is missing from {}; expected openvino_model.xml",
+                    model_path.display()
+                )
+            })?
+        }
+    } else {
+        return Err(anyhow!(
+            "OpenVINO model path does not exist: {}",
+            model_path.display()
+        ));
+    };
+
+    let metadata = std::fs::symlink_metadata(&xml)?;
+    if metadata.file_type().is_symlink() {
+        return Err(anyhow!(
+            "OpenVINO IR XML graph must not be a symbolic link: {}",
+            xml.display()
+        ));
+    }
+    let bin = xml.with_extension("bin");
+    if !bin.is_file() {
+        return Err(anyhow!(
+            "OpenVINO IR weights are missing: expected {} beside {}",
+            bin.display(),
+            xml.display()
+        ));
+    }
+    let bin_metadata = std::fs::symlink_metadata(&bin)?;
+    if bin_metadata.file_type().is_symlink() {
+        return Err(anyhow!(
+            "OpenVINO IR weights must not be a symbolic link: {}",
+            bin.display()
+        ));
+    }
+    Ok((xml, bin))
+}
+
 fn maybe_export_awq(model_path: &Path) -> Result<()> {
     if model_path.join("openvino_model.xml").exists() || !is_awq_model(model_path) {
         return Ok(());
@@ -263,14 +332,9 @@ impl Engine for OpenVINOEngine {
 
         maybe_export_awq(model_path)?;
 
-        // Verify it contains either configuration or model representation
-        let is_ir = model_path.join("openvino_model.xml").exists();
-        if !is_ir {
-            tracing::warn!(
-                "openvino_model.xml not found in {}. Model might need to be exported.",
-                model_path.display()
-            );
-        }
+        // Validate the complete IR package before publishing a runtime. The
+        // external GenAI worker expects both graph and weights.
+        let (xml_file, _) = discover_ir_files(model_path)?;
 
         let is_quantized = model_path.to_string_lossy().to_lowercase().contains("int4")
             || model_path.to_string_lossy().to_lowercase().contains("int8")
@@ -286,7 +350,8 @@ impl Engine for OpenVINOEngine {
             id: model_path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
+                .or_else(|| xml_file.file_stem().and_then(|n| n.to_str()))
+                .unwrap_or("openvino-model")
                 .to_string(),
             modality: Modality::Text,
             quantized: is_quantized,
@@ -439,6 +504,33 @@ mod tests {
         let model_path = dir.path().join("my-qwen-awq-model");
         std::fs::create_dir_all(&model_path).unwrap();
         assert!(super::is_awq_model(&model_path));
+    }
+
+    #[test]
+    fn discover_ir_files_requires_graph_and_weights() {
+        let dir = tempdir().unwrap();
+        let xml = dir.path().join("openvino_model.xml");
+        std::fs::write(&xml, b"<net/>\n").unwrap();
+        let missing = discover_ir_files(dir.path()).unwrap_err().to_string();
+        assert!(missing.contains("IR weights are missing"));
+
+        let bin = dir.path().join("openvino_model.bin");
+        std::fs::write(&bin, [0_u8; 4]).unwrap();
+        let (resolved_xml, resolved_bin) = discover_ir_files(dir.path()).unwrap();
+        assert_eq!(resolved_xml, xml);
+        assert_eq!(resolved_bin, bin);
+    }
+
+    #[test]
+    fn discover_ir_files_rejects_non_xml_and_missing_paths() {
+        let dir = tempdir().unwrap();
+        let weights = dir.path().join("model.bin");
+        std::fs::write(&weights, [0_u8; 4]).unwrap();
+        let error = discover_ir_files(&weights).unwrap_err().to_string();
+        assert!(error.contains("expects an IR .xml file"));
+        let missing = dir.path().join("missing");
+        let error = discover_ir_files(&missing).unwrap_err().to_string();
+        assert!(error.contains("does not exist"));
     }
 
     #[test]
