@@ -109,6 +109,7 @@ pub trait LoadedModel: Send + Sync {
             top_k: None,
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
+            logit_bias: None,
             seed: None,
             response_format: None,
         };
@@ -217,6 +218,7 @@ pub trait LoadedModel: Send + Sync {
             top_k: request.params.top_k,
             presence_penalty: request.params.presence_penalty,
             frequency_penalty: request.params.frequency_penalty,
+            logit_bias: request.params.logit_bias.clone(),
             seed: request.params.seed,
             response_format: request.params.response_format.clone(),
         };

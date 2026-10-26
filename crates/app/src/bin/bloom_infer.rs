@@ -913,6 +913,7 @@ fn main() -> Result<()> {
             top_k: args.top_k,
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
+            logit_bias: None,
             seed: args.seed,
             response_format: None,
         };
@@ -930,6 +931,7 @@ fn main() -> Result<()> {
         top_k: resolved_input.top_k,
         presence_penalty: 0.0,
         frequency_penalty: 0.0,
+        logit_bias: None,
         seed: resolved_input.seed,
         response_format: None,
     };
@@ -1688,6 +1690,7 @@ fn run_bench(args: &Args, engine: &dyn Engine, model_path: &std::path::Path) -> 
         top_k: args.top_k,
         presence_penalty: 0.0,
         frequency_penalty: 0.0,
+        logit_bias: None,
         seed: Some(42),
         response_format: None,
     };

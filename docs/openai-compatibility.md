@@ -408,8 +408,9 @@ template:
 | `functions` | `[]` |
 | `function_call` | `"none"` |
 | `logprobs`, `store`, `echo` | `false` |
-| `frequency_penalty`, `presence_penalty` | `0` |
-| `logit_bias`, `metadata` | `{}` |
+| `frequency_penalty`, `presence_penalty` | Finite values from -2 through 2; applied to seen-token probabilities during native generation. |
+| `logit_bias` | `{}` or a bounded numeric token-bias map described below |
+| `metadata` | `{}` |
 | `top_logprobs` | `0` |
 | `user` | A non-empty, control-free string of at most 256 characters |
 
@@ -437,8 +438,8 @@ used nor persisted.
 Any unsupported non-neutral value for these fields is rejected with HTTP 400 and an
 `invalid_request_error` before runtime availability, concurrency admission,
 tokenization, or inference. Examples include a non-empty deprecated `functions`
-array, a custom or built-in tool, `n` greater than one, non-zero penalties,
-requested log probabilities, non-empty logit bias, and
+array, a custom or built-in tool, `n` greater than one, requested log
+probabilities, and
 `echo: true`. Unknown non-null fields follow the same fail-closed rule. Error text
 reports at most eight bounded safe field names and never echoes arbitrary large
 or control-bearing names.
@@ -447,9 +448,13 @@ The llama.cpp-compatible `top_k` sampling extension is supported on Chat
 Completions, legacy Completions, Responses text requests, and Ollama
 `options.top_k`. It must be an integer from 1 through 32,768 and is applied
 before `top_p`; omitted values preserve the existing backend defaults.
+OpenAI-compatible `presence_penalty` and `frequency_penalty` are also applied
+to the sampled token history and accept finite values from -2 through 2.
+`logit_bias` accepts up to 1,024 numeric token IDs from 0 through 1,000,000
+with finite values from -100 through 100.
 
-Multiple choices, token log probabilities, penalty/logit-bias sampling, custom
-tools, and deprecated function fields are
+Multiple choices, token log probabilities, custom tools, and deprecated
+function fields are
 therefore explicitly unsupported today. Message content arrays accept text
 parts plus the bounded single-user `image_url` subset described above. Bloom
 rejects audio, file, refusal, malformed, empty, or over-limit part arrays with

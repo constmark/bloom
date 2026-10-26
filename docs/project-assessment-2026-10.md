@@ -185,7 +185,7 @@ OpenVINO, ASR, NPU, and vendor paths depend on external runtimes; MLX remains
 experimental; reranking is a normalized bi-encoder path rather than a native
 cross-encoder; the external llama.cpp adapter forwards text completion only;
 trained multimodal/tool-quality coverage is incomplete; and multiple choices,
-log probabilities, penalty/logit-bias sampling, custom/built-in tools,
+log probabilities, custom/built-in tools,
 deprecated function fields, and batched legacy prompts remain explicitly
 unsupported. Stable promotion also still needs target-hardware performance,
 multi-hour soak, cancellation/failure injection, upgrade/rollback, container

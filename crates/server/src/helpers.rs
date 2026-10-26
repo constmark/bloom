@@ -259,7 +259,8 @@ fn neutral_request_extension(field: &str, value: &serde_json::Value) -> bool {
         "frequency_penalty" | "presence_penalty" => value
             .as_f64()
             .is_some_and(|penalty| penalty.is_finite() && (-2.0..=2.0).contains(&penalty)),
-        "logit_bias" | "metadata" => value.as_object().is_some_and(|entries| entries.is_empty()),
+        "logit_bias" => valid_logit_bias(value),
+        "metadata" => value.as_object().is_some_and(|entries| entries.is_empty()),
         "top_logprobs" => value.as_u64() == Some(0),
         "user" => value.as_str().is_some_and(|user| {
             !user.is_empty() && user.chars().count() <= 256 && !user.chars().any(char::is_control)
@@ -290,6 +291,7 @@ fn neutral_responses_extension(field: &str, value: &serde_json::Value) -> bool {
         "frequency_penalty" | "presence_penalty" => value
             .as_f64()
             .is_some_and(|penalty| penalty.is_finite() && (-2.0..=2.0).contains(&penalty)),
+        "logit_bias" => valid_logit_bias(value),
         "truncation" => value.as_str() == Some("disabled"),
         "service_tier" => matches!(value.as_str(), Some("auto" | "default")),
         "user" | "safety_identifier" => value.as_str().is_some_and(|identifier| {
@@ -2741,6 +2743,50 @@ pub(crate) fn request_penalties(
     ))
 }
 
+fn valid_logit_bias(value: &serde_json::Value) -> bool {
+    let Some(entries) = value.as_object() else {
+        return false;
+    };
+    entries.len() <= 1_024
+        && entries.iter().all(|(token, bias)| {
+            token.parse::<u32>().is_ok_and(|token| token <= 1_000_000)
+                && bias
+                    .as_f64()
+                    .is_some_and(|bias| bias.is_finite() && (-100.0..=100.0).contains(&bias))
+        })
+}
+
+pub(crate) fn request_logit_bias(
+    extensions: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> std::result::Result<Option<std::collections::BTreeMap<u32, f64>>, String> {
+    let Some(value) = extensions
+        .get("logit_bias")
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(None);
+    };
+    if !valid_logit_bias(value) {
+        return Err(
+            "logit_bias must be an object with at most 1024 numeric token ids (0..1000000) and finite values between -100 and 100."
+                .to_string(),
+        );
+    }
+    let Some(entries) = value.as_object() else {
+        return Err("logit_bias must be a JSON object".to_string());
+    };
+    let mut result = std::collections::BTreeMap::new();
+    for (token, bias) in entries {
+        let token = token
+            .parse::<u32>()
+            .map_err(|_| "logit_bias token id is invalid")?;
+        let bias = bias
+            .as_f64()
+            .ok_or_else(|| "logit_bias value is invalid".to_string())?;
+        result.insert(token, bias);
+    }
+    Ok(Some(result))
+}
+
 pub(crate) fn single_completion_prompt(
     prompt: &serde_json::Value,
 ) -> std::result::Result<String, String> {
@@ -3052,6 +3098,7 @@ pub(crate) fn collect_embedding(
         top_k: None,
         presence_penalty: 0.0,
         frequency_penalty: 0.0,
+        logit_bias: None,
         seed: None,
         response_format: None,
     };

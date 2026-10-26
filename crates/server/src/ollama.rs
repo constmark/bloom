@@ -440,6 +440,8 @@ struct OllamaGenerationOptions {
     temperature: Option<f64>,
     top_p: Option<f64>,
     top_k: Option<usize>,
+    presence_penalty: Option<f64>,
+    frequency_penalty: Option<f64>,
     seed: Option<u64>,
     stop: Vec<String>,
 }
@@ -2169,10 +2171,7 @@ fn ollama_chat_request(
             tool_choice: None,
             parallel_tool_calls: None,
             internal_request_id: None,
-            extensions: options
-                .top_k
-                .map(|top_k| BTreeMap::from([("top_k".to_string(), json!(top_k))]))
-                .unwrap_or_default(),
+            extensions: ollama_sampling_extensions(&options),
         },
         image,
     ))
@@ -2239,10 +2238,7 @@ fn ollama_generate_request(
             tool_choice: None,
             parallel_tool_calls: None,
             internal_request_id: None,
-            extensions: options
-                .top_k
-                .map(|top_k| BTreeMap::from([("top_k".to_string(), json!(top_k))]))
-                .unwrap_or_default(),
+            extensions: ollama_sampling_extensions(&options),
         },
         image,
     ))
@@ -2327,13 +2323,15 @@ fn prepare_ollama_image_request(
         );
     }
     let max_tokens = resolve_chat_max_tokens(request.max_tokens, request.max_completion_tokens)?;
+    let (presence_penalty, frequency_penalty) = request_penalties(&request.extensions)?;
     let params = InferenceParams {
         max_tokens,
         temperature: request.temperature.unwrap_or(0.7),
         top_p: request.top_p.unwrap_or(0.9),
         top_k: request_top_k(&request.extensions)?,
-        presence_penalty: 0.0,
-        frequency_penalty: 0.0,
+        presence_penalty,
+        frequency_penalty,
+        logit_bias: None,
         seed: request.seed,
         response_format: None,
     };
@@ -2639,6 +2637,8 @@ fn parse_ollama_options(
             "temperature",
             "top_p",
             "top_k",
+            "presence_penalty",
+            "frequency_penalty",
             "seed",
             "stop",
         ],
@@ -2672,6 +2672,12 @@ fn parse_ollama_options(
                 .ok_or_else(|| "options.top_k must be between 1 and 32768".to_string())
         })
         .transpose()?;
+    let presence_penalty =
+        optional_penalty(options.get("presence_penalty"), "options.presence_penalty")?;
+    let frequency_penalty = optional_penalty(
+        options.get("frequency_penalty"),
+        "options.frequency_penalty",
+    )?;
     let seed = options
         .get("seed")
         .filter(|value| !value.is_null())
@@ -2695,9 +2701,43 @@ fn parse_ollama_options(
         temperature,
         top_p,
         top_k,
+        presence_penalty,
+        frequency_penalty,
         seed,
         stop,
     })
+}
+
+fn optional_penalty(
+    value: Option<&serde_json::Value>,
+    label: &str,
+) -> std::result::Result<Option<f64>, String> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let penalty = value
+        .as_f64()
+        .ok_or_else(|| format!("{label} must be a number between -2 and 2"))?;
+    if !penalty.is_finite() || !(-2.0..=2.0).contains(&penalty) {
+        return Err(format!("{label} must be finite and between -2 and 2"));
+    }
+    Ok(Some(penalty))
+}
+
+fn ollama_sampling_extensions(
+    options: &OllamaGenerationOptions,
+) -> BTreeMap<String, serde_json::Value> {
+    let mut extensions = BTreeMap::new();
+    if let Some(top_k) = options.top_k {
+        extensions.insert("top_k".to_string(), json!(top_k));
+    }
+    if let Some(penalty) = options.presence_penalty {
+        extensions.insert("presence_penalty".to_string(), json!(penalty));
+    }
+    if let Some(penalty) = options.frequency_penalty {
+        extensions.insert("frequency_penalty".to_string(), json!(penalty));
+    }
+    extensions
 }
 
 fn optional_f64(
@@ -4346,6 +4386,8 @@ mod tests {
             "temperature": 0.2,
             "top_p": 0.8,
             "top_k": 40,
+            "presence_penalty": 0.4,
+            "frequency_penalty": -0.2,
             "seed": 7,
             "stop": ["END"]
         })))
@@ -4353,6 +4395,8 @@ mod tests {
         assert_eq!(options.max_tokens, Some(32));
         assert_eq!(options.seed, Some(7));
         assert_eq!(options.top_k, Some(40));
+        assert_eq!(options.presence_penalty, Some(0.4));
+        assert_eq!(options.frequency_penalty, Some(-0.2));
         assert_eq!(options.stop, vec!["END"]);
         for invalid in [
             json!({"num_predict": 0}),
@@ -4360,6 +4404,7 @@ mod tests {
             json!({"stop": [""]}),
             json!({"stop": ["a", "b", "c", "d", "e"]}),
             json!({"top_k": 0}),
+            json!({"presence_penalty": 2.1}),
         ] {
             assert!(parse_ollama_options(Some(&invalid)).is_err());
         }

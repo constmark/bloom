@@ -429,6 +429,7 @@ fn main() -> Result<()> {
         top_k: args.top_k,
         presence_penalty: 0.0,
         frequency_penalty: 0.0,
+        logit_bias: None,
         seed: Some(args.seed),
         response_format: None,
     };

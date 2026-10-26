@@ -191,6 +191,8 @@ pub struct InferenceParams {
     pub presence_penalty: f64,
     #[serde(default)]
     pub frequency_penalty: f64,
+    #[serde(default)]
+    pub logit_bias: Option<std::collections::BTreeMap<u32, f64>>,
     pub seed: Option<u64>,
     #[serde(default)]
     pub response_format: Option<bloomai_core::ResponseFormat>,
@@ -205,6 +207,7 @@ impl Default for InferenceParams {
             top_k: None,
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
+            logit_bias: None,
             seed: None,
             response_format: None,
         }
@@ -220,6 +223,7 @@ impl InferenceParams {
             top_k: self.top_k,
             presence_penalty: self.presence_penalty,
             frequency_penalty: self.frequency_penalty,
+            logit_bias: self.logit_bias.clone(),
             seed: self.seed,
             response_format: self.response_format.clone(),
         }

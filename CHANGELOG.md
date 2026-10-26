@@ -10,6 +10,10 @@ called out in release notes.
 
 ### Reliability and distribution
 
+- Add bounded OpenAI/Ollama presence and frequency penalties to the shared
+  generation contract and Candle sampler, including history-aware greedy and
+  temperature sampling paths. Add bounded OpenAI `logit_bias` support and
+  forward all controls through the external llama.cpp adapter.
 - Add bounded top-k sampling across the core generation contract, Candle
   TopK/TopK+TopP sampler, OpenAI text endpoints, Ollama `options.top_k`, and
   the standalone/benchmark CLIs. Omitted values preserve existing defaults;

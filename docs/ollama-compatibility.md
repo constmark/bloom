@@ -265,6 +265,7 @@ The following `options` are mapped into Bloom's shared generation admission:
 | `temperature` | Finite number, validated by the shared generation layer; defaults to 0.7. |
 | `top_p` | Finite number, validated by the shared generation layer; defaults to 0.9. |
 | `top_k` | Integer from 1 through 32,768; limits sampling to the k most likely tokens before `top_p`. |
+| `presence_penalty`, `frequency_penalty` | Finite values from -2 through 2; applied to seen-token probabilities during native generation. |
 | `seed` | `-1` for no fixed seed or a non-negative integer. |
 | `stop` | One non-empty string or up to four strings; each is limited to 1,024 characters and all are limited to 16 KiB. Matches are excluded from output and end generation early. |
 

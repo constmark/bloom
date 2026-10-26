@@ -116,6 +116,7 @@ pub(crate) fn collect_embedding(
         top_k: None,
         presence_penalty: 0.0,
         frequency_penalty: 0.0,
+        logit_bias: None,
         seed: None,
         response_format: None,
     };

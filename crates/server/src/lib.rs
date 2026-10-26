@@ -2958,6 +2958,7 @@ mod tests {
             "stop": "END",
             "tools": [{"type": "function", "function": {"name": "lookup"}}],
             "frequency_penalty": 0.5,
+            "logit_bias": {"42": -3.0},
             "unknown_semantic": true
         }))
         .unwrap();
@@ -2969,6 +2970,8 @@ mod tests {
             helpers::request_penalties(&active.extensions).unwrap(),
             (0.0, 0.5)
         );
+        let bias = helpers::request_logit_bias(&active.extensions).unwrap();
+        assert_eq!(bias.unwrap().get(&42), Some(&-3.0));
         assert_eq!(
             helpers::normalize_stop_sequences(active.stop.as_ref()).unwrap(),
             vec!["END"]

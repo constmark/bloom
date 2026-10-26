@@ -2324,6 +2324,16 @@ async fn handle_chat_completions_inner(
             );
         }
     };
+    let logit_bias = match request_logit_bias(&payload.extensions) {
+        Ok(logit_bias) => logit_bias,
+        Err(message) => {
+            return error_response(
+                axum::http::StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                message,
+            );
+        }
+    };
     if !state.app.ready.load(Ordering::Acquire) {
         return model_unavailable_response(&state).await;
     }
@@ -2383,6 +2393,7 @@ async fn handle_chat_completions_inner(
         top_k,
         presence_penalty,
         frequency_penalty,
+        logit_bias,
         seed: payload.seed,
         response_format: match core_response_format {
             bloomai_core::ResponseFormat::Text => None,
@@ -3485,6 +3496,16 @@ pub(crate) async fn handle_responses(
             );
         }
     };
+    let logit_bias = match request_logit_bias(&payload.extensions) {
+        Ok(logit_bias) => logit_bias,
+        Err(message) => {
+            return error_response(
+                axum::http::StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                message,
+            );
+        }
+    };
     let (response_format, response_text_format) = match responses_text_format(payload.text.as_ref())
     {
         Ok(format) => format,
@@ -3658,6 +3679,9 @@ pub(crate) async fn handle_responses(
                     "frequency_penalty".to_string(),
                     serde_json::json!(frequency_penalty),
                 );
+            }
+            if let Some(logit_bias) = logit_bias {
+                extensions.insert("logit_bias".to_string(), serde_json::json!(logit_bias));
             }
             extensions
         },
@@ -3947,6 +3971,16 @@ pub(crate) async fn handle_completions(
             );
         }
     };
+    let logit_bias = match request_logit_bias(&payload.extensions) {
+        Ok(logit_bias) => logit_bias,
+        Err(message) => {
+            return error_response(
+                axum::http::StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                message,
+            );
+        }
+    };
     let response_format = match response_format_mode(payload.response_format.as_ref()) {
         Ok(mode) => mode,
         Err(message) => {
@@ -4013,6 +4047,7 @@ pub(crate) async fn handle_completions(
         top_k,
         presence_penalty,
         frequency_penalty,
+        logit_bias,
         seed: payload.seed,
         response_format: match core_response_format {
             bloomai_core::ResponseFormat::Text => None,

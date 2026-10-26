@@ -1510,7 +1510,13 @@ impl CandleTextModel {
         params: &GenerationParams,
         history: &[u32],
     ) -> Result<u32> {
-        if params.presence_penalty == 0.0 && params.frequency_penalty == 0.0 {
+        if params.presence_penalty == 0.0
+            && params.frequency_penalty == 0.0
+            && params
+                .logit_bias
+                .as_ref()
+                .is_none_or(std::collections::BTreeMap::is_empty)
+        {
             return Ok(logits_processor.sample(logits)?);
         }
 
@@ -1524,6 +1530,13 @@ impl CandleTextModel {
                 if let Some(value) = adjusted.get_mut(token as usize) {
                     *value -=
                         (params.presence_penalty + params.frequency_penalty * count as f64) as f32;
+                }
+            }
+            if let Some(logit_bias) = &params.logit_bias {
+                for (&token, &bias) in logit_bias {
+                    if let Some(value) = adjusted.get_mut(token as usize) {
+                        *value += bias as f32;
+                    }
                 }
             }
             let len = adjusted.len();
@@ -1542,6 +1555,13 @@ impl CandleTextModel {
                         + params.frequency_penalty * count as f64)
                         .clamp(-20.0, 20.0);
                     *probability *= adjustment.exp() as f32;
+                }
+                if let Some(bias) = params
+                    .logit_bias
+                    .as_ref()
+                    .and_then(|biases| biases.get(&(token as u32)))
+                {
+                    *probability *= bias.clamp(-20.0, 20.0).exp() as f32;
                 }
                 if probability.is_finite() && *probability > 0.0 {
                     total += *probability;
@@ -2372,6 +2392,7 @@ impl LoadedModel for CandleTextModel {
             top_k: request.params.top_k,
             presence_penalty: request.params.presence_penalty,
             frequency_penalty: request.params.frequency_penalty,
+            logit_bias: request.params.logit_bias.clone(),
             seed: request.params.seed,
             response_format: request.params.response_format.clone(),
         };

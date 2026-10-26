@@ -265,6 +265,10 @@ pub struct GenerationParams {
     /// OpenAI-compatible range is -2 through 2.
     #[serde(default)]
     pub frequency_penalty: f64,
+    /// Optional token-id to logit bias map. Values follow OpenAI's bounded
+    /// -100..=100 convention.
+    #[serde(default)]
+    pub logit_bias: Option<std::collections::BTreeMap<u32, f64>>,
     pub seed: Option<u64>,
     #[serde(default)]
     pub response_format: Option<ResponseFormat>,
@@ -279,6 +283,7 @@ impl Default for GenerationParams {
             top_k: None,
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
+            logit_bias: None,
             seed: None,
             response_format: None,
         }
@@ -311,6 +316,16 @@ impl GenerationParams {
         ] {
             if !value.is_finite() || !(-2.0..=2.0).contains(&value) {
                 return Err(format!("{name} must be finite and between -2 and 2"));
+            }
+        }
+        if let Some(logit_bias) = &self.logit_bias {
+            if logit_bias.len() > 1_024 {
+                return Err("logit_bias cannot contain more than 1024 token ids".to_string());
+            }
+            if logit_bias.iter().any(|(token, bias)| {
+                *token > 1_000_000 || !bias.is_finite() || !(-100.0..=100.0).contains(bias)
+            }) {
+                return Err("logit_bias token ids must be <= 1000000 and values must be finite between -100 and 100".to_string());
             }
         }
         if let Some(ResponseFormat::JsonSchema(schema)) = &self.response_format
@@ -463,6 +478,7 @@ mod tests {
         assert_eq!(params.top_k, None);
         assert_eq!(params.presence_penalty, 0.0);
         assert_eq!(params.frequency_penalty, 0.0);
+        assert_eq!(params.logit_bias, None);
         assert_eq!(params.seed, None);
     }
 
@@ -496,6 +512,14 @@ mod tests {
             presence_penalty: 2.1,
             ..GenerationParams::default()
         };
+        assert!(params.validate().is_err());
+
+        params = GenerationParams {
+            logit_bias: Some(std::collections::BTreeMap::from([(1, 100.0)])),
+            ..GenerationParams::default()
+        };
+        assert!(params.validate().is_ok());
+        params.logit_bias = Some(std::collections::BTreeMap::from([(1, 100.1)]));
         assert!(params.validate().is_err());
 
         params = GenerationParams {

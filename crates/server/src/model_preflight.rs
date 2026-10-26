@@ -686,23 +686,18 @@ fn unsupported_device_format(
     if manifest.files.is_empty() || supported.is_empty() {
         return None;
     }
-    manifest
+    let unsupported = manifest
         .files
         .iter()
-        .all(|file| !supported.contains(&file.format))
-        .then(|| {
-            format!(
-                "Device backend does not advertise support for model formats {}.",
-                manifest
-                    .files
-                    .iter()
-                    .map(|file| format_name(file.format))
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        })
+        .filter(|file| file.format != ModelFormat::Unknown && !supported.contains(&file.format))
+        .map(|file| format_name(file.format))
+        .collect::<BTreeSet<_>>();
+    (!unsupported.is_empty()).then(|| {
+        format!(
+            "Device backend does not advertise support for model formats {}.",
+            unsupported.into_iter().collect::<Vec<_>>().join(", ")
+        )
+    })
 }
 
 fn summarize_manifest(manifest: &ModelManifest) -> ModelManifestSummary {
@@ -898,6 +893,41 @@ mod tests {
             }"#,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn mixed_packages_fail_preflight_when_any_weight_format_is_unsupported() {
+        let manifest = ModelManifest {
+            files: vec![
+                bloomai_core::ModelFile {
+                    name: "weights.gguf".to_string(),
+                    format: ModelFormat::Gguf,
+                    size_bytes: 1,
+                    hash_sha256: None,
+                    required: true,
+                },
+                bloomai_core::ModelFile {
+                    name: "weights.onnx".to_string(),
+                    format: ModelFormat::Onnx,
+                    size_bytes: 1,
+                    hash_sha256: None,
+                    required: true,
+                },
+                bloomai_core::ModelFile {
+                    name: "metadata.json".to_string(),
+                    format: ModelFormat::Unknown,
+                    size_bytes: 1,
+                    hash_sha256: None,
+                    required: false,
+                },
+            ],
+            ..ModelManifest::default()
+        };
+
+        let blocker = unsupported_device_format(&manifest, &[ModelFormat::Gguf])
+            .expect("the unsupported ONNX weight must block preflight");
+        assert!(blocker.contains("onnx"));
+        assert!(!blocker.contains("unknown"));
     }
 
     #[test]

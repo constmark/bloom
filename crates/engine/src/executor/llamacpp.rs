@@ -228,7 +228,7 @@ impl LoadedModel for LlamaCppModel {
 
 impl LlamaCppModel {
     fn complete(&self, prompt: &str, params: &GenerationParams) -> Result<String> {
-        let body = json!({
+        let mut body = json!({
             "prompt": prompt,
             "n_predict": params.max_tokens,
             "temperature": params.temperature,
@@ -236,6 +236,18 @@ impl LlamaCppModel {
             "stream": false,
             "seed": params.seed.map(|v| v as i64).unwrap_or(-1),
         });
+        if let Some(top_k) = params.top_k {
+            body["top_k"] = json!(top_k);
+        }
+        if params.presence_penalty != 0.0 {
+            body["presence_penalty"] = json!(params.presence_penalty);
+        }
+        if params.frequency_penalty != 0.0 {
+            body["frequency_penalty"] = json!(params.frequency_penalty);
+        }
+        if let Some(logit_bias) = &params.logit_bias {
+            body["logit_bias"] = json!(logit_bias);
+        }
         let response = post_json(self.addr, "/completion", &body, DEFAULT_COMPLETION_TIMEOUT)?;
         self.validate_speculative_response(&response)?;
         response
@@ -253,7 +265,7 @@ impl LlamaCppModel {
         params: &GenerationParams,
         sink: &mut dyn OutputSink,
     ) -> Result<()> {
-        let body = json!({
+        let mut body = json!({
             "prompt": prompt,
             "n_predict": params.max_tokens,
             "temperature": params.temperature,
@@ -261,6 +273,18 @@ impl LlamaCppModel {
             "stream": true,
             "seed": params.seed.map(|v| v as i64).unwrap_or(-1),
         });
+        if let Some(top_k) = params.top_k {
+            body["top_k"] = json!(top_k);
+        }
+        if params.presence_penalty != 0.0 {
+            body["presence_penalty"] = json!(params.presence_penalty);
+        }
+        if params.frequency_penalty != 0.0 {
+            body["frequency_penalty"] = json!(params.frequency_penalty);
+        }
+        if let Some(logit_bias) = &params.logit_bias {
+            body["logit_bias"] = json!(logit_bias);
+        }
         let mut saw_speculative_confirmation = self.spec_type == "none";
         post_json_stream(
             self.addr,

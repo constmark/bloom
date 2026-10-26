@@ -443,6 +443,7 @@ impl InferencePipeline {
             top_k: request.params.top_k,
             presence_penalty: request.params.presence_penalty,
             frequency_penalty: request.params.frequency_penalty,
+            logit_bias: request.params.logit_bias.clone(),
             seed: request.params.seed,
             response_format: request.params.response_format.clone(),
         };

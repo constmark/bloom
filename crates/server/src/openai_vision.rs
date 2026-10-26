@@ -133,6 +133,7 @@ pub(crate) fn prepare_openai_vision_request(
             top_k,
             presence_penalty,
             frequency_penalty,
+            logit_bias: request_logit_bias(&request.extensions)?,
             seed: request.seed,
             response_format: None,
         },
