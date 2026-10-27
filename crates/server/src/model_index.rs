@@ -1,6 +1,7 @@
 //! Signed, bounded model discovery indexes for verified acquisitions.
 
 use std::collections::{BTreeMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::RwLock as StdRwLock;
@@ -801,10 +802,84 @@ fn validate_remote_index_url(url: &Url, policy: &ModelIndexUrlPolicy) -> Result<
         .host_str()
         .ok_or_else(|| anyhow!("model index URL must include a host"))?
         .to_ascii_lowercase();
-    if !policy.allow_loopback && matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1") {
-        return Err(anyhow!("model index URL must not target a loopback host"));
+    // A configured index may be refreshed repeatedly and follows redirects. Reject
+    // literal private/link-local/multicast addresses at every hop so a public index
+    // cannot turn the refresh client into an internal-network SSRF primitive. The
+    // loopback exception remains available to the in-process test policy only.
+    if is_restricted_index_host(&host)
+        && !(policy.allow_loopback && is_loopback_index_host(&host))
+    {
+        return Err(anyhow!(
+            "model index URL must not target a loopback, private, link-local, or multicast host"
+        ));
     }
     Ok(())
+}
+
+fn is_loopback_index_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| match address {
+                IpAddr::V4(address) => address.octets()[0] == 127,
+                IpAddr::V6(address) => address == Ipv6Addr::LOCALHOST,
+            })
+}
+
+fn is_restricted_index_host(host: &str) -> bool {
+    let normalized = host.trim_end_matches('.');
+    if normalized.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let Ok(address) = normalized.parse::<IpAddr>() else {
+        return false;
+    };
+    match address {
+        IpAddr::V4(address) => restricted_ipv4(address),
+        IpAddr::V6(address) => restricted_ipv6(address),
+    }
+}
+
+fn restricted_ipv4(address: Ipv4Addr) -> bool {
+    let octets = address.octets();
+    let first = octets[0];
+    let second = octets[1];
+    (first == 0) // unspecified and this-host networks
+        || first == 10
+        || first == 127
+        || (first == 100 && (64..=127).contains(&second)) // carrier-grade NAT
+        || (first == 169 && second == 254) // link-local
+        || (first == 172 && (16..=31).contains(&second))
+        || (first == 192 && second == 168)
+        || (first == 192 && second == 0 && octets[2] == 0) // IETF protocol assignments
+        || (first == 192 && second == 0 && octets[2] == 2) // documentation
+        || (first == 198 && second == 51 && octets[2] == 100) // documentation
+        || (first == 203 && second == 0 && octets[2] == 113) // documentation
+        || (first == 198 && (18..=19).contains(&second)) // benchmarking
+        || first >= 224 // multicast and reserved
+}
+
+fn restricted_ipv6(address: Ipv6Addr) -> bool {
+    let segments = address.segments();
+    if address == Ipv6Addr::UNSPECIFIED || address == Ipv6Addr::LOCALHOST {
+        return true;
+    }
+    // fc00::/7 (ULA), fe80::/10 (link-local), ff00::/8 (multicast), and
+    // 2001:db8::/32 (documentation) must not be used as refresh targets.
+    (segments[0] & 0xfe00) == 0xfc00
+        || (segments[0] & 0xffc0) == 0xfe80
+        || (segments[0] & 0xff00) == 0xff00
+        || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        // IPv4-mapped addresses can otherwise hide a private IPv4 target.
+        || (segments[..5].iter().all(|segment| *segment == 0)
+            && segments[5] == 0xffff
+            && restricted_ipv4(Ipv4Addr::new(
+                (segments[6] >> 8) as u8,
+                segments[6] as u8,
+                (segments[7] >> 8) as u8,
+                segments[7] as u8,
+            )))
 }
 
 fn parse_public_key(value: &str) -> Result<VerifyingKey> {
@@ -1620,6 +1695,36 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn remote_index_urls_reject_internal_literal_targets() {
+        let policy = ModelIndexUrlPolicy::default();
+        for host in [
+            "127.0.0.1",
+            "10.0.0.8",
+            "172.16.1.2",
+            "192.168.1.2",
+            "169.254.169.254",
+            "224.0.0.1",
+            "[::1]",
+            "[fc00::1]",
+            "[fe80::1]",
+            "[ff02::1]",
+            "[::ffff:10.0.0.8]",
+        ] {
+            let url = Url::parse(&format!("https://{host}/index.json")).unwrap();
+            assert!(
+                validate_remote_index_url(&url, &policy).is_err(),
+                "internal host should be rejected: {host}"
+            );
+        }
+        let loopback_policy = ModelIndexUrlPolicy {
+            allow_http: true,
+            allow_loopback: true,
+        };
+        let loopback = Url::parse("http://127.0.0.1:8080/index.json").unwrap();
+        assert!(validate_remote_index_url(&loopback, &loopback_policy).is_ok());
     }
 
     #[test]

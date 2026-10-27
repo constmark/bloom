@@ -166,7 +166,7 @@ fn default_python() -> PathBuf {
         .join("..")
         .join("..");
     resolve_python(
-        std::env::var_os("BLOOM_PYTHON").or_else(|| std::env::var_os("BLOOM_ASR_PYTHON")),
+        std::env::var_os("BLOOM_ASR_PYTHON").or_else(|| std::env::var_os("BLOOM_PYTHON")),
         &repo_root,
     )
 }
@@ -600,6 +600,15 @@ mod tests {
             resolve_python(Some(explicit.clone().into_os_string()), dir.path()),
             explicit
         );
+    }
+
+    #[test]
+    fn asr_python_override_precedes_shared_python() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _shared = EnvVarGuard::set("BLOOM_PYTHON", "/tmp/shared-bloom-python");
+        let _asr = EnvVarGuard::set("BLOOM_ASR_PYTHON", "/tmp/asr-bloom-python");
+
+        assert_eq!(default_python(), PathBuf::from("/tmp/asr-bloom-python"));
     }
 
     #[test]

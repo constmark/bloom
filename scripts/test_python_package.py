@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-"""Build an SDK sdist, rebuild its wheel, and exercise a clean installation.
+"""Build an SDK sdist, rebuild its wheel, and exercise clean installations.
 
 Install requirements/python-package.txt and build bloomai-ffi first. All
 packaging and installation happens outside the source tree. No publication.
+
+Pass ``--compatibility-library`` once or more to run the installed wheel
+against additional native libraries (for example, a previously released
+ABI-1 library and the current ABI-2 library). This is the packaged
+cross-version compatibility gate; each library is loaded in a fresh process.
 """
 
 import argparse
@@ -28,13 +33,34 @@ def run(command, *, cwd, env=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--native-library", type=Path)
+    parser.add_argument(
+        "--compatibility-library",
+        action="append",
+        type=Path,
+        default=[],
+        help="additional ABI library to test with the installed wheel (repeatable)",
+    )
     args = parser.parse_args()
     name = {"darwin": "libbloom_ffi.dylib", "win32": "bloom_ffi.dll"}.get(
         sys.platform, "libbloom_ffi.so"
     )
     native = (args.native_library or ROOT / "target/debug" / name).resolve()
-    if not native.is_file():
-        parser.error("native library missing; run cargo build -p bloomai-ffi --locked first")
+    libraries = []
+    for candidate in [native, *args.compatibility_library]:
+        candidate = candidate.resolve()
+        if not candidate.is_file():
+            parser.error(
+                f"native library missing: {candidate}; run cargo build -p bloomai-ffi --locked first"
+            )
+        if candidate not in libraries:
+            libraries.append(candidate)
+    contract_command = [
+        sys.executable,
+        str(ROOT / "scripts/check_ffi_abi_compatibility.py"),
+    ]
+    for library in libraries:
+        contract_command.extend(("--library", str(library)))
+    run(contract_command, cwd=ROOT)
     with tempfile.TemporaryDirectory(prefix="bloom-python-package-") as directory:
         work = Path(directory)
         source = work / "python"
@@ -76,20 +102,30 @@ def main():
         env = os.environ.copy()
         env["BLOOM_FFI_LIB"] = str(work / "missing-native-library")
         run([str(python), "-I", "-c", "import bloom_sdk"], cwd=work, env=env)
-        env["BLOOM_FFI_LIB"] = str(native)
-        run([str(python), "-I", "-c", """
+        smoke = """
+import ctypes
+import os
 from pathlib import Path
 import sys
 import bloom_sdk
 assert Path(sys.prefix) in Path(bloom_sdk.__file__).resolve().parents
+native = ctypes.CDLL(os.environ["BLOOM_FFI_LIB"])
+abi = int(native.bloom_abi_version()) if hasattr(native, "bloom_abi_version") else 1
+assert abi in (1, 2), abi
 with bloom_sdk.BloomPipeline('.', engine='mock') as pipeline:
-    assert pipeline._uses_v2
+    assert pipeline._uses_v2 is (abi >= 2)
     assert pipeline.generate('installed wheel')['text'] == 'echo: installed wheel'
     chunks = list(pipeline.generate_stream('installed wheel'))
     assert chunks[0] == {'TextDelta': 'echo: installed wheel'}
     assert chunks[-1] == 'End'
-"""], cwd=work, env=env)
-    print("PASS: SDK sdist -> wheel -> isolated install -> native ABI v2")
+"""
+        for library in libraries:
+            env["BLOOM_FFI_LIB"] = str(library)
+            run([str(python), "-I", "-c", smoke], cwd=work, env=env)
+        print(
+            "PASS: SDK sdist -> wheel -> isolated install -> "
+            f"native ABI compatibility ({len(libraries)} library(s))"
+        )
 
 
 if __name__ == "__main__":

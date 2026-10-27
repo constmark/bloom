@@ -104,6 +104,11 @@ BloomStreamCallbackV2 = ctypes.CFUNCTYPE(
 )
 
 BLOOM_STATUS_CANCELLED = -8
+# Keep the managed wrapper aligned with the native ABI's bounded input.  The
+# limit is measured in UTF-8 bytes (rather than Python code points), matching
+# the length-delimited slice accepted by revision 2 and the CString boundary
+# used by revision 1.
+MAX_MODEL_PATH_BYTES = 128 * 1024
 
 # Keep the Python boundary's diagnostic vocabulary stable while allowing
 # applications to present messages in their own UI language.  Native errors
@@ -392,6 +397,14 @@ class BloomPipeline:
         ):
             if "\0" in field_value:
                 raise ValueError(f"{field_name} must not contain NUL characters")
+        try:
+            model_path_bytes = model_path.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise ValueError("model_path must be valid UTF-8") from error
+        if len(model_path_bytes) > MAX_MODEL_PATH_BYTES:
+            raise ValueError(
+                f"model_path exceeds the {MAX_MODEL_PATH_BYTES}-byte UTF-8 limit"
+            )
         if (
             not isinstance(context_size, int)
             or isinstance(context_size, bool)
@@ -410,7 +423,7 @@ class BloomPipeline:
         err_buf = ctypes.create_string_buffer(512)
         try:
             if self._uses_v2:
-                model_slice, model_owner = _bytes_slice(model_path.encode("utf-8"))
+                model_slice, model_owner = _bytes_slice(model_path_bytes)
                 engine_slice, engine_owner = _bytes_slice(engine.encode("utf-8"))
                 device_slice, device_owner = _bytes_slice(device.encode("utf-8"))
                 self._pipeline = self._lib.bloom_pipeline_load_v2(
@@ -425,7 +438,7 @@ class BloomPipeline:
                 _ = (model_owner, engine_owner, device_owner)
             else:
                 self._pipeline = self._lib.bloom_pipeline_load(
-                    model_path.encode("utf-8"),
+                    model_path_bytes,
                     engine.encode("utf-8"),
                     device.encode("utf-8"),
                     context_size,
@@ -819,6 +832,10 @@ class BloomPipeline:
                     raise BloomInferenceError(
                         f"{_label(self.locale, 'invalid_chunk')}: {error}"
                     ) from error
+                if not isinstance(value, dict):
+                    raise BloomInferenceError(
+                        f"{_label(self.locale, 'invalid_chunk')}: expected a JSON object"
+                    )
                 yield value
         finally:
             stop_stream()

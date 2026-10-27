@@ -37,7 +37,7 @@ fn default_python() -> PathBuf {
         .join("..")
         .join("..");
     resolve_python(
-        std::env::var_os("BLOOM_PYTHON").or_else(|| std::env::var_os("BLOOM_ASR_PYTHON")),
+        std::env::var_os("BLOOM_ASR_PYTHON").or_else(|| std::env::var_os("BLOOM_PYTHON")),
         &repo_root,
     )
 }

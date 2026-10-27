@@ -972,7 +972,11 @@ impl WanModel {
         // Permute to [b, dim, F, H', W']
         let x = x.permute((0, 2, 1, 3, 4))?;
         let (_b, _d, fp, hp, wp) = x.dims5()?;
-        let x = x.flatten_from(2)?.t()?; // [b, seq_len, dim]
+        // After flattening the spatiotemporal axes we have [b, dim, seq].
+        // `Tensor::t()` is a matrix-only transpose and would either reject a
+        // batched tensor or collapse the batch into the wrong shape. Swap the
+        // channel and sequence axes explicitly to produce [b, seq, dim].
+        let x = x.flatten_from(2)?.transpose(1, 2)?; // [b, seq_len, dim]
 
         // Time embedding
         let t_emb = sinusoidal_embedding_1d(cfg.freq_dim, t)?;

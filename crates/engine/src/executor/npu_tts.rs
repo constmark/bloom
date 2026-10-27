@@ -42,10 +42,14 @@ fn repo_script_path(script_name: &str) -> PathBuf {
 }
 
 fn default_python() -> PathBuf {
-    if let Some(path) = std::env::var_os("BLOOM_PYTHON") {
+    // A TTS-specific interpreter must take precedence over the shared
+    // override. This lets one process use a general Python runtime for other
+    // bridges while keeping the TTS dependencies isolated in their own
+    // environment.
+    if let Some(path) = std::env::var_os("BLOOM_TTS_PYTHON") {
         return PathBuf::from(path);
     }
-    if let Some(path) = std::env::var_os("BLOOM_TTS_PYTHON") {
+    if let Some(path) = std::env::var_os("BLOOM_PYTHON") {
         return PathBuf::from(path);
     }
 
@@ -768,6 +772,17 @@ mod tests {
         assert!(cap.supported_devices.contains(&DeviceClass::Npu));
         assert!(cap.supported_formats.contains(&ModelFormat::OpenVinoIr));
         assert!(!cap.supports_streaming);
+    }
+
+    #[test]
+    fn tts_specific_python_override_precedes_shared_python() {
+        use crate::test_env::{ENV_LOCK, EnvVarGuard};
+
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _shared = EnvVarGuard::set("BLOOM_PYTHON", "/tmp/shared-bloom-python");
+        let _tts = EnvVarGuard::set("BLOOM_TTS_PYTHON", "/tmp/tts-bloom-python");
+
+        assert_eq!(default_python(), PathBuf::from("/tmp/tts-bloom-python"));
     }
 
     #[test]

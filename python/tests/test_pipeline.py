@@ -227,6 +227,13 @@ class BloomPipelineTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "NUL"):
                     pipeline_module.BloomPipeline(**arguments)
 
+    def test_constructor_rejects_model_paths_over_native_utf8_limit(self):
+        oversized = "模型" * (
+            pipeline_module.MAX_MODEL_PATH_BYTES // len("模型".encode("utf-8")) + 1
+        )
+        with self.assertRaisesRegex(ValueError, "UTF-8 limit"):
+            pipeline_module.BloomPipeline(oversized, engine="mock")
+
     def test_constructor_accepts_pathlike_and_localizes_diagnostics(self):
         pipeline = pipeline_module.BloomPipeline(Path("模型/问答.gguf"), engine="mock", locale="zh_CN")
         self.assertEqual(pipeline.locale, "zh-CN")
@@ -470,7 +477,7 @@ class BloomPipelineTests(unittest.TestCase):
         self.assertEqual(self.fake_lib.freed_tokens, 1)
 
     def test_invalid_stream_encoding_or_json_cancels_native_worker(self):
-        for value in (b"\xff", b"not-json"):
+        for value in (b"\xff", b"not-json", b"null"):
             with self.subTest(value=value):
                 def invalid(_p, _i, _a, callback, *_rest):
                     chunk = ctypes.create_string_buffer(value)

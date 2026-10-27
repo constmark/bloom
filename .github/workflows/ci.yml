@@ -110,6 +110,9 @@ jobs:
       - name: Test Python SDK boundary
         run: |
           cargo build -p bloomai-ffi --locked
+          python3 scripts/check_ffi_abi_compatibility.py \
+            --library target/debug/libbloom_ffi.so
+          python3 scripts/test_ffi_abi_compatibility.py
           BLOOM_TEST_NATIVE_FFI=1 python3 -m unittest discover -s python/tests -v
       - name: Test Python SDK distribution
         run: |

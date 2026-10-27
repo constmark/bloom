@@ -329,7 +329,14 @@ impl T5TextEncoder {
             .permute((0, 2, 1, 3))?;
 
         let scale = (dh as f64).sqrt().recip();
-        let scores = (q.matmul(&k.t()?)?.affine(scale, 0.0))?;
+        // `q` and `k` are four-dimensional ([batch, heads, seq, head_dim]).
+        // `Tensor::t()` only supports matrices, so using it here either
+        // errors at runtime for a real T5 checkpoint or (depending on the
+        // Candle version) silently applies the wrong axes.  Transpose the
+        // sequence and head-dimension axes explicitly to obtain
+        // [batch, heads, seq, seq] attention scores.
+        let k_t = k.transpose(2, 3)?.contiguous()?;
+        let scores = (q.matmul(&k_t)?.affine(scale, 0.0))?;
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
         let out = probs.matmul(&v)?;
 

@@ -108,12 +108,31 @@ work.
 The packaging gate builds an sdist, rebuilds the wheel from it, checks package
 metadata and license contents, installs into a clean temporary environment,
 imports with no native library, then exercises buffered and streamed inference
-through the installed wrapper and the real ABI v2 mock engine:
+through the installed wrapper and the real ABI v2 mock engine. The native
+contract gate also validates the exported revision-1 and revision-2 symbols,
+the revision-2 cancellation lifecycle, and bounded invalid-input paths:
 
 ```bash
 python3 -m pip install -r requirements/python-package.txt
 cargo build -p bloomai-ffi --locked
+python3 scripts/check_ffi_abi_compatibility.py \
+  --library target/debug/libbloom_ffi.so
 python3 scripts/test_python_package.py
+```
+
+`test_python_package.py` invokes the same native contract check for every
+library passed through `--native-library` or `--compatibility-library` before
+building the temporary wheel environment.
+
+To exercise a previously released ABI-1 library through the wheel as well,
+pass it as an additional compatibility input. Each library runs in a fresh
+process so the wrapper cannot retain symbols or version state from the prior
+load:
+
+```bash
+python3 scripts/test_python_package.py \
+  --native-library target/debug/libbloom_ffi.so \
+  --compatibility-library /path/to/legacy/libbloom_ffi.so
 ```
 
 Pass `--native-library /absolute/path/to/library` to validate another build.
