@@ -93,6 +93,45 @@ and gauges to explain a run, not as an arbitrary performance gate or a claim
 that another host, model or backend will achieve the same result.
 
 This workload is one part of the [deployment exit criteria](production-readiness.md).
+
+## Enforce the deployment-cell evidence gate
+
+After collecting a target-host report, run the fail-closed validator. It
+requires a two-hour run by default, at least two distinct concurrency levels,
+fixed model/build identity, physical backend inventory, host-memory evidence,
+and disconnect recovery. A passing result means only that the workload
+evidence is complete; it does not promote the cell to stable support.
+
+```bash
+python3 scripts/validate_deployment_cell.py qwen2-cpu-http-workload.json \
+  --expected-model-sha256 aca679832ded61145239ce7f5c5ebddb1c57ada786c9c2373388e0596f \
+  --backend candle --device cpu \
+  --failure-report qwen2-cpu-failure-injection.json \
+  > qwen2-cpu-cell-validation.json
+```
+
+The validator deliberately leaves physical disk-full, target-host
+upgrade/rollback, accelerator-memory, and token-level TBT checks as separate
+acceptance gates. This prevents a short HTTP smoke test from being mistaken
+for a complete production claim.
+
+The process-boundary and storage-quota checks are available as a separate gate:
+
+```bash
+python3 scripts/deployment_failure_injection.py \
+  --server-bin target/release/bloom_server \
+  --model /path/to/qwen2-0_5b-instruct-q4_0.gguf \
+  --scenario all --backend candle --device cpu \
+  --output qwen2-cpu-failure-injection.json
+```
+
+`invalid-model` verifies that an invalid package becomes a terminal readiness
+or load failure. `process-interruption` sends a hard process interruption and
+then starts the same model catalog again, proving that the operating-system
+lease is recoverable. `storage-quota` starts bounded local imports with a
+one-byte catalog quota, verifies the expected 409 conflict, and checks that no
+staging file remains. Pass the resulting report to the evidence gate with
+`--failure-report`; a failed or incomplete scenario is rejected.
 Before promoting the Qwen2 CPU cell, run it on an immutable OS/hardware/build
 combination and retain the report with cold/warm baselines, server logs, power
 settings, CPU model, and deployment configuration. Then separately exercise

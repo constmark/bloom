@@ -49,6 +49,14 @@ recovery, and host RSS using the [HTTP workload procedure](http-workload.md).
 Multi-hour target-host evidence and the failure-injection drills above are
 still required before `stable` classification.
 
+The workload evidence gate now requires a passing report from
+`scripts/deployment_failure_injection.py` covering invalid-model admission,
+POSIX process interruption and catalog-lease reacquisition, and model-storage
+quota rejection without staging residue. Signed upgrade recovery has focused
+CPU coverage for file and package directory transactions, including restart
+rollback before replacement publication and restart completion after it; a
+target-host upgrade/rollback run remains required for deployment promotion.
+
 ### P0: complete the chosen deployment artifact
 
 Release archives have provenance, while the Dockerfile is CI-built and receives

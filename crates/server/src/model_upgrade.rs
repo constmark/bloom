@@ -821,7 +821,9 @@ impl UpgradePaths {
 
 #[cfg(test)]
 mod tests {
-    use super::super::model_provenance::{ModelProvenanceDraft, read_provenance};
+    use super::super::model_provenance::{
+        ModelPackageProvenanceDraft, ModelProvenanceDraft, read_provenance,
+    };
     use super::*;
 
     fn sha256(bytes: &[u8]) -> String {
@@ -849,6 +851,60 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    async fn install_old_package(
+        root: &Path,
+        directory: &str,
+        config: &[u8],
+        weights: &[u8],
+        index_id: &str,
+    ) -> (Vec<ModelPackageFile>, u64, String) {
+        let files = normalize_package_files(
+            vec![
+                ModelPackageFile {
+                    filename: "config.json".to_string(),
+                    size_bytes: config.len() as u64,
+                    sha256: sha256(config),
+                },
+                ModelPackageFile {
+                    filename: "model.safetensors".to_string(),
+                    size_bytes: weights.len() as u64,
+                    sha256: sha256(weights),
+                },
+            ],
+            (config.len() + weights.len()) as u64,
+        )
+        .unwrap();
+        fs::create_dir_all(root.join(directory)).await.unwrap();
+        fs::write(root.join(directory).join("config.json"), config)
+            .await
+            .unwrap();
+        fs::write(root.join(directory).join("model.safetensors"), weights)
+            .await
+            .unwrap();
+        let size_bytes = (config.len() + weights.len()) as u64;
+        let digest = package_digest(&files).unwrap();
+        write_package_provenance(
+            root,
+            ModelPackageProvenanceDraft {
+                acquisition: ModelAcquisitionKind::Download,
+                model_index_id: Some(index_id.to_string()),
+                directory: directory.to_string(),
+                size_bytes,
+                source_url: Some(format!(
+                    "https://huggingface.co/acme/old/resolve/{}/config.json",
+                    "11".repeat(20)
+                )),
+                source_host: Some("huggingface.co".to_string()),
+                sha256: digest.clone(),
+                license: Some("Apache-2.0".to_string()),
+                files: files.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        (files, size_bytes, digest)
     }
 
     fn source(catalog_id: &str, bytes: &[u8], index_id: &str) -> ModelUpgradeSource {
@@ -1081,6 +1137,194 @@ mod tests {
         assert_eq!(recovery, Some(ModelUpgradeRecovery::RolledBack));
         assert_eq!(fs::read(temp.path().join("model.gguf")).await.unwrap(), old);
         assert_eq!(fs::read(staged).await.unwrap(), b"tampered replacement");
+    }
+
+    #[tokio::test]
+    async fn restart_rolls_back_a_directory_package_when_previous_entry_was_preserved() {
+        let temp = tempfile::tempdir().unwrap();
+        let index_id = "package-crash-safe";
+        let old_config = br#"{"model_type":"qwen2"}"#;
+        let old_weights = b"old package weights";
+        let (old_files, old_size, old_digest) = install_old_package(
+            temp.path(),
+            "model-package",
+            old_config,
+            old_weights,
+            index_id,
+        )
+        .await;
+        let source = ModelUpgradeSource {
+            catalog_id: "model-package".to_string(),
+            kind: ModelUpgradeEntryKind::Directory,
+            size_bytes: old_size,
+            sha256: old_digest.clone(),
+            model_index_id: index_id.to_string(),
+        };
+        let new_config = br#"{"model_type":"qwen2","revision":2}"#;
+        let new_weights = b"new package weights";
+        let target_files = normalize_package_files(
+            vec![
+                ModelPackageFile {
+                    filename: "config.json".to_string(),
+                    size_bytes: new_config.len() as u64,
+                    sha256: sha256(new_config),
+                },
+                ModelPackageFile {
+                    filename: "model.safetensors".to_string(),
+                    size_bytes: new_weights.len() as u64,
+                    sha256: sha256(new_weights),
+                },
+            ],
+            (new_config.len() + new_weights.len()) as u64,
+        )
+        .unwrap();
+        let target_size = (new_config.len() + new_weights.len()) as u64;
+        let target = ModelUpgradeTarget {
+            catalog_id: "model-package".to_string(),
+            size_bytes: target_size,
+            sha256: package_digest(&target_files).unwrap(),
+            source_url: Some(format!(
+                "https://huggingface.co/acme/new/resolve/{}/config.json",
+                "22".repeat(20)
+            )),
+            source_host: Some("huggingface.co".to_string()),
+            license: Some("Apache-2.0".to_string()),
+            model_index_id: index_id.to_string(),
+            files: target_files,
+        };
+        let staged = staged_entry_path(temp.path(), &target);
+        fs::create_dir_all(&staged).await.unwrap();
+        fs::write(staged.join("config.json"), new_config)
+            .await
+            .unwrap();
+        fs::write(staged.join("model.safetensors"), new_weights)
+            .await
+            .unwrap();
+        prepare_interrupted_transaction(temp.path(), source, target, false).await;
+
+        let recovery = recover_model_upgrade(temp.path()).await.unwrap();
+
+        assert_eq!(recovery, Some(ModelUpgradeRecovery::RolledBack));
+        assert_eq!(
+            fs::read(temp.path().join("model-package/config.json"))
+                .await
+                .unwrap(),
+            old_config
+        );
+        assert_eq!(
+            fs::read(temp.path().join("model-package/model.safetensors"))
+                .await
+                .unwrap(),
+            old_weights
+        );
+        assert_eq!(fs::read(staged.join("config.json")).await.unwrap(), new_config);
+        let provenance = read_provenance(temp.path(), "model-package", old_size)
+            .unwrap()
+            .unwrap();
+        assert_eq!(provenance.file_count, Some(old_files.len()));
+        assert_eq!(provenance.sha256, old_digest);
+        assert!(!temp.path().join(UPGRADE_DIRECTORY).exists());
+    }
+
+    #[tokio::test]
+    async fn restart_completes_a_directory_package_after_target_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let index_id = "package-complete-after-crash";
+        let old_config = br#"{"model_type":"qwen2"}"#;
+        let old_weights = b"old package weights";
+        let (_old_files, old_size, old_digest) = install_old_package(
+            temp.path(),
+            "model-package",
+            old_config,
+            old_weights,
+            index_id,
+        )
+        .await;
+        let source = ModelUpgradeSource {
+            catalog_id: "model-package".to_string(),
+            kind: ModelUpgradeEntryKind::Directory,
+            size_bytes: old_size,
+            sha256: old_digest,
+            model_index_id: index_id.to_string(),
+        };
+        let new_config = br#"{"model_type":"qwen2","revision":3}"#;
+        let new_weights = b"new package weights";
+        let target_files = normalize_package_files(
+            vec![
+                ModelPackageFile {
+                    filename: "config.json".to_string(),
+                    size_bytes: new_config.len() as u64,
+                    sha256: sha256(new_config),
+                },
+                ModelPackageFile {
+                    filename: "model.safetensors".to_string(),
+                    size_bytes: new_weights.len() as u64,
+                    sha256: sha256(new_weights),
+                },
+            ],
+            (new_config.len() + new_weights.len()) as u64,
+        )
+        .unwrap();
+        let target_size = (new_config.len() + new_weights.len()) as u64;
+        let target = ModelUpgradeTarget {
+            catalog_id: "model-package".to_string(),
+            size_bytes: target_size,
+            sha256: package_digest(&target_files).unwrap(),
+            source_url: Some(format!(
+                "https://huggingface.co/acme/new/resolve/{}/config.json",
+                "22".repeat(20)
+            )),
+            source_host: Some("huggingface.co".to_string()),
+            license: Some("Apache-2.0".to_string()),
+            model_index_id: index_id.to_string(),
+            files: target_files,
+        };
+        let staged = staged_entry_path(temp.path(), &target);
+        fs::create_dir_all(&staged).await.unwrap();
+        fs::write(staged.join("config.json"), new_config)
+            .await
+            .unwrap();
+        fs::write(staged.join("model.safetensors"), new_weights)
+            .await
+            .unwrap();
+        prepare_interrupted_transaction(temp.path(), source, target.clone(), true).await;
+
+        let recovery = recover_model_upgrade(temp.path()).await.unwrap();
+
+        assert_eq!(recovery, Some(ModelUpgradeRecovery::Completed));
+        assert_eq!(
+            fs::read(temp.path().join("model-package/config.json"))
+                .await
+                .unwrap(),
+            new_config
+        );
+        assert_eq!(
+            fs::read(temp.path().join("model-package/model.safetensors"))
+                .await
+                .unwrap(),
+            new_weights
+        );
+        let provenance = read_provenance(temp.path(), "model-package", target_size)
+            .unwrap()
+            .unwrap();
+        assert_eq!(provenance.file_count, Some(2));
+        assert_eq!(provenance.sha256, target.sha256);
+        assert!(!temp.path().join(UPGRADE_DIRECTORY).exists());
+    }
+
+    #[tokio::test]
+    async fn restart_discards_a_prepared_upgrade_without_a_transaction_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let upgrade_root = temp.path().join(UPGRADE_DIRECTORY);
+        fs::create_dir_all(&upgrade_root).await.unwrap();
+        fs::write(upgrade_root.join("transaction.json.tmp"), b"incomplete")
+            .await
+            .unwrap();
+
+        let recovery = recover_model_upgrade(temp.path()).await.unwrap();
+
+        assert_eq!(recovery, Some(ModelUpgradeRecovery::DiscardedPrepared));
+        assert!(!upgrade_root.exists());
     }
 
     #[cfg(unix)]
