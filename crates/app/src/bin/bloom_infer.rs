@@ -403,6 +403,23 @@ fn select_backend_name(
             "mlx".to_string()
         } else if has_format(bloomai_core::ModelFormat::VulkanSpirv) {
             "vulkan".to_string()
+        } else if manifest
+            .runtime_hints
+            .preferred_backends
+            .iter()
+            .any(|backend| backend == "qwen3_vl")
+        {
+            "qwen3_vl".to_string()
+        } else if manifest
+            .runtime_hints
+            .preferred_backends
+            .iter()
+            .any(|backend| backend == "llamacpp")
+        {
+            // GGUF families such as Phi-3/4, Gemma 3, SmolLM3, Ministral 3,
+            // Granite 3.3 and LFM2 have no Candle native loader in this
+            // build. Manifest inference marks them for the external bridge.
+            "llamacpp".to_string()
         } else if is_qwen_vl {
             "qwen3_vl".to_string()
         } else if matches!(&manifest.family, bloomai_core::ModelFamily::Custom(c) if c == "longcat-image-edit")
@@ -2046,6 +2063,42 @@ mod tests {
                 "format {format:?}"
             );
         }
+    }
+
+    #[test]
+    fn select_backend_routes_external_gguf_architectures_to_llamacpp() {
+        let mut manifest = bloomai_core::ModelManifest::default();
+        manifest.files.push(bloomai_core::ModelFile {
+            name: "model.gguf".to_string(),
+            format: bloomai_core::ModelFormat::Gguf,
+            size_bytes: 1,
+            hash_sha256: None,
+            required: true,
+        });
+        manifest
+            .runtime_hints
+            .preferred_backends
+            .push("llamacpp".to_string());
+        assert_eq!(
+            select_backend_name(None, "candle", "none", &manifest),
+            "llamacpp"
+        );
+    }
+
+    #[test]
+    fn select_backend_routes_qwen3_vl_hint_to_vision_engine() {
+        let mut manifest = bloomai_core::ModelManifest {
+            family: bloomai_core::ModelFamily::Qwen,
+            ..Default::default()
+        };
+        manifest
+            .runtime_hints
+            .preferred_backends
+            .push("qwen3_vl".to_string());
+        assert_eq!(
+            select_backend_name(None, "candle", "none", &manifest),
+            "qwen3_vl"
+        );
     }
 
     #[test]

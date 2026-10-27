@@ -59,6 +59,14 @@ The scheduler integrates:
 - sliding-window, context-shift, and inactive-compaction policies; and
 - optional CacheMesh L2/L3 offload.
 
+For a native streaming Qwen executor, `BLOOM_KV_CACHE_DTYPE=int8` or `fp8`
+selects one-byte paged-cache storage; `bf16`, `f16`, and `f32` retain the
+corresponding wider layout.  The `fp8` paged representation currently uses
+Bloom's checked INT8-compatible payload until a device-native FP8 attention
+kernel is available.  Local F16/BF16/F32 tensor blocks stay on the admitted
+device during prefix restore.  CacheMesh and quantized blocks use the vector
+serialization path so eviction and cross-process restore remain portable.
+
 The server exposes cache statistics through `/v1/kv-cache-stats` and `/metrics`.
 
 ## Tests

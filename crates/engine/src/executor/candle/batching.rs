@@ -1,5 +1,6 @@
 use super::{CandleKvHook, CandleTextModel, QwenModelWrapper};
 use crate::batching::BatchExecutorConfig;
+use crate::core::quantization::KvCacheDtype;
 use crate::executor::batch_executor::CandleBatchExecutor;
 use crate::executor::qwen_streaming::QwenStreamingModelForCausalLM;
 use crate::scheduler::paged_cache::{PagedAttentionCache, PagedCacheConfig};
@@ -40,11 +41,12 @@ pub(super) fn build(
         );
     }
 
-    // MoE weights already live in immutable Tensor storage, and its GPU expert
-    // cache has its own mutex/budget. Keep one empty-KV template for the executor
-    // lifetime instead of copying every CPU weight from disk for every request.
-    // Other architectures retain their existing reload behavior.
-    let moe_template = if model.model_type == super::ModelType::Qwen2Moe {
+    // A streaming model keeps immutable weights in mmap-backed tensors and
+    // owns only its KV state mutably.  Forking one empty-KV template per
+    // request shares those weights instead of reopening every safetensors
+    // shard for each admitted sequence.  This is the same residency model a
+    // single-node serving engine needs for continuous batching.
+    let streaming_template = if model.uses_streaming_variant() || use_paged_kv {
         model.weight_artifacts.verify()?;
         let loaded = {
             let source = model
@@ -55,8 +57,10 @@ pub(super) fn build(
                 Some(QwenModelWrapper::Streaming(streaming)) => {
                     Some(streaming.fork_with_empty_kv())
                 }
-                Some(_) => anyhow::bail!("native Qwen2-MoE requires a Streaming wrapper"),
-                None => None,
+                // The startup verification wrapper may be a regular Candle
+                // model even when IFB/CacheMesh later selects the streaming
+                // adapter. Reload the correct adapter below in that case.
+                Some(_) | None => None,
             }
         };
         let template = match loaded {
@@ -65,13 +69,11 @@ pub(super) fn build(
             // executor. In that case reload once here, before accepting work.
             None => match model.reload_with_paged_kv()? {
                 QwenModelWrapper::Streaming(streaming) => streaming.fork_with_empty_kv(),
-                _ => anyhow::bail!("native Qwen2-MoE requires a Streaming wrapper"),
+                _ => anyhow::bail!("native paged-KV batching requires a Streaming wrapper"),
             },
         };
         model.weight_artifacts.verify()?;
-        tracing::info!(
-            "Sharing native Qwen2-MoE weights and expert cache across independent request KV caches"
-        );
+        tracing::info!("Sharing native streaming weights across independent request KV caches");
         Some(Arc::new(template))
     } else {
         None
@@ -86,7 +88,7 @@ pub(super) fn build(
     let restored_prefix_handles_for_free = Arc::clone(&restored_prefix_handles);
 
     let model_for_forward = Arc::clone(&model);
-    let template_for_forward = moe_template.clone();
+    let template_for_forward = streaming_template.clone();
     let request_models_for_forward = Arc::clone(&request_models);
     let forward_fn = Box::new(
         move |input_ids: &candle_core::Tensor,
@@ -122,7 +124,7 @@ pub(super) fn build(
     );
 
     let model_for_batch = Arc::clone(&model);
-    let template_for_batch = moe_template.clone();
+    let template_for_batch = streaming_template.clone();
     let request_models_for_batch = Arc::clone(&request_models);
     let forward_batch_fn = Box::new(
         move |input_ids: &candle_core::Tensor,
@@ -162,8 +164,9 @@ pub(super) fn build(
                     models_to_run.push(Arc::clone(model));
                 }
             }
-            let mut logits = Vec::with_capacity(batch_size);
-            for (index, model) in models_to_run.iter().enumerate() {
+            let run_request = |index: usize,
+                               model: &Arc<std::sync::Mutex<QwenModelWrapper>>|
+             -> Result<candle_core::Tensor> {
                 let start = cu_seqlens[index];
                 let end = cu_seqlens[index + 1];
                 let sequence_len = end.checked_sub(start).ok_or_else(|| {
@@ -171,10 +174,55 @@ pub(super) fn build(
                 })?;
                 let start_pos = start_positions.get(index).copied().unwrap_or(0);
                 let request_input = input_ids.narrow(0, start, sequence_len)?.unsqueeze(0)?;
-                let result = model
+                model
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
-                    .forward(&request_input, start_pos)?;
+                    .forward(&request_input, start_pos)
+            };
+
+            // Candle does not expose a ragged Qwen forward kernel here. CPU
+            // requests can still make real progress concurrently because each
+            // handle owns a private KV state while immutable streaming weights
+            // are shared. Keep the GPU path serialized: parallel CUDA launches
+            // would compete for one admitted context and generally regress
+            // latency without a dedicated stream/graph scheduler.
+            let request_logits = if input_ids.device().is_cpu()
+                && batch_size > 1
+                && batch_size
+                    <= std::thread::available_parallelism()
+                        .map(|parallelism| parallelism.get().saturating_mul(2))
+                        .unwrap_or(2)
+            {
+                let slots = (0..batch_size)
+                    .map(|_| Mutex::new(None))
+                    .collect::<Vec<Mutex<Option<Result<candle_core::Tensor>>>>>();
+                std::thread::scope(|scope| {
+                    for (index, model) in models_to_run.iter().enumerate() {
+                        let slot = &slots[index];
+                        scope.spawn(move || {
+                            let result = run_request(index, model);
+                            *slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(result);
+                        });
+                    }
+                });
+                slots
+                    .into_iter()
+                    .map(|slot| {
+                        slot.into_inner()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .ok_or_else(|| anyhow!("CPU batch worker did not finish"))?
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                models_to_run
+                    .iter()
+                    .enumerate()
+                    .map(|(index, model)| run_request(index, model))
+                    .collect::<Result<Vec<_>>>()?
+            };
+
+            let mut logits = Vec::with_capacity(batch_size);
+            for result in request_logits {
                 logits.push(final_token_logits(result)?);
             }
             // Each request contributes one vocabulary vector, regardless of
@@ -184,7 +232,7 @@ pub(super) fn build(
     );
 
     let model_for_prepare = Arc::clone(&model);
-    let template_for_prepare = moe_template;
+    let template_for_prepare = streaming_template;
     let request_models_for_prepare = Arc::clone(&request_models);
     let prepare_request = Box::new(move |handle| -> Result<()> {
         let mut models = request_models_for_prepare
@@ -208,7 +256,7 @@ pub(super) fn build(
             total_blocks,
             num_layers,
             kv_dim,
-            kv_dtype: crate::core::quantization::KvCacheDtype::F16,
+            kv_dtype: KvCacheDtype::from_env(),
             long_context_policy,
         },
         cachemesh.clone(),

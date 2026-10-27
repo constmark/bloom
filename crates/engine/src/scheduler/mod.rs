@@ -218,10 +218,34 @@ pub trait KvCachePool: Send + Sync {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrefixCacheKey {
     pub tokens: Vec<u32>,
     pub multimodal_hash: Option<String>,
+}
+
+impl std::hash::Hash for PrefixCacheKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Equality still checks the complete token vector, but hashing every
+        // token made long-prefix admission repeatedly scan the same prompt.
+        // Include the length plus a bounded, deterministic sample so normal
+        // prefixes hash in O(1); collisions remain correct because HashMap
+        // calls the derived equality implementation before returning a hit.
+        self.tokens.len().hash(state);
+        let len = self.tokens.len();
+        if len > 0 {
+            let sample_stride = len.div_ceil(8).max(1);
+            for index in (0..len).step_by(sample_stride).take(8) {
+                self.tokens[index].hash(state);
+            }
+            if len > 8 {
+                for index in len.saturating_sub(4)..len {
+                    self.tokens[index].hash(state);
+                }
+            }
+        }
+        self.multimodal_hash.hash(state);
+    }
 }
 
 struct ActiveRequestRecord {
@@ -736,7 +760,7 @@ impl KvCachePool for BloomKvCachePool {
                         if let Some(record) = state.active_requests.get(evict_id) {
                             let age = record.created_at.elapsed().as_secs_f64().max(0.001);
                             let value = record.estimated_token_value;
-                            let cost = (record.blocks.len() * 16) as f64;
+                            let cost = record.blocks.len().saturating_mul(self.block_size) as f64;
                             let score = age * value * cost;
                             if score < lowest_score {
                                 lowest_score = score;

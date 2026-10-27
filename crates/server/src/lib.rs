@@ -9533,6 +9533,26 @@ mod tests {
     }
 
     #[test]
+    fn select_backend_routes_manifest_external_runtime_hints() {
+        let mut manifest = bloomai_core::ModelManifest::default();
+        manifest
+            .runtime_hints
+            .preferred_backends
+            .push("llamacpp".to_string());
+        manifest.files.push(bloomai_core::ModelFile {
+            name: "model.gguf".to_string(),
+            format: bloomai_core::ModelFormat::Gguf,
+            size_bytes: 1,
+            hash_sha256: None,
+            required: true,
+        });
+        assert_eq!(select_backend_name("candle", "none", &manifest), "llamacpp");
+
+        manifest.runtime_hints.preferred_backends = vec!["qwen3_vl".to_string()];
+        assert_eq!(select_backend_name("candle", "none", &manifest), "qwen3_vl");
+    }
+
+    #[test]
     fn normalize_embedding_input_accepts_string_or_string_array() {
         assert_eq!(
             normalize_embedding_input(&json!("hello")).unwrap(),

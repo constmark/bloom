@@ -44,12 +44,18 @@ impl ModelType {
         config
             .get("model_type")
             .and_then(|t| t.as_str())
-            .and_then(|t| match t {
-                "qwen2" => Some(ModelType::Qwen2),
+            .and_then(|t| match t.to_ascii_lowercase().as_str() {
+                // Hugging Face has used both the canonical family name and
+                // dotted/underscored aliases in Qwen2.5 exports. They all
+                // share the Qwen2 tensor contract consumed by Candle.
+                "qwen2" | "qwen2.5" | "qwen2_5" | "qwen25" => Some(ModelType::Qwen2),
                 "qwen2_moe" | "upcycling-qwen2-moe" => Some(ModelType::Qwen2Moe),
                 "qwen3" => Some(ModelType::Qwen3),
                 "gemma4_unified" | "gemma4" => Some(ModelType::Gemma4),
-                "llama" => Some(ModelType::Llama),
+                // Llama 3.x checkpoints retain `llama` today, but accepting
+                // the generation aliases keeps locally converted configs
+                // routable without changing their tensor layout.
+                "llama" | "llama3" | "llama3.2" | "llama3_2" => Some(ModelType::Llama),
                 "bert" => Some(ModelType::Bert),
                 _ => None,
             })
@@ -76,6 +82,166 @@ impl ModelType {
             Self::Bert => "bert",
         }
     }
+}
+
+/// Normalize small schema differences seen in current Hugging Face exports
+/// before deserializing Candle's stricter model config structs. This keeps the
+/// on-disk config untouched while making Qwen2.5/Qwen3 and Llama 3.2 aliases
+/// behave like their canonical model families.
+fn normalize_native_text_config(mut config: serde_json::Value) -> serde_json::Value {
+    let Some(obj) = config.as_object_mut() else {
+        return config;
+    };
+
+    let model_type = obj
+        .get("model_type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_ascii_lowercase);
+    let canonical = match model_type.as_deref() {
+        Some("qwen2.5" | "qwen2_5" | "qwen25") => Some("qwen2"),
+        Some("llama3" | "llama3.2" | "llama3_2") => Some("llama"),
+        _ => None,
+    };
+    if let Some(canonical) = canonical {
+        obj.insert(
+            "model_type".to_string(),
+            serde_json::Value::String(canonical.to_string()),
+        );
+    }
+
+    // Transformers 5.x moved RoPE settings under rope_parameters. Candle's
+    // Qwen and Llama loaders still consume the scalar/rope_scaling spellings.
+    if !obj.contains_key("rope_theta")
+        && let Some(value) = obj
+            .get("rope_parameters")
+            .and_then(|value| value.get("rope_theta"))
+            .cloned()
+    {
+        obj.insert("rope_theta".to_string(), value);
+    }
+    if !obj.contains_key("rope_scaling")
+        && let Some(value) = obj.get("rope_parameters").cloned()
+        && model_type
+            .as_deref()
+            .is_some_and(|t| t.starts_with("llama"))
+    {
+        obj.insert("rope_scaling".to_string(), value);
+    }
+
+    let canonical_type = obj
+        .get("model_type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let hidden_size = obj.get("hidden_size").and_then(serde_json::Value::as_u64);
+    let num_heads = obj
+        .get("num_attention_heads")
+        .and_then(serde_json::Value::as_u64);
+    if canonical_type == "qwen2" {
+        // Candle's legacy Qwen2 config uses a concrete sliding-window size;
+        // null means full-context attention in Hugging Face checkpoints.
+        if (!obj.contains_key("sliding_window")
+            || obj
+                .get("sliding_window")
+                .is_some_and(serde_json::Value::is_null))
+            && let Some(max_position_embeddings) = obj.get("max_position_embeddings").cloned()
+        {
+            obj.insert("sliding_window".to_string(), max_position_embeddings);
+        }
+        if !obj.contains_key("max_window_layers")
+            && let Some(layers) = obj.get("num_hidden_layers").cloned()
+        {
+            obj.insert("max_window_layers".to_string(), layers);
+        }
+        if !obj.contains_key("use_sliding_window") {
+            obj.insert(
+                "use_sliding_window".to_string(),
+                serde_json::Value::Bool(false),
+            );
+        }
+    } else if canonical_type == "qwen3" {
+        if !obj.contains_key("head_dim")
+            && let (Some(hidden), Some(heads)) = (hidden_size, num_heads)
+            && heads > 0
+            && hidden % heads == 0
+        {
+            obj.insert("head_dim".to_string(), serde_json::json!(hidden / heads));
+        }
+        if !obj.contains_key("max_window_layers")
+            && let Some(layers) = obj.get("num_hidden_layers").cloned()
+        {
+            obj.insert("max_window_layers".to_string(), layers);
+        }
+        if !obj.contains_key("attention_bias") {
+            obj.insert("attention_bias".to_string(), serde_json::Value::Bool(false));
+        }
+        if !obj.contains_key("use_sliding_window") {
+            obj.insert(
+                "use_sliding_window".to_string(),
+                serde_json::Value::Bool(false),
+            );
+        }
+        if !obj.contains_key("sliding_window") {
+            // Candle's Qwen3 config requires this optional field to be
+            // present even when the checkpoint uses full-context attention.
+            obj.insert("sliding_window".to_string(), serde_json::Value::Null);
+        }
+        if !obj.contains_key("tie_word_embeddings") {
+            obj.insert(
+                "tie_word_embeddings".to_string(),
+                serde_json::Value::Bool(false),
+            );
+        }
+    }
+    config
+}
+
+/// Resolve a sequence-classifier head width from Hugging Face metadata.
+///
+/// Older Sentence Transformers cross-encoder packages (including the
+/// official `cross-encoder/ms-marco-MiniLM-L6-v2` package) omit the
+/// top-level `num_labels` field and only expose a one-entry `id2label` map.
+/// Accept both forms while keeping an explicitly malformed non-positive value
+/// fail-closed at the caller.
+fn cross_encoder_num_labels(config: &serde_json::Value) -> Option<usize> {
+    config
+        .get("num_labels")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            config
+                .get("id2label")
+                .and_then(serde_json::Value::as_object)
+                .map(|labels| labels.len() as u64)
+        })
+        .or_else(|| {
+            config
+                .get("label2id")
+                .and_then(serde_json::Value::as_object)
+                .map(|labels| labels.len() as u64)
+        })
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+}
+
+fn parse_llama_rope_scaling(
+    config: &serde_json::Value,
+) -> Result<Option<candle_transformers::models::llama::Llama3RopeConfig>> {
+    let Some(value) = config
+        .get("rope_scaling")
+        .or_else(|| config.get("rope_parameters"))
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    let mut value = value;
+    if let Some(object) = value.as_object_mut()
+        && !object.contains_key("rope_type")
+        && let Some(legacy_type) = object.remove("type")
+    {
+        object.insert("rope_type".to_string(), legacy_type);
+    }
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(|error| anyhow!("failed to parse Llama RoPE scaling configuration: {error}"))
 }
 
 fn prepare_runtime_tokenizer(
@@ -233,10 +399,23 @@ fn masked_mean_pool(hidden_states: &Tensor, attention_mask: &Tensor) -> Result<T
     Ok(sums.broadcast_div(&counts)?)
 }
 
+#[cfg(test)]
 fn forward_bert_embedding_batch(
     model: &candle_transformers::models::bert::BertModel,
     sequences: &[&[u32]],
     pad_token_id: u32,
+) -> Result<Vec<Vec<f32>>> {
+    forward_bert_embedding_batch_with_pooling(model, sequences, pad_token_id, false)
+}
+
+/// Run a BERT encoder batch and apply the pooling mode declared by the
+/// Sentence Transformers metadata.  Mean-token pooling is the historical
+/// default; CLS-only pooling is used by BGE-small and related packages.
+fn forward_bert_embedding_batch_with_pooling(
+    model: &candle_transformers::models::bert::BertModel,
+    sequences: &[&[u32]],
+    pad_token_id: u32,
+    cls_pooling: bool,
 ) -> Result<Vec<Vec<f32>>> {
     if sequences.is_empty() || sequences.iter().any(|sequence| sequence.is_empty()) {
         return Err(anyhow!(
@@ -266,7 +445,12 @@ fn forward_bert_embedding_batch(
     let attention_mask = Tensor::from_vec(attention, (batch_size, max_len), &model.device)?;
     let token_type_ids = input_ids.zeros_like()?;
     let hidden_states = model.forward(&input_ids, &token_type_ids, Some(&attention_mask))?;
-    masked_mean_pool(&hidden_states, &attention_mask)?
+    let pooled = if cls_pooling {
+        hidden_states.narrow(1, 0, 1)?.squeeze(1)?
+    } else {
+        masked_mean_pool(&hidden_states, &attention_mask)?
+    };
+    pooled
         .to_dtype(DType::F32)?
         .to_vec2::<f32>()
         .map_err(Into::into)
@@ -409,7 +593,54 @@ fn unsupported_candle_gguf_architecture(manifest: &ModelManifest) -> Option<Stri
         .get("gguf_architecture")
         .and_then(serde_json::Value::as_str)
         .map(|value| value.to_ascii_lowercase())?;
-    matches!(architecture.as_str(), "mistral" | "deepseek").then_some(architecture)
+    let unsupported = matches!(
+        architecture.as_str(),
+        "mistral"
+            | "deepseek"
+            | "phi3"
+            | "phi3moe"
+            | "phi4"
+            | "phi4mm"
+            | "gemma3"
+            | "smollm3"
+            | "mistral3"
+            | "ministral3"
+            | "granite"
+            | "granite3"
+            | "granite3.3"
+            | "lfm2"
+    );
+    unsupported.then_some(architecture)
+}
+
+fn unsupported_candle_hf_architecture(manifest: &ModelManifest) -> Option<String> {
+    if manifest
+        .files
+        .iter()
+        .any(|file| file.format == ModelFormat::Gguf)
+    {
+        return None;
+    }
+    let model_type = manifest
+        .parameters
+        .get("model_type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_ascii_lowercase)?;
+    matches!(
+        model_type.as_str(),
+        "phi3"
+            | "phi3moe"
+            | "phi4"
+            | "phi4mm"
+            | "gemma3"
+            | "smollm3"
+            | "mistral3"
+            | "ministral3"
+            | "granite"
+            | "granite3"
+            | "lfm2"
+    )
+    .then_some(model_type)
 }
 
 impl Engine for CandleEngine {
@@ -496,15 +727,21 @@ impl Engine for CandleEngine {
     }
 
     fn supports(&self, manifest: &ModelManifest, device_cap: &DeviceCapability) -> SupportLevel {
+        if let Some(architecture) = unsupported_candle_gguf_architecture(manifest) {
+            return SupportLevel::Unsupported(format!(
+                "Candle has no native loader for GGUF architecture '{}'; use the external llama.cpp adapter",
+                architecture
+            ));
+        }
+        if let Some(model_type) = unsupported_candle_hf_architecture(manifest) {
+            return SupportLevel::Unsupported(format!(
+                "Candle has no native loader for model_type '{}'; convert the checkpoint to GGUF and use the external llama.cpp adapter",
+                model_type
+            ));
+        }
         let base = default_engine_supports(&self.capability(), manifest, device_cap);
         if !base.is_supported() {
             return base;
-        }
-        if let Some(architecture) = unsupported_candle_gguf_architecture(manifest) {
-            return SupportLevel::Unsupported(format!(
-                "Candle GGUF loading for '{}' is not implemented; use the external llama.cpp adapter or a supported Qwen/Llama/Gemma GGUF architecture",
-                architecture
-            ));
         }
         base
     }
@@ -593,7 +830,7 @@ impl CandleEngine {
                 .map_err(|e| anyhow!("failed to read config.json: {}", e))?;
             let config: serde_json::Value = serde_json::from_str(&config_str)
                 .map_err(|e| anyhow!("failed to parse config.json: {}", e))?;
-            (config, None)
+            (normalize_native_text_config(config), None)
         } else if let Some(path) = gguf_file_path
             .clone()
             .or_else(|| find_gguf_file(model_path))
@@ -1729,6 +1966,13 @@ impl CandleTextModel {
             }
             None => return Err(anyhow!("BERT model is not loaded")),
         };
+        let cls_pooling = self
+            .metadata
+            .manifest
+            .parameters
+            .get("embedding_pooling")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|pooling| pooling.eq_ignore_ascii_case("cls"));
 
         let mut outputs = vec![None; inputs.len()];
         for indices in batches {
@@ -1736,8 +1980,12 @@ impl CandleTextModel {
                 .iter()
                 .map(|index| sequences[*index].as_slice())
                 .collect::<Vec<_>>();
-            let batch_outputs =
-                forward_bert_embedding_batch(model, &batch_sequences, pad_token_id)?;
+            let batch_outputs = forward_bert_embedding_batch_with_pooling(
+                model,
+                &batch_sequences,
+                pad_token_id,
+                cls_pooling,
+            )?;
             if batch_outputs.len() != indices.len() {
                 return Err(anyhow!(
                     "BERT embedding microbatch returned {} vectors for {} inputs",
@@ -2234,6 +2482,7 @@ impl CandleTextModel {
                         .get("tie_word_embeddings")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
+                    let rope_scaling = parse_llama_rope_scaling(&self.config)?;
 
                     let cfg = candle_transformers::models::llama::Config {
                         hidden_size,
@@ -2247,7 +2496,7 @@ impl CandleTextModel {
                         rope_theta,
                         bos_token_id: None,
                         eos_token_id: None,
-                        rope_scaling: None,
+                        rope_scaling,
                         max_position_embeddings,
                         tie_word_embeddings,
                     };
@@ -2268,15 +2517,11 @@ impl CandleTextModel {
                                 .map_err(|e| {
                                     anyhow!("failed to build BERT cross-encoder backbone: {e}")
                                 })?;
-                        let num_labels = self
-                            .config
-                            .get("num_labels")
-                            .and_then(serde_json::Value::as_u64)
-                            .and_then(|value| usize::try_from(value).ok())
-                            .filter(|value| *value > 0)
-                            .ok_or_else(|| {
-                                anyhow!("cross-encoder config must declare a positive num_labels")
-                            })?;
+                        let num_labels = cross_encoder_num_labels(&self.config).ok_or_else(|| {
+                            anyhow!(
+                                "cross-encoder config must declare a positive num_labels or non-empty id2label/label2id map"
+                            )
+                        })?;
                         let pooler = candle_nn::linear(
                             cfg.hidden_size,
                             cfg.hidden_size,
@@ -4114,8 +4359,86 @@ mod tests {
         let llama = serde_json::json!({ "model_type": "llama" });
         assert_eq!(ModelType::from_config(&llama), Some(ModelType::Llama));
 
+        for alias in ["qwen2.5", "qwen2_5", "qwen25"] {
+            assert_eq!(
+                ModelType::from_config(&serde_json::json!({"model_type": alias})),
+                Some(ModelType::Qwen2)
+            );
+        }
+        for alias in ["llama3", "llama3.2", "llama3_2"] {
+            assert_eq!(
+                ModelType::from_config(&serde_json::json!({"model_type": alias})),
+                Some(ModelType::Llama)
+            );
+        }
+
         let invalid = serde_json::json!({ "model_type": "invalid_model" });
         assert_eq!(ModelType::from_config(&invalid), None);
+    }
+
+    #[test]
+    fn native_text_config_normalizes_current_hf_aliases() {
+        let qwen = normalize_native_text_config(serde_json::json!({
+            "model_type": "qwen2.5",
+            "hidden_size": 1536,
+            "num_attention_heads": 12,
+            "num_hidden_layers": 28,
+            "max_position_embeddings": 32768,
+            "rope_parameters": {"rope_theta": 1_000_000.0},
+            "sliding_window": null,
+        }));
+        assert_eq!(qwen["model_type"], "qwen2");
+        assert_eq!(qwen["rope_theta"], 1_000_000.0);
+        assert_eq!(qwen["sliding_window"], 32768);
+        assert_eq!(qwen["max_window_layers"], 28);
+
+        let qwen3 = normalize_native_text_config(serde_json::json!({
+            "model_type": "qwen3",
+            "hidden_size": 2048,
+            "num_attention_heads": 16,
+            "num_hidden_layers": 28,
+        }));
+        assert_eq!(qwen3["head_dim"], 128);
+        assert_eq!(qwen3["attention_bias"], false);
+        assert_eq!(qwen3["max_window_layers"], 28);
+        assert!(qwen3["sliding_window"].is_null());
+
+        let llama = normalize_native_text_config(serde_json::json!({
+            "model_type": "llama3.2",
+            "rope_parameters": {
+                "rope_theta": 500_000.0,
+                "rope_type": "llama3",
+                "factor": 8.0,
+                "low_freq_factor": 1.0,
+                "high_freq_factor": 4.0,
+                "original_max_position_embeddings": 8192
+            },
+        }));
+        assert_eq!(llama["model_type"], "llama");
+        assert_eq!(llama["rope_theta"], 500_000.0);
+        assert_eq!(llama["rope_scaling"]["rope_type"], "llama3");
+        let rope_scaling = parse_llama_rope_scaling(&llama).unwrap().unwrap();
+        assert!(matches!(
+            rope_scaling.rope_type,
+            candle_transformers::models::llama::Llama3RopeType::Llama3
+        ));
+        assert_eq!(rope_scaling.factor, 8.0);
+        assert_eq!(rope_scaling.original_max_position_embeddings, 8192);
+    }
+
+    #[test]
+    fn cross_encoder_num_labels_accepts_legacy_id2label_metadata() {
+        let legacy = serde_json::json!({
+            "architectures": ["BertForSequenceClassification"],
+            "model_type": "bert",
+            "id2label": {"0": "LABEL_0"}
+        });
+        assert_eq!(cross_encoder_num_labels(&legacy), Some(1));
+        assert_eq!(
+            cross_encoder_num_labels(&serde_json::json!({"num_labels": 2})),
+            Some(2)
+        );
+        assert_eq!(cross_encoder_num_labels(&serde_json::json!({})), None);
     }
 
     #[test]

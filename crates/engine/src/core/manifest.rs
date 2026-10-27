@@ -148,9 +148,11 @@ pub fn estimate_memory(manifest: &ModelManifest, context_size: usize) -> MemoryE
 /// Native unquantized Safetensors weights are converted to F32 by the current
 /// Candle CPU kernels and to F16 on GPU unless `BLOOM_DTYPE` explicitly selects
 /// another supported precision. Device-aware estimates charge CPU/NPU KV
-/// storage as F32 and GPU KV storage at the verified model tensor width because
-/// the current execution wrappers do not implement the narrower
-/// `BLOOM_KV_CACHE_DTYPE` formats. The on-disk dtype remains available through
+/// storage as F32 and GPU KV storage at the verified model tensor width.
+/// Native streaming Qwen paged caches can use narrower
+/// `BLOOM_KV_CACHE_DTYPE` formats at runtime, but admission remains
+/// conservative for model-internal tensors until every execution wrapper
+/// reports that physical layout. The on-disk dtype remains available through
 /// `ModelManifest::primary_dtype`. GPU and NPU estimates assume full-layer
 /// accelerator placement unless `BLOOM_GPU_LAYERS` explicitly overrides it;
 /// the device-agnostic [`estimate_memory`] retains its legacy env-only policy.
@@ -710,6 +712,27 @@ pub struct GgufMetadataSummary {
     pub file_size: usize,
 }
 
+/// GGUF architecture tags handled by the external llama.cpp adapter in this
+/// build. These stay out of the Candle native loader until an
+/// architecture-specific Candle implementation exists.
+pub(crate) fn is_llamacpp_gguf_architecture(architecture: &str) -> bool {
+    matches!(
+        architecture.to_ascii_lowercase().as_str(),
+        "phi3"
+            | "phi3moe"
+            | "phi4"
+            | "phi4mm"
+            | "gemma3"
+            | "smollm3"
+            | "mistral3"
+            | "ministral3"
+            | "granite"
+            | "granite3"
+            | "granite3.3"
+            | "lfm2"
+    )
+}
+
 const MAX_CHAT_TEMPLATE_BYTES: usize = 256 * 1024;
 const MAX_TOKENIZER_CONFIG_BYTES: u64 = 512 * 1024;
 const MAX_SENTENCE_TRANSFORMER_CONFIG_BYTES: u64 = 64 * 1024;
@@ -866,6 +889,16 @@ pub fn infer_manifest_from_gguf_summary(summary: &GgufMetadataSummary) -> ModelM
         manifest
             .parameters
             .insert("gguf_architecture".to_string(), serde_json::json!(arch));
+        if is_llamacpp_gguf_architecture(arch) {
+            manifest.runtime_hints.preferred_backends = vec!["llamacpp".to_string()];
+            manifest.parameters.insert(
+                "bloom_external_runtime_reason".to_string(),
+                serde_json::json!(format!(
+                    "GGUF architecture '{}' is routed through the external llama.cpp adapter; Candle has no native loader",
+                    arch
+                )),
+            );
+        }
     }
     if let Some(base) = summary.rope_freq_base {
         manifest
@@ -1433,13 +1466,16 @@ fn infer_from_hf_config(model_path: &Path, config: serde_json::Value) -> Result<
         .to_string_lossy()
         .into_owned();
 
+    // Some converted checkpoints omit `architectures` or use a generic
+    // architecture label. Fall back to model_type so native text families
+    // still receive the correct manifest route.
     if model_type.contains("asr") || arch.contains("asr") {
         manifest.family = ModelFamily::FunAsr;
-    } else if arch.contains("qwen") {
+    } else if arch.contains("qwen") || model_type.contains("qwen") {
         manifest.family = ModelFamily::Qwen;
-    } else if arch.contains("llama") {
+    } else if arch.contains("llama") || model_type.contains("llama") {
         manifest.family = ModelFamily::Llama;
-    } else if arch.contains("gemma") {
+    } else if arch.contains("gemma") || model_type.contains("gemma") {
         manifest.family = ModelFamily::Gemma;
     } else if arch.contains("bert") || model_type == "bert" {
         manifest.family = ModelFamily::Bert;
@@ -1547,6 +1583,13 @@ fn infer_from_hf_config(model_path: &Path, config: serde_json::Value) -> Result<
     let is_vl = model_type.contains("vl") || arch.contains("vl");
     let is_asr = manifest.family == ModelFamily::FunAsr;
 
+    // Qwen3-VL is the one multimodal text/image path with a built-in Candle
+    // executor. Keep the route explicit so a generic Qwen text backend never
+    // claims the vision checkpoint. (Qwen2-VL remains unsupported here.)
+    if model_type == "qwen3_vl" {
+        manifest.runtime_hints.preferred_backends = vec!["qwen3_vl".to_string()];
+    }
+
     manifest.io_schema = ModelIoSchema {
         inputs: if is_asr {
             vec![Modality::Audio]
@@ -1589,6 +1632,9 @@ fn infer_from_hf_config(model_path: &Path, config: serde_json::Value) -> Result<
             manifest.files = gguf_manifest.files;
             manifest.license = gguf_manifest.license;
             manifest.io_schema = gguf_manifest.io_schema;
+            manifest.runtime_hints.preferred_backends =
+                gguf_manifest.runtime_hints.preferred_backends;
+            manifest.runtime_hints.supports_mmap = gguf_manifest.runtime_hints.supports_mmap;
             for (key, value) in gguf_manifest.parameters {
                 manifest.parameters.insert(key, value);
             }
@@ -1802,22 +1848,30 @@ fn validate_sentence_transformer_pooling(
             ));
         }
     }
-    if config
+    let mean_tokens = config
         .get("pooling_mode_mean_tokens")
         .and_then(serde_json::Value::as_bool)
-        != Some(true)
-    {
+        .unwrap_or(false);
+    let cls_token = config
+        .get("pooling_mode_cls_token")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    // Sentence Transformers' BGE family uses CLS-only pooling while E5 and
+    // most sentence encoders use mean-token pooling.  Both are stateless
+    // pooling modes supported by Bloom; mixed/other modes remain fail-closed.
+    if mean_tokens == cls_token {
         return Err(anyhow::anyhow!(
-            "unsupported Sentence Transformers pooling configuration: mean-token pooling must be enabled"
+            "unsupported Sentence Transformers pooling configuration: enable exactly one of mean-token or CLS-token pooling"
         ));
     }
     if config.iter().any(|(name, value)| {
         name.starts_with("pooling_mode_")
             && name != "pooling_mode_mean_tokens"
+            && name != "pooling_mode_cls_token"
             && value.as_bool() == Some(true)
     }) {
         return Err(anyhow::anyhow!(
-            "unsupported Sentence Transformers pooling configuration: only mean-token pooling may be enabled"
+            "unsupported Sentence Transformers pooling configuration: only mean-token or CLS-token pooling may be enabled"
         ));
     }
 
@@ -1843,6 +1897,10 @@ fn validate_sentence_transformer_pooling(
     manifest.parameters.insert(
         "embedding_dimensions".to_string(),
         serde_json::Value::from(dimensions),
+    );
+    manifest.parameters.insert(
+        "embedding_pooling".to_string(),
+        serde_json::Value::String(if cls_token { "cls" } else { "mean" }.to_string()),
     );
     Ok(())
 }
@@ -2871,10 +2929,22 @@ fn infer_from_gguf(_model_path: &Path, gguf_path: &Path) -> Result<ModelManifest
             | "tts"
             | "mistral"
             | "deepseek"
+            | "phi3"
+            | "phi3moe"
+            | "phi4"
+            | "phi4mm"
+            | "gemma3"
+            | "smollm3"
+            | "mistral3"
+            | "ministral3"
+            | "granite"
+            | "granite3"
+            | "granite3.3"
+            | "lfm2"
     );
     if !arch_supported && !arch_lower.is_empty() {
         return Err(BloomError::UnsupportedFamily(format!(
-            "unsupported GGUF architecture: '{}'. Supported architectures are: llama, qwen, qwen2, qwen3, gemma, mistral, deepseek. [Diagnostic Tip] Run `inspect_gguf` to verify model structure.",
+            "unsupported GGUF architecture: '{}'. Supported native architectures are llama, qwen, qwen2, qwen3, gemma; external llama.cpp architectures include phi3/phi4, gemma3, smollm3, mistral3/ministral3, granite3.3, and lfm2. [Diagnostic Tip] Run `inspect_gguf` to verify model structure.",
             arch
         )).into());
     }
@@ -3622,6 +3692,38 @@ mod tests {
     }
 
     #[test]
+    fn gguf_external_architectures_declare_llamacpp_route() {
+        for architecture in [
+            "phi3",
+            "phi4",
+            "gemma3",
+            "smollm3",
+            "mistral3",
+            "ministral3",
+            "granite3.3",
+            "lfm2",
+        ] {
+            let manifest = infer_manifest_from_gguf_summary(&GgufMetadataSummary {
+                architecture: Some(architecture.to_string()),
+                quantization_type: Some("Q4_K_M".to_string()),
+                ..Default::default()
+            });
+            assert_eq!(
+                manifest.runtime_hints.preferred_backends,
+                vec!["llamacpp".to_string()],
+                "architecture {architecture}"
+            );
+            assert_eq!(
+                manifest
+                    .parameters
+                    .get("gguf_architecture")
+                    .and_then(|v| v.as_str()),
+                Some(architecture)
+            );
+        }
+    }
+
+    #[test]
     fn test_infer_hf_quantization_variants() {
         let awq = serde_json::json!({
             "quantization_config": {"quant_method": "awq_marlin", "bits": 4, "group_size": 128}
@@ -3703,6 +3805,24 @@ mod tests {
         );
         let quant = manifest.quantization.as_ref().unwrap();
         assert!(matches!(quant.scheme, QuantScheme::GGUF(ref s) if s == "Q4_K_M"));
+    }
+
+    #[test]
+    fn hf_text_manifest_routes_model_type_aliases_without_architectures() {
+        let dir = tempfile::tempdir().unwrap();
+        let qwen = infer_from_hf_config(
+            dir.path(),
+            serde_json::json!({"model_type": "qwen2.5", "hidden_size": 1536}),
+        )
+        .unwrap();
+        assert_eq!(qwen.family, ModelFamily::Qwen);
+
+        let llama = infer_from_hf_config(
+            dir.path(),
+            serde_json::json!({"model_type": "llama3.2", "hidden_size": 2048}),
+        )
+        .unwrap();
+        assert_eq!(llama.family, ModelFamily::Llama);
     }
 
     #[test]
@@ -3906,6 +4026,7 @@ mod tests {
         fs::write(
             dir.path().join("config.json"),
             br#"{
+                "_name_or_path":"intfloat/multilingual-e5-small",
                 "model_type": "bert",
                 "hidden_size": 384,
                 "num_hidden_layers": 6,
@@ -3997,7 +4118,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("config.json"),
-            br#"{"architectures":["BertForSequenceClassification"],"model_type":"bert","hidden_size":384}"#,
+            br#"{"architectures":["BertForSequenceClassification"],"model_type":"bert","hidden_size":384,"id2label":{"0":"LABEL_0"}}"#,
         )
         .unwrap();
         write_test_safetensors(&dir.path().join("model.safetensors"), &["weight"]);
@@ -4013,6 +4134,53 @@ mod tests {
         );
         assert_eq!(model_manifest_tasks(&manifest), ["rerank"]);
         assert!(!model_manifest_supports_embeddings(&manifest));
+    }
+
+    #[test]
+    fn hf_bge_cls_pooling_fixture_routes_to_embedding_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            br#"{"architectures":["BertModel"],"model_type":"bert","hidden_size":384,"max_position_embeddings":512}"#,
+        )
+        .unwrap();
+        write_test_safetensors(&dir.path().join("model.safetensors"), &["weight"]);
+        fs::write(
+            dir.path().join("modules.json"),
+            br#"[
+                {"idx":0,"path":"","type":"sentence_transformers.models.Transformer"},
+                {"idx":1,"path":"1_Pooling","type":"sentence_transformers.models.Pooling"},
+                {"idx":2,"path":"2_Normalize","type":"sentence_transformers.models.Normalize"}
+            ]"#,
+        )
+        .unwrap();
+        fs::create_dir(dir.path().join("1_Pooling")).unwrap();
+        fs::write(
+            dir.path().join("1_Pooling/config.json"),
+            br#"{
+                "word_embedding_dimension":384,
+                "pooling_mode_cls_token":true,
+                "pooling_mode_mean_tokens":false,
+                "pooling_mode_max_tokens":false,
+                "pooling_mode_mean_sqrt_len_tokens":false
+            }"#,
+        )
+        .unwrap();
+
+        let manifest = load_manifest(dir.path()).unwrap();
+        assert_eq!(
+            manifest.parameters.get("bloom_task"),
+            Some(&serde_json::json!("embedding"))
+        );
+        assert_eq!(
+            manifest.parameters.get("embedding_pooling"),
+            Some(&serde_json::json!("cls"))
+        );
+        assert_eq!(
+            manifest.parameters.get("embedding_normalization"),
+            Some(&serde_json::json!("l2"))
+        );
+        assert_eq!(model_manifest_tasks(&manifest), ["embedding", "rerank"]);
     }
 
     #[test]
@@ -4059,7 +4227,7 @@ mod tests {
         .unwrap();
 
         let error = load_manifest(dir.path()).unwrap_err().to_string();
-        assert!(error.contains("only mean-token pooling may be enabled"));
+        assert!(error.contains("enable exactly one of mean-token or CLS-token pooling"));
     }
 
     #[test]

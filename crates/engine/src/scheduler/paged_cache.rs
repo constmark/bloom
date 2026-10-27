@@ -298,58 +298,48 @@ impl PagedAttentionCache {
             ));
         }
 
-        // Convert to F32 CPU vectors for fallback compatibility. Candle's
-        // attention layout is normally [B, H, T, D], while the paged-cache
-        // vector contract is token-major [T, H * D]. Flattening [B,H,T,D]
-        // directly would silently group all tokens by head whenever H > 1.
-        let tensor_to_token_major = |tensor: &Tensor| -> Result<Vec<f32>> {
-            let tensor = tensor.to_dtype(candle_core::DType::F32)?;
-            match tensor.dims() {
-                [1, heads, tokens, head_dim]
-                    if *tokens == num_tokens
-                        && heads.checked_mul(*head_dim) == Some(self.config.kv_dim) =>
-                {
-                    tensor
-                        .transpose(1, 2)?
-                        .contiguous()?
-                        .flatten_all()?
-                        .to_vec1::<f32>()
-                        .map_err(Into::into)
-                }
-                [tokens, width] if *tokens == num_tokens && *width == self.config.kv_dim => {
-                    tensor.flatten_all()?.to_vec1::<f32>().map_err(Into::into)
-                }
-                [heads, tokens, head_dim]
-                    if *tokens == num_tokens
-                        && heads.checked_mul(*head_dim) == Some(self.config.kv_dim) =>
-                {
-                    tensor
-                        .transpose(0, 1)?
-                        .contiguous()?
-                        .flatten_all()?
-                        .to_vec1::<f32>()
-                        .map_err(Into::into)
-                }
-                _ => Err(anyhow!(
-                    "KV tensor shape mismatch: expected [1,H,{},D] or [{},{}], got {:?}",
-                    num_tokens,
-                    num_tokens,
-                    self.config.kv_dim,
-                    tensor.dims()
-                )),
-            }
+        // Keep the hot GPU path tensor-resident when there is no CacheMesh or
+        // quantized backing store.  The old implementation copied every KV
+        // block to F32 on the host even though decode restoration could use
+        // the original device tensors directly.  CacheMesh and one-byte KV
+        // formats still materialise vectors because they need serialization
+        // or checked quantization.
+        let materialize_host = self.cachemesh.is_some() || self.config.kv_dtype.needs_dequant();
+        Self::validate_tensor_shape(&keys, num_tokens, self.config.kv_dim)?;
+        Self::validate_tensor_shape(&values, num_tokens, self.config.kv_dim)?;
+        let keys_vec = if materialize_host {
+            Some(Self::tensor_to_token_major(
+                &keys,
+                num_tokens,
+                self.config.kv_dim,
+            )?)
+        } else {
+            None
         };
-        let keys_vec = tensor_to_token_major(&keys)?;
-        let values_vec = tensor_to_token_major(&values)?;
+        let values_vec = if materialize_host {
+            Some(Self::tensor_to_token_major(
+                &values,
+                num_tokens,
+                self.config.kv_dim,
+            )?)
+        } else {
+            None
+        };
         let expected = num_tokens
             .checked_mul(self.config.kv_dim)
             .ok_or_else(|| anyhow!("KV tensor shape overflows usize"))?;
-        if keys_vec.len() != expected || values_vec.len() != expected {
+        if keys_vec
+            .as_ref()
+            .is_some_and(|values| values.len() != expected)
+            || values_vec
+                .as_ref()
+                .is_some_and(|values| values.len() != expected)
+        {
             return Err(anyhow!(
                 "KV tensor shape mismatch: expected {} elements per tensor, got keys={}, values={}",
                 expected,
-                keys_vec.len(),
-                values_vec.len()
+                keys_vec.as_ref().map_or(0, Vec::len),
+                values_vec.as_ref().map_or(0, Vec::len)
             ));
         }
 
@@ -358,15 +348,26 @@ impl PagedAttentionCache {
         // `read_kv` intentionally consults the quantized fields for INT8/FP8.
         let (stored_keys, stored_values, quantized_keys, quantized_values) =
             if self.config.kv_dtype.needs_dequant() {
-                let qk =
-                    Int8QuantizedKv::try_quantize_f32(&keys_vec, num_tokens, self.config.kv_dim)
-                        .map_err(|error| anyhow!(error))?;
-                let qv =
-                    Int8QuantizedKv::try_quantize_f32(&values_vec, num_tokens, self.config.kv_dim)
-                        .map_err(|error| anyhow!(error))?;
+                let qk = Int8QuantizedKv::try_quantize_f32(
+                    keys_vec.as_deref().unwrap_or_default(),
+                    num_tokens,
+                    self.config.kv_dim,
+                )
+                .map_err(|error| anyhow!(error))?;
+                let qv = Int8QuantizedKv::try_quantize_f32(
+                    values_vec.as_deref().unwrap_or_default(),
+                    num_tokens,
+                    self.config.kv_dim,
+                )
+                .map_err(|error| anyhow!(error))?;
                 (Vec::new(), Vec::new(), Some(qk), Some(qv))
             } else {
-                (keys_vec, values_vec, None, None)
+                (
+                    keys_vec.unwrap_or_default(),
+                    values_vec.unwrap_or_default(),
+                    None,
+                    None,
+                )
             };
 
         let block_data = BlockKvData {
@@ -453,12 +454,25 @@ impl PagedAttentionCache {
                 } else {
                     return Err(anyhow!("quantized KV block is missing key/value payload"));
                 }
-            } else {
-                if block.keys.len() != expected || block.values.len() != expected {
-                    return Err(anyhow!("KV block vector shape mismatch"));
-                }
+            } else if block.keys.len() == expected && block.values.len() == expected {
                 block_keys.extend(&block.keys);
                 block_values.extend(&block.values);
+            } else if let (Some(keys), Some(values)) = (&block.keys_tensor, &block.values_tensor) {
+                // Tensor-only L1 blocks intentionally avoid a synchronous
+                // device-to-host copy on write.  A caller explicitly asking
+                // for the vector API still gets a checked conversion here.
+                block_keys.extend(Self::tensor_to_token_major(
+                    keys,
+                    block.num_tokens,
+                    self.config.kv_dim,
+                )?);
+                block_values.extend(Self::tensor_to_token_major(
+                    values,
+                    block.num_tokens,
+                    self.config.kv_dim,
+                )?);
+            } else {
+                return Err(anyhow!("KV block vector shape mismatch"));
             }
             let padding = self
                 .config
@@ -506,6 +520,78 @@ impl PagedAttentionCache {
         }
 
         Ok((all_keys, all_values))
+    }
+
+    /// Convert Candle's attention layouts to the cache's token-major vector
+    /// contract.  This helper is intentionally only called by CacheMesh,
+    /// quantization, and explicit vector reads; the normal GPU path keeps the
+    /// original tensors resident on the device.
+    fn tensor_to_token_major(
+        tensor: &Tensor,
+        num_tokens: usize,
+        kv_dim: usize,
+    ) -> Result<Vec<f32>> {
+        let tensor = tensor.to_dtype(candle_core::DType::F32)?;
+        match tensor.dims() {
+            [1, heads, tokens, head_dim]
+                if *tokens == num_tokens && heads.checked_mul(*head_dim) == Some(kv_dim) =>
+            {
+                tensor
+                    .transpose(1, 2)?
+                    .contiguous()?
+                    .flatten_all()?
+                    .to_vec1::<f32>()
+                    .map_err(Into::into)
+            }
+            [tokens, width] if *tokens == num_tokens && *width == kv_dim => {
+                tensor.flatten_all()?.to_vec1::<f32>().map_err(Into::into)
+            }
+            [heads, tokens, head_dim]
+                if *tokens == num_tokens && heads.checked_mul(*head_dim) == Some(kv_dim) =>
+            {
+                tensor
+                    .transpose(0, 1)?
+                    .contiguous()?
+                    .flatten_all()?
+                    .to_vec1::<f32>()
+                    .map_err(Into::into)
+            }
+            _ => Err(anyhow!(
+                "KV tensor shape mismatch: expected [1,H,{},D] or [{},{}], got {:?}",
+                num_tokens,
+                num_tokens,
+                kv_dim,
+                tensor.dims()
+            )),
+        }
+    }
+
+    fn validate_tensor_shape(tensor: &Tensor, num_tokens: usize, kv_dim: usize) -> Result<()> {
+        let valid = match tensor.dims() {
+            [1, heads, tokens, head_dim]
+                if *tokens == num_tokens && heads.checked_mul(*head_dim) == Some(kv_dim) =>
+            {
+                true
+            }
+            [tokens, width] if *tokens == num_tokens && *width == kv_dim => true,
+            [heads, tokens, head_dim]
+                if *tokens == num_tokens && heads.checked_mul(*head_dim) == Some(kv_dim) =>
+            {
+                true
+            }
+            _ => false,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "KV tensor shape mismatch: expected [1,H,{},D] or [{},{}], got {:?}",
+                num_tokens,
+                num_tokens,
+                kv_dim,
+                tensor.dims()
+            ))
+        }
     }
 
     /// Runs paged attention using TileLang compiler/kernel.
@@ -612,6 +698,15 @@ impl PagedAttentionCache {
     /// Get the cache configuration.
     pub fn config(&self) -> &PagedCacheConfig {
         &self.config
+    }
+
+    /// Whether blocks may be restored from the serialized CacheMesh tiers.
+    ///
+    /// Local tensor-only restore is safe only when every resident block was
+    /// written by this cache instance; CacheMesh entries can legitimately be
+    /// vector-backed after an eviction or process restart.
+    pub fn cachemesh_enabled(&self) -> bool {
+        self.cachemesh.is_some()
     }
 
     /// Get a reference to the underlying block pool.
@@ -797,13 +892,22 @@ impl PagedAttentionCache {
                             .saturating_add(qk.memory_bytes().saturating_add(qv.memory_bytes()));
                     }
                 } else {
-                    total = total.saturating_add(
-                        block
-                            .keys
-                            .len()
-                            .saturating_add(block.values.len())
-                            .saturating_mul(element_size),
-                    );
+                    let host_elements = block.keys.len().saturating_add(block.values.len());
+                    if host_elements > 0 {
+                        total = total.saturating_add(host_elements.saturating_mul(element_size));
+                    } else if let (Some(keys), Some(values)) =
+                        (&block.keys_tensor, &block.values_tensor)
+                    {
+                        // Tensor-only blocks keep the physical KV on the
+                        // admitted device. Report their logical footprint so
+                        // diagnostics remain useful without forcing a host
+                        // materialisation.
+                        total = total.saturating_add(
+                            keys.elem_count()
+                                .saturating_add(values.elem_count())
+                                .saturating_mul(element_size),
+                        );
+                    }
                 }
             }
         }
@@ -958,20 +1062,29 @@ impl PagedAttentionCache {
 
         let num_kv_heads = self.config.kv_dim / head_dim;
 
-        for &block_id in &visible_block_ids {
-            let mut got_tensor = false;
-            {
-                let layer_data = self.layer_data.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(block) = layer_data[layer_idx].get(&block_id)
-                    && let (Some(k), Some(v)) = (&block.keys_tensor, &block.values_tensor)
-                {
-                    keys_tensors.push(k.clone());
-                    values_tensors.push(v.clone());
-                    got_tensor = true;
-                }
-            }
+        // Snapshot all resident tensor blocks under one lock.  Attention runs
+        // once per layer and long contexts can contain dozens of blocks; the
+        // previous loop reacquired the cache mutex for every block.
+        let resident_tensors = {
+            let layer_data = self.layer_data.lock().unwrap_or_else(|e| e.into_inner());
+            visible_block_ids
+                .iter()
+                .map(|&block_id| {
+                    layer_data[layer_idx].get(&block_id).and_then(|block| {
+                        Some((
+                            block.keys_tensor.as_ref()?.clone(),
+                            block.values_tensor.as_ref()?.clone(),
+                        ))
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
 
-            if !got_tensor {
+        for (&block_id, resident) in visible_block_ids.iter().zip(resident_tensors) {
+            if let Some((keys, values)) = resident {
+                keys_tensors.push(keys);
+                values_tensors.push(values);
+            } else {
                 // Construct tensor on device from CPU fallback keys/values
                 let (keys_vec, values_vec) = self.read_kv(layer_idx, &[block_id])?;
                 let tokens = keys_vec.len() / self.config.kv_dim;

@@ -486,6 +486,7 @@ impl Gemma4StreamingModel {
         rms_norm_eps: f64,
         attn_logit_softcapping: Option<f64>,
         attention_mask: Option<&Tensor>,
+        sliding_attention: bool,
         seqlen_offset: usize,
         kv_cache: &mut KvCache,
         kv_cache_dtype: KvCacheDType,
@@ -596,21 +597,69 @@ impl Gemma4StreamingModel {
         let key_states = repeat_kv(key_states, num_kv_groups)?.contiguous()?;
         let value_states = repeat_kv(value_states, num_kv_groups)?.contiguous()?;
 
-        // Attention score calculation
+        // Attention score calculation.  Gemma4's sliding-window layers and
+        // logit-softcapping require the eager path.  Global, non-softcapped
+        // CUDA/Metal attention can use FlashAttention for cold prefill and
+        // decode, matching the streaming Qwen fast path while preserving the
+        // masked suffix-prefill fallback.
         let scale = 1.0 / (head_dim as f64).sqrt();
-        let mut attn_weights = (query_states.matmul(&key_states.transpose(2, 3)?)? * scale)?;
-
-        if let Some(sc) = attn_logit_softcapping {
-            attn_weights = ((attn_weights / sc)?.tanh()? * sc)?;
-        }
-
-        if let Some(mask) = attention_mask {
-            attn_weights = attn_weights.broadcast_add(mask)?;
-        }
-
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-
-        let attn_output = attn_weights.matmul(&value_states)?;
+        // Keep the parameter part of the no-feature build as well; the
+        // feature-gated predicate below otherwise has no reference to it.
+        let _ = sliding_attention;
+        let flash_eligible = {
+            #[cfg(feature = "flash-attn")]
+            {
+                !sliding_attention
+                    && attn_logit_softcapping.is_none()
+                    && (device.is_cuda() || device.is_metal())
+                    && (attention_mask.is_none() || seqlen_offset == 0)
+            }
+            #[cfg(not(feature = "flash-attn"))]
+            {
+                false
+            }
+        };
+        let attn_output = if flash_eligible {
+            #[cfg(feature = "flash-attn")]
+            {
+                let q_flash = query_states.transpose(1, 2)?.contiguous()?;
+                let k_flash = key_states.transpose(1, 2)?.contiguous()?;
+                let v_flash = value_states.transpose(1, 2)?.contiguous()?;
+                match candle_flash_attn::flash_attn(
+                    &q_flash,
+                    &k_flash,
+                    &v_flash,
+                    scale as f32,
+                    q_len > 1,
+                ) {
+                    Ok(output) => output.transpose(1, 2)?,
+                    Err(error) => {
+                        tracing::debug!(%error, "flash attention unavailable for Gemma4 shape; using eager attention");
+                        let mut attn_weights =
+                            (query_states.matmul(&key_states.transpose(2, 3)?)? * scale)?;
+                        if let Some(mask) = attention_mask {
+                            attn_weights = attn_weights.broadcast_add(mask)?;
+                        }
+                        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+                        attn_weights.matmul(&value_states)?
+                    }
+                }
+            }
+            #[cfg(not(feature = "flash-attn"))]
+            {
+                unreachable!("flash attention eligibility is disabled without the feature")
+            }
+        } else {
+            let mut attn_weights = (query_states.matmul(&key_states.transpose(2, 3)?)? * scale)?;
+            if let Some(sc) = attn_logit_softcapping {
+                attn_weights = ((attn_weights / sc)?.tanh()? * sc)?;
+            }
+            if let Some(mask) = attention_mask {
+                attn_weights = attn_weights.broadcast_add(mask)?;
+            }
+            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+            attn_weights.matmul(&value_states)?
+        };
 
         let attn_output = attn_output.transpose(1, 2)?.reshape((b_sz, q_len, ()))?;
 
@@ -761,6 +810,7 @@ impl Gemma4StreamingModel {
                 self.rms_norm_eps,
                 self.attn_logit_softcapping,
                 mask_layer.as_ref(),
+                is_sliding,
                 seqlen_offset,
                 &mut self.kv_caches[layer_idx],
                 self.kv_cache_dtype,

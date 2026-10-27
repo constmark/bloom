@@ -747,7 +747,7 @@ impl CandleBatchExecutor {
                 .to_vec1::<f32>()?
         };
 
-        let next_tok = sample_logits(&logits_vec, req_params);
+        let next_tok = sample_logits(&logits_vec, req_params, generated_tokens);
         Ok(next_tok)
     }
 
@@ -940,6 +940,77 @@ impl CandleBatchExecutor {
         let config = cache.config();
         let block_size = config.block_size;
         let kv_dim = config.kv_dim;
+        if block_size == 0 {
+            return Err(anyhow!("KV cache block size must be greater than zero"));
+        }
+
+        // A local paged cache normally holds the exact device tensors emitted
+        // by the model.  Restore those blocks without copying them through
+        // F32 host vectors.  CacheMesh restores and explicitly vector-backed
+        // test/cache entries fall through to the portable path below.
+        if !cache.cachemesh_enabled() {
+            let mut tensor_restore_succeeded = true;
+            let mut tensor_layers = Vec::with_capacity(config.num_layers);
+            // Resolve the request's physical spans once.  The old inner loop
+            // repeated a pool mutex lookup for every layer and every token;
+            // active requests cannot have their block table compacted, so the
+            // spans remain valid for this restore operation.
+            let mut restore_spans = Vec::new();
+            let mut position = 0usize;
+            while position < end_pos {
+                let Some(block_id) = cache.block_for_handle(handle, position) else {
+                    tensor_restore_succeeded = false;
+                    break;
+                };
+                let slot = position % block_size;
+                let take = (block_size - slot).min(end_pos - position);
+                restore_spans.push((block_id, slot, take));
+                position += take;
+            }
+            for layer_idx in 0..config.num_layers {
+                if !tensor_restore_succeeded {
+                    break;
+                }
+                let mut key_segments = Vec::new();
+                let mut value_segments = Vec::new();
+                for &(block_id, slot, take) in &restore_spans {
+                    let Ok(Some((keys, values))) = cache.read_kv_tensor(layer_idx, block_id) else {
+                        tensor_restore_succeeded = false;
+                        break;
+                    };
+                    let Ok(key_segment) = keys.narrow(2, slot, take) else {
+                        tensor_restore_succeeded = false;
+                        break;
+                    };
+                    let Ok(value_segment) = values.narrow(2, slot, take) else {
+                        tensor_restore_succeeded = false;
+                        break;
+                    };
+                    key_segments.push(key_segment);
+                    value_segments.push(value_segment);
+                }
+                if !tensor_restore_succeeded {
+                    break;
+                }
+                let keys = Tensor::cat(&key_segments, 2)?;
+                let values = Tensor::cat(&value_segments, 2)?;
+                tensor_layers.push((keys, values));
+            }
+            if tensor_restore_succeeded {
+                for (layer_idx, (keys, values)) in tensor_layers.iter().enumerate() {
+                    if let Err(error) = hook.inject_kv_tensor(handle, layer_idx, 0, keys, values) {
+                        tracing::debug!(%error, "tensor-only prefix restore unavailable; using vector fallback");
+                        let _ = hook.clear_kv_cache(handle);
+                        tensor_restore_succeeded = false;
+                        break;
+                    }
+                }
+            }
+            if tensor_restore_succeeded {
+                return Ok(());
+            }
+        }
+
         for layer_idx in 0..config.num_layers {
             let mut keys = vec![0.0f32; end_pos * kv_dim];
             let mut values = vec![0.0f32; end_pos * kv_dim];
@@ -1095,14 +1166,93 @@ impl TokenBudget {
 /// Sample a token from logits using temperature, top-p, and optional seed.
 ///
 /// When `params` is `None` or temperature is 0, falls back to greedy (argmax).
-fn sample_logits(logits: &[f32], params: Option<&GenerationParams>) -> u32 {
-    let (temperature, top_p, seed) = match params {
-        Some(p) => (p.temperature, p.top_p, p.seed),
-        None => (1.0, 1.0, None),
-    };
+fn sample_logits(
+    logits: &[f32],
+    params: Option<&GenerationParams>,
+    generated_tokens: &[u32],
+) -> u32 {
+    let (temperature, top_p, top_k, seed, presence_penalty, frequency_penalty, logit_bias) =
+        match params {
+            Some(p) => (
+                p.temperature,
+                p.top_p,
+                p.top_k,
+                p.seed,
+                p.presence_penalty,
+                p.frequency_penalty,
+                p.logit_bias.as_ref(),
+            ),
+            None => (1.0, 1.0, None, None, 0.0, 0.0, None),
+        };
 
-    // Greedy when temperature is effectively 0
+    if logits.is_empty() {
+        return 0;
+    }
+
+    // Apply repetition penalties and logit bias before top-k/top-p selection,
+    // matching the single-request Candle path. The count map is allocated
+    // only when a penalty is active, which keeps the greedy/default path cheap.
+    let counts = if presence_penalty != 0.0 || frequency_penalty != 0.0 {
+        let mut counts = std::collections::HashMap::<u32, usize>::new();
+        for &token in generated_tokens {
+            *counts.entry(token).or_default() += 1;
+        }
+        Some(counts)
+    } else {
+        None
+    };
+    let mut candidates: Vec<(usize, f32)> = logits
+        .iter()
+        .enumerate()
+        .map(|(token, &logit)| {
+            let mut value = if logit.is_finite() {
+                logit
+            } else {
+                f32::NEG_INFINITY
+            };
+            if let Some(count) = counts
+                .as_ref()
+                .and_then(|counts| counts.get(&(token as u32)))
+            {
+                value -= (presence_penalty + frequency_penalty * *count as f64) as f32;
+            }
+            if let Some(bias) = logit_bias.and_then(|biases| biases.get(&(token as u32))) {
+                value += *bias as f32;
+            }
+            (token, value)
+        })
+        .collect();
+
+    // Greedy sampling never needs a softmax. Top-k does not change argmax,
+    // but penalties and bias have already been applied above.
     if temperature <= 1e-6 {
+        return candidates
+            .iter()
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .map(|(idx, _)| *idx as u32)
+            .unwrap_or(0);
+    }
+
+    // Select the largest k logits in O(vocab) average time, then sort only the
+    // retained slice. This avoids the previous full-vocabulary sort whenever
+    // a request supplies top_k, which is common for serving workloads.
+    if let Some(k) = top_k.filter(|k| *k > 0 && *k < candidates.len()) {
+        candidates.select_nth_unstable_by(k - 1, |a, b| b.1.total_cmp(&a.1));
+        candidates.truncate(k);
+    }
+
+    let temperature = temperature as f32;
+    let max_logit = candidates
+        .iter()
+        .map(|(_, logit)| *logit / temperature)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let mut weighted: Vec<(usize, f32)> = candidates
+        .into_iter()
+        .map(|(token, logit)| (token, ((logit / temperature) - max_logit).exp()))
+        .filter(|(_, weight)| weight.is_finite() && *weight > 0.0)
+        .collect();
+
+    if weighted.is_empty() {
         return logits
             .iter()
             .enumerate()
@@ -1111,80 +1261,49 @@ fn sample_logits(logits: &[f32], params: Option<&GenerationParams>) -> u32 {
             .unwrap_or(0);
     }
 
-    // Apply temperature scaling
-    let scaled: Vec<f32> = logits.iter().map(|&v| v / temperature as f32).collect();
-
-    // Softmax
-    let max_val = scaled.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let exp: Vec<f32> = scaled.iter().map(|&v| (v - max_val).exp()).collect();
-    let sum_exp: f32 = exp.iter().sum();
-    let mut probs: Vec<f32> = exp.iter().map(|&v| (v / sum_exp).max(0.0)).collect();
-
-    // Top-p (nucleus) filtering
+    // Top-p requires probability order. With top_k present this sorts only k
+    // elements; without top_k it preserves the exact nucleus semantics.
     if top_p < 1.0 && top_p > 0.0 {
-        let mut indexed: Vec<(usize, f32)> =
-            probs.iter().enumerate().map(|(i, &p)| (i, p)).collect();
-        indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
-
+        weighted.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let total: f32 = weighted.iter().map(|(_, weight)| *weight).sum();
         let mut cumulative = 0.0f32;
-        let mut cutoff_idx = indexed.len();
-        for (i, &(_, p)) in indexed.iter().enumerate() {
-            cumulative += p;
+        let mut cutoff = weighted.len();
+        for (index, (_, weight)) in weighted.iter().enumerate() {
+            cumulative += *weight / total;
             if cumulative > top_p as f32 {
-                cutoff_idx = i + 1;
+                cutoff = index + 1;
                 break;
             }
         }
-
-        // Zero out probabilities beyond cutoff
-        let allowed: std::collections::HashSet<usize> =
-            indexed[..cutoff_idx].iter().map(|&(idx, _)| idx).collect();
-        for (i, p) in probs.iter_mut().enumerate() {
-            if !allowed.contains(&i) {
-                *p = 0.0;
-            }
-        }
-
-        // Re-normalize
-        let new_sum: f32 = probs.iter().sum();
-        if new_sum > 0.0 {
-            for p in probs.iter_mut() {
-                *p /= new_sum;
-            }
-        }
+        weighted.truncate(cutoff);
     }
 
-    // Weighted random sampling with optional seed
+    let total: f32 = weighted.iter().map(|(_, weight)| *weight).sum();
+    if !(total.is_finite() && total > 0.0) {
+        return weighted.first().map(|(idx, _)| *idx as u32).unwrap_or(0);
+    }
+
+    // Weighted random sampling with optional seed. The LCG keeps seeded batch
+    // requests deterministic without sharing mutable RNG state between them.
     let mut rng_state = seed.unwrap_or_else(|| {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64
     });
-
-    // Simple LCG PRNG for deterministic sampling with seed
-    let r = {
-        rng_state = rng_state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        (rng_state >> 33) as f32 / (u32::MAX as f32)
-    };
+    rng_state = rng_state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    let threshold = (rng_state >> 33) as f32 / (u32::MAX as f32);
 
     let mut cumulative = 0.0f32;
-    for (i, &p) in probs.iter().enumerate() {
-        cumulative += p;
-        if r <= cumulative {
-            return i as u32;
+    for (token, weight) in &weighted {
+        cumulative += *weight / total;
+        if threshold <= cumulative {
+            return *token as u32;
         }
     }
-
-    // Fallback to argmax
-    probs
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.total_cmp(b))
-        .map(|(idx, _)| idx as u32)
-        .unwrap_or(0)
+    weighted.last().map(|(idx, _)| *idx as u32).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1192,7 +1311,38 @@ mod tests {
     use super::*;
     use crate::scheduler::kv_hook::{InMemoryKvHook, KvHook};
     use crate::scheduler::paged_cache::{LongContextPolicy, PagedCacheConfig};
+    use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn batch_sampler_applies_top_k_penalties_and_logit_bias() {
+        let top_k = GenerationParams {
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: Some(1),
+            seed: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(sample_logits(&[10.0, 9.0, 8.0], Some(&top_k), &[]), 0);
+
+        let penalized = GenerationParams {
+            temperature: 0.0,
+            presence_penalty: 2.0,
+            frequency_penalty: 0.0,
+            ..Default::default()
+        };
+        // Token 0 falls below token 1 after its presence penalty.
+        assert_eq!(sample_logits(&[10.0, 9.0, 8.0], Some(&penalized), &[0]), 1);
+
+        let mut bias = BTreeMap::new();
+        bias.insert(2, 5.0);
+        let biased = GenerationParams {
+            temperature: 0.0,
+            logit_bias: Some(bias),
+            ..Default::default()
+        };
+        assert_eq!(sample_logits(&[1.0, 2.0, 1.5], Some(&biased), &[]), 2);
+    }
 
     #[test]
     fn batch_vocabulary_rows_remain_separate_during_prefill_and_decode() {

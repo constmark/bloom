@@ -162,6 +162,23 @@ pub(crate) fn select_backend_name(
             "mlx".to_string()
         } else if has_format(bloomai_core::ModelFormat::VulkanSpirv) {
             "vulkan".to_string()
+        } else if manifest
+            .runtime_hints
+            .preferred_backends
+            .iter()
+            .any(|backend| backend == "qwen3_vl")
+        {
+            "qwen3_vl".to_string()
+        } else if manifest
+            .runtime_hints
+            .preferred_backends
+            .iter()
+            .any(|backend| backend == "llamacpp")
+        {
+            // GGUF-only families without a Candle-native loader (Phi, Gemma 3,
+            // SmolLM3, Ministral, Granite and LFM2) are explicitly marked by
+            // manifest inference for the external llama.cpp bridge.
+            "llamacpp".to_string()
         } else if is_qwen_vl {
             "qwen3_vl".to_string()
         } else if matches!(&manifest.family, bloomai_core::ModelFamily::Custom(c) if c == "longcat-image-edit")

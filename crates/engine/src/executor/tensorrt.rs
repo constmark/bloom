@@ -76,11 +76,13 @@ impl CudaGraphManager {
         }
     }
 
-    /// Simulates capturing a forward pass as a CUDA Graph to avoid kernel launch overhead.
+    /// CUDA Graph capture is unavailable until the optional TensorRT runtime
+    /// is linked.  The default adapter is a package-validation skeleton and
+    /// must fail closed instead of reporting a simulated capture as usable.
     pub fn capture_pass(&mut self) -> Result<()> {
-        self.captured = true;
-        tracing::info!("CUDA Graph captured successfully for batch shapes.");
-        Ok(())
+        Err(anyhow!(
+            "CUDA Graph capture is unavailable in the TensorRT skeleton; link the optional TensorRT/TensorRT-LLM runtime"
+        ))
     }
 
     /// Replays the captured CUDA graph.
@@ -357,11 +359,12 @@ mod tests {
     fn test_cuda_graph_manager() {
         let mut manager = CudaGraphManager::new();
         assert!(!manager.is_captured());
-        manager.capture_pass().unwrap();
-        assert!(manager.is_captured());
+        let error = manager.capture_pass().unwrap_err().to_string();
+        assert!(error.contains("CUDA Graph capture is unavailable"));
+        assert!(!manager.is_captured());
         assert_eq!(manager.replay_count(), 0);
-        manager.replay_pass().unwrap();
-        assert_eq!(manager.replay_count(), 1);
+        assert!(manager.replay_pass().is_err());
+        assert_eq!(manager.replay_count(), 0);
     }
 
     #[test]

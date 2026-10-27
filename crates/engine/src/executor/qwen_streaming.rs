@@ -456,14 +456,59 @@ impl StreamingQwenAttention {
         let k = repeat_kv(k, self.num_kv_groups)?.contiguous()?;
         let v = repeat_kv(v, self.num_kv_groups)?.contiguous()?;
 
-        // 7. Attention score
+        // 7. Attention score.  The eager matmul/softmax path is kept for
+        // CPU, masked suffix-prefill, and builds without the optional flash
+        // attention feature.  Cold prefill and decode on CUDA/Metal use the
+        // fused kernel, which avoids materialising the score/probability
+        // matrices and is the main single-device attention fast path.
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
-        if let Some(m) = attn_mask {
-            scores = scores.broadcast_add(m)?;
-        }
-        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
-        let ctx = probs.matmul(&v)?;
+        let flash_eligible = {
+            #[cfg(feature = "flash-attn")]
+            {
+                (device.is_cuda() || device.is_metal()) && (attn_mask.is_none() || offset == 0)
+            }
+            #[cfg(not(feature = "flash-attn"))]
+            {
+                false
+            }
+        };
+        let ctx = if flash_eligible {
+            #[cfg(feature = "flash-attn")]
+            {
+                let q_flash = q.transpose(1, 2)?.contiguous()?;
+                let k_flash = k.transpose(1, 2)?.contiguous()?;
+                let v_flash = v.transpose(1, 2)?.contiguous()?;
+                match candle_flash_attn::flash_attn(
+                    &q_flash,
+                    &k_flash,
+                    &v_flash,
+                    scale as f32,
+                    l > 1,
+                ) {
+                    Ok(output) => output.transpose(1, 2)?,
+                    Err(error) => {
+                        tracing::debug!(%error, "flash attention unavailable for this Qwen shape; using eager attention");
+                        let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+                        if let Some(mask) = attn_mask {
+                            scores = scores.broadcast_add(mask)?;
+                        }
+                        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+                        probs.matmul(&v)?
+                    }
+                }
+            }
+            #[cfg(not(feature = "flash-attn"))]
+            {
+                unreachable!("flash attention eligibility is disabled without the feature")
+            }
+        } else {
+            let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+            if let Some(mask) = attn_mask {
+                scores = scores.broadcast_add(mask)?;
+            }
+            let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+            probs.matmul(&v)?
+        };
 
         // 8. Output proj
         let out = ctx

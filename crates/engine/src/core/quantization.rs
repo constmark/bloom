@@ -219,6 +219,26 @@ pub enum KvCacheDtype {
 }
 
 impl KvCacheDtype {
+    /// Resolve the runtime KV-cache storage format requested by the process.
+    ///
+    /// The paged cache currently has a native one-byte representation for
+    /// INT8/FP8-compatible storage.  FP8 is intentionally represented by the
+    /// checked INT8 payload until a device-native FP8 cache kernel is added;
+    /// callers still get the correct one-byte capacity accounting.
+    pub fn from_env() -> Self {
+        match std::env::var("BLOOM_KV_CACHE_DTYPE")
+            .ok()
+            .map(|value| value.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("f32") => Self::F32,
+            Some("bf16") => Self::BF16,
+            Some("int8" | "i8" | "q8") => Self::Int8,
+            Some("fp8" | "fp8_e4m3" | "fp8_e5m2" | "e4m3" | "e5m2") => Self::Fp8,
+            _ => Self::F16,
+        }
+    }
+
     /// Size in bytes of a single element.
     pub fn element_size(&self) -> usize {
         match self {
