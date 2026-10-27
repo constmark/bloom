@@ -26,7 +26,7 @@ or file detection alone does not mean that inference works.
 | Gemma, Mistral, and DeepSeek GGUF | Candle | `blocked` | Requires architecture-specific loaders |
 | FunASR and Qwen ASR | Python bridge | `external-runtime` | Requires the model-specific Python environment |
 | OpenVINO IR | OpenVINO | `external-runtime` | Requires OpenVINO and exported IR files |
-| GGUF fallback and MTP | llama.cpp | `external-runtime` | Launches a compatible `llama-server` |
+| GGUF fallback and MTP | llama.cpp | `external-runtime` | Launches a compatible `llama-server`; MTP requires GGUF next-n heads and `--spec-type draft-mtp` |
 | ONNX graph | ONNX Runtime adapter | `experimental` | Executes through the bundled Python `onnxruntime` bridge; install `onnxruntime` or `onnxruntime-gpu` |
 | TensorRT plan | TensorRT adapter | `skeleton` | Plan detection and diagnostics only |
 

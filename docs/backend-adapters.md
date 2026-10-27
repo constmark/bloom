@@ -77,6 +77,13 @@ cargo run --release --bin bloom_infer -- \
 `--speculative mtp` selects this adapter automatically and requires a
 `llama-server` that advertises `draft-mtp` support.
 
+Bloom's MTP support is provided by this adapter: the GGUF must contain the
+model's native next-token heads and the installed llama.cpp server must expose
+`--spec-type draft-mtp`. The Candle backend does not load MTP auxiliary heads;
+an explicitly selected Candle backend therefore fails during model loading
+with a remediation pointing to this adapter instead of silently running a
+different speculative strategy.
+
 ## Python-backed runtimes and probes
 
 MLX generation and Metal/MPS/CoreML diagnostics use a Python interpreter only

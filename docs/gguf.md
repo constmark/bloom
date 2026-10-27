@@ -139,6 +139,7 @@ Depending on the llama.cpp version, the binary path may be `build/bin/llama-quan
 | `llama-server not found` | The llama.cpp server was not found when using `--speculative mtp` | Set `BLOOM_LLAMA_CPP_SERVER=/path/to/llama-server`, or put a recent `llama-server` on PATH. |
 | `does not advertise speculative mode 'draft-mtp'` | llama.cpp is too old to support MTP speculative | Switch to a newer llama.cpp / LM Studio server build that supports `--spec-type draft-mtp`. |
 | `response did not confirm speculative mode` | The external server did not actually enable the requested speculative mode | Check whether the MTP GGUF contains next-n heads, whether `--speculative mtp` was passed, and the server logs. |
+| `speculative=mtp is unavailable in the Candle backend` | A native Candle/Safetensors load was requested, but Candle does not load auxiliary MTP heads | Use a GGUF containing next-n heads with a recent `llama-server`; Bloom will select the `llamacpp` adapter automatically when the backend is not explicit. |
 | OOM or insufficient VRAM | Context, batch, model size, or quantization scheme exceeds the device budget | Lower `--context-size` / `--max-tokens`, switch to a Q4/Q5/Q8 GGUF, or fall back to CPU. |
 | tokens/s far behind llama.cpp | Backend kernels, quantization type, or batch strategy not tuned for this device | Pin the same model and prompt with `scripts/compare_llamacpp.py` and record the differences. |
 

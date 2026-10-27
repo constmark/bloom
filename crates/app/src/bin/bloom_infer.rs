@@ -210,7 +210,8 @@ struct Args {
     #[arg(long)]
     gpu_layers: Option<usize>,
 
-    /// Speculative decoding mode: none, ngram, draft, mtp.
+    /// Speculative decoding mode: none, ngram, draft, or mtp. MTP uses the
+    /// external llama.cpp adapter when the backend is selected automatically.
     #[arg(long, default_value = "none")]
     speculative: String,
 

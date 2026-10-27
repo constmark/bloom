@@ -220,7 +220,8 @@ pub(crate) struct Args {
     )]
     pub staged_model_retention_seconds: u64,
 
-    /// Speculative decoding mode: none, ngram, or mtp (draft is not memory-safe yet).
+    /// Speculative decoding mode: none, ngram, or mtp. MTP is served by the
+    /// external llama.cpp adapter; draft-model speculation is not memory-safe yet.
     #[arg(long, default_value = "none")]
     pub speculative: String,
 

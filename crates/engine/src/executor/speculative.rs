@@ -736,6 +736,10 @@ pub enum SpeculativeMode {
         num_speculative: usize,
     },
     /// Native multi-token-prediction heads attached to the target model.
+    ///
+    /// The external llama.cpp adapter executes this mode today. Candle parses
+    /// the mode for routing and validation, but deliberately rejects it until
+    /// model-family-specific auxiliary-head loading is implemented.
     Mtp {
         /// Number of auxiliary future tokens to verify per step.
         num_speculative: usize,

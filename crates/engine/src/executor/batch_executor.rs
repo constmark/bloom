@@ -397,6 +397,20 @@ impl CandleBatchExecutor {
         params: &[GenerationParams],
         generated_tokens: &[Vec<u32>],
     ) -> Result<(Vec<u32>, Option<Vec<Vec<u32>>>)> {
+        #[cfg(test)]
+        let speculative_mode = match &self.speculative_mode {
+            Some(mode) => mode.clone(),
+            None => SpeculativeMode::from_env()?,
+        };
+        #[cfg(not(test))]
+        let speculative_mode = SpeculativeMode::from_env()?;
+
+        if matches!(speculative_mode, SpeculativeMode::Mtp { .. }) {
+            return Err(anyhow!(
+                "native MTP speculative decoding is unavailable in the Candle batch executor; use the llama.cpp backend with a GGUF model containing MTP/next-n heads"
+            ));
+        }
+
         let mut model_guard = self.model.lock().unwrap_or_else(|e| e.into_inner());
         let model = model_guard
             .as_mut()
@@ -449,14 +463,6 @@ impl CandleBatchExecutor {
         for _ in 0..tokens.len() {
             results.push(Mutex::new(None));
         }
-
-        #[cfg(test)]
-        let speculative_mode = match &self.speculative_mode {
-            Some(mode) => mode.clone(),
-            None => SpeculativeMode::from_env()?,
-        };
-        #[cfg(not(test))]
-        let speculative_mode = SpeculativeMode::from_env()?;
 
         std::thread::scope(|s| {
             for (i, &tok) in tokens.iter().enumerate() {
@@ -1947,6 +1953,37 @@ mod tests {
 
         assert_eq!(result.next_tokens, vec![11]);
         assert_eq!(result.speculative_tokens, Some(vec![vec![12, 13]]));
+    }
+
+    #[test]
+    fn mtp_batch_requests_fail_closed_instead_of_using_ngram() {
+        let forward_fn = Box::new(
+            |_input: &Tensor, _start_pos: usize, _handle: Option<usize>| -> Result<Tensor> {
+                panic!("MTP requests must be rejected before the model is called")
+            },
+        );
+        let executor = CandleBatchExecutor::new(forward_fn, Device::Cpu, 1, 1)
+            .with_speculative_mode(SpeculativeMode::Mtp { num_speculative: 2 });
+
+        let error = match executor.execute(ExecutionBatch {
+            phase: ExecutionPhase::Decode,
+            request_ids: vec!["mtp-request".to_string()],
+            tokens: vec![1],
+            cu_seqlens: vec![0, 1],
+            kv_handles: vec![1],
+            start_positions: vec![0],
+            params: vec![GenerationParams {
+                temperature: 0.0,
+                ..Default::default()
+            }],
+            generated_tokens: vec![vec![1, 2, 3]],
+        }) {
+            Ok(_) => panic!("the Candle batch path must not silently emulate native MTP"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("native MTP"));
+        assert!(error.to_string().contains("llama.cpp"));
     }
 
     /// Verify that `response_format = JsonObject` on the IFB hot path

@@ -24,8 +24,8 @@ use crate::{
 };
 
 use super::speculative::{
-    NGramStrategy, SpeculativeMode, SpeculativeStrategy, config_supports_mtp, verify_greedy_tokens,
-    verify_with_rejection_sampling,
+    NGramStrategy, SpeculativeMode, SpeculativeStrategy, config_supports_mtp,
+    speculative_mode_is_mtp, verify_greedy_tokens, verify_with_rejection_sampling,
 };
 
 /// Model type enum for supported variants
@@ -609,14 +609,25 @@ impl CandleEngine {
             ));
         };
 
+        // Native MTP heads are not part of Candle's model wrappers yet.  Keep
+        // this check at load time (rather than waiting for the first token) so
+        // an explicitly selected Candle backend cannot appear healthy and then
+        // fail during generation.  The automatic backend selector routes MTP
+        // requests to the llama.cpp adapter, which is the supported native
+        // MTP implementation today.
         if std::env::var("BLOOM_SPECULATIVE")
-            .map(|mode| matches!(mode.as_str(), "mtp" | "native-mtp" | "draft-mtp"))
+            .map(|mode| speculative_mode_is_mtp(&mode))
             .unwrap_or(false)
-            && config_supports_mtp(&config)
         {
+            let advertised = config_supports_mtp(&config);
+            let detail = if advertised {
+                "the model advertises MTP/next-n auxiliary heads, but Candle cannot load those heads yet"
+            } else {
+                "the model does not advertise MTP/next-n auxiliary heads"
+            };
             return Err(anyhow!(
-                "speculative=mtp was requested and this model advertises MTP/next-n heads, \
-                 but the current Candle backend cannot load native MTP auxiliary heads yet"
+                "speculative=mtp is unavailable in the Candle backend: {detail}; \
+                 use a GGUF model with a recent llama-server and the llamacpp backend"
             ));
         }
 
@@ -2773,17 +2784,10 @@ impl CandleTextModel {
         let mut prev_text = String::new();
         let mut next_token = 0;
         let speculative_mode = SpeculativeMode::from_env()?;
-        if matches!(speculative_mode, SpeculativeMode::Mtp { .. })
-            && !config_supports_mtp(&self.config)
-        {
-            return Err(anyhow!(
-                "speculative=mtp was requested, but model config does not advertise MTP/next-n heads"
-            ));
-        }
         if matches!(speculative_mode, SpeculativeMode::Mtp { .. }) {
             return Err(anyhow!(
-                "speculative=mtp was requested and the model advertises MTP metadata, \
-                 but the current Candle backend cannot read native MTP auxiliary logits yet"
+                "speculative=mtp is unavailable in the Candle backend; \
+                 use a GGUF model with a recent llama-server and the llamacpp backend"
             ));
         }
         let speculative_strategy: Option<Box<dyn SpeculativeStrategy>> = match speculative_mode {
