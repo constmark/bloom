@@ -414,7 +414,8 @@ template:
 | `best_of` | `1` |
 | `functions` | `[]` |
 | `function_call` | `"none"` |
-| `logprobs`, `store`, `echo` | `false` |
+| `logprobs`, `store` | `false` |
+| `echo` on legacy Completions | `false` or `true`; true prefixes each returned choice with its prompt and emits a prompt prefix chunk when streaming |
 | `frequency_penalty`, `presence_penalty` | Finite values from -2 through 2; applied to seen-token probabilities during native generation. |
 | `logit_bias` | `{}` or a bounded numeric token-bias map described below |
 | `metadata` | `{}` |
@@ -448,7 +449,7 @@ tokenization, or inference. Examples include a non-empty deprecated `functions`
 array on legacy Completions, a custom or built-in tool, an out-of-range `n`, an
 `n` greater than one combined with streaming, continuous batching, tools, or
 structured output, requested log probabilities, and
-`echo: true`. Unknown non-null fields follow the same fail-closed rule. Error text
+an unsupported active field. Unknown non-null fields follow the same fail-closed rule. Error text
 reports at most eight bounded safe field names and never echoes arbitrary large
 or control-bearing names.
 

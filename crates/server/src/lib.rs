@@ -3028,14 +3028,20 @@ mod tests {
 
         let completion_semantics = serde_json::from_value::<CompletionRequest>(json!({
             "prompt": "Hello",
-            "best_of": 2,
             "echo": true
         }))
         .unwrap();
+        helpers::validate_completion_request_compatibility(&completion_semantics).unwrap();
+        assert!(helpers::request_echo(&completion_semantics.extensions));
+        let unsupported_completion = serde_json::from_value::<CompletionRequest>(json!({
+            "prompt": "Hello",
+            "best_of": 2
+        }))
+        .unwrap();
         let completion_error =
-            helpers::validate_completion_request_compatibility(&completion_semantics).unwrap_err();
+            helpers::validate_completion_request_compatibility(&unsupported_completion)
+                .unwrap_err();
         assert!(completion_error.contains("best_of"));
-        assert!(completion_error.contains("echo"));
 
         let mut bounded = neutral;
         let oversized_field = "x".repeat(1_000);
@@ -8098,6 +8104,16 @@ mod tests {
         assert_eq!(body["model"], "not loaded");
         assert_eq!(body["runtime_pool"]["resident_generations"], 0);
         assert_eq!(body["runtime_pool"]["draining_generations"], 0);
+        assert_eq!(body["worker"]["protocol"]["name"], "elderwand-worker");
+        assert_eq!(body["worker"]["protocol"]["version"], 1);
+        assert_eq!(body["worker"]["lifecycle"], "unhealthy");
+        assert!(
+            body["worker"]["protocol"]["features"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|feature| feature == "multimodal_stream")
+        );
         assert_eq!(body["runtime_pool"]["draining_request_leases"], 0);
         assert!(body["runtime_memory_budget"]["host_limit_bytes"].is_u64());
         assert_eq!(body["runtime_memory_budget"]["host_committed_bytes"], 0);

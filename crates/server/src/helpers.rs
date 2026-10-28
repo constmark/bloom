@@ -205,7 +205,7 @@ pub(crate) fn validate_completion_request_compatibility(
     reject_non_neutral_extensions(
         "completion request",
         &request.extensions,
-        neutral_request_extension,
+        neutral_completion_extension,
     )
 }
 
@@ -301,6 +301,23 @@ fn neutral_request_extension(field: &str, value: &serde_json::Value) -> bool {
         }),
         _ => false,
     }
+}
+
+/// Legacy text Completions has one small compatibility feature that is useful
+/// to clients which still send prompt text back in the response: `echo`.
+/// Keep it scoped to that endpoint so Chat Completions cannot accidentally
+/// accept and silently ignore the same field.
+fn neutral_completion_extension(field: &str, value: &serde_json::Value) -> bool {
+    neutral_request_extension(field, value) || (field == "echo" && value.as_bool().is_some())
+}
+
+pub(crate) fn request_echo(
+    extensions: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> bool {
+    extensions
+        .get("echo")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// Parse the OpenAI `n` option for Chat/Completion requests.

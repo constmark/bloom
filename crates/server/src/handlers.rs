@@ -220,6 +220,38 @@ pub(crate) async fn handle_observability(
                 "decoding_queue": queue_stats.1,
                 "active_requests": queue_stats.2
             },
+            "worker": {
+                "protocol": {
+                    "name": "elderwand-worker",
+                    "version": 1,
+                    "features": [
+                        "chat_completions",
+                        "completions",
+                        "responses",
+                        "embeddings",
+                        "rerank",
+                        "multimodal_stream",
+                        "world_state",
+                        "kv_cache_stats",
+                        "model_management",
+                        "observability",
+                        "cancellation"
+                    ]
+                },
+                "lifecycle": if ready { "ready" } else { "unhealthy" },
+                "engine": "bloom",
+                "active_requests": queue_stats.2,
+                "pending_requests": queue_stats.0.saturating_add(queue_stats.1),
+                "max_concurrent_requests": 0,
+                "last_heartbeat_unix_ms": unix_millis(),
+                "generation": 1,
+                "models": if model_id == "not loaded" {
+                    Vec::<&str>::new()
+                } else {
+                    vec![model_id]
+                },
+                "backends": Vec::<&str>::new()
+            },
             "startup_memory_estimate": startup_memory_estimate,
             "kv_cache": {
                 "total_blocks": kv_metrics.total_blocks,
@@ -236,6 +268,14 @@ pub(crate) async fn handle_observability(
             "memory": memory,
         })),
     )
+}
+
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
 }
 
 // ─── /v1/kv-cache-stats ────────────────────────────────────────────────────
@@ -4089,6 +4129,7 @@ pub(crate) async fn handle_completions(
             );
         }
     };
+    let echo = request_echo(&payload.extensions);
     if choice_count > 1 && (payload.stream || state.app.enable_ifb) {
         return error_response(
             axum::http::StatusCode::BAD_REQUEST,
@@ -4298,7 +4339,9 @@ pub(crate) async fn handle_completions(
         .cloned()
         .map(|prompt| ModelInput::Text { prompt })
         .collect::<Vec<_>>();
-    let input = ModelInput::Text { prompt };
+    let input = ModelInput::Text {
+        prompt: prompt.clone(),
+    };
     let request_id = next_request_id(&state, "cmpl");
     let cancel_scheduler = if state.app.enable_ifb {
         scheduler_opt.clone()
@@ -4460,7 +4503,11 @@ pub(crate) async fn handle_completions(
                 "model": model_id,
                 "choices": [{
                     "index": 0,
-                    "text": generated_text,
+                    "text": if echo {
+                        format!("{prompt}{generated_text}")
+                    } else {
+                        generated_text
+                    },
                     "finish_reason": finish_reason
                 }],
                 "usage": {
@@ -4626,7 +4673,26 @@ pub(crate) async fn handle_completions(
         );
         let mut lifecycle_for_final = lifecycle.client_guard();
 
-        let final_stream = sse_stream
+        let echo_prefix_events = if echo {
+            let prefix_id = request_id.clone();
+            let prefix_model = model_id.clone();
+            let prefix_prompt = prompt.clone();
+            vec![Ok::<Event, std::convert::Infallible>(json_event(json!({
+                "id": prefix_id,
+                "object": "text_completion.chunk",
+                "created": unix_seconds(),
+                "model": prefix_model,
+                "choices": [{
+                    "index": 0,
+                    "text": prefix_prompt,
+                    "finish_reason": null
+                }]
+            })))]
+        } else {
+            Vec::new()
+        };
+        let final_stream = futures::stream::iter(echo_prefix_events)
+            .chain(sse_stream)
             .chain(flush_stream)
             .chain(futures::stream::once(async move {
                 if stream_failed_for_validation.load(Ordering::Acquire) {
@@ -4773,9 +4839,21 @@ pub(crate) async fn handle_completions(
             } else {
                 generation_finish_reason(output_tokens, max_tokens)
             };
+            let prompt_index = index / choice_count;
+            let response_text = if echo {
+                format!(
+                    "{}{generated_text}",
+                    prompts
+                        .get(prompt_index)
+                        .map(String::as_str)
+                        .unwrap_or_default()
+                )
+            } else {
+                generated_text
+            };
             choices.push(json!({
                 "index": index,
-                "text": generated_text,
+                "text": response_text,
                 "finish_reason": finish_reason
             }));
         }
@@ -4922,7 +5000,26 @@ pub(crate) async fn handle_completions(
     let final_model_id = model_id.clone();
     let mut lifecycle_for_final = lifecycle.client_guard();
 
-    let final_stream = sse_stream
+    let echo_prefix_events = if echo {
+        let prefix_id = request_id.clone();
+        let prefix_model = model_id.clone();
+        let prefix_prompt = prompt.clone();
+        vec![Ok::<Event, std::convert::Infallible>(json_event(json!({
+            "id": prefix_id,
+            "object": "text_completion.chunk",
+            "created": unix_seconds(),
+            "model": prefix_model,
+            "choices": [{
+                "index": 0,
+                "text": prefix_prompt,
+                "finish_reason": null
+            }]
+        })))]
+    } else {
+        Vec::new()
+    };
+    let final_stream = futures::stream::iter(echo_prefix_events)
+        .chain(sse_stream)
         .chain(futures::stream::once(async move {
             let text = {
                 let acc = accumulated_text_for_final

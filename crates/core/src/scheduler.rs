@@ -77,6 +77,13 @@ impl RequestClass {
 pub struct SchedulerConfig {
     pub max_concurrent_requests: usize,
     pub token_scheduling: TokenSchedulingConfig,
+    /// Queue aging quantum in milliseconds.  Every quantum spent waiting
+    /// lowers the effective class rank by one, preventing background work
+    /// from being starved by an endless stream of interactive requests.
+    pub aging_quantum_ms: u64,
+    /// Number of terminal outcomes retained for diagnostics.  A bounded
+    /// history keeps a long-running edge worker from growing without limit.
+    pub completed_retention: usize,
 }
 
 impl Default for SchedulerConfig {
@@ -85,6 +92,8 @@ impl Default for SchedulerConfig {
         Self {
             max_concurrent_requests: token_scheduling.budget().concurrent_segments,
             token_scheduling,
+            aging_quantum_ms: 1_000,
+            completed_retention: 1_024,
         }
     }
 }
@@ -183,6 +192,7 @@ struct SchedulerState {
     pending: VecDeque<QueuedInvocation>,
     active: HashMap<String, ActiveInvocation>,
     completed: HashMap<String, InvocationResult>,
+    completed_order: VecDeque<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,6 +201,9 @@ pub struct SchedulerSnapshot {
     pub active_count: usize,
     pub completed_count: usize,
     pub max_concurrent_requests: usize,
+    pub pending_tokens: usize,
+    pub active_tokens: usize,
+    pub oldest_pending_ms: u64,
 }
 
 /// Core dispatch scheduler. It owns queue ordering and request-level resource
@@ -315,17 +328,96 @@ impl CoreScheduler {
         if let Some(handle) = active.scheduled.cache_handle {
             self.resources.release_cache(handle.handle_id);
         }
-        state.completed.insert(request_id.to_string(), result);
+        self.remember_completed(&mut state, request_id.to_string(), result);
         Ok(())
+    }
+
+    /// Cancel a request that is waiting or currently active.
+    ///
+    /// Active work is removed from the dispatch table and its resource lease
+    /// is released.  The concrete engine is expected to observe the same
+    /// request id through its cancellation channel; this method makes the
+    /// scheduler's view linearizable and prevents a cancelled request from
+    /// consuming admission capacity forever.
+    pub fn cancel(&self, request_id: &str) -> Result<bool, BloomError> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = state
+            .pending
+            .iter()
+            .position(|queued| queued.request.request_id == request_id)
+        {
+            let queued = state
+                .pending
+                .remove(index)
+                .expect("pending position must remain valid under the scheduler lock");
+            if let Some(handle) = queued.cache_handle {
+                self.resources.release_cache(handle.handle_id);
+            }
+            self.remember_completed(
+                &mut state,
+                request_id.to_string(),
+                InvocationResult::Cancelled,
+            );
+            return Ok(true);
+        }
+
+        if let Some(active) = state.active.remove(request_id) {
+            if let Some(handle) = active.scheduled.cache_handle {
+                self.resources.release_cache(handle.handle_id);
+            }
+            self.remember_completed(
+                &mut state,
+                request_id.to_string(),
+                InvocationResult::Cancelled,
+            );
+            return Ok(true);
+        }
+
+        Ok(false)
     }
 
     pub fn snapshot(&self) -> SchedulerSnapshot {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let pending_tokens = state
+            .pending
+            .iter()
+            .map(|queued| queued.request.token_cost())
+            .sum();
+        let active_tokens = state
+            .active
+            .values()
+            .map(|active| active.scheduled.token_cost)
+            .sum();
+        let oldest_pending_ms = state
+            .pending
+            .iter()
+            .map(|queued| queued.queued_at.elapsed().as_millis() as u64)
+            .max()
+            .unwrap_or(0);
         SchedulerSnapshot {
             pending_count: state.pending.len(),
             active_count: state.active.len(),
             completed_count: state.completed.len(),
             max_concurrent_requests: self.config.max_concurrent_requests,
+            pending_tokens,
+            active_tokens,
+            oldest_pending_ms,
+        }
+    }
+
+    fn remember_completed(
+        &self,
+        state: &mut SchedulerState,
+        request_id: String,
+        result: InvocationResult,
+    ) {
+        state.completed.insert(request_id.clone(), result);
+        state.completed_order.push_back(request_id);
+        while state.completed.len() > self.config.completed_retention {
+            let Some(oldest) = state.completed_order.pop_front() else {
+                break;
+            };
+            state.completed.remove(&oldest);
         }
     }
 
@@ -342,10 +434,8 @@ impl CoreScheduler {
             .collect::<Vec<_>>();
 
         candidates.sort_by(|(_, a), (_, b)| {
-            a.request
-                .class
-                .rank()
-                .cmp(&b.request.class.rank())
+            self.effective_class_rank(a)
+                .cmp(&self.effective_class_rank(b))
                 .then_with(|| b.request.priority.cmp(&a.request.priority))
                 .then_with(|| a.seq.cmp(&b.seq))
         });
@@ -360,6 +450,12 @@ impl CoreScheduler {
             }
         }
         None
+    }
+
+    fn effective_class_rank(&self, queued: &QueuedInvocation) -> u8 {
+        let quantum = self.config.aging_quantum_ms.max(1);
+        let boost = (queued.queued_at.elapsed().as_millis() as u64 / quantum) as u8;
+        queued.request.class.rank().saturating_sub(boost)
     }
 
     fn backend_is_eligible(
@@ -514,5 +610,85 @@ mod tests {
         let snapshot = resources.snapshot();
         assert_eq!(snapshot.cache_count, 0);
         assert_eq!(snapshot.ram_allocated, 0);
+    }
+
+    #[test]
+    fn cancellation_releases_pending_cache_and_records_terminal_state() {
+        let resources = Arc::new(ResourceCoordinator::new(
+            1024,
+            1024,
+            MemoryTopology::Unified,
+        ));
+        let scheduler = CoreScheduler::new(SchedulerConfig::default(), Arc::clone(&resources));
+        let mut request =
+            InvocationRequest::for_language_model("cancel-me", "m", ticket("m"), 8, 8);
+        request.cache_bytes = 128;
+        scheduler.submit(request).unwrap();
+        assert_eq!(resources.snapshot().cache_count, 1);
+        assert!(scheduler.cancel("cancel-me").unwrap());
+        assert!(!scheduler.cancel("cancel-me").unwrap());
+        assert_eq!(resources.snapshot().cache_count, 0);
+        let snapshot = scheduler.snapshot();
+        assert_eq!(snapshot.pending_count, 0);
+        assert_eq!(snapshot.completed_count, 1);
+    }
+
+    #[test]
+    fn queue_aging_prevents_background_starvation() {
+        let scheduler = CoreScheduler::new(
+            SchedulerConfig {
+                max_concurrent_requests: 1,
+                aging_quantum_ms: 1,
+                ..Default::default()
+            },
+            Arc::new(ResourceCoordinator::new(
+                1024,
+                1024,
+                MemoryTopology::Unified,
+            )),
+        );
+        let mut background =
+            InvocationRequest::for_language_model("background", "m", ticket("m"), 8, 8);
+        background.class = RequestClass::BackgroundBatch;
+        scheduler.submit(background).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        let mut foreground =
+            InvocationRequest::for_language_model("foreground", "m", ticket("m"), 8, 8);
+        foreground.class = RequestClass::ForegroundInteractive;
+        scheduler.submit(foreground).unwrap();
+        let ready = scheduler.next_ready(&[capability()]).unwrap();
+        assert_eq!(ready[0].request_id, "background");
+    }
+
+    #[test]
+    fn completed_history_is_bounded() {
+        let scheduler = CoreScheduler::new(
+            SchedulerConfig {
+                max_concurrent_requests: 1,
+                completed_retention: 1,
+                ..Default::default()
+            },
+            Arc::new(ResourceCoordinator::new(
+                1024,
+                1024,
+                MemoryTopology::Unified,
+            )),
+        );
+        for id in ["one", "two"] {
+            scheduler
+                .submit(InvocationRequest::for_language_model(
+                    id,
+                    "m",
+                    ticket("m"),
+                    1,
+                    1,
+                ))
+                .unwrap();
+            let ready = scheduler.next_ready(&[capability()]).unwrap();
+            scheduler
+                .complete(&ready[0].request_id, InvocationResult::Success)
+                .unwrap();
+        }
+        assert_eq!(scheduler.snapshot().completed_count, 1);
     }
 }
