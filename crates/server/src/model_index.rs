@@ -801,13 +801,17 @@ fn validate_remote_index_url(url: &Url, policy: &ModelIndexUrlPolicy) -> Result<
     let host = url
         .host_str()
         .ok_or_else(|| anyhow!("model index URL must include a host"))?
+        // `Url::host_str()` preserves brackets around IPv6 literals. Strip
+        // them before IP parsing so bracketed loopback/private targets cannot
+        // bypass the literal-address SSRF policy.
+        .trim_start_matches('[')
+        .trim_end_matches(']')
         .to_ascii_lowercase();
     // A configured index may be refreshed repeatedly and follows redirects. Reject
     // literal private/link-local/multicast addresses at every hop so a public index
     // cannot turn the refresh client into an internal-network SSRF primitive. The
     // loopback exception remains available to the in-process test policy only.
-    if is_restricted_index_host(&host)
-        && !(policy.allow_loopback && is_loopback_index_host(&host))
+    if is_restricted_index_host(&host) && !(policy.allow_loopback && is_loopback_index_host(&host))
     {
         return Err(anyhow!(
             "model index URL must not target a loopback, private, link-local, or multicast host"
@@ -819,12 +823,10 @@ fn validate_remote_index_url(url: &Url, policy: &ModelIndexUrlPolicy) -> Result<
 fn is_loopback_index_host(host: &str) -> bool {
     let host = host.trim_end_matches('.');
     host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<IpAddr>()
-            .is_ok_and(|address| match address {
-                IpAddr::V4(address) => address.octets()[0] == 127,
-                IpAddr::V6(address) => address == Ipv6Addr::LOCALHOST,
-            })
+        || host.parse::<IpAddr>().is_ok_and(|address| match address {
+            IpAddr::V4(address) => address.octets()[0] == 127,
+            IpAddr::V6(address) => address == Ipv6Addr::LOCALHOST,
+        })
 }
 
 fn is_restricted_index_host(host: &str) -> bool {

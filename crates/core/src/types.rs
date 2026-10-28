@@ -304,7 +304,7 @@ impl GenerationParams {
         if !self.temperature.is_finite() || !(0.0..=2.0).contains(&self.temperature) {
             return Err("temperature must be finite and between 0 and 2".to_string());
         }
-        if !self.top_p.is_finite() || !(0.0 < self.top_p && self.top_p <= 1.0) {
+        if !(self.top_p.is_finite() && 0.0 < self.top_p && self.top_p <= 1.0) {
             return Err("top_p must be finite, greater than 0, and at most 1".to_string());
         }
         if self.top_k == Some(0) {

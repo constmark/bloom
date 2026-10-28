@@ -33,6 +33,26 @@ impl OutputSink for ValidatingOutputSink<'_> {
     }
 }
 
+impl ValidatingOutputSink<'_> {
+    /// Complete the stream contract after the backend returns.
+    ///
+    /// Backends are allowed to emit chunks synchronously, but the terminal
+    /// `End` event is part of the engine protocol.  Without this check a
+    /// backend that returns `Ok(())` after a partial stream would make an
+    /// external scheduler believe the request completed and could leave a
+    /// request lease/KV allocation live indefinitely.
+    fn finish(&self) -> Result<()> {
+        if self.ended {
+            Ok(())
+        } else {
+            Err(
+                BloomError::Engine("backend completed without a terminal output event".to_string())
+                    .into(),
+            )
+        }
+    }
+}
+
 /// Default context size used for memory pre-checks when none is specified.
 const DEFAULT_CONTEXT_SIZE: usize = 2048;
 
@@ -418,7 +438,9 @@ impl InferencePipeline {
             inner: sink,
             ended: false,
         };
-        self.model.infer_stream(input, params, &mut validating_sink)
+        self.model
+            .infer_stream(input, params, &mut validating_sink)?;
+        validating_sink.finish()
     }
 
     /// Whether the loaded model has a native embedding-batch execution path.
@@ -465,7 +487,8 @@ impl InferencePipeline {
             inner: sink,
             ended: false,
         };
-        self.model.infer_request(request, &mut validating_sink)
+        self.model.infer_request(request, &mut validating_sink)?;
+        validating_sink.finish()
     }
 
     pub fn metadata(&self) -> &crate::ModelMetadata {
@@ -579,6 +602,40 @@ mod tests {
         Arc,
         atomic::{AtomicBool, Ordering},
     };
+
+    #[test]
+    fn validating_stream_requires_terminal_event() {
+        let mut received = Vec::new();
+        let mut sink = ValidatingOutputSink {
+            inner: &mut |chunk| {
+                received.push(chunk);
+                Ok(())
+            },
+            ended: false,
+        };
+        sink.on_chunk(OutputChunk::TextDelta("partial".to_string()))
+            .unwrap();
+        let error = sink.finish().unwrap_err().to_string();
+        assert!(error.contains("without a terminal output event"));
+        assert_eq!(received.len(), 1);
+    }
+
+    #[test]
+    fn validating_stream_accepts_one_terminal_event_and_rejects_followup_chunks() {
+        let mut received = Vec::new();
+        let mut sink = ValidatingOutputSink {
+            inner: &mut |chunk| {
+                received.push(chunk);
+                Ok(())
+            },
+            ended: false,
+        };
+        sink.on_chunk(OutputChunk::End).unwrap();
+        sink.finish().unwrap();
+        let error = sink.on_chunk(OutputChunk::TextDelta("late".to_string()));
+        assert!(error.is_err());
+        assert_eq!(received.len(), 1);
+    }
 
     #[test]
     fn sentence_encoder_context_prefers_task_limit_over_architecture_capacity() {

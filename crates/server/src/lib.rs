@@ -4468,6 +4468,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_catalog_resolves_catalog_id_for_an_external_startup_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, _receiver) = test_server_state(temp.path().to_path_buf());
+        let runtime = test_text_runtime(temp.path().join("tiny.gguf"), Arc::new(AtomicU64::new(0)));
+        assert!(
+            state
+                .app
+                .runtime_pool
+                .write()
+                .await
+                .publish_default(runtime)
+                .is_empty()
+        );
+        state.app.ready.store(true, Ordering::Release);
+
+        let response = handle_model_catalog(State(state)).await;
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["active_model"]["catalog_id"], "tiny.gguf");
+        assert_eq!(body["active_model"]["source"], "catalog");
+    }
+
+    #[tokio::test]
     async fn backends_endpoint_includes_physical_device_probe_results() {
         let temp = tempfile::tempdir().unwrap();
         let (state, _receiver) = test_server_state(temp.path().to_path_buf());
@@ -8830,6 +8857,33 @@ mod tests {
         let queued = receiver.recv().await.unwrap();
         assert_eq!(queued.path, model_path.canonicalize().unwrap());
         assert_eq!(queued.catalog_id.as_deref(), Some("tiny"));
+    }
+
+    #[tokio::test]
+    async fn repeated_model_switch_joins_the_same_inflight_load() {
+        let temp = tempfile::tempdir().unwrap();
+        write_test_model_manifest(temp.path(), "tiny");
+        let (state, mut receiver) = test_server_state(temp.path().to_path_buf());
+
+        let first = handle_model_switch(
+            State(Arc::clone(&state)),
+            Json(ModelSwitchRequest {
+                id: "tiny".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(first.status(), axum::http::StatusCode::ACCEPTED);
+
+        let second = handle_model_switch(
+            State(Arc::clone(&state)),
+            Json(ModelSwitchRequest {
+                id: "tiny".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(second.status(), axum::http::StatusCode::ACCEPTED);
+        assert!(receiver.try_recv().is_ok());
+        assert!(receiver.try_recv().is_err());
     }
 
     #[tokio::test]

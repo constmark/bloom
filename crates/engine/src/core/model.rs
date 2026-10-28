@@ -72,6 +72,9 @@ pub trait LoadedModel: Send + Sync {
         params: &GenerationParams,
         sink: &mut dyn OutputSink,
     ) -> Result<()> {
+        // Implementations must emit exactly one terminal `OutputChunk::End`
+        // before returning `Ok(())`.  `InferencePipeline` enforces this at the
+        // boundary so schedulers can release request ownership deterministically.
         let output = self.infer(input, params)?;
         output.validate().map_err(BloomError::InvalidInput)?;
         if let Some(text) = output.text {

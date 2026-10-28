@@ -314,7 +314,10 @@ impl LlamaCppModel {
                 self.spec_type
             );
         }
-        Ok(())
+        // The llama-server wire stream has no Bloom-native terminal chunk.
+        // Emit one after the process stream has been fully consumed so the
+        // pipeline can uphold the same completion contract as native models.
+        sink.on_chunk(OutputChunk::End)
     }
 
     fn validate_speculative_response(&self, response: &serde_json::Value) -> Result<()> {

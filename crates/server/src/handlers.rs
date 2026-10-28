@@ -20,6 +20,20 @@ fn encoder_model_generation_response(model_id: &str) -> axum::response::Response
     )
 }
 
+fn kv_utilization(metrics: &bloomai_engine::KvCacheMetrics) -> f64 {
+    if metrics.total_blocks == 0 {
+        return 0.0;
+    }
+    // Treat malformed telemetry as exhausted/empty rather than allowing a
+    // corrupt free-block count to underflow a release build.  Cache metrics
+    // are an observability surface and must never take the server down while
+    // an external scheduler is polling them.
+    let allocated = metrics
+        .total_blocks
+        .saturating_sub(metrics.free_blocks.min(metrics.total_blocks));
+    (allocated as f64 / metrics.total_blocks as f64).clamp(0.0, 1.0)
+}
+
 pub(crate) async fn handle_health(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
     let in_flight = state
         .app
@@ -116,11 +130,7 @@ pub(crate) async fn handle_observability(
             bloomai_engine::KvCacheMetrics::default()
         }
     };
-    let kv_utilization = if kv_metrics.total_blocks > 0 {
-        (kv_metrics.total_blocks - kv_metrics.free_blocks) as f64 / kv_metrics.total_blocks as f64
-    } else {
-        0.0
-    };
+    let kv_utilization = kv_utilization(&kv_metrics);
     let queue_stats = {
         if let Some(scheduler) = runtime
             .as_ref()
@@ -244,11 +254,7 @@ pub(crate) async fn handle_kv_cache_stats(
             bloomai_engine::KvCacheMetrics::default()
         }
     };
-    let utilization = if kv_metrics.total_blocks > 0 {
-        (kv_metrics.total_blocks - kv_metrics.free_blocks) as f64 / kv_metrics.total_blocks as f64
-    } else {
-        0.0
-    };
+    let utilization = kv_utilization(&kv_metrics);
     let cachemesh = runtime
         .as_ref()
         .and_then(|runtime| runtime.cachemesh.as_ref())
@@ -392,16 +398,22 @@ pub(crate) async fn handle_model_delete(
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ModelSwitchRequest {
+    /// `id` is the canonical selector.  Accept `model` as an additive alias
+    /// so an Elderwand controller can use the same control payload for an
+    /// embedded Bloom runtime and a remote Bloom worker.
+    #[serde(alias = "model")]
     pub(crate) id: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ModelPreflightRequest {
+    #[serde(alias = "model")]
     pub(crate) id: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ModelRemoveRequest {
+    #[serde(alias = "model")]
     pub(crate) id: String,
 }
 
@@ -452,6 +464,7 @@ impl ModelRemovalError {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ModelIntegrityRequest {
+    #[serde(alias = "model")]
     pub(crate) id: String,
 }
 
@@ -487,10 +500,34 @@ pub(crate) async fn handle_model_catalog(
         "idle"
     };
     let active_model = runtime.as_ref().map(|runtime| {
+        // A model started with `--model /path/to/foo.gguf` has no catalog ID
+        // on its runtime because it was loaded as an external source.  If
+        // that source is also a direct catalog entry, expose the catalog
+        // selector in the control-plane snapshot so an Elderwand controller
+        // can confirm a switch by ID instead of timing out on an internal
+        // model ID that may differ from the filename.
+        let catalog_id = runtime.catalog_id.clone().or_else(|| {
+            catalog.models.iter().find_map(|entry| {
+                if !entry.active {
+                    return None;
+                }
+                let candidate = Path::new(&catalog.root).join(&entry.id);
+                candidate
+                    .canonicalize()
+                    .ok()
+                    .filter(|path| path == &runtime.source_path)
+                    .map(|_| entry.id.clone())
+            })
+        });
+        let source = if catalog_id.is_some() {
+            "catalog"
+        } else {
+            "external"
+        };
         json!({
             "id": runtime.model_id,
-            "catalog_id": runtime.catalog_id,
-            "source": if runtime.catalog_id.is_some() { "catalog" } else { "external" },
+            "catalog_id": catalog_id,
+            "source": source,
             "input_modalities": runtime.input_modalities
         })
     });
@@ -1736,7 +1773,11 @@ pub(crate) async fn handle_model_switch(
 
     match state
         .app
-        .admit_model_load(path, Some(model_id.clone()), false)
+        // Repeated control-plane switches for the same source join the
+        // in-flight load.  This makes retries from an Elderwand controller
+        // idempotent while a switch for a different source still receives a
+        // lifecycle-busy conflict.
+        .admit_model_load(path, Some(model_id.clone()), true)
         .await
     {
         Ok(ModelLoadAdmission::AlreadyReady { .. }) => Json(json!({
@@ -5909,5 +5950,54 @@ mod tests {
         let payload = stream_error_payload("tokenization_error", "decoder failed");
         assert_eq!(payload["error"]["type"], "tokenization_error");
         assert_eq!(payload["error"]["message"], "decoder failed");
+    }
+
+    #[test]
+    fn model_lifecycle_requests_accept_shared_model_selector_alias() {
+        let switch: ModelSwitchRequest = serde_json::from_value(serde_json::json!({
+            "model": "small"
+        }))
+        .unwrap();
+        let preflight: ModelPreflightRequest = serde_json::from_value(serde_json::json!({
+            "model": "small"
+        }))
+        .unwrap();
+        let remove: ModelRemoveRequest = serde_json::from_value(serde_json::json!({
+            "model": "small"
+        }))
+        .unwrap();
+        let integrity: ModelIntegrityRequest = serde_json::from_value(serde_json::json!({
+            "model": "small"
+        }))
+        .unwrap();
+
+        assert_eq!(switch.id, "small");
+        assert_eq!(preflight.id, "small");
+        assert_eq!(remove.id, "small");
+        assert_eq!(integrity.id, "small");
+    }
+
+    #[test]
+    fn kv_utilization_fails_closed_for_malformed_free_block_counts() {
+        assert_eq!(
+            kv_utilization(&bloomai_engine::KvCacheMetrics::default()),
+            0.0
+        );
+        assert_eq!(
+            kv_utilization(&bloomai_engine::KvCacheMetrics {
+                total_blocks: 4,
+                free_blocks: 2,
+                ..Default::default()
+            }),
+            0.5
+        );
+        assert_eq!(
+            kv_utilization(&bloomai_engine::KvCacheMetrics {
+                total_blocks: 4,
+                free_blocks: 9,
+                ..Default::default()
+            }),
+            0.0
+        );
     }
 }
