@@ -12,6 +12,8 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 pub(crate) struct ChildGuard {
     child: Child,
     reaped: bool,
+    #[cfg(unix)]
+    process_group: Option<libc::pid_t>,
 }
 
 /// Write a request to a spawned inference process while preserving ownership
@@ -40,7 +42,45 @@ impl ChildGuard {
                 .spawn()
                 .context("failed to spawn inference process")?,
             reaped: false,
+            #[cfg(unix)]
+            process_group: None,
         })
+    }
+
+    fn spawn_bounded(command: &mut Command) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let child = Self::spawn(command)?;
+        #[cfg(unix)]
+        {
+            let mut child = child;
+            child.process_group = Some(child.id() as libc::pid_t);
+            Ok(child)
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(child)
+        }
+    }
+
+    fn kill(&mut self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        if let Some(group) = self.process_group {
+            // SAFETY: spawn_bounded created a separate process group whose
+            // positive ID is the child PID. A negative PID targets only that
+            // group, including descendants holding inherited pipe handles.
+            if unsafe { libc::kill(-group, libc::SIGKILL) } == 0 {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error);
+            }
+        }
+        self.child.kill()
     }
 
     pub(crate) fn wait(&mut self) -> std::io::Result<ExitStatus> {
@@ -77,7 +117,7 @@ impl DerefMut for ChildGuard {
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         if !self.reaped {
-            let _ = self.child.kill();
+            let _ = self.kill();
             let _ = self.child.wait();
         }
     }
@@ -145,7 +185,9 @@ pub(crate) struct BoundedProcessOutput {
 /// If `request` is empty, stdin is closed before waiting. Otherwise it is
 /// written on a worker thread so a child that stops consuming input remains
 /// interruptible by `timeout`. The process is killed and reaped on timeout or
-/// polling failure, and all pipe readers are joined before returning.
+/// polling failure, and all pipe readers are joined before returning. On Unix,
+/// the bounded worker owns a process group so descendants cannot keep its
+/// inherited pipes open after timeout. Pipe draining shares the same deadline.
 pub(crate) fn run_bounded_output(
     command: &mut Command,
     request: &[u8],
@@ -153,7 +195,7 @@ pub(crate) fn run_bounded_output(
     stderr_limit: usize,
     timeout: Duration,
 ) -> Result<BoundedProcessOutput> {
-    let mut child = ChildGuard::spawn(command)?;
+    let mut child = ChildGuard::spawn_bounded(command)?;
     let stdout = child
         .stdout
         .take()
@@ -181,13 +223,28 @@ pub(crate) fn run_bounded_output(
         Some(thread::spawn(move || stdin.write_all(&request)))
     };
 
+    let mut exit_status = None;
     let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => {
-                thread::sleep(Duration::from_millis(10));
-            }
-            Ok(None) => {
+        let polled = match exit_status {
+            Some(status) => Ok(Some(status)),
+            None => child.try_wait(),
+        };
+        match polled {
+            Ok(status) => {
+                exit_status = status;
+                if let Some(status) = status
+                    && stdout_reader.is_finished()
+                    && stderr_reader.is_finished()
+                    && stdin_writer
+                        .as_ref()
+                        .is_none_or(|writer| writer.is_finished())
+                {
+                    break status;
+                }
+                if Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
                 let _ = child.kill();
                 let _ = child.wait();
                 discard_process_threads(stdout_reader, stderr_reader, stdin_writer);
@@ -305,6 +362,32 @@ mod tests {
         let (bytes, exceeded) = read_bounded("abc".as_bytes(), 3).unwrap();
         assert_eq!(bytes, b"abc");
         assert!(!exceeded);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_timeout_closes_descendant_pipes_even_after_parent_exit() {
+        for script in ["sleep 30 <&0 & wait", "sleep 30 <&0 & exit 0"] {
+            let mut command = Command::new("sh");
+            command
+                .args(["-c", script])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let started = Instant::now();
+            // The unread request also exercises cancellation of a blocked
+            // stdin writer while descendants retain all three pipe handles.
+            let error = run_bounded_output(
+                &mut command,
+                &vec![b'x'; 1024 * 1024],
+                16,
+                16,
+                Duration::from_secs(1),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("timed out after 1 seconds"));
+            assert!(started.elapsed() < Duration::from_secs(5));
+        }
     }
 
     #[cfg(unix)]
