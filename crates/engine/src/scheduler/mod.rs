@@ -614,6 +614,9 @@ impl KvCachePool for BloomKvCachePool {
     fn free(&self, handle: usize) {
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if !state.handle_to_request_id.contains_key(&handle) {
+                return;
+            }
             if let Some(request_id) = state.handle_to_request_id.remove(&handle) {
                 // `free` is the terminal release path. The request record is
                 // retained as an inactive prefix-cache entry, but neither
@@ -659,7 +662,10 @@ impl KvCachePool for BloomKvCachePool {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut evicted_blocks = Vec::new();
 
-        if state.active_requests.contains_key(request_id) {
+        // free_paged is a temporary release: its live handle may resume.
+        // free(handle) is terminal: its inactive prefix record can be replaced
+        // only after the new allocation has pinned any reusable blocks.
+        if state.request_id_to_handle.contains_key(request_id) {
             let handle = state
                 .request_id_to_handle
                 .get(request_id)
@@ -703,6 +709,9 @@ impl KvCachePool for BloomKvCachePool {
             .len()
             .checked_add(max_new_tokens)
             .ok_or_else(|| BloomError::SchedulingFailed("KV token count overflows usize".into()))?;
+        let next_handle = state.next_handle.checked_add(1).ok_or_else(|| {
+            BloomError::SchedulingFailed("KV cache handle sequence exhausted".into())
+        })?;
         let needed_blocks = total_tokens.div_ceil(self.block_size);
         let num_prompt_blocks = prompt_tokens.len() / self.block_size;
         let mut reused_blocks = Vec::new();
@@ -888,8 +897,31 @@ impl KvCachePool for BloomKvCachePool {
         let mut final_prefixes = reused_prefixes;
         final_prefixes.extend(new_prefixes);
 
+        if let Some(retired) = state.active_requests.remove(request_id) {
+            // Replacement of a terminal ID must relinquish exactly the old
+            // record's references. Shared/pinned prefixes remain allocated.
+            for (block_id, prefix) in retired.blocks.iter().zip(&retired.prefixes) {
+                let release = state
+                    .block_ref_counts
+                    .get_mut(block_id)
+                    .is_some_and(|count| {
+                        *count = count.saturating_sub(1);
+                        *count == 0
+                    });
+                if release {
+                    state.block_ref_counts.remove(block_id);
+                    if state.block_table.get(prefix) == Some(block_id) {
+                        state.block_table.remove(prefix);
+                    }
+                    state.free_blocks.push_back(*block_id);
+                    evicted_blocks.push(*block_id);
+                }
+            }
+        }
+        state.lru_list.retain(|id| id != request_id);
+
         let handle = state.next_handle;
-        state.next_handle += 1;
+        state.next_handle = next_handle;
         state
             .handle_to_request_id
             .insert(handle, request_id.to_string());
@@ -1588,6 +1620,8 @@ pub struct InferenceScheduler {
     /// Serializes allocation/prefix restoration, batch construction/execution,
     /// and cancellation so KV storage cannot change underneath an executor.
     execution_gate: Mutex<()>,
+    /// Admitted identities, independent of queue placement; guarded by execution_gate.
+    live_request_ids: Mutex<HashSet<RequestId>>,
     prefill_queue: Mutex<VecDeque<ScheduledRequest>>,
     decoding_queue: Mutex<VecDeque<ScheduledRequest>>,
     active_requests: Mutex<HashMap<RequestId, ScheduledRequest>>,
@@ -1647,6 +1681,7 @@ impl InferenceScheduler {
         Self {
             executor,
             execution_gate: Mutex::new(()),
+            live_request_ids: Mutex::new(HashSet::new()),
             prefill_queue: Mutex::new(VecDeque::new()),
             decoding_queue: Mutex::new(VecDeque::new()),
             active_requests: Mutex::new(HashMap::new()),
@@ -1747,6 +1782,10 @@ impl InferenceScheduler {
 
     /// Cancel while the caller already owns `execution_gate`.
     fn cancel_request_inner(&self, request_id: &str) -> bool {
+        self.live_request_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(request_id);
         // A response body can disappear independently of queue ownership. Drop
         // the client sender first so cancellation never leaves an orphaned
         // channel registration, including races before or after scheduling.
@@ -1887,8 +1926,25 @@ impl InferenceScheduler {
             .unwrap_or_else(|e| e.into_inner());
         self.drain_busy_cancellations();
         let request_id = request.id.clone();
+        // Reject before allocation or failure cleanup: both the handle and
+        // channel registration still belong to the previously admitted owner.
+        if !self
+            .live_request_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(request_id.clone())
+        {
+            return Err(BloomError::SchedulingFailed(format!(
+                "request {request_id} is already scheduled"
+            ))
+            .into());
+        }
         let result = self.submit_inner(request);
         if result.is_err() {
+            self.live_request_ids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&request_id);
             self.clear_prefill_reuse(&request_id);
             self.token_senders
                 .lock()
@@ -2043,6 +2099,10 @@ impl InferenceScheduler {
         // gate, so release the just-created allocation before publishing the
         // request into a scheduler queue.
         if self.take_busy_cancellation(&request.id) {
+            self.live_request_ids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&request.id);
             self.clear_prefill_reuse(&request.id);
             if let Some(handle) = request.kv_handle.take() {
                 self.kv_pool.free(handle);
@@ -2845,6 +2905,10 @@ impl InferenceScheduler {
 
                 if is_finished {
                     req.state = RequestState::Finished;
+                    self.live_request_ids
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(id);
                     if let Some(handle) = req.kv_handle {
                         self.kv_pool.free(handle);
                     }

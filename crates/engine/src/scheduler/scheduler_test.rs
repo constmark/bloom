@@ -596,6 +596,223 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_submission_preserves_owner_and_terminal_id_can_be_reused() {
+        for chunked in [false, true] {
+            let pool = Arc::new(BloomKvCachePool::new(4, 8));
+            let mut config = CoreTokenSchedulingConfig::default();
+            config.chunked_prefill.enabled = chunked;
+            let scheduler =
+                InferenceScheduler::with_config(Arc::new(MockExecutor), pool.clone(), config);
+            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+            scheduler
+                .token_senders
+                .lock()
+                .unwrap()
+                .insert("identity".into(), sender);
+            let mut original = request_for_cleanup("identity");
+            original.params.max_tokens = 2;
+            scheduler.submit(original).unwrap();
+            let handle = pool.state.lock().unwrap().request_id_to_handle["identity"];
+            for phase in 0..2 {
+                let before = scheduler.queue_stats();
+                let mut duplicate = request_for_cleanup("identity");
+                duplicate.prompt_tokens.clear();
+                assert!(
+                    scheduler
+                        .submit(duplicate)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("already scheduled")
+                );
+                assert_eq!(scheduler.queue_stats(), before);
+                assert_eq!(
+                    pool.state.lock().unwrap().request_id_to_handle["identity"],
+                    handle
+                );
+                assert!(
+                    scheduler
+                        .token_senders
+                        .lock()
+                        .unwrap()
+                        .contains_key("identity")
+                );
+                scheduler.step().unwrap();
+                assert_eq!(receiver.try_recv().unwrap().unwrap(), 42, "phase {phase}");
+            }
+            assert!(pool.block_for_handle(handle, 0).is_none());
+            scheduler.submit(request_for_cleanup("identity")).unwrap();
+            let replacement = pool.state.lock().unwrap().request_id_to_handle["identity"];
+            assert_ne!(replacement, handle);
+            pool.free(handle);
+            assert!(pool.block_for_handle(replacement, 0).is_some());
+            scheduler.step().unwrap();
+            assert_eq!(scheduler.queue_stats(), (0, 0, 0));
+        }
+    }
+
+    #[test]
+    fn terminal_pool_replacement_preserves_shared_ownership_and_unique_free_list() {
+        let pool = BloomKvCachePool::new(4, 8);
+        let releases = Arc::new(Mutex::new(Vec::new()));
+        let recorded = releases.clone();
+        pool.set_on_free(move |handle| recorded.lock().unwrap().push(handle));
+        let old = pool
+            .allocate_paged("reusable", &[1, 2, 3, 4], 4, None)
+            .unwrap();
+        let shared = pool
+            .allocate_paged("shared", &[1, 2, 3, 4], 0, None)
+            .unwrap();
+        pool.free(old.handle);
+        let new = pool
+            .allocate_paged("reusable", &[1, 2, 3, 4], 0, None)
+            .unwrap();
+        assert_eq!(new.matched_tokens, 4);
+        assert_eq!(new.allocated_blocks, shared.allocated_blocks);
+        assert_ne!(new.handle, old.handle);
+        pool.free(old.handle);
+        assert_eq!(*releases.lock().unwrap(), vec![old.handle]);
+        {
+            let state = pool.state.lock().unwrap();
+            assert!(state.active_requests["reusable"].active);
+            assert_eq!(state.block_ref_counts[&new.allocated_blocks[0]], 2);
+            assert_eq!(state.free_blocks.len(), 7);
+        }
+        pool.free(new.handle);
+        pool.free(shared.handle);
+        pool.compact_inactive(8);
+        pool.free(new.handle);
+        pool.compact_inactive(8);
+        let state = pool.state.lock().unwrap();
+        assert_eq!(state.free_blocks.len(), 8);
+        assert_eq!(
+            state
+                .free_blocks
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            8
+        );
+        assert!(state.block_ref_counts.is_empty());
+        assert!(state.block_table.is_empty());
+        assert!(state.handle_to_request_id.is_empty());
+    }
+
+    #[test]
+    fn terminal_pool_replacement_handles_different_prompt_and_failed_reservation() {
+        let pool = BloomKvCachePool::new(4, 2);
+        let old = pool
+            .allocate_paged("reusable", &[1, 2, 3, 4], 0, None)
+            .unwrap();
+        pool.free(old.handle);
+        assert!(
+            pool.allocate_paged("reusable", &[1, 2, 3, 4], 100, None)
+                .is_err()
+        );
+        let new = pool
+            .allocate_paged("reusable", &[5, 6, 7, 8], 0, None)
+            .unwrap();
+        assert_ne!(new.handle, old.handle);
+        assert_eq!(new.matched_tokens, 0);
+        pool.free(old.handle);
+        assert_eq!(
+            pool.block_for_handle(new.handle, 0),
+            Some(new.allocated_blocks[0])
+        );
+        pool.free(new.handle);
+        pool.compact_inactive(2);
+        let state = pool.state.lock().unwrap();
+        assert_eq!(state.free_blocks.len(), 2);
+        assert!(state.block_ref_counts.is_empty());
+    }
+
+    #[test]
+    fn cancellation_releases_identity_during_chunked_prefill() {
+        let pool = Arc::new(BloomKvCachePool::new(4, 8));
+        let mut config = CoreTokenSchedulingConfig::default();
+        config.chunked_prefill.enabled = true;
+        config.chunked_prefill.chunk_size = 2;
+        let scheduler =
+            InferenceScheduler::with_config(Arc::new(MockExecutor), pool.clone(), config);
+        let mut request = request_for_cleanup("cancel-reuse");
+        request.prompt_tokens = vec![1; 8];
+        scheduler.submit(request).unwrap();
+        scheduler.step().unwrap();
+        assert!(
+            scheduler
+                .submit(request_for_cleanup("cancel-reuse"))
+                .unwrap_err()
+                .to_string()
+                .contains("already scheduled")
+        );
+        assert!(scheduler.cancel_request("cancel-reuse"));
+        scheduler
+            .submit(request_for_cleanup("cancel-reuse"))
+            .unwrap();
+        scheduler.step().unwrap();
+        assert!(scheduler.live_request_ids.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_submission_does_not_reserve_the_request_identity() {
+        let pool = Arc::new(MockKvPool::new(2));
+        let scheduler = InferenceScheduler::new(Arc::new(PrepareFailExecutor), pool);
+        for _ in 0..2 {
+            assert!(
+                scheduler
+                    .submit(request_for_cleanup("retry"))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("prefix restore failed")
+            );
+            assert!(scheduler.live_request_ids.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn concurrent_duplicate_submissions_admit_only_one_owner() {
+        let pool = Arc::new(BloomKvCachePool::new(4, 8));
+        let scheduler = Arc::new(InferenceScheduler::new(
+            Arc::new(MockExecutor),
+            pool.clone(),
+        ));
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let workers = (0..8)
+            .map(|_| {
+                let scheduler = scheduler.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    scheduler.submit(request_for_cleanup("concurrent")).is_ok()
+                })
+            })
+            .collect::<Vec<_>>();
+        let admitted = workers
+            .into_iter()
+            .map(|worker| usize::from(worker.join().unwrap()))
+            .sum::<usize>();
+        assert_eq!(admitted, 1);
+        assert_eq!(pool.state.lock().unwrap().handle_to_request_id.len(), 1);
+        assert!(scheduler.cancel_request("concurrent"));
+        assert!(scheduler.live_request_ids.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn handle_exhaustion_does_not_reserve_blocks_or_reuse_an_old_handle() {
+        let pool = BloomKvCachePool::new(4, 2);
+        pool.state.lock().unwrap().next_handle = usize::MAX;
+        assert!(
+            pool.allocate_paged("exhausted", &[1], 1, None)
+                .unwrap_err()
+                .to_string()
+                .contains("handle sequence exhausted")
+        );
+        let state = pool.state.lock().unwrap();
+        assert_eq!(state.free_blocks.len(), 2);
+        assert!(state.active_requests.is_empty());
+        assert!(state.block_ref_counts.is_empty());
+    }
+
+    #[test]
     fn submit_prepare_failure_frees_allocation_and_guard() {
         let kv_pool = Arc::new(MockKvPool::new(1));
         let scheduler = InferenceScheduler::new(Arc::new(PrepareFailExecutor), kv_pool.clone());
