@@ -98,8 +98,8 @@ pub struct PagedAttentionCache {
     /// Per-layer, per-block KV data.
     /// Indexed as: layer_data[layer_idx][block_id] = BlockKvData
     layer_data: Arc<Mutex<Vec<HashMap<usize, BlockKvData>>>>,
-    /// Monotonic generations prevent an in-flight offload from deleting a
-    /// newer write to the same physical block.
+    /// Monotonic write and ownership generations protect resident data from
+    /// in-flight offloads and restores, including same-key block reassignment.
     block_generations: Arc<Mutex<HashMap<(usize, usize), u64>>>,
     /// Stable CacheMesh keys for each layer/block currently assigned by the pool.
     block_keys: Arc<Mutex<HashMap<(usize, usize), CacheMeshKey>>>,
@@ -146,12 +146,14 @@ impl PagedAttentionCache {
             &pool,
             layer_data.clone(),
             block_keys.clone(),
+            block_generations.clone(),
             cachemesh.clone(),
             config.clone(),
         );
         install_cachemesh_allocation_hook(
             &pool,
             block_keys.clone(),
+            block_generations.clone(),
             cachemesh.clone(),
             config.clone(),
         );
@@ -497,8 +499,7 @@ impl PagedAttentionCache {
                 }
                 _ => {
                     if let Some(block) = self.restore_from_cachemesh(layer_idx, block_id)? {
-                        let block_data = from_cachemesh_block(&block, &self.config)?;
-                        let (block_keys, block_values) = append_block(&block_data)?;
+                        let (block_keys, block_values) = append_block(&block)?;
                         all_keys.extend(block_keys);
                         all_values.extend(block_values);
                     } else {
@@ -749,13 +750,10 @@ impl PagedAttentionCache {
                 break;
             };
             for layer_idx in 0..self.config.num_layers {
-                if self.get_l1_block(layer_idx, block_id).is_some() {
-                    continue;
-                }
-                let Some(key) = self.cachemesh_key(layer_idx, block_id) else {
+                let Some((key, generation)) = self.restore_snapshot(layer_idx, block_id) else {
                     continue;
                 };
-                pending.push((layer_idx, block_id, key));
+                pending.push((layer_idx, block_id, key, generation));
             }
         }
         if let Some(mesh) = &self.cachemesh
@@ -764,7 +762,7 @@ impl PagedAttentionCache {
             for _ in &pending {
                 mesh.record_l1_lookup(false);
             }
-            let keys: Vec<_> = pending.iter().map(|(_, _, key)| key.clone()).collect();
+            let keys: Vec<_> = pending.iter().map(|(_, _, key, _)| key.clone()).collect();
             let restored = mesh.restore_many(&keys)?;
             if restored.len() != pending.len() {
                 return Err(anyhow!(
@@ -773,21 +771,13 @@ impl PagedAttentionCache {
                     pending.len()
                 ));
             }
-            for ((layer_idx, block_id, _), result) in pending.into_iter().zip(restored) {
+            for ((layer_idx, block_id, key, generation), result) in
+                pending.into_iter().zip(restored)
+            {
                 let Some((_tier, block)) = result else {
                     continue;
                 };
-                block.validate()?;
-                if block.block_size != self.config.block_size || block.kv_dim != self.config.kv_dim
-                {
-                    return Err(anyhow!(
-                        "CacheMesh block layout does not match the current model"
-                    ));
-                }
-                let block_data = from_cachemesh_block(&block, &self.config)?;
-                self.layer_data.lock().unwrap_or_else(|e| e.into_inner())[layer_idx]
-                    .insert(block_id, block_data);
-                self.bump_block_generation(layer_idx, block_id);
+                self.commit_restored_block(layer_idx, block_id, &key, generation, &block)?;
             }
         }
 
@@ -1220,33 +1210,80 @@ impl PagedAttentionCache {
             .and_then(|layer| layer.get(&block_id).cloned())
     }
 
+    // All combined local accesses use layer_data -> block_keys -> generations.
+    // No local lock is retained during CacheMesh/remote backend operations.
+    fn restore_snapshot(&self, layer_idx: usize, block_id: usize) -> Option<(CacheMeshKey, u64)> {
+        let layers = self.layer_data.lock().unwrap_or_else(|e| e.into_inner());
+        if layers.get(layer_idx)?.contains_key(&block_id) {
+            return None;
+        }
+        let keys = self.block_keys.lock().unwrap_or_else(|e| e.into_inner());
+        let key = keys.get(&(layer_idx, block_id))?.clone();
+        let generations = self
+            .block_generations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        Some((
+            key,
+            generations
+                .get(&(layer_idx, block_id))
+                .copied()
+                .unwrap_or(0),
+        ))
+    }
+
+    fn commit_restored_block(
+        &self,
+        layer_idx: usize,
+        block_id: usize,
+        key: &CacheMeshKey,
+        generation: u64,
+        block: &CacheMeshBlock,
+    ) -> Result<BlockKvData> {
+        block.validate()?;
+        if &block.key != key
+            || block.block_size != self.config.block_size
+            || block.kv_dim != self.config.kv_dim
+        {
+            return Err(anyhow!(
+                "CacheMesh block identity or layout does not match the current model"
+            ));
+        }
+        let data = from_cachemesh_block(block, &self.config)?;
+        let mut layers = self.layer_data.lock().unwrap_or_else(|e| e.into_inner());
+        let keys = self.block_keys.lock().unwrap_or_else(|e| e.into_inner());
+        let mut generations = self
+            .block_generations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let current = generations.entry((layer_idx, block_id)).or_insert(0);
+        if keys.get(&(layer_idx, block_id)) != Some(key) || *current != generation {
+            return Err(anyhow!(
+                "CacheMesh restore superseded by a block ownership or generation change"
+            ));
+        }
+        layers[layer_idx].insert(block_id, data.clone());
+        *current = current.saturating_add(1);
+        Ok(data)
+    }
+
     fn restore_from_cachemesh(
         &self,
         layer_idx: usize,
         block_id: usize,
-    ) -> Result<Option<CacheMeshBlock>> {
+    ) -> Result<Option<BlockKvData>> {
         let Some(mesh) = &self.cachemesh else {
             return Ok(None);
         };
-        let Some(key) = self.cachemesh_key(layer_idx, block_id) else {
-            return Ok(None);
+        let Some((key, generation)) = self.restore_snapshot(layer_idx, block_id) else {
+            return Ok(self.get_l1_block(layer_idx, block_id));
         };
         mesh.record_l1_lookup(false);
         let Some((_tier, block)) = mesh.restore(&key)? else {
             return Ok(None);
         };
-        block.validate()?;
-        if block.block_size != self.config.block_size || block.kv_dim != self.config.kv_dim {
-            return Err(anyhow!(
-                "CacheMesh block layout does not match the current model"
-            ));
-        }
-
-        let block_data = from_cachemesh_block(&block, &self.config)?;
-        let mut layer_data = self.layer_data.lock().unwrap_or_else(|e| e.into_inner());
-        layer_data[layer_idx].insert(block_id, block_data);
-        self.bump_block_generation(layer_idx, block_id);
-        Ok(Some(block))
+        self.commit_restored_block(layer_idx, block_id, &key, generation, &block)
+            .map(Some)
     }
 
     fn bump_block_generation(&self, layer_idx: usize, block_id: usize) {
@@ -1263,12 +1300,13 @@ fn install_cachemesh_eviction_hook(
     pool: &Arc<BloomKvCachePool>,
     layer_data: Arc<Mutex<Vec<HashMap<usize, BlockKvData>>>>,
     block_keys: Arc<Mutex<HashMap<(usize, usize), CacheMeshKey>>>,
+    block_generations: Arc<Mutex<HashMap<(usize, usize), u64>>>,
     cachemesh: Option<Arc<CacheMesh>>,
     config: PagedCacheConfig,
 ) {
     pool.set_on_evict(move |block_ids| {
         // Detach the evicted blocks while holding the local maps, then do
-        // backend I/O after releasing both locks. A slow filesystem or remote
+        // backend I/O after releasing local locks. A slow filesystem or remote
         // backend must not stall concurrent KV reads/writes.
         let pending = {
             let mut layer_data = layer_data.lock().unwrap_or_else(|e| e.into_inner());
@@ -1277,6 +1315,11 @@ fn install_cachemesh_eviction_hook(
             for &block_id in block_ids {
                 for layer_idx in 0..config.num_layers {
                     let key = block_keys.remove(&(layer_idx, block_id));
+                    let mut generations =
+                        block_generations.lock().unwrap_or_else(|e| e.into_inner());
+                    let generation = generations.entry((layer_idx, block_id)).or_insert(0);
+                    *generation = generation.saturating_add(1);
+                    drop(generations);
                     let Some(block) = layer_data[layer_idx].remove(&block_id) else {
                         continue;
                     };
@@ -1307,6 +1350,7 @@ fn install_cachemesh_eviction_hook(
 fn install_cachemesh_allocation_hook(
     pool: &Arc<BloomKvCachePool>,
     block_keys: Arc<Mutex<HashMap<(usize, usize), CacheMeshKey>>>,
+    block_generations: Arc<Mutex<HashMap<(usize, usize), u64>>>,
     cachemesh: Option<Arc<CacheMesh>>,
     config: PagedCacheConfig,
 ) {
@@ -1317,6 +1361,13 @@ fn install_cachemesh_allocation_hook(
     pool.set_on_allocate(
         move |request_id, prompt_tokens, block_ids, multimodal_hash| {
             let mut keys = block_keys.lock().unwrap_or_else(|error| error.into_inner());
+            let mut generations = block_generations.lock().unwrap_or_else(|e| e.into_inner());
+            for &block_id in block_ids {
+                for layer in 0..config.num_layers {
+                    let generation = generations.entry((layer, block_id)).or_insert(0);
+                    *generation = generation.saturating_add(1);
+                }
+            }
             register_block_keys_into(
                 &mut keys,
                 &namespace,
@@ -1886,6 +1937,7 @@ mod tests {
         entered: Arc<Barrier>,
         release: Arc<Barrier>,
         block_first_put: AtomicBool,
+        block_first_get: AtomicBool,
         blocks: Mutex<HashMap<CacheMeshKey, CacheMeshBlock>>,
     }
 
@@ -1895,6 +1947,7 @@ mod tests {
                 entered,
                 release,
                 block_first_put: AtomicBool::new(true),
+                block_first_get: AtomicBool::new(false),
                 blocks: Mutex::new(HashMap::new()),
             }
         }
@@ -1902,12 +1955,17 @@ mod tests {
 
     impl RemoteCacheBackend for BlockingRemoteCache {
         fn get(&self, key: &CacheMeshKey) -> Result<Option<CacheMeshBlock>> {
-            Ok(self
+            let snapshot = self
                 .blocks
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .get(key)
-                .cloned())
+                .cloned();
+            if self.block_first_get.swap(false, Ordering::SeqCst) {
+                self.entered.wait();
+                self.release.wait();
+            }
+            Ok(snapshot)
         }
 
         fn put(&self, block: CacheMeshBlock) -> Result<()> {
@@ -1946,6 +2004,79 @@ mod tests {
                     .map(CacheMeshBlock::bytes)
                     .sum(),
             )
+        }
+    }
+
+    #[test]
+    fn late_restore_rejects_new_writes_and_reassigned_blocks() {
+        for batched in [false, true] {
+            for change in ["write", "different-key", "same-key"] {
+                let entered = Arc::new(Barrier::new(2));
+                let release = Arc::new(Barrier::new(2));
+                let remote = Arc::new(BlockingRemoteCache::new(entered.clone(), release.clone()));
+                remote.block_first_put.store(false, Ordering::SeqCst);
+                let mesh = Arc::new(CacheMesh::with_remote(
+                    CacheMeshConfig {
+                        enabled: true,
+                        l2_capacity_bytes: 1,
+                        l3_enabled: true,
+                        write_through_l3: true,
+                        ..Default::default()
+                    },
+                    remote.clone(),
+                ));
+                let mut config = test_config();
+                config.total_blocks = 1;
+                config.num_layers = 1;
+                let cache = Arc::new(PagedAttentionCache::with_cachemesh(config, mesh));
+                let original = cache.allocate("original", &[1, 2, 3, 4], 0).unwrap();
+                let block = original.allocated_blocks[0];
+                cache
+                    .write_kv(0, block, vec![1.0; 32], vec![2.0; 32], 4)
+                    .unwrap();
+                assert!(cache.offload_block(0, block).unwrap());
+                remote.block_first_get.store(true, Ordering::SeqCst);
+                let reader_cache = cache.clone();
+                let reader = std::thread::spawn(move || {
+                    if batched {
+                        reader_cache.prepare_prefill(original.handle, 5).map(|_| ())
+                    } else {
+                        reader_cache.read_kv(0, &[block]).map(|_| ())
+                    }
+                });
+                entered.wait();
+                // Remote I/O must not retain any of the local cache locks.
+                assert!(cache.layer_data.try_lock().is_ok());
+                assert!(cache.block_keys.try_lock().is_ok());
+                assert!(cache.block_generations.try_lock().is_ok());
+                if change == "write" {
+                    cache
+                        .write_kv(0, block, vec![9.0; 32], vec![10.0; 32], 4)
+                        .unwrap();
+                } else {
+                    cache.pool.free(original.handle);
+                    assert_eq!(cache.pool.compact_inactive(1), 1);
+                    let prompt = if change == "same-key" {
+                        [1, 2, 3, 4]
+                    } else {
+                        [5, 6, 7, 8]
+                    };
+                    let replacement = cache.allocate("replacement", &prompt, 0).unwrap();
+                    assert_eq!(replacement.allocated_blocks, vec![block]);
+                }
+                release.wait();
+                let result = reader.join().unwrap();
+                if change == "write" {
+                    assert_eq!(
+                        cache.read_kv(0, &[block]).unwrap(),
+                        (vec![9.0; 32], vec![10.0; 32])
+                    );
+                } else {
+                    assert_eq!(cache.layer_block_count(0), 0);
+                }
+                assert!(result.is_err(), "batched={batched}, change={change}");
+                assert!(result.unwrap_err().to_string().contains("superseded"));
+            }
         }
     }
 
