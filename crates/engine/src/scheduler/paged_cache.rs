@@ -1272,17 +1272,18 @@ fn install_cachemesh_eviction_hook(
         // backend must not stall concurrent KV reads/writes.
         let pending = {
             let mut layer_data = layer_data.lock().unwrap_or_else(|e| e.into_inner());
-            let block_keys = block_keys.lock().unwrap_or_else(|e| e.into_inner());
+            let mut block_keys = block_keys.lock().unwrap_or_else(|e| e.into_inner());
             let mut pending = Vec::new();
             for &block_id in block_ids {
                 for layer_idx in 0..config.num_layers {
+                    let key = block_keys.remove(&(layer_idx, block_id));
                     let Some(block) = layer_data[layer_idx].remove(&block_id) else {
                         continue;
                     };
                     let Some(mesh) = cachemesh.as_ref() else {
                         continue;
                     };
-                    let Some(key) = block_keys.get(&(layer_idx, block_id)).cloned() else {
+                    let Some(key) = key else {
                         continue;
                     };
                     pending.push((mesh.clone(), key, block));
@@ -1628,6 +1629,92 @@ mod tests {
     }
 
     #[test]
+    fn defrag_preserves_two_layer_multimodal_kv_identity() {
+        let cache = PagedAttentionCache::new(test_config());
+        let a = cache
+            .allocate_multimodal("a", &[1, 2, 3, 4], 0, Some("image-a"))
+            .unwrap();
+        let b = cache
+            .allocate_multimodal("b", &[1, 2, 3, 4], 0, Some("image-b"))
+            .unwrap();
+        assert_ne!(a.allocated_blocks, b.allocated_blocks);
+        for (allocation, base) in [(&a, 1.0), (&b, 10.0)] {
+            for layer in 0..2 {
+                let value = base + layer as f32;
+                cache
+                    .write_kv(
+                        layer,
+                        allocation.allocated_blocks[0],
+                        vec![value; 32],
+                        vec![-value; 32],
+                        4,
+                    )
+                    .unwrap();
+            }
+        }
+        assert_eq!(cache.pool.defragment_and_compact_prefixes(), 0);
+        for (allocation, base) in [(&a, 1.0), (&b, 10.0)] {
+            let block = cache.pool.block_for_handle(allocation.handle, 0).unwrap();
+            assert_eq!(block, allocation.allocated_blocks[0]);
+            for layer in 0..2 {
+                let value = base + layer as f32;
+                assert_eq!(
+                    cache.read_kv(layer, &[block]).unwrap(),
+                    (vec![value; 32], vec![-value; 32])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn defrag_same_key_retires_only_duplicate_layer_storage() {
+        let mesh = Arc::new(CacheMesh::new(CacheMeshConfig {
+            enabled: true,
+            l2_capacity_bytes: 4096,
+            ..Default::default()
+        }));
+        let cache = PagedAttentionCache::with_cachemesh(test_config(), mesh);
+        let a = cache
+            .allocate_multimodal("a", &[1, 2, 3, 4], 0, Some("same-media"))
+            .unwrap();
+        // Construct duplicate physical ownership by dropping only the lookup
+        // entry. Ordinary allocation otherwise shares the existing block.
+        cache.pool.state.lock().unwrap().block_table.clear();
+        let b = cache
+            .allocate_multimodal("b", &[1, 2, 3, 4], 0, Some("same-media"))
+            .unwrap();
+        assert_ne!(a.allocated_blocks, b.allocated_blocks);
+        for allocation in [&a, &b] {
+            for layer in 0..2 {
+                let value = 1.0 + layer as f32;
+                cache
+                    .write_kv(
+                        layer,
+                        allocation.allocated_blocks[0],
+                        vec![value; 32],
+                        vec![-value; 32],
+                        4,
+                    )
+                    .unwrap();
+            }
+        }
+        assert_eq!(cache.pool.defragment_and_compact_prefixes(), 1);
+        let canonical = a.allocated_blocks[0];
+        assert_eq!(cache.pool.block_for_handle(b.handle, 0), Some(canonical));
+        for layer in 0..2 {
+            let value = 1.0 + layer as f32;
+            assert_eq!(
+                cache.read_kv(layer, &[canonical]).unwrap(),
+                (vec![value; 32], vec![-value; 32])
+            );
+            assert!(!cache.layer_data.lock().unwrap()[layer].contains_key(&b.allocated_blocks[0]));
+            let keys = cache.block_keys.lock().unwrap();
+            assert!(keys.contains_key(&(layer, canonical)));
+            assert!(!keys.contains_key(&(layer, b.allocated_blocks[0])));
+        }
+    }
+
+    #[test]
     fn test_paged_cache_memory_bytes() {
         let cache = PagedAttentionCache::new(test_config());
         assert_eq!(cache.memory_bytes(), 0);
@@ -1639,6 +1726,72 @@ mod tests {
             .write_kv(0, block_id, vec![0.0; 32], vec![0.0; 32], 4)
             .unwrap();
         assert!(cache.memory_bytes() > 0);
+    }
+
+    #[test]
+    fn allocation_defrag_clears_retired_storage_before_block_reassignment() {
+        let mesh = Arc::new(CacheMesh::new(CacheMeshConfig {
+            enabled: true,
+            l2_capacity_bytes: 4096,
+            ..Default::default()
+        }));
+        let mut config = test_config();
+        config.total_blocks = 2;
+        let cache = PagedAttentionCache::with_cachemesh(config, mesh);
+        let a = cache
+            .allocate_multimodal("a", &[1, 2, 3, 4], 0, Some("media"))
+            .unwrap();
+        cache.pool.state.lock().unwrap().block_table.clear();
+        let b = cache
+            .allocate_multimodal("b", &[1, 2, 3, 4], 0, Some("media"))
+            .unwrap();
+        for allocation in [&a, &b] {
+            for layer in 0..2 {
+                cache
+                    .write_kv(
+                        layer,
+                        allocation.allocated_blocks[0],
+                        vec![1.0; 32],
+                        vec![2.0; 32],
+                        4,
+                    )
+                    .unwrap();
+            }
+        }
+        // Both owners are active and capacity is exhausted: allocation must
+        // compact duplicates, retire B's old storage, then assign its block.
+        let c = cache
+            .allocate_multimodal("c", &[9, 8, 7, 6], 0, Some("other"))
+            .unwrap();
+        assert_eq!(c.allocated_blocks, b.allocated_blocks);
+        assert_eq!(
+            cache.pool.block_for_handle(b.handle, 0),
+            Some(a.allocated_blocks[0])
+        );
+        for layer in 0..2 {
+            assert!(!cache.layer_data.lock().unwrap()[layer].contains_key(&c.allocated_blocks[0]));
+            assert_eq!(
+                cache.read_kv(layer, &c.allocated_blocks).unwrap(),
+                (vec![0.0; 32], vec![0.0; 32])
+            );
+            cache
+                .write_kv(
+                    layer,
+                    c.allocated_blocks[0],
+                    vec![10.0; 32],
+                    vec![20.0; 32],
+                    4,
+                )
+                .unwrap();
+            assert_eq!(
+                cache.read_kv(layer, &a.allocated_blocks).unwrap(),
+                (vec![1.0; 32], vec![2.0; 32])
+            );
+            assert_eq!(
+                cache.read_kv(layer, &c.allocated_blocks).unwrap(),
+                (vec![10.0; 32], vec![20.0; 32])
+            );
+        }
     }
 
     #[test]

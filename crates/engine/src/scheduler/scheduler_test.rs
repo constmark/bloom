@@ -2681,14 +2681,86 @@ mod tests {
         }
 
         let merged = pool.defragment_and_compact_prefixes();
-        assert_eq!(merged, 1);
+        assert_eq!(merged, 0);
 
         {
             let state = pool.state.lock().unwrap_or_else(|e| e.into_inner());
             let rec1 = &state.active_requests["req-compact-1"];
             let rec2 = &state.active_requests["req-compact-2"];
-            assert_eq!(rec1.blocks[0], rec2.blocks[0]);
-            assert_eq!(state.block_ref_counts[&rec1.blocks[0]], 2);
+            assert_ne!(rec1.blocks[0], rec2.blocks[0]);
+            assert_eq!(state.block_ref_counts[&rec1.blocks[0]], 1);
+            assert_eq!(state.block_ref_counts[&rec2.blocks[0]], 1);
         }
+    }
+    #[test]
+    fn defrag_merges_complete_key_and_repairs_all_ownership_indexes() {
+        let pool = Arc::new(BloomKvCachePool::new(4, 4));
+        let prefix = PrefixCacheKey {
+            tokens: vec![1, 2, 3, 4],
+            multimodal_hash: Some("same-media".into()),
+        };
+        let a = pool
+            .allocate_paged("a", &prefix.tokens, 0, Some("same-media"))
+            .unwrap();
+        // Normal allocation deduplicates eagerly. Remove just the lookup index
+        // to construct a duplicate-owner fixture without corrupting ownership.
+        pool.state.lock().unwrap().block_table.remove(&prefix);
+        let b = pool
+            .allocate_paged("b", &prefix.tokens, 0, Some("same-media"))
+            .unwrap();
+        let c = pool
+            .allocate_paged("c", &prefix.tokens, 0, Some("same-media"))
+            .unwrap();
+        assert_ne!(a.allocated_blocks, b.allocated_blocks);
+        assert_eq!(b.allocated_blocks, c.allocated_blocks);
+        let retired = b.allocated_blocks[0];
+        let canonical = a.allocated_blocks[0];
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let events = observed.clone();
+        let weak = Arc::downgrade(&pool);
+        pool.set_on_evict(move |blocks| {
+            let pool = weak.upgrade().unwrap();
+            // Callback must execute after PoolState is unlocked.
+            assert!(pool.state.try_lock().is_ok());
+            events.lock().unwrap().extend_from_slice(blocks);
+        });
+        assert_eq!(pool.defragment_and_compact_prefixes(), 2);
+        assert_eq!(*observed.lock().unwrap(), vec![retired]);
+        assert_eq!(pool.defragment_and_compact_prefixes(), 0);
+        assert_eq!(*observed.lock().unwrap(), vec![retired]);
+        for handle in [a.handle, b.handle, c.handle] {
+            assert_eq!(pool.block_for_handle(handle, 0), Some(canonical));
+        }
+        {
+            let state = pool.state.lock().unwrap();
+            assert_eq!(state.block_table[&prefix], canonical);
+            assert_eq!(state.block_ref_counts[&canonical], 3);
+            assert!(!state.block_ref_counts.contains_key(&retired));
+            assert_eq!(
+                state
+                    .free_blocks
+                    .iter()
+                    .filter(|&&block| block == retired)
+                    .count(),
+                1
+            );
+            assert!(!state.free_blocks.contains(&canonical));
+            assert_eq!(state.metrics.active_blocks, 1);
+            assert_eq!(state.metrics.free_blocks, 3);
+        }
+        let d = pool
+            .allocate_paged("d", &prefix.tokens, 0, Some("same-media"))
+            .unwrap();
+        assert_eq!(d.matched_tokens, 4);
+        assert_eq!(d.allocated_blocks, vec![canonical]);
+        for handle in [a.handle, b.handle, c.handle, d.handle] {
+            pool.free(handle);
+        }
+        pool.compact_inactive(4);
+        let state = pool.state.lock().unwrap();
+        assert!(state.block_table.is_empty());
+        assert!(state.block_ref_counts.is_empty());
+        assert_eq!(state.free_blocks.len(), 4);
+        assert_eq!(state.free_blocks.iter().collect::<HashSet<_>>().len(), 4);
     }
 }

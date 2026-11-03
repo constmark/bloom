@@ -530,67 +530,93 @@ impl BloomKvCachePool {
     /// Compact duplicate/redundant prefix segments across all requests and
     /// defragment the block layout to optimize contiguous memory access.
     pub fn defragment_and_compact_prefixes(&self) -> usize {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        self.defragment_and_compact_prefixes_impl(&mut state)
+        let mut evicted_blocks = Vec::new();
+        let merged = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            self.defragment_and_compact_prefixes_impl(&mut state, &mut evicted_blocks)
+        };
+        // The paged cache hook may read pool state and perform backend I/O.
+        self.notify_evicted(&evicted_blocks);
+        merged
     }
 
-    fn defragment_and_compact_prefixes_impl(&self, state: &mut PoolState) -> usize {
-        let mut merged_count = 0;
-
-        // 1. Cross-segment Prefix Compaction (Deduplication)
-        let mut prefix_to_block = std::collections::HashMap::new();
-        let mut updates = Vec::new();
-
-        for (request_id, record) in &state.active_requests {
-            for (idx, prefix) in record.prefixes.iter().enumerate() {
-                if prefix.tokens.is_empty() {
+    fn defragment_and_compact_prefixes_impl(
+        &self,
+        state: &mut PoolState,
+        evicted_blocks: &mut Vec<usize>,
+    ) -> usize {
+        // Use the same complete identity as normal prefix lookup. Choosing
+        // the lowest owned block makes the result independent of map order.
+        let mut canonical_blocks: HashMap<PrefixCacheKey, usize> = HashMap::new();
+        for record in state.active_requests.values() {
+            for (&block, prefix) in record.blocks.iter().zip(&record.prefixes) {
+                if prefix.tokens.is_empty() || !state.block_ref_counts.contains_key(&block) {
                     continue;
                 }
-                if let Some(&canonical_block_id) = prefix_to_block.get(&prefix.tokens) {
-                    let current_block_id = record.blocks[idx];
-                    if current_block_id != canonical_block_id {
-                        updates.push((
-                            request_id.clone(),
-                            idx,
-                            canonical_block_id,
-                            current_block_id,
-                        ));
-                    }
-                } else {
-                    prefix_to_block.insert(prefix.tokens.clone(), record.blocks[idx]);
+                canonical_blocks
+                    .entry(prefix.clone())
+                    .and_modify(|canonical| *canonical = (*canonical).min(block))
+                    .or_insert(block);
+            }
+        }
+
+        let mut updates = Vec::new();
+        for (request_id, record) in &state.active_requests {
+            for (index, (&block, prefix)) in record.blocks.iter().zip(&record.prefixes).enumerate()
+            {
+                if let Some(&canonical) = canonical_blocks.get(prefix)
+                    && block != canonical
+                    && state
+                        .block_ref_counts
+                        .get(&block)
+                        .is_some_and(|count| *count > 0)
+                {
+                    updates.push((request_id.clone(), index, canonical, block));
                 }
             }
         }
 
-        // Apply updates
-        for (request_id, idx, canonical_block_id, current_block_id) in updates {
-            // First perform the ref counts updates on state
+        let merged = updates.len();
+        for (request_id, index, canonical, old) in updates {
+            // Transfer one record's ownership without disturbing temporary
+            // allocation pins or other records still referencing either block.
             *state
                 .block_ref_counts
-                .entry(canonical_block_id)
-                .or_insert(1) += 1;
-
-            let count = state.block_ref_counts.entry(current_block_id).or_insert(1);
-            *count = count.saturating_sub(1);
+                .get_mut(&canonical)
+                .expect("owned canonical block") += 1;
+            let count = state
+                .block_ref_counts
+                .get_mut(&old)
+                .expect("owned duplicate block");
+            *count -= 1;
             if *count == 0 {
-                state.free_blocks.push_back(current_block_id);
-                state.block_ref_counts.remove(&current_block_id);
+                state.block_ref_counts.remove(&old);
+                state.free_blocks.push_back(old);
+                evicted_blocks.push(old);
+                state.block_table.retain(|_, block| *block != old);
             }
-
-            // Then mutably borrow record in a separate step to update block mapping
-            if let Some(record) = state.active_requests.get_mut(&request_id) {
-                record.blocks[idx] = canonical_block_id;
-                merged_count += 1;
-            }
+            state
+                .active_requests
+                .get_mut(&request_id)
+                .expect("compacted request")
+                .blocks[index] = canonical;
         }
+        // Repair lookup even when it previously pointed at a retired duplicate.
+        state.block_table.extend(canonical_blocks);
 
-        // 2. In-place defragmentation (GC)
-        let mut sorted_free: Vec<usize> = state.free_blocks.iter().copied().collect();
+        let mut sorted_free: Vec<usize> = state
+            .free_blocks
+            .iter()
+            .copied()
+            .filter(|block| {
+                *block < self.total_blocks && !state.block_ref_counts.contains_key(block)
+            })
+            .collect();
         sorted_free.sort_unstable();
+        sorted_free.dedup();
         state.free_blocks = sorted_free.into_iter().collect();
         state.update_block_counts(self.total_blocks);
-
-        merged_count
+        merged
     }
 }
 
@@ -753,7 +779,8 @@ impl KvCachePool for BloomKvCachePool {
             while state.free_blocks.is_empty() {
                 if state.lru_list.is_empty() {
                     // Automatically trigger prefix cache compaction and defragmentation to reclaim duplicate space
-                    let merged = self.defragment_and_compact_prefixes_impl(&mut state);
+                    let merged =
+                        self.defragment_and_compact_prefixes_impl(&mut state, &mut evicted_blocks);
                     if merged > 0 && !state.free_blocks.is_empty() {
                         continue;
                     }
