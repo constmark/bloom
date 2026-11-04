@@ -527,6 +527,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn load_validates_external_runtime_probe() {
         use crate::test_env::{ENV_LOCK, EnvVarGuard};

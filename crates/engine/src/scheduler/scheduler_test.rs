@@ -2160,6 +2160,17 @@ mod tests {
             .unwrap();
         assert_eq!(alloc1.allocated_blocks.len(), 2);
         assert_eq!(alloc1.matched_tokens, 0); // first time, no match
+        {
+            let state = pool.state.lock().unwrap_or_else(|error| error.into_inner());
+            assert_eq!(state.request_id_to_handle.get("req1"), Some(&alloc1.handle));
+            assert_eq!(
+                state
+                    .handle_to_request_id
+                    .get(&alloc1.handle)
+                    .map(String::as_str),
+                Some("req1")
+            );
+        }
 
         let metrics = pool.get_metrics();
         assert_eq!(metrics.free_blocks, 6);

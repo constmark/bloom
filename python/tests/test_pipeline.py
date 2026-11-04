@@ -576,7 +576,7 @@ class BloomPipelineTests(unittest.TestCase):
         self.assertEqual(self.fake_lib.freed_tokens, 1)
 
     def test_invalid_stream_encoding_or_json_cancels_native_worker(self):
-        for value in (b"\xff", b"not-json", b"null", b'"unknown"', b"42"):
+        for value in (b"\xff", b"not-json", b"null", b'"unknown"', b"[]", b"42"):
             with self.subTest(value=value):
                 def invalid(_p, _i, _a, callback, *_rest):
                     chunk = ctypes.create_string_buffer(value)
