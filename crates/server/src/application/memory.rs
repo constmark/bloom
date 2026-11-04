@@ -1624,6 +1624,47 @@ mod tests {
     }
 
     #[test]
+    fn cgroup_probe_rejects_inherited_mounts_outside_namespace_root() {
+        // cgroup_namespaces(7): a mount inherited from the parent namespace
+        // can have root /.. while our membership is /. Its visible controls
+        // belong to an ancestor, not necessarily to our own cgroup. Treating
+        // /.. as / could admit work using the ancestor's looser memory limit.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let child = root.join("hidden-namespace-root");
+        std::fs::create_dir(&child).unwrap();
+        for (limit_file, usage_file, membership, fs) in [
+            (
+                "memory.max",
+                "memory.current",
+                "0::/\n",
+                "cgroup2 cgroup rw",
+            ),
+            (
+                "memory.limit_in_bytes",
+                "memory.usage_in_bytes",
+                "7:memory:/\n",
+                "cgroup cgroup rw,memory",
+            ),
+        ] {
+            std::fs::write(root.join(limit_file), "1000000\n").unwrap();
+            std::fs::write(root.join(usage_file), "100\n").unwrap();
+            std::fs::write(child.join(limit_file), "1000\n").unwrap();
+            std::fs::write(child.join(usage_file), "900\n").unwrap();
+            for mount_root in ["/..", "/../..", "/../sibling"] {
+                let mountinfo = format!(
+                    "29 23 0:26 {mount_root} {} ro - {fs}\n",
+                    mountinfo_path(root)
+                );
+                assert!(
+                    strict_linux_cgroup_memory_from(membership, &mountinfo).is_err(),
+                    "must not substitute ancestor controls for {mount_root}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn cgroup_probe_validates_unlimited_control_pairs() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
