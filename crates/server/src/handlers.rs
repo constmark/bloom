@@ -10,12 +10,12 @@ async fn model_unavailable_response(state: &ServerState) -> axum::response::Resp
     )
 }
 
-fn encoder_model_generation_response(model_id: &str) -> axum::response::Response {
+fn non_generation_model_response(model_id: &str) -> axum::response::Response {
     error_response(
         axum::http::StatusCode::UNPROCESSABLE_ENTITY,
         "unsupported_operation",
         format!(
-            "Model '{model_id}' is an encoder-only model and cannot serve text-generation requests. Use /v1/embeddings, /v1/rerank, /api/embed, or /api/embeddings when the loaded encoder supports that route."
+            "Model '{model_id}' does not support text generation. Use the model's advertised embedding, reranking, or tensor operations; tensor models run through the Rust or CLI interface."
         ),
     )
 }
@@ -2157,7 +2157,10 @@ struct GeneratedText {
     stopped: bool,
 }
 
-fn stream_error_payload(error_type: &str, message: impl Into<String>) -> serde_json::Value {
+pub(crate) fn stream_error_payload(
+    error_type: &str,
+    message: impl Into<String>,
+) -> serde_json::Value {
     json!({
         "error": {
             "message": message.into(),
@@ -2360,11 +2363,11 @@ async fn handle_chat_completions_inner(
             );
         }
     };
-    if choice_count > 1 && (payload.stream || state.app.enable_ifb) {
+    if choice_count > 1 && state.app.enable_ifb {
         return error_response(
             axum::http::StatusCode::BAD_REQUEST,
             "invalid_request_error",
-            "n greater than 1 is currently supported only for non-streaming text Chat Completions without continuous batching.",
+            "n greater than 1 is currently supported only for direct text Chat Completions without continuous batching.",
         );
     }
     let vision_request = match prepare_openai_vision_request(&payload) {
@@ -2448,13 +2451,14 @@ async fn handle_chat_completions_inner(
             "response_format cannot be combined with active function tools in Bloom. Tool arguments are validated against each function's parameters schema.",
         );
     }
-    if choice_count > 1
+    if payload.stream
+        && choice_count > 1
         && (tool_config.is_some() || !matches!(response_format, ResponseFormatMode::Text))
     {
         return error_response(
             axum::http::StatusCode::BAD_REQUEST,
             "invalid_request_error",
-            "n greater than 1 is currently supported only for non-streaming text Chat Completions without tools or structured output.",
+            "streaming n greater than 1 currently supports direct text Chat Completions without tools or structured output; use a non-streaming request for structured or function-tool choices.",
         );
     }
     let core_response_format = match (&tool_config, &response_format) {
@@ -2542,7 +2546,7 @@ async fn handle_chat_completions_inner(
     let runtime = Arc::clone(runtime_lease.runtime());
     let model_id = runtime.model_id.clone();
     if model_is_non_generation(&runtime.pipeline) {
-        return encoder_model_generation_response(&model_id);
+        return non_generation_model_response(&model_id);
     }
     let pipeline = Arc::clone(&runtime.pipeline);
     let model_family = runtime.model_family.clone();
@@ -3087,6 +3091,42 @@ async fn handle_chat_completions_inner(
             .into_response();
     }
 
+    if payload.stream && choice_count > 1 {
+        let generated_count = Arc::new(AtomicU64::new(0));
+        let lifecycle = InferenceLifecycle::new(
+            cancel_guard,
+            InferenceLifecycleResources {
+                metrics: Arc::clone(&state.app.metrics),
+                request_start,
+                generated_tokens: Arc::clone(&generated_count),
+                prompt_tokens: prompt_tokens as u64,
+                permit,
+                runtime_lease: runtime_lease.clone(),
+            },
+            StreamExecution::Blocking,
+        );
+        return crate::openai_choices::stream_text_choices(
+            Arc::clone(&state),
+            pipeline,
+            crate::openai_choices::TextChoiceStream {
+                request_id,
+                model_id,
+                inputs: vec![input],
+                echo_prompts: None,
+                choice_count,
+                params,
+                stop_sequences,
+                chat: true,
+                include_usage,
+                prompt_tokens: prompt_tokens as u64,
+            },
+            lifecycle,
+            generated_count,
+            cancel_token,
+            request_start,
+        );
+    }
+
     if !payload.stream {
         let generated_count = Arc::new(AtomicU64::new(0));
         let lifecycle = InferenceLifecycle::new(
@@ -3191,7 +3231,7 @@ async fn handle_chat_completions_inner(
             };
             choices.push(json!({
                 "index": index,
-                "message": chat_output_message(&request_id, &parsed_output),
+                "message": chat_output_message_for_choice(&request_id, index, &parsed_output),
                 "finish_reason": finish_reason
             }));
         }
@@ -4130,11 +4170,11 @@ pub(crate) async fn handle_completions(
         }
     };
     let echo = request_echo(&payload.extensions);
-    if choice_count > 1 && (payload.stream || state.app.enable_ifb) {
+    if choice_count > 1 && state.app.enable_ifb {
         return error_response(
             axum::http::StatusCode::BAD_REQUEST,
             "invalid_request_error",
-            "n greater than 1 is currently supported only for non-streaming text Completions without continuous batching.",
+            "n greater than 1 is currently supported only for direct text Completions without continuous batching.",
         );
     }
     let stop_sequences = match normalize_stop_sequences(payload.stop.as_ref()) {
@@ -4197,11 +4237,11 @@ pub(crate) async fn handle_completions(
             );
         }
     };
-    if choice_count > 1 && !matches!(response_format, ResponseFormatMode::Text) {
+    if payload.stream && choice_count > 1 && !matches!(response_format, ResponseFormatMode::Text) {
         return error_response(
             axum::http::StatusCode::BAD_REQUEST,
             "invalid_request_error",
-            "n greater than 1 is currently supported only for non-streaming text Completions without structured output.",
+            "streaming n greater than 1 currently supports direct text Completions without structured output; use a non-streaming request for structured choices.",
         );
     }
     let prompts = match completion_prompts(&payload.prompt) {
@@ -4214,11 +4254,18 @@ pub(crate) async fn handle_completions(
             );
         }
     };
-    if prompts.len() > 1 && (payload.stream || state.app.enable_ifb) {
+    if payload.stream && prompts.len() > 1 && !matches!(response_format, ResponseFormatMode::Text) {
         return error_response(
             axum::http::StatusCode::BAD_REQUEST,
             "invalid_request_error",
-            "batched prompts are currently supported only for non-streaming text Completions without continuous batching.",
+            "streaming batched prompts currently support text output only.",
+        );
+    }
+    if prompts.len() > 1 && state.app.enable_ifb {
+        return error_response(
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "batched prompts are currently supported only for direct text Completions without continuous batching.",
         );
     }
     if !state.app.ready.load(Ordering::Acquire) {
@@ -4233,7 +4280,7 @@ pub(crate) async fn handle_completions(
     let runtime = Arc::clone(runtime_lease.runtime());
     let model_id = runtime.model_id.clone();
     if model_is_non_generation(&runtime.pipeline) {
-        return encoder_model_generation_response(&model_id);
+        return non_generation_model_response(&model_id);
     }
     let pipeline = Arc::clone(&runtime.pipeline);
     let scheduler_opt = runtime.scheduler.clone();
@@ -4743,6 +4790,42 @@ pub(crate) async fn handle_completions(
         return Sse::new(final_stream)
             .keep_alive(axum::response::sse::KeepAlive::default())
             .into_response();
+    }
+
+    if payload.stream && (choice_count > 1 || inputs.len() > 1) {
+        let generated_count = Arc::new(AtomicU64::new(0));
+        let lifecycle = InferenceLifecycle::new(
+            cancel_guard,
+            InferenceLifecycleResources {
+                metrics: Arc::clone(&state.app.metrics),
+                request_start,
+                generated_tokens: Arc::clone(&generated_count),
+                prompt_tokens: prompt_tokens as u64,
+                permit,
+                runtime_lease: runtime_lease.clone(),
+            },
+            StreamExecution::Blocking,
+        );
+        return crate::openai_choices::stream_text_choices(
+            Arc::clone(&state),
+            pipeline,
+            crate::openai_choices::TextChoiceStream {
+                request_id,
+                model_id,
+                inputs,
+                echo_prompts: echo.then_some(prompts),
+                choice_count,
+                params,
+                stop_sequences,
+                chat: false,
+                include_usage: false,
+                prompt_tokens: prompt_tokens as u64,
+            },
+            lifecycle,
+            generated_count,
+            cancel_token,
+            request_start,
+        );
     }
 
     if !payload.stream {

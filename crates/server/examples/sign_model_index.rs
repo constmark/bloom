@@ -369,9 +369,17 @@ fn validate_package_directory(value: &str) -> Result<()> {
         || value.starts_with('.')
         || value.contains(['/', '\\', '%'])
         || value.chars().any(char::is_control)
-        || [".gguf", ".onnx", ".mlmodel", ".mlpackage", ".mlmodelc"]
-            .iter()
-            .any(|suffix| lower.ends_with(suffix))
+        || [
+            ".gguf",
+            ".onnx",
+            ".mlmodel",
+            ".mlpackage",
+            ".mlmodelc",
+            ".plan",
+            ".engine",
+        ]
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
     {
         return Err(anyhow!("model package directory is invalid"));
     }
@@ -528,7 +536,7 @@ fn validate_filename(filename: &str) -> Result<()> {
                 .rsplit_once('.')
                 .map(|(_, extension)| extension.to_ascii_lowercase())
                 .as_deref(),
-            Some("gguf" | "onnx" | "mlmodel")
+            Some("gguf" | "onnx" | "mlmodel" | "plan" | "engine")
         )
     {
         return Err(anyhow!("entry filename is not a supported direct child"));
@@ -642,6 +650,25 @@ mod tests {
             encode_hex(key.verifying_key().as_bytes()),
             "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c"
         );
+    }
+
+    #[test]
+    fn tensorrt_weight_entries_pass_offline_signing_without_relaxing_path_rules() {
+        for extension in ["plan", "engine"] {
+            let filename = format!("numeric.{extension}");
+            let mut payload: serde_json::Value = serde_json::from_slice(&valid_payload()).unwrap();
+            payload["models"][0]["filename"] = serde_json::json!(filename);
+            payload["models"][0]["download_url"] = serde_json::json!(format!(
+                "https://huggingface.co/acme/tiny/resolve/{}/{filename}",
+                "ab".repeat(20)
+            ));
+            assert_eq!(
+                validate_payload_identity(&serde_json::to_vec(&payload).unwrap()).unwrap(),
+                1
+            );
+            assert!(validate_filename(&format!("../{filename}")).is_err());
+            assert!(validate_package_directory(&filename).is_err());
+        }
     }
 
     #[test]

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import pathlib
 import re
 import sys
@@ -22,11 +23,17 @@ REFERENCE_LINK = re.compile(r"^\s*\[[^\]]+\]:\s*(\S+)")
 
 
 def markdown_files(root: pathlib.Path) -> list[pathlib.Path]:
-    return sorted(
-        path
-        for path in root.rglob("*.md")
-        if not EXCLUDED_DIRECTORIES.intersection(path.relative_to(root).parts)
-    )
+    # Prune before descending: Cargo creates/removes directories under target
+    # while checks run, so filtering after rglob both races and scans build trees.
+    def fail(error: OSError) -> None:
+        raise error
+
+    found = []
+    for directory, children, filenames in os.walk(root, topdown=True, onerror=fail):
+        children[:] = [name for name in children if name not in EXCLUDED_DIRECTORIES]
+        found.extend(pathlib.Path(directory) / name for name in filenames if name.endswith(".md"))
+    return sorted(found)
+
 
 
 def link_target(raw_target: str) -> str | None:

@@ -3364,6 +3364,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tensorrt_downloads_verify_before_catalog_publication() {
+        for extension in ["plan", "engine"] {
+            let bytes = b"opaque TensorRT model fixture".repeat(32);
+            let (url, server) = test_server(bytes.clone()).await;
+            let temp = tempfile::tempdir().unwrap();
+            let manager = ModelDownloadManager::with_policy(
+                temp.path().to_path_buf(),
+                1024 * 1024,
+                test_policy(),
+            )
+            .unwrap();
+            let filename = format!("numeric.{extension}");
+            manager
+                .start(request(url.clone(), &filename, &bytes))
+                .await
+                .unwrap();
+            let complete = wait_for_terminal(&manager).await;
+            assert_eq!(
+                complete.phase,
+                ModelDownloadPhase::Complete,
+                "{:?}",
+                complete.error
+            );
+            let catalog =
+                super::super::model_manager::ModelCatalog::scan(temp.path(), None).unwrap();
+            assert_eq!(catalog.models[0].format, "tensorrt");
+            assert_eq!(catalog.models[0].id, filename);
+            assert!(catalog.models[0].provenance.is_some());
+            let wrong_filename = format!("wrong.{extension}");
+            let mut invalid = request(url, &wrong_filename, &bytes);
+            invalid.sha256 = "00".repeat(32);
+            manager.start(invalid).await.unwrap();
+            assert_eq!(
+                wait_for_terminal(&manager).await.phase,
+                ModelDownloadPhase::Error
+            );
+            assert!(!temp.path().join(&wrong_filename).exists());
+            let source =
+                format!("https://huggingface.co/acme/repo/blob/main/{filename}?download=true");
+            let (prepared, source_filename) =
+                prepare_source_url(&source, &DownloadUrlPolicy::default()).unwrap();
+            assert_eq!(source_filename, filename);
+            assert!(
+                prepared
+                    .as_str()
+                    .ends_with(&format!("/resolve/main/{filename}"))
+            );
+            assert!(
+                prepare_source_url(
+                    &format!("https://evil.example/{filename}"),
+                    &DownloadUrlPolicy::default()
+                )
+                .is_err()
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn downloads_verifies_and_atomically_installs_a_model_package() {
         let files = sharded_package_files();
         let (base_url, server) = package_server(files.clone(), Duration::from_millis(25)).await;

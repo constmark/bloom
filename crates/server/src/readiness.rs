@@ -68,7 +68,7 @@ pub(crate) async fn handle_ready(
             } else if model_supports_rerank(&runtime.pipeline) {
                 vec!["rerank"]
             } else {
-                vec!["generation"]
+                bloomai_engine::model_manifest_tasks(&runtime.pipeline.metadata().manifest).to_vec()
             }
         })
         .unwrap_or_default();

@@ -33,6 +33,7 @@ request.
 - [Production readiness gap register](production-readiness.md)
 - [September 2026 project assessment](project-assessment-2026-09.md)
 - [October 2026 cross-platform assessment](project-assessment-2026-10.md)
+- [November 2026 capability audit](project-assessment-2026-11.md)
 
 ## Understand and extend Bloom
 
@@ -42,6 +43,11 @@ request.
 - [Support matrix](support-matrix.md)
 - [Scheduler](scheduler.md)
 - [Backend adapters](backend-adapters.md)
+- [External llama.cpp operation contract](llamacpp-adapter.md)
+- [CoreML numeric tensor execution](coreml-tensor.md)
+- [TensorRT numeric execution](tensorrt-tensor.md)
+- [Numeric CLI output](numeric-cli.md)
+- [Bounded WASM processors](wasm-plugins.md)
 - [Edge inference project shortlist](edge-inference-options-2026-10.md)
 - [Bloom versus open-source edge engines](bloom-vs-edge-engines-2026-10.md)
 - [Plugins and processors](plugins.md)

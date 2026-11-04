@@ -7,7 +7,7 @@ Bloom's plugin system is used to extend backends, engines, processors, operators
 | Type | Purpose | Default validation | Execution boundary |
 | :--- | :--- | :--- | :--- |
 | `native` | Dynamic library plugins | Path exists; optionally check for the `bloom_plugin_init` symbol | Executes in-process and must be treated as trusted code. |
-| `wasm` | WASM plugins | Path exists and ends with `.wasm` | Manifest validation only; WASM execution is not implemented. |
+| `wasm` | Inline data processors | Path exists and ends with `.wasm`; execution loader validates binary/ABI | Import-free interpreter with memory, fuel, I/O, deadline and cancellation bounds; see [WASM processor ABI](wasm-plugins.md). |
 | `subprocess` | External binaries or scripts | Path exists | Executes in a separate process; working directory, environment variables, and input paths must be restricted. |
 | `remote` | Network service plugins | Only `https://` or explicit local `http://127.0.0.1:` is allowed | Requires upper-layer authentication, timeouts, size limits, and auditing. |
 
@@ -53,7 +53,7 @@ Processor plugins can declare behavior through `input_modalities`, `output_modal
 
 ## Default Testing Requirements
 
-- Default CI only performs manifest/schema validation and entry point mock validation; it does not load unknown native libraries.
+- Default CI performs manifest/schema and entry point validation, plus actual bounded WASM processor execution and malicious-module tests. It does not load unknown native libraries.
 - Each plugin type needs error-path tests for missing dependencies and missing hardware.
 - Tests for real hardware, vendor SDKs, and remote endpoints must be feature-gated or use a dedicated runner.
 - Model packages must not commit large weights; only the manifest, hashes, license, and reproducible download/conversion instructions should be committed.

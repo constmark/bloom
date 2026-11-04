@@ -237,3 +237,19 @@ require(
 )
 
 print("Bloom Desktop checks passed")
+
+// A numeric runtime can be ready without supporting chat or sentence embeddings.
+let tensorModel = decodeReadiness(
+    """
+    {
+      "schema_version":3,"object":"bloom.readiness","protocol_version":3,
+      "minimum_ui_protocol_version":3,"maximum_ui_protocol_version":3,
+      "server_version":"0.1.0","status":"ready","progress":100,"model":"numeric",
+      "loading":false,"load_error":null,"input_modalities":["multi"],
+      "model_tasks":["tensor"],"context_window":128,"in_flight_requests":0,
+      "available_permits":1,"memory_pressure_high":false,"ram_utilization":0.1
+    }
+    """
+)
+require(tensorModel.isCompatible, "Tensor readiness should be accepted")
+require(!tensorModel.supportsChat, "Numeric model must not enable chat")

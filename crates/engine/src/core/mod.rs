@@ -8,4 +8,5 @@ pub mod pipeline;
 pub(crate) mod process;
 pub mod quantization;
 pub mod security;
+pub(crate) mod structured;
 pub mod telemetry;

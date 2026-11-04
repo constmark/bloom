@@ -45,7 +45,7 @@ static site or embed it in the server binary.
 - Verified acquisition provenance with optional source and license declarations
 - Cancellable on-demand SHA-256 re-verification with durable mismatch quarantine
 - JPEG/PNG image attachments with bounded multipart upload, streaming output, and cancellation
-- Persistent system prompt, `max_tokens`, `temperature`, `top_p`, seed, and bounded stop-sequence controls
+- Persistent system prompt, `max_tokens`, `temperature`, `top_p`, `top_k`, presence/frequency penalties, token logit biases, seed, and bounded stop-sequence controls
 - Persistent Text, JSON object, and bounded JSON Schema response modes
 - Persistent message history, empty states, and actionable error banners with
   validated HTTP request IDs for log correlation
@@ -135,6 +135,18 @@ characters and all entries to 16 KiB. Bloom stops before the first matching
 sequence even when it spans streamed model deltas. Image chat rejects an active
 stop setting during preflight and leaves the draft and conversation unchanged.
 
+Settings also exposes optional Top K (1–32,768), presence and frequency
+penalties (−2 through 2), and a JSON logit-bias object such as `{"17": -5.0}`.
+Logit bias accepts up to 1,024 unique canonical decimal token IDs from 0 through
+1,000,000, each with a finite value of −100 through 100. These token IDs depend
+on the active model's tokenizer. Empty Top K, zero penalties, and an empty bias
+object preserve the default behavior. Values persist across browser sessions;
+older settings migrate with neutral defaults. Invalid input prevents saving,
+and duplicate or malformed bias IDs are rejected instead of overwritten.
+These additional controls apply to text chat. An image submission with active
+Top K, penalties, or logit biases fails preflight with a corrective message
+before changing the draft or conversation.
+
 The Diagnostics drawer polls the authenticated, versioned
 `/v1/observability` snapshot and presents server uptime, model/load state,
 request and token counters, scheduling queues, memory observations, the startup
@@ -214,7 +226,7 @@ pipeline; Bloom never performs a bulk restore. The format is documented in
 
 Start the server with `--enable-model-downloads` to expose the download form.
 Downloads accept public HTTPS URLs on `huggingface.co` and its trusted CDN
-hosts and install only single-file GGUF, ONNX, or Core ML models. Paste a
+hosts and install only single-file GGUF, ONNX, Core ML, or TensorRT (`.plan`/`.engine`) models. Paste a
 repository `/blob/` or `/resolve/` file URL and use `Inspect source` to fill the
 safe filename, declared size, published 64-character SHA-256, and an immutable
 commit URL through a metadata-only HEAD request. Inspection never starts the

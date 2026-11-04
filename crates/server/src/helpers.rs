@@ -325,7 +325,8 @@ pub(crate) fn request_echo(
 /// Running many independent generations can consume a large amount of
 /// memory and scheduler capacity, so Bloom deliberately keeps this bounded.
 /// The handlers currently support multiple choices only for direct,
-/// non-streaming text requests; callers enforce those mode constraints.
+/// text requests. Buffered choices also support structured output and function
+/// tools; streaming choices remain plain text. Callers enforce mode constraints.
 pub(crate) const MAX_CHOICE_COUNT: usize = 8;
 pub(crate) const MAX_COMPLETION_PROMPTS: usize = 8;
 
@@ -3119,7 +3120,8 @@ pub(crate) fn validate_json_schema_subset(
                 }
             }
         }
-        if let Some(properties) = schema.get("properties").and_then(|v| v.as_object()) {
+        let properties = schema.get("properties").and_then(|v| v.as_object());
+        if let Some(properties) = properties {
             for (field, property_schema) in properties {
                 if let Some(field_value) = object.get(field) {
                     validate_json_schema_subset(
@@ -3129,14 +3131,14 @@ pub(crate) fn validate_json_schema_subset(
                     )?;
                 }
             }
-            if schema.get("additionalProperties").and_then(|v| v.as_bool()) == Some(false) {
-                for field in object.keys() {
-                    if !properties.contains_key(field) {
-                        return Err(format!(
-                            "{} contains unsupported property '{}'",
-                            path, field
-                        ));
-                    }
+        }
+        if schema.get("additionalProperties").and_then(|v| v.as_bool()) == Some(false) {
+            for field in object.keys() {
+                if properties.is_none_or(|properties| !properties.contains_key(field)) {
+                    return Err(format!(
+                        "{} contains unsupported property '{}'",
+                        path, field
+                    ));
                 }
             }
         }
@@ -3215,8 +3217,7 @@ pub(crate) fn model_supports_rerank(pipeline: &InferencePipeline) -> bool {
 /// are routed to the reranking endpoint and must be rejected by generation
 /// handlers rather than sent through the text decoder path.
 pub(crate) fn model_is_non_generation(pipeline: &InferencePipeline) -> bool {
-    model_supports_embeddings(pipeline)
-        || bloomai_engine::model_manifest_is_cross_encoder(&pipeline.metadata().manifest)
+    !bloomai_engine::model_manifest_tasks(&pipeline.metadata().manifest).contains(&"generation")
 }
 
 pub(crate) fn collect_embedding(
@@ -3342,5 +3343,28 @@ pub(crate) fn model_unload_error_details(
             "model_not_loaded",
             "The selected runtime generation is no longer loaded.",
         ),
+    }
+}
+
+#[cfg(test)]
+mod closed_object_schema_tests {
+    use super::*;
+
+    #[test]
+    fn closed_objects_reject_unknown_keys_without_a_properties_map() {
+        let closed = json!({"type": "object", "additionalProperties": false});
+        assert!(validate_json_schema_subset(&json!({}), &closed, "$").is_ok());
+        assert!(validate_json_schema_subset(&json!({"secret": 1}), &closed, "$").is_err());
+        let nested = json!({
+            "type": "object",
+            "properties": {"child": closed},
+            "additionalProperties": false
+        });
+        assert!(validate_json_schema_subset(&json!({"child": {}}), &nested, "$").is_ok());
+        assert!(
+            validate_json_schema_subset(&json!({"child": {"secret": 1}}), &nested, "$")
+                .unwrap_err()
+                .contains("$.child")
+        );
     }
 }

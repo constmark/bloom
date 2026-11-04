@@ -91,7 +91,8 @@ impl UnifiedMemoryConfig {
 
 fn apply_margin(bytes: usize, margin_percent: u8) -> usize {
     let margin = margin_percent.min(90) as usize;
-    bytes.saturating_mul(100usize.saturating_sub(margin)) / 100
+    let retained = 100 - margin;
+    bytes / 100 * retained + bytes % 100 * retained / 100
 }
 
 #[cfg(test)]
@@ -106,6 +107,15 @@ mod tests {
         };
 
         assert_eq!(config.effective_ram_budget(1000), 750);
+    }
+
+    #[test]
+    fn large_budgets_preserve_the_requested_margin_without_overflow() {
+        assert_eq!(apply_margin(usize::MAX, 0), usize::MAX);
+        assert_eq!(
+            apply_margin(usize::MAX, 25),
+            usize::MAX / 100 * 75 + usize::MAX % 100 * 75 / 100
+        );
     }
 
     #[test]

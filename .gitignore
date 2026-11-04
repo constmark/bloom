@@ -96,6 +96,9 @@ test_*.rs
 !scripts/test_server_http_boundary.py
 !scripts/test_server_shutdown.py
 !scripts/test_http_workload.py
+!scripts/test_tensorrt_infer.py
+!scripts/test_markdown_links.py
+!scripts/test_model_catalog_schemas.py
 !scripts/test_create_release_archive.py
 !scripts/test_community_metadata.py
 !scripts/test_release_workflow_security.py

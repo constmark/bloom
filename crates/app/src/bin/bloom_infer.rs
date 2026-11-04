@@ -31,6 +31,7 @@ use bloomai_engine::executor::mlx::MlxEngine;
 use bloomai_engine::executor::npu_tts::NpuTtsEngine;
 use bloomai_engine::executor::onnx::OnnxRuntimeEngine;
 use bloomai_engine::executor::openvino::OpenVINOEngine;
+use bloomai_engine::executor::tensorrt::TensorRtEngine;
 use bloomai_engine::executor::vulkan::VulkanEngine;
 
 #[cfg(feature = "candle-engine")]
@@ -140,6 +141,11 @@ struct Args {
     /// Enable streaming output (print tokens as they are generated).
     #[arg(long, default_value_t = false)]
     stream: bool,
+
+    /// Print the complete ModelOutput as JSON; with --stream, emit one
+    /// complete OutputChunk JSON value per line (including the End event).
+    #[arg(long, conflicts_with_all = ["bench_json", "bench", "interactive", "inspect", "list_engines"])]
+    json: bool,
 
     /// Device to run on: auto, cpu, gpu, or npu. Auto probes the host and
     /// chooses the best device supported by the selected engine.
@@ -399,6 +405,8 @@ fn select_backend_name(
             "openvino".to_string()
         } else if has_format(bloomai_core::ModelFormat::CoreMl) {
             "coreml".to_string()
+        } else if has_format(bloomai_core::ModelFormat::TensorRtEngine) {
+            "tensorrt".to_string()
         } else if has_format(bloomai_core::ModelFormat::Mlx) {
             "mlx".to_string()
         } else if has_format(bloomai_core::ModelFormat::VulkanSpirv) {
@@ -622,7 +630,11 @@ fn manifest_chat_template(manifest: &bloomai_core::ModelManifest) -> CliChatTemp
     }
 }
 
-fn resolve_and_parse_input(args: &Args, template: CliChatTemplate) -> Result<ResolvedInput> {
+fn resolve_and_parse_input(
+    args: &Args,
+    template: CliChatTemplate,
+    tensor: bool,
+) -> Result<ResolvedInput> {
     let raw_input = if let Some(ref path) = args.prompt_file {
         std::fs::read_to_string(path)
             .map_err(|e| anyhow!("failed to read prompt file '{}': {}", path.display(), e))?
@@ -641,6 +653,24 @@ fn resolve_and_parse_input(args: &Args, template: CliChatTemplate) -> Result<Res
     };
 
     let trimmed = raw_input.trim();
+
+    if tensor {
+        let value: serde_json::Value = serde_json::from_str(trimmed)
+            .map_err(|error| anyhow!("tensor input must be numeric tensor JSON: {error}"))?;
+        if !value.is_array() && !value.is_object() {
+            return Err(anyhow!(
+                "tensor input must be a JSON array or named tensor object"
+            ));
+        }
+        return Ok(ResolvedInput {
+            prompt: trimmed.to_string(),
+            max_tokens: args.max_tokens,
+            temperature: args.temperature,
+            top_p: args.top_p,
+            top_k: args.top_k,
+            seed: args.seed,
+        });
+    }
 
     if trimmed.starts_with('{') {
         // Structured decision engines such as Laya consume the request JSON
@@ -722,6 +752,7 @@ fn build_engine_registry() -> EngineRegistry {
     registry.register("npu-tts", Box::new(NpuTtsEngine));
     registry.register("onnxruntime", Box::new(OnnxRuntimeEngine));
     registry.register("coreml", Box::new(CoreMlEngine));
+    registry.register("tensorrt", Box::new(TensorRtEngine));
     registry.register("mlx", Box::new(MlxEngine));
     registry.register("vulkan", Box::new(VulkanEngine));
     registry.register("llamacpp", Box::new(LlamaCppEngine));
@@ -766,6 +797,43 @@ fn configure_process_environment(args: &Args) {
     }
 }
 
+fn format_inference_output(
+    output: &bloomai_engine::ModelOutput,
+    json: bool,
+) -> Result<Option<String>> {
+    output.validate().map_err(anyhow::Error::msg)?;
+    if json {
+        Ok(Some(serde_json::to_string(output)?))
+    } else if output.text.is_none()
+        && output.image.is_none()
+        && output.video.is_none()
+        && output.audio.is_none()
+    {
+        output
+            .logits
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(Into::into)
+    } else {
+        Ok(None)
+    }
+}
+
+fn format_stream_output(
+    chunk: &bloomai_engine::io::OutputChunk,
+    json: bool,
+) -> Result<Option<String>> {
+    chunk.validate().map_err(anyhow::Error::msg)?;
+    if json {
+        Ok(Some(serde_json::to_string(chunk)?))
+    } else if let bloomai_engine::io::OutputChunk::Embedding(values) = chunk {
+        Ok(Some(serde_json::to_string(values)?))
+    } else {
+        Ok(None)
+    }
+}
+
 fn main() -> Result<()> {
     // Initialize tracing (controlled via RUST_LOG env var).
     tracing_subscriber::fmt()
@@ -784,6 +852,13 @@ fn main() -> Result<()> {
     }
     let config = bloomai_app::load_config(&config_path)?;
     apply_config(&mut args, &matches, &config.infer);
+    if args.json
+        && (args.bench || args.bench_json || args.interactive || args.inspect || args.list_engines)
+    {
+        return Err(anyhow!(
+            "--json cannot be combined with benchmark, interactive, inspection, or engine-list modes"
+        ));
+    }
     configure_process_environment(&args);
 
     // --- Set up Engine Registry ---
@@ -830,6 +905,19 @@ fn main() -> Result<()> {
     if model_manifest_supports_embeddings(&manifest) {
         return Err(anyhow!(
             "bloom_infer serves text generation and cannot run an embedding encoder; start bloom_server and use /v1/embeddings, /v1/rerank, /api/embed, or /api/embeddings"
+        ));
+    }
+
+    let tensor_model = bloomai_engine::model_manifest_tasks(&manifest) == ["tensor"];
+    if tensor_model
+        && (args.interactive
+            || args.bench
+            || args.bench_json
+            || args.system_prompt.is_some()
+            || args.image.is_some())
+    {
+        return Err(anyhow!(
+            "tensor models accept numeric JSON with default generation parameters; interactive chat, generation benchmarks, system prompts, and images are unsupported"
         ));
     }
 
@@ -939,7 +1027,7 @@ fn main() -> Result<()> {
     }
 
     // --- Resolve and parse prompt / input overrides ---
-    let resolved_input = resolve_and_parse_input(&args, chat_template)?;
+    let resolved_input = resolve_and_parse_input(&args, chat_template, tensor_model)?;
 
     // Build generation parameters
     let params = GenerationParams {
@@ -1013,6 +1101,7 @@ fn main() -> Result<()> {
         let ftt = Arc::clone(&first_token_time);
         let quiet = args.quiet;
         let bench = args.bench_json;
+        let json_output = args.json;
 
         // Shared state for collecting video frames in streaming mode
         let video_frames: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1029,6 +1118,9 @@ fn main() -> Result<()> {
             input,
             &params,
             &mut move |chunk: bloomai_engine::io::OutputChunk| {
+                if !bench && let Some(line) = format_stream_output(&chunk, json_output)? {
+                    println!("{line}");
+                }
                 match chunk {
                     bloomai_engine::io::OutputChunk::TextDelta(text) => {
                         // Record first token time
@@ -1043,7 +1135,7 @@ fn main() -> Result<()> {
                             let mut count = tc.lock().unwrap_or_else(|e| e.into_inner());
                             *count += 1;
                         }
-                        if !bench {
+                        if !bench && !json_output {
                             print!("{}", text);
                             use std::io::Write;
                             std::io::stdout().flush()?;
@@ -1087,7 +1179,7 @@ fn main() -> Result<()> {
                             );
                         }
                     }
-                    bloomai_engine::io::OutputChunk::End if !bench => {
+                    bloomai_engine::io::OutputChunk::End if !bench && !json_output => {
                         println!(); // final newline
                     }
                     bloomai_engine::io::OutputChunk::End => {}
@@ -1115,7 +1207,7 @@ fn main() -> Result<()> {
                         &video,
                         &args.output,
                     )?;
-                    if !args.bench_json {
+                    if !args.bench_json && !args.json {
                         println!(
                             "Video saved to {} ({}x{}, {} frames @ {} fps)",
                             args.output.display(),
@@ -1137,11 +1229,16 @@ fn main() -> Result<()> {
     } else {
         // Non-streaming mode: collect full output
         let output = pipeline.run(input, &params)?;
+        if !args.bench_json
+            && let Some(line) = format_inference_output(&output, args.json)?
+        {
+            println!("{line}");
+        }
         if let Some(ref image) = output.image {
             std::fs::write(&args.output, image)?;
             *token_count.lock().unwrap_or_else(|e| e.into_inner()) = 1;
             *first_token_time.lock().unwrap_or_else(|e| e.into_inner()) = Some(infer_start);
-            if !args.bench_json {
+            if !args.bench_json && !args.json {
                 println!("Image saved to {}", args.output.display());
             }
         } else if let Some(ref video) = output.video {
@@ -1149,7 +1246,7 @@ fn main() -> Result<()> {
             #[cfg(feature = "candle-engine")]
             {
                 bloomai_engine::executor::wan::video_encoder::encode_video(video, &args.output)?;
-                if !args.bench_json {
+                if !args.bench_json && !args.json {
                     println!(
                         "Video saved to {} ({}x{}, {} frames @ {} fps)",
                         args.output.display(),
@@ -1171,14 +1268,14 @@ fn main() -> Result<()> {
             *token_count.lock().unwrap_or_else(|e| e.into_inner()) = approx_tokens;
             *first_token_time.lock().unwrap_or_else(|e| e.into_inner()) = Some(infer_start);
 
-            if args.quiet && !args.bench_json {
+            if args.quiet && !args.bench_json && !args.json {
                 println!("{}", text);
-            } else if !args.bench_json {
+            } else if !args.bench_json && !args.json {
                 println!("--- Output ---");
                 println!("{}", text);
                 println!("--- End ---");
             }
-        } else if !args.bench_json {
+        } else if !args.bench_json && !args.json && output.logits.is_none() {
             println!("(no text output)");
         }
     }
@@ -1240,10 +1337,14 @@ fn main() -> Result<()> {
                 .unwrap_or_else(|| "n/a".to_string()),
             total_elapsed.as_secs_f64()
         );
-        eprintln!(
-            "Tokens: {} generated | Speed: {:.1} tok/s",
-            generated_tokens, tokens_per_sec
-        );
+        if tensor_model {
+            eprintln!("Numeric inference: {:.2}s", generation_secs);
+        } else {
+            eprintln!(
+                "Tokens: {} generated | Speed: {:.1} tok/s",
+                generated_tokens, tokens_per_sec
+            );
+        }
         eprintln!("Memory estimate: {}", mem.display_summary());
     }
 
@@ -2042,10 +2143,12 @@ mod tests {
 
     #[test]
     fn select_backend_auto_routes_known_model_formats() {
+        let registry = build_engine_registry();
         for (format, expected) in [
             (bloomai_core::ModelFormat::Onnx, "onnxruntime"),
             (bloomai_core::ModelFormat::OpenVinoIr, "openvino"),
             (bloomai_core::ModelFormat::CoreMl, "coreml"),
+            (bloomai_core::ModelFormat::TensorRtEngine, "tensorrt"),
             (bloomai_core::ModelFormat::Mlx, "mlx"),
             (bloomai_core::ModelFormat::VulkanSpirv, "vulkan"),
         ] {
@@ -2061,6 +2164,10 @@ mod tests {
                 select_backend_name(None, "candle", "none", &manifest),
                 expected,
                 "format {format:?}"
+            );
+            assert!(
+                registry.get(expected).is_ok(),
+                "unregistered route: {expected}"
             );
         }
     }
@@ -2150,7 +2257,79 @@ mod tests {
             "--prompt",
             r#"{"state":"hello","questions":{"q":{"type":"noul","instructions":"is it safe?"}}}"#,
         ]);
-        let resolved = resolve_and_parse_input(&args, CliChatTemplate::Legacy).unwrap();
+        let resolved = resolve_and_parse_input(&args, CliChatTemplate::Legacy, false).unwrap();
         assert_eq!(resolved.prompt, args.prompt);
+    }
+
+    #[test]
+    fn tensor_input_preserves_numeric_json_and_generation_controls() {
+        for prompt in [
+            "[1.0,2.0]",
+            r#"{"inputs":{"x":{"shape":[1,2],"data":[1,2]}}}"#,
+        ] {
+            let args = Args::parse_from([
+                "bloom_infer",
+                "--prompt",
+                prompt,
+                "--max-tokens",
+                "9",
+                "--top-k",
+                "4",
+            ]);
+            let resolved = resolve_and_parse_input(&args, CliChatTemplate::ChatMl, true).unwrap();
+            assert_eq!(resolved.prompt, prompt);
+            assert_eq!(resolved.max_tokens, 9);
+            assert_eq!(resolved.top_k, Some(4));
+            // Engines see the exact non-default controls and reject them;
+            // the CLI must not silently replace them with tensor defaults.
+        }
+    }
+
+    #[test]
+    fn numeric_and_json_output_preserve_every_value_without_changing_text_mode() {
+        let output = bloomai_engine::ModelOutput {
+            logits: Some(vec![1.25, -2.5, 0.0]),
+            text: None,
+            audio: None,
+            image: None,
+            video: None,
+        };
+        let plain: Vec<f32> =
+            serde_json::from_str(&format_inference_output(&output, false).unwrap().unwrap())
+                .unwrap();
+        assert_eq!(plain, output.logits.clone().unwrap());
+        let encoded: serde_json::Value =
+            serde_json::from_str(&format_inference_output(&output, true).unwrap().unwrap())
+                .unwrap();
+        assert_eq!(encoded, serde_json::to_value(&output).unwrap());
+        let event = bloomai_engine::io::OutputChunk::Embedding(plain.clone());
+        assert_eq!(
+            format_stream_output(&event, false).unwrap().unwrap(),
+            serde_json::to_string(&plain).unwrap()
+        );
+        assert_eq!(
+            format_stream_output(&event, true).unwrap().unwrap(),
+            serde_json::to_string(&event).unwrap()
+        );
+        assert_eq!(
+            format_stream_output(&bloomai_engine::io::OutputChunk::End, true)
+                .unwrap()
+                .unwrap(),
+            "\"End\""
+        );
+        let text = bloomai_engine::ModelOutput {
+            text: Some("unchanged".into()),
+            ..output
+        };
+        assert_eq!(format_inference_output(&text, false).unwrap(), None);
+        assert_eq!(
+            format_stream_output(
+                &bloomai_engine::io::OutputChunk::TextDelta("unchanged".into()),
+                false
+            )
+            .unwrap(),
+            None
+        );
+        assert!(Args::try_parse_from(["bloom_infer", "--json", "--bench-json"]).is_err());
     }
 }

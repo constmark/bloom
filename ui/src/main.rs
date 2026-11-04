@@ -315,14 +315,19 @@ impl ConnectionState {
                 supports_audio_input,
                 supports_generation,
                 supports_embeddings,
+                supports_rerank,
                 ..
             } => {
                 let task = if *supports_audio_input && !*supports_text_input {
                     copy.transcription
                 } else if *supports_embeddings && !*supports_generation {
                     copy.embeddings
-                } else {
+                } else if *supports_generation {
                     copy.generation
+                } else if *supports_rerank {
+                    "Rerank"
+                } else {
+                    "Tensor"
                 };
                 ("ok", format!("{} · {task} · {model}", copy.ready))
             }
@@ -473,6 +478,8 @@ fn empty_state_view(connection: &ConnectionState, locale: Locale) -> EmptyStateV
         ConnectionState::Ready {
             model,
             supports_generation,
+            supports_embeddings,
+            supports_rerank,
             ..
         } => {
             if *supports_generation {
@@ -491,16 +498,28 @@ fn empty_state_view(connection: &ConnectionState, locale: Locale) -> EmptyStateV
                 }
             } else {
                 EmptyStateView {
-                    title: match locale {
+                    title: if !*supports_embeddings && !*supports_rerank {
+                        match locale {
+                            Locale::English => "Tensor model ready",
+                            Locale::SimplifiedChinese => "数值模型已就绪",
+                            Locale::Japanese => "テンソルモデルの準備完了",
+                        }.to_string()
+                    } else { match locale {
                         Locale::English => "Embedding model ready".to_string(),
                         Locale::SimplifiedChinese => "向量模型已就绪".to_string(),
                         Locale::Japanese => "埋め込みモデルの準備完了".to_string(),
-                    },
-                    body: match locale {
+                    } },
+                    body: if !*supports_embeddings && !*supports_rerank {
+                        match locale {
+                            Locale::English => format!("{model} runs numeric tensors through the Rust or CLI interface. Select a generation model to chat."),
+                            Locale::SimplifiedChinese => format!("{model} 通过 Rust 或命令行处理数值张量。要开始对话，请切换至生成模型。"),
+                            Locale::Japanese => format!("{model} は Rust または CLI で数値テンソルを処理します。会話には生成モデルを選択してください。"),
+                        }
+                    } else { match locale {
                         Locale::English => format!("{model} serves embeddings and reranking rather than text generation."),
                         Locale::SimplifiedChinese => format!("{model} 用于向量与重排序，而不是文本生成。"),
                         Locale::Japanese => format!("{model} はテキスト生成ではなく、埋め込みと再ランキングを提供します。"),
-                    },
+                    } },
                     action: None,
                 }
             }
@@ -3543,11 +3562,11 @@ fn ModelDrawer(config: Signal<ConnConfig>, on_close: EventHandler<()>, locale: L
                         if snapshot.import.enabled {
                             div { class: "model-import-form",
                                 label { class: "model-file-picker",
-                                    span { "Local GGUF, ONNX, or Core ML file" }
+                                    span { "Local GGUF, ONNX, Core ML, or TensorRT file" }
                                     input {
                                         key: "{import_input_key}",
                                         r#type: "file",
-                                        accept: ".gguf,.onnx,.mlmodel",
+                                        accept: ".gguf,.onnx,.mlmodel,.plan,.engine",
                                         disabled: import_busy(),
                                         onchange: move |event| {
                                             let Some(file_data) = event.files().into_iter().next() else {
@@ -3556,7 +3575,7 @@ fn ModelDrawer(config: Signal<ConnConfig>, on_close: EventHandler<()>, locale: L
                                             let filename = file_data.name();
                                             if !supported_model_import_filename(&filename) {
                                                 operation_error.set(Some(
-                                                    "Choose a non-hidden GGUF, ONNX, or Core ML file.".to_string()
+                                                    "Choose a non-hidden GGUF, ONNX, Core ML, or TensorRT file.".to_string()
                                                 ));
                                                 selected_import.set(None);
                                                 import_input_key += 1;
@@ -3745,7 +3764,7 @@ fn ModelDrawer(config: Signal<ConnConfig>, on_close: EventHandler<()>, locale: L
                     } else if snapshot.data.is_empty() {
                         div { class: "catalog-empty",
                             strong { "No recognized models found" }
-                            p { "Add a GGUF, ONNX, or Core ML file, or a recognized model directory." }
+                            p { "Add a GGUF, ONNX, Core ML, or TensorRT file, or a recognized model directory." }
                         }
                     } else {
                         div { class: "model-list", aria_label: "Available local models",
@@ -4085,6 +4104,7 @@ fn format_model_tasks(tasks: &[String]) -> String {
             "generation" => "Generation",
             "embedding" => "Embedding",
             "rerank" => "Rerank",
+            "tensor" => "Tensor",
             _ => "Unknown",
         })
         .collect::<Vec<_>>()
@@ -4185,7 +4205,9 @@ fn model_index_local_state(
     let expected_file_count = is_package.then_some(entry.files.len());
     if destination.is_some_and(|installed| {
         let format_matches = installed.format == entry.format
-            || (installed.format == "coreml" && entry.format == "mlmodel");
+            || (installed.format == "coreml" && entry.format == "mlmodel")
+            || (installed.format == "tensorrt"
+                && matches!(entry.format.as_str(), "plan" | "engine"));
         installed.kind == expected_kind
             && format_matches
             && installed.size_complete
@@ -4418,7 +4440,7 @@ fn supported_model_import_filename(name: &str) -> bool {
         name.rsplit_once('.')
             .map(|(_, extension)| extension.to_ascii_lowercase())
             .as_deref(),
-        Some("gguf" | "onnx" | "mlmodel")
+        Some("gguf" | "onnx" | "mlmodel" | "plan" | "engine")
     )
 }
 
@@ -5919,6 +5941,17 @@ fn SettingsDrawer(
     let mut max_tokens = use_signal(|| generation().max_tokens);
     let mut temperature = use_signal(|| generation().temperature);
     let mut top_p = use_signal(|| generation().top_p);
+    let mut top_k = use_signal(|| {
+        generation()
+            .top_k
+            .map(|value| value.to_string())
+            .unwrap_or_default()
+    });
+    let mut presence_penalty = use_signal(|| generation().presence_penalty);
+    let mut frequency_penalty = use_signal(|| generation().frequency_penalty);
+    let mut logit_bias = use_signal(|| {
+        serde_json::to_string_pretty(&generation().logit_bias).unwrap_or_else(|_| "{}".to_string())
+    });
     let mut seed = use_signal(|| {
         generation()
             .seed
@@ -6031,10 +6064,28 @@ fn SettingsDrawer(
                 return;
             }
         };
+        let parsed_top_k = match api::parse_top_k_setting(&top_k()) {
+            Ok(value) => value,
+            Err(message) => {
+                test_result.set(Some((false, message)));
+                return;
+            }
+        };
+        let parsed_logit_bias = match api::parse_logit_bias_setting(&logit_bias()) {
+            Ok(value) => value,
+            Err(message) => {
+                test_result.set(Some((false, message)));
+                return;
+            }
+        };
         let options = ChatOptions {
             max_tokens: max_tokens(),
             temperature: temperature(),
             top_p: top_p(),
+            top_k: parsed_top_k,
+            presence_penalty: presence_penalty(),
+            frequency_penalty: frequency_penalty(),
+            logit_bias: parsed_logit_bias,
             seed: parsed_seed,
             stop_sequences: parsed_stop_sequences,
             system_prompt: system_prompt(),
@@ -6249,6 +6300,66 @@ fn SettingsDrawer(
                             }
                         },
                     }
+                }
+                div { class: "field",
+                    label { r#for: "top-k", "Top K (optional, text chat)" }
+                    input {
+                        id: "top-k",
+                        r#type: "number",
+                        min: "1",
+                        max: "32768",
+                        step: "1",
+                        value: "{top_k}",
+                        placeholder: "Default",
+                        oninput: move |event| top_k.set(event.value()),
+                    }
+                    div { class: "help", "Limit sampling to the most likely 1–32768 tokens. Leave blank for the model default." }
+                }
+                div { class: "field",
+                    label { r#for: "presence-penalty", "Presence penalty (text chat): {presence_penalty:.2}" }
+                    input {
+                        id: "presence-penalty",
+                        r#type: "range",
+                        min: "-2",
+                        max: "2",
+                        step: "0.05",
+                        value: "{presence_penalty}",
+                        oninput: move |event| {
+                            if let Ok(value) = event.value().parse::<f64>() {
+                                presence_penalty.set(value);
+                            }
+                        },
+                    }
+                    div { class: "help", "Positive values discourage tokens already generated. Zero disables this penalty." }
+                }
+                div { class: "field",
+                    label { r#for: "frequency-penalty", "Frequency penalty (text chat): {frequency_penalty:.2}" }
+                    input {
+                        id: "frequency-penalty",
+                        r#type: "range",
+                        min: "-2",
+                        max: "2",
+                        step: "0.05",
+                        value: "{frequency_penalty}",
+                        oninput: move |event| {
+                            if let Ok(value) = event.value().parse::<f64>() {
+                                frequency_penalty.set(value);
+                            }
+                        },
+                    }
+                    div { class: "help", "Positive values increasingly discourage repeated tokens. Zero disables this penalty." }
+                }
+                div { class: "field",
+                    label { r#for: "logit-bias", "Logit bias (optional, text chat)" }
+                    textarea {
+                        id: "logit-bias",
+                        rows: 4,
+                        maxlength: "{api::MAX_LOGIT_BIAS_BYTES}",
+                        value: "{logit_bias}",
+                        placeholder: r#"{{"17": -5.0}}"#,
+                        oninput: move |event| logit_bias.set(event.value()),
+                    }
+                    div { class: "help", "Enter a JSON object with up to 1024 unique token IDs (0–1000000) and biases (-100 to 100). Token IDs depend on the model. Use an empty object to disable." }
                 }
                 div { class: "field",
                     label { r#for: "seed", "Seed (optional)" }
@@ -6639,6 +6750,10 @@ mod tests {
     fn local_model_import_accepts_only_supported_single_file_names() {
         assert!(supported_model_import_filename("model.gguf"));
         assert!(supported_model_import_filename("MODEL.ONNX"));
+        assert!(supported_model_import_filename("numeric.plan"));
+        assert!(supported_model_import_filename("NUMERIC.ENGINE"));
+        assert!(!supported_model_import_filename(".hidden.plan"));
+        assert!(!supported_model_import_filename("folder/numeric.engine"));
         assert!(!supported_model_import_filename(".hidden.gguf"));
         assert!(!supported_model_import_filename("folder/model.gguf"));
         assert!(!supported_model_import_filename("model.safetensors"));
@@ -6747,6 +6862,19 @@ mod tests {
             model_index_local_state(&coreml_entry, &[coreml_install]),
             ModelIndexLocalState::Verified
         );
+
+        for extension in ["plan", "engine"] {
+            let mut numeric_entry = entry.clone();
+            numeric_entry.filename = format!("numeric.{extension}");
+            numeric_entry.format = extension.to_string();
+            let mut numeric_installed = installed.clone();
+            numeric_installed.id = numeric_entry.filename.clone();
+            numeric_installed.format = "tensorrt".to_string();
+            assert_eq!(
+                model_index_local_state(&numeric_entry, &[numeric_installed]),
+                ModelIndexLocalState::Verified
+            );
+        }
 
         let mut unaliased = installed.clone();
         unaliased.provenance.as_mut().unwrap().model_index_id = None;

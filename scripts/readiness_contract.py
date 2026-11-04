@@ -139,17 +139,7 @@ def validate_readiness_document(
     ):
         raise ReadinessContractError("readiness input modalities are invalid")
     tasks = value.get("model_tasks")
-    if (
-        not isinstance(tasks, list)
-        or len(tasks) > 3
-        or len(set(item for item in tasks if isinstance(item, str))) != len(tasks)
-        or any(
-            not isinstance(item, str)
-            or item not in {"generation", "embedding", "rerank"}
-            for item in tasks
-        )
-        or ("rerank" in tasks and "embedding" not in tasks)
-    ):
+    if tasks not in ([], ["generation"], ["embedding"], ["embedding", "rerank"], ["rerank"], ["tensor"]):
         raise ReadinessContractError("readiness model tasks are invalid")
     context_window = value.get("context_window")
     if context_window is not None and not _integer(

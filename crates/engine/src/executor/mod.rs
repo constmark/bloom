@@ -26,6 +26,7 @@ pub mod qwen3_vl;
 #[cfg(feature = "candle-engine")]
 pub mod qwen_streaming;
 pub mod speculative;
+pub mod tensorrt;
 pub mod vulkan;
 #[cfg(feature = "candle-engine")]
 pub mod wan;

@@ -45,7 +45,10 @@ See the [edge-engine goal](docs/edge-engine-goal.md),
 - Native BERT sentence embeddings plus classifier-head cross-encoder reranking,
   with mask-aware bounded batching, mean pooling, and CPU-trained quality gates
 - Safe local model catalog with load preflight, portable inventory export, transactional lifecycle, verified downloads, and resumable browser imports
-- Pluggable engines, backends, processors, operators, and model packages
+- Pluggable engines, backends, processors, operators, and model packages,
+  including bounded [WASM processors](docs/wasm-plugins.md)
+- [CoreML CPU numeric execution](docs/coreml-tensor.md) on macOS and a guarded
+  [TensorRT numeric runtime](docs/tensorrt-tensor.md), with truthful task routing
 - Memory estimation, KV-cache management, in-flight batching, and tiered CacheMesh
   / `LayeredBlockCache` caching ([deployment guide](docs/cachemesh.md))
 - Task-aware browser UI for streaming chat, embeddings, and reranking,
@@ -534,7 +537,9 @@ All generation routes admit `max_tokens` from 1 through 32,768. Chat also
 accepts the current `max_completion_tokens` spelling; if both are sent, their
 values must match. The legacy completion route accepts up to eight nonblank
 prompts, each at most 262,144 characters and 768 KiB combined, for direct
-non-streaming requests. Embeddings accept 1 through 256 nonblank
+buffered or streaming text requests. Direct text Chat/Completion requests also
+accept `n=1..8` independent choices in either mode; streaming preserves
+per-choice indices and terminal events, with cancellation of the entire request. Embeddings accept 1 through 256 nonblank
 strings, each at most 262,144 characters and together at most 768 KiB; only
 finite, L2-normalized float output is currently supported, with optional
 dimensionality reduction from 1 through 16,384. Native BERT encoders execute

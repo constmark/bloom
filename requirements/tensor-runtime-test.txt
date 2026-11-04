@@ -1,0 +1,2 @@
+# Optional CPU-only bridge contract tests; no TensorRT/CUDA hardware runtime.
+numpy==2.5.4

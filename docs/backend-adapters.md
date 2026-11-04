@@ -24,8 +24,8 @@ Every adapter must:
 | FunASR / Qwen ASR | External Python | `external-runtime` | Runs model-specific ASR scripts |
 | Laya | Native Rust (`laya-decision`) | `experimental` | Runs ModernBERT decision checkpoints and returns typed JSON answers |
 | ONNX Runtime | Python `onnxruntime` bridge | `experimental` | Executes the first model input/output; text, audio, image bytes and numeric outputs are supported |
-| TensorRT | Vendor runtime | `skeleton` | Plan detection and diagnostics only |
-| CoreML | Apple framework | `skeleton` | Package probing and diagnostics only |
+| TensorRT | External NVIDIA Python | `external-runtime` | Runs named numeric tensor plans through TensorRT 10.x/CUDA; target-GPU evidence pending. See [contract](tensorrt-tensor.md) |
+| CoreML | System Swift/CoreML CPU | `experimental` | Runs fixed-shape numeric tensor models on macOS; real GLM/Scaler CPU gates. See [contract](coreml-tensor.md) |
 | MLX | Apple runtime | `experimental` | Text generation through the bundled `mlx_lm` Python bridge; install `requirements/mlx.txt` and use an MLX-LM model package |
 | Vulkan | GPU runtime | `skeleton` | Shader probing and diagnostics only |
 
@@ -63,6 +63,10 @@ draining both pipes, and aborts after ten minutes by default. Set
 `BLOOM_ONNX_TIMEOUT_SECS` to a value from 1 to 3600 to change the deadline.
 
 ## llama.cpp
+
+The [operation contract](llamacpp-adapter.md) documents text/structured output,
+exact tokenization, embedding batches, cross-encoder reranking, trusted task
+metadata, and the remaining external-runtime evidence requirements.
 
 Set the server path explicitly when it is not available on `PATH`:
 

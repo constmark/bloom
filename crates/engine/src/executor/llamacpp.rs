@@ -7,7 +7,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use bloomai_core::{DeviceClass, DeviceKind, GenerationParams, Modality, ModelFamily, ModelFormat};
+use bloomai_core::{
+    DeviceClass, DeviceKind, GenerationParams, Modality, ModelFamily, ModelFormat, ResponseFormat,
+};
 use serde_json::json;
 
 use crate::core::parallelism::ParallelStrategy;
@@ -69,12 +71,11 @@ impl Engine for LlamaCppEngine {
             supported_modalities: vec![Modality::Text],
             supports_streaming: true,
             supports_quantized_models: true,
-            // The external adapter currently forwards only `/completion`.
-            // Keep routing truthful until the corresponding llama-server
-            // operations and typed contracts are implemented.
-            supports_embeddings: false,
-            supports_rerank: false,
-            supports_structured_output: false,
+            // Operations remain model-specific: trusted manifest task metadata
+            // selects a dedicated generation, embedding, or rank process.
+            supports_embeddings: true,
+            supports_rerank: true,
+            supports_structured_output: true,
             max_context_tokens: None,
             supported_quant_methods: vec![QuantMethod::Gguf],
             supported_parallel_strategies: vec![ParallelStrategy::None],
@@ -94,6 +95,7 @@ impl Engine for LlamaCppEngine {
 
     fn load(&self, model_path: &Path, device: DeviceKind) -> Result<Box<dyn LoadedModel>> {
         let gguf_path = resolve_gguf_path(model_path)?;
+        let manifest = crate::manifest_adapter::load_manifest(model_path).unwrap_or_default();
         let binary = resolve_llama_server_binary()?;
         crate::core::security::validate_runner(&binary)?;
         let port = reserve_port()?;
@@ -124,6 +126,7 @@ impl Engine for LlamaCppEngine {
             .arg(context_size.to_string())
             .arg("--no-webui");
 
+        configure_model_task(&mut command, &manifest, spec_type)?;
         if let Some(threads) = threads {
             command.arg("--threads").arg(threads.to_string());
         }
@@ -161,7 +164,6 @@ impl Engine for LlamaCppEngine {
             .unwrap_or(DEFAULT_READY_TIMEOUT);
         wait_until_ready(addr, &mut child, ready_timeout)?;
 
-        let manifest = crate::manifest_adapter::load_manifest(model_path).unwrap_or_default();
         let model_id = gguf_path
             .file_stem()
             .and_then(|name| name.to_str())
@@ -200,6 +202,10 @@ impl LoadedModel for LlamaCppModel {
             ModelInput::Text { prompt } => prompt,
             _ => bail!("llamacpp backend only supports text input"),
         };
+        anyhow::ensure!(
+            !self.is_encoder(),
+            "llamacpp encoder models do not generate text; use embed_batch or rerank_batch"
+        );
         let text = self.complete(&prompt, params)?;
         Ok(ModelOutput {
             text: Some(text),
@@ -216,47 +222,138 @@ impl LoadedModel for LlamaCppModel {
         params: &GenerationParams,
         sink: &mut dyn OutputSink,
     ) -> Result<()> {
+        params.validate().map_err(anyhow::Error::msg)?;
         let prompt = match input {
             ModelInput::Text { prompt } => prompt,
             _ => bail!("llamacpp backend only supports text input"),
         };
-        self.complete_stream(&prompt, params, sink)?;
-        sink.on_chunk(OutputChunk::End)?;
-        Ok(())
+        if self.supports_native_embedding_batch() {
+            anyhow::ensure!(
+                matches!(params.response_format, None | Some(ResponseFormat::Text)),
+                "encoder models do not support response_format"
+            );
+            let mut embeddings = self.embed_batch(&[prompt])?;
+            sink.on_chunk(OutputChunk::Embedding(embeddings.remove(0)))?;
+            return sink.on_chunk(OutputChunk::End);
+        }
+        anyhow::ensure!(
+            !self.is_encoder(),
+            "llamacpp cross encoders require rerank_batch"
+        );
+        self.complete_stream(&prompt, params, sink)
+    }
+
+    fn tokenize(&self, text: &str) -> Option<Result<Vec<u32>>> {
+        Some((|| {
+            ModelInput::Text {
+                prompt: text.to_string(),
+            }
+            .validate()
+            .map_err(anyhow::Error::msg)?;
+            let response = post_json(
+                self.addr,
+                "/tokenize",
+                &json!({
+                    "content": text,
+                    "add_special": true,
+                    "parse_special": true,
+                    "with_pieces": false
+                }),
+                DEFAULT_COMPLETION_TIMEOUT,
+            )?;
+            let tokens = response
+                .get("tokens")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| anyhow!("llama-server tokenize response is missing tokens"))?;
+            anyhow::ensure!(
+                tokens.len() <= crate::MAX_TOKEN_COUNT,
+                "llama-server tokenizer exceeded the token limit"
+            );
+            tokens
+                .iter()
+                .map(|token| {
+                    token
+                        .as_u64()
+                        .and_then(|id| u32::try_from(id).ok())
+                        .ok_or_else(|| anyhow!("llama-server returned an invalid token id"))
+                })
+                .collect()
+        })())
+    }
+
+    fn supports_native_embedding_batch(&self) -> bool {
+        crate::model_manifest_supports_embeddings(&self.metadata.manifest)
+    }
+
+    fn embed_batch(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+        anyhow::ensure!(
+            self.supports_native_embedding_batch(),
+            "the loaded llama.cpp model is not an embedding model"
+        );
+        validate_text_batch(inputs)?;
+        let response = post_json(
+            self.addr,
+            "/v1/embeddings",
+            &json!({
+                "input": inputs,
+                "encoding_format": "float"
+            }),
+            DEFAULT_COMPLETION_TIMEOUT,
+        )?;
+        parse_embedding_response(&response, inputs.len())
+    }
+
+    fn supports_native_rerank(&self) -> bool {
+        crate::model_manifest_is_cross_encoder(&self.metadata.manifest)
+    }
+
+    fn rerank_batch(&self, query: &str, documents: &[String]) -> Result<Vec<f32>> {
+        anyhow::ensure!(
+            self.supports_native_rerank(),
+            "the loaded llama.cpp model is not a cross encoder"
+        );
+        ModelInput::Text {
+            prompt: query.to_string(),
+        }
+        .validate()
+        .map_err(anyhow::Error::msg)?;
+        validate_text_batch(documents)?;
+        let response = post_json(
+            self.addr,
+            "/reranking",
+            &json!({
+                "query": query,
+                "documents": documents,
+                "top_n": documents.len()
+            }),
+            DEFAULT_COMPLETION_TIMEOUT,
+        )?;
+        parse_rerank_response(&response, documents.len())
     }
 }
 
 impl LlamaCppModel {
+    fn is_encoder(&self) -> bool {
+        crate::model_manifest_tasks(&self.metadata.manifest) != ["generation"]
+    }
+
     fn complete(&self, prompt: &str, params: &GenerationParams) -> Result<String> {
-        let mut body = json!({
-            "prompt": prompt,
-            "n_predict": params.max_tokens,
-            "temperature": params.temperature,
-            "top_p": params.top_p,
-            "stream": false,
-            "seed": params.seed.map(|v| v as i64).unwrap_or(-1),
-        });
-        if let Some(top_k) = params.top_k {
-            body["top_k"] = json!(top_k);
-        }
-        if params.presence_penalty != 0.0 {
-            body["presence_penalty"] = json!(params.presence_penalty);
-        }
-        if params.frequency_penalty != 0.0 {
-            body["frequency_penalty"] = json!(params.frequency_penalty);
-        }
-        if let Some(logit_bias) = &params.logit_bias {
-            body["logit_bias"] = json!(logit_bias);
-        }
+        let body = completion_body(prompt, params, false)?;
         let response = post_json(self.addr, "/completion", &body, DEFAULT_COMPLETION_TIMEOUT)?;
+        anyhow::ensure!(
+            response.get("error").is_none(),
+            "llama-server completion returned an error: {response}"
+        );
         self.validate_speculative_response(&response)?;
-        response
+        let text = response
             .get("content")
             .and_then(|v| v.as_str())
             .map(str::to_string)
             .ok_or_else(|| {
                 anyhow!("llama-server response missing string field 'content': {response}")
-            })
+            })?;
+        validate_structured_completion(&text, params)?;
+        Ok(text)
     }
 
     fn complete_stream(
@@ -265,26 +362,9 @@ impl LlamaCppModel {
         params: &GenerationParams,
         sink: &mut dyn OutputSink,
     ) -> Result<()> {
-        let mut body = json!({
-            "prompt": prompt,
-            "n_predict": params.max_tokens,
-            "temperature": params.temperature,
-            "top_p": params.top_p,
-            "stream": true,
-            "seed": params.seed.map(|v| v as i64).unwrap_or(-1),
-        });
-        if let Some(top_k) = params.top_k {
-            body["top_k"] = json!(top_k);
-        }
-        if params.presence_penalty != 0.0 {
-            body["presence_penalty"] = json!(params.presence_penalty);
-        }
-        if params.frequency_penalty != 0.0 {
-            body["frequency_penalty"] = json!(params.frequency_penalty);
-        }
-        if let Some(logit_bias) = &params.logit_bias {
-            body["logit_bias"] = json!(logit_bias);
-        }
+        let body = completion_body(prompt, params, true)?;
+        let mut saw_terminal = false;
+        let mut structured_text = String::new();
         let mut saw_speculative_confirmation = self.spec_type == "none";
         post_json_stream(
             self.addr,
@@ -292,9 +372,33 @@ impl LlamaCppModel {
             &body,
             DEFAULT_COMPLETION_TIMEOUT,
             |event: &serde_json::Value| {
-                if let Some(content) = event.get("content").and_then(|v| v.as_str())
-                    && !content.is_empty()
-                {
+                anyhow::ensure!(!saw_terminal, "llama-server emitted data after completion");
+                anyhow::ensure!(
+                    event.get("error").is_none(),
+                    "llama-server stream returned an error: {event}"
+                );
+                anyhow::ensure!(
+                    event.is_object(),
+                    "llama-server stream event must be an object"
+                );
+                let content = event
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow!("llama-server stream event is missing string content")
+                    })?;
+                if matches!(
+                    params.response_format,
+                    Some(ResponseFormat::JsonObject | ResponseFormat::JsonSchema(_))
+                ) {
+                    anyhow::ensure!(
+                        structured_text.len().saturating_add(content.len())
+                            <= crate::MAX_TEXT_BYTES,
+                        "structured output exceeds the text byte limit"
+                    );
+                    structured_text.push_str(content);
+                }
+                if !content.is_empty() {
                     sink.on_chunk(OutputChunk::TextDelta(content.to_string()))?;
                 }
                 if event
@@ -304,9 +408,18 @@ impl LlamaCppModel {
                     self.validate_speculative_response(event)?;
                     saw_speculative_confirmation = true;
                 }
+                if let Some(stop) = event.get("stop") {
+                    saw_terminal = stop
+                        .as_bool()
+                        .ok_or_else(|| anyhow!("llama-server stream stop must be boolean"))?;
+                }
                 Ok(())
             },
         )?;
+        anyhow::ensure!(
+            saw_terminal,
+            "llama-server stream ended before its terminal completion event"
+        );
 
         if !saw_speculative_confirmation {
             bail!(
@@ -314,6 +427,7 @@ impl LlamaCppModel {
                 self.spec_type
             );
         }
+        validate_structured_completion(&structured_text, params)?;
         // The llama-server wire stream has no Bloom-native terminal chunk.
         // Emit one after the process stream has been fully consumed so the
         // pipeline can uphold the same completion contract as native models.
@@ -338,6 +452,226 @@ impl LlamaCppModel {
         }
         Ok(())
     }
+}
+
+fn validate_structured_completion(text: &str, params: &GenerationParams) -> Result<()> {
+    match &params.response_format {
+        None | Some(ResponseFormat::Text) => Ok(()),
+        Some(format) => {
+            anyhow::ensure!(
+                text.len() <= crate::MAX_TEXT_BYTES,
+                "structured output exceeds the text byte limit"
+            );
+            let value: serde_json::Value = serde_json::from_str(text)
+                .context("llama-server returned invalid structured JSON")?;
+            anyhow::ensure!(
+                value.is_object(),
+                "llama-server structured output must be a JSON object"
+            );
+            if let ResponseFormat::JsonSchema(schema) = format {
+                crate::core::structured::validate_complete_json_schema(&value, schema, "$")
+                    .map_err(anyhow::Error::msg)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+// Use the same endpoint contract as the pinned llama.cpp reference. Keeping
+// this conversion shared prevents buffered and streamed sampling from drifting.
+fn completion_body(
+    prompt: &str,
+    params: &GenerationParams,
+    stream: bool,
+) -> Result<serde_json::Value> {
+    params.validate().map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(
+        params.seed.is_none_or(|seed| seed <= u32::MAX as u64),
+        "llama.cpp seeds must fit in an unsigned 32-bit integer"
+    );
+    ModelInput::Text {
+        prompt: prompt.to_string(),
+    }
+    .validate()
+    .map_err(anyhow::Error::msg)?;
+    let mut body = json!({
+        "prompt": prompt,
+        "n_predict": params.max_tokens,
+        "temperature": params.temperature,
+        "top_p": params.top_p,
+        "stream": stream,
+        // Validate the external runtime's uint32 seed instead of wrapping it.
+        "seed": params.seed.map(serde_json::Value::from).unwrap_or(json!(-1)),
+        "presence_penalty": params.presence_penalty,
+        "frequency_penalty": params.frequency_penalty,
+    });
+    if let Some(top_k) = params.top_k {
+        body["top_k"] = json!(top_k);
+    }
+    if let Some(logit_bias) = &params.logit_bias {
+        body["logit_bias"] = json!(
+            logit_bias
+                .iter()
+                .map(|(token, bias)| json!([token, bias]))
+                .collect::<Vec<_>>()
+        );
+    }
+    match &params.response_format {
+        None | Some(ResponseFormat::Text) => {}
+        Some(ResponseFormat::JsonObject) => body["json_schema"] = json!({"type": "object"}),
+        Some(ResponseFormat::JsonSchema(schema)) => body["json_schema"] = schema.clone(),
+    }
+    Ok(body)
+}
+
+fn configure_model_task(
+    command: &mut Command,
+    manifest: &bloomai_core::ModelManifest,
+    spec_type: &str,
+) -> Result<()> {
+    let cross_encoder = crate::model_manifest_is_cross_encoder(manifest);
+    let embedding = crate::model_manifest_supports_embeddings(manifest);
+    if !cross_encoder && !embedding {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        spec_type == "none",
+        "llama.cpp encoder models do not support speculative generation"
+    );
+    command.arg("--embedding");
+    if cross_encoder {
+        command.arg("--reranking").arg("--pooling").arg("rank");
+    } else {
+        let pooling = manifest
+            .parameters
+            .get("embedding_pooling")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("mean");
+        anyhow::ensure!(
+            matches!(pooling, "mean" | "cls" | "last"),
+            "llama.cpp pooled embeddings require mean, cls, or last pooling"
+        );
+        command.arg("--pooling").arg(pooling);
+    }
+    Ok(())
+}
+
+const MAX_ENCODER_BATCH_ITEMS: usize = 256;
+
+fn validate_text_batch(inputs: &[String]) -> Result<()> {
+    anyhow::ensure!(
+        !inputs.is_empty() && inputs.len() <= MAX_ENCODER_BATCH_ITEMS,
+        "encoder batches must contain 1..={MAX_ENCODER_BATCH_ITEMS} inputs"
+    );
+    let mut bytes = 0usize;
+    for prompt in inputs {
+        ModelInput::Text {
+            prompt: prompt.clone(),
+        }
+        .validate()
+        .map_err(anyhow::Error::msg)?;
+        bytes = bytes.saturating_add(prompt.len());
+    }
+    anyhow::ensure!(
+        bytes <= crate::MAX_TEXT_BYTES,
+        "encoder batch exceeds the text byte limit"
+    );
+    Ok(())
+}
+
+fn response_index(value: &serde_json::Value, count: usize) -> Result<usize> {
+    value
+        .get("index")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
+        .filter(|index| *index < count)
+        .ok_or_else(|| anyhow!("llama-server returned an invalid result index"))
+}
+
+fn finite_f32(value: &serde_json::Value) -> Result<f32> {
+    let number = value
+        .as_f64()
+        .ok_or_else(|| anyhow!("llama-server returned a non-numeric value"))?
+        as f32;
+    anyhow::ensure!(
+        number.is_finite(),
+        "llama-server returned a non-finite float32 value"
+    );
+    Ok(number)
+}
+
+fn parse_embedding_response(response: &serde_json::Value, count: usize) -> Result<Vec<Vec<f32>>> {
+    let data = response
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow!("llama-server embedding response is missing data"))?;
+    anyhow::ensure!(
+        data.len() == count,
+        "llama-server returned the wrong embedding count"
+    );
+    let mut output = vec![None; count];
+    let mut dimensions = None;
+    let mut values = 0usize;
+    for item in data {
+        let index = response_index(item, count)?;
+        anyhow::ensure!(
+            output[index].is_none(),
+            "llama-server returned a duplicate embedding index"
+        );
+        let embedding = item
+            .get("embedding")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| anyhow!("llama-server returned an invalid embedding"))?;
+        anyhow::ensure!(
+            !embedding.is_empty()
+                && dimensions.is_none_or(|dimensions| dimensions == embedding.len()),
+            "llama-server embedding dimensions are empty or inconsistent"
+        );
+        values = values.saturating_add(embedding.len());
+        anyhow::ensure!(
+            values <= crate::MAX_TENSOR_VALUES,
+            "llama-server embedding batch exceeds the value limit"
+        );
+        dimensions = Some(embedding.len());
+        output[index] = Some(
+            embedding
+                .iter()
+                .map(finite_f32)
+                .collect::<Result<Vec<_>>>()?,
+        );
+    }
+    output
+        .into_iter()
+        .map(|embedding| {
+            embedding.ok_or_else(|| anyhow!("llama-server embedding index is missing"))
+        })
+        .collect()
+}
+
+fn parse_rerank_response(response: &serde_json::Value, count: usize) -> Result<Vec<f32>> {
+    let data = response
+        .get("results")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow!("llama-server rerank response is missing results"))?;
+    anyhow::ensure!(
+        data.len() == count,
+        "llama-server returned the wrong rerank count"
+    );
+    let mut output = vec![None; count];
+    for item in data {
+        let index = response_index(item, count)?;
+        anyhow::ensure!(
+            output[index].is_none(),
+            "llama-server returned a duplicate rerank index"
+        );
+        output[index] = Some(finite_f32(item.get("relevance_score").ok_or_else(
+            || anyhow!("llama-server rerank response is missing relevance_score"),
+        )?)?);
+    }
+    output
+        .into_iter()
+        .map(|score| score.ok_or_else(|| anyhow!("llama-server rerank index is missing")))
+        .collect()
 }
 
 impl Drop for LlamaCppModel {
@@ -435,13 +769,18 @@ fn command_exists(binary: &Path) -> bool {
     if crate::core::security::validate_runner(binary).is_err() {
         return false;
     }
-    Command::new(binary)
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    let mut command = Command::new(binary);
+    command.arg("--version");
+    crate::core::process::run_bounded_output(
+        &mut command,
+        &[],
+        MAX_LLAMA_HELP_BYTES,
+        MAX_LLAMA_HELP_BYTES,
+        LLAMA_HELP_TIMEOUT,
+    )
+    .is_ok_and(|output| {
+        output.status.success() && !output.stdout_exceeded && !output.stderr_exceeded
+    })
 }
 
 fn validate_llama_server_support(binary: &Path, spec_type: &str) -> Result<()> {
@@ -564,10 +903,8 @@ where
     F: FnMut(&serde_json::Value) -> Result<()>,
 {
     let body_text = serde_json::to_string(body)?;
-    let mut stream = TcpStream::connect_timeout(&addr, timeout)
+    let mut stream = DeadlineStream::connect(addr, timeout)
         .with_context(|| format!("failed to connect to llama-server at {addr}"))?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
 
     let request = format!(
         "POST {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Type: application/json\r\nAccept: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
@@ -582,6 +919,119 @@ where
 const MAX_HTTP_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
 const MAX_STREAM_EVENT_BYTES: usize = 1024 * 1024;
+
+// A socket idle timeout alone can be reset indefinitely by a noisy or hung
+// worker. Share one absolute budget across connection, writes, and all reads.
+struct DeadlineStream {
+    stream: TcpStream,
+    deadline: Instant,
+}
+
+impl DeadlineStream {
+    fn connect(addr: SocketAddr, timeout: Duration) -> std::io::Result<Self> {
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid llama-server deadline",
+            )
+        })?;
+        let stream = TcpStream::connect_timeout(&addr, timeout)?;
+        Ok(Self { stream, deadline })
+    }
+
+    fn remaining(&self) -> std::io::Result<Duration> {
+        self.deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "llama-server request deadline exceeded",
+                )
+            })
+    }
+}
+
+impl Read for DeadlineStream {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.stream.set_read_timeout(Some(self.remaining()?))?;
+        self.stream.read(bytes)
+    }
+}
+
+impl Write for DeadlineStream {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        self.stream.write(bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        self.stream.flush()
+    }
+}
+
+#[derive(Default)]
+struct HttpResponseFraming {
+    content_length: Option<usize>,
+    chunked: bool,
+}
+
+impl HttpResponseFraming {
+    fn add_header(&mut self, header: &str) -> Result<()> {
+        let (name, value) = header
+            .trim_end_matches(['\r', '\n'])
+            .split_once(':')
+            .ok_or_else(|| anyhow!("malformed llama-server HTTP header"))?;
+        if name.eq_ignore_ascii_case("content-length") {
+            anyhow::ensure!(
+                self.content_length.is_none() && !self.chunked,
+                "ambiguous llama-server response framing"
+            );
+            let value = value.trim();
+            anyhow::ensure!(
+                !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()),
+                "invalid llama-server content length"
+            );
+            let length = value.parse::<usize>()?;
+            anyhow::ensure!(
+                length <= MAX_HTTP_RESPONSE_BYTES,
+                "llama-server content length exceeds the byte limit"
+            );
+            self.content_length = Some(length);
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            anyhow::ensure!(
+                !self.chunked && self.content_length.is_none(),
+                "ambiguous llama-server response framing"
+            );
+            anyhow::ensure!(
+                value.trim().eq_ignore_ascii_case("chunked"),
+                "unsupported llama-server transfer encoding"
+            );
+            self.chunked = true;
+        }
+        Ok(())
+    }
+}
+
+fn consume_chunk_trailers(reader: &mut impl BufRead) -> Result<()> {
+    let mut bytes = 0usize;
+    loop {
+        let trailer = bounded_line(reader, MAX_HTTP_HEADER_BYTES.saturating_sub(bytes))?;
+        bytes += trailer.len();
+        if trailer == "\r\n" || trailer == "\n" {
+            return Ok(());
+        }
+        let (name, _) = trailer
+            .split_once(':')
+            .ok_or_else(|| anyhow!("malformed llama-server chunk trailer"))?;
+        anyhow::ensure!(
+            !name.eq_ignore_ascii_case("content-length")
+                && !name.eq_ignore_ascii_case("transfer-encoding"),
+            "llama-server chunk trailer contains response framing"
+        );
+    }
+}
 
 fn bounded_line(reader: &mut impl BufRead, limit: usize) -> Result<String> {
     let mut line = String::new();
@@ -604,10 +1054,8 @@ fn request(
         Some(body) => serde_json::to_string(body)?,
         None => String::new(),
     };
-    let mut stream = TcpStream::connect_timeout(&addr, timeout)
+    let mut stream = DeadlineStream::connect(addr, timeout)
         .with_context(|| format!("failed to connect to llama-server at {addr}"))?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
 
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
@@ -627,7 +1075,7 @@ fn request(
     parse_http_json(&raw)
 }
 
-fn read_streaming_http_json_events<F>(stream: TcpStream, mut on_event: F) -> Result<()>
+fn read_streaming_http_json_events<F>(stream: impl Read, mut on_event: F) -> Result<()>
 where
     F: FnMut(&serde_json::Value) -> Result<()>,
 {
@@ -636,7 +1084,7 @@ where
     if status.split_whitespace().nth(1) != Some("200") {
         bail!("llama-server returned {}", status.trim());
     }
-    let mut transfer_encoding = String::new();
+    let mut framing = HttpResponseFraming::default();
     let mut header_bytes = status.len();
     loop {
         let header = bounded_line(
@@ -647,20 +1095,12 @@ where
         if header == "\r\n" || header == "\n" {
             break;
         }
-        if let Some((name, value)) = header.split_once(':')
-            && name.eq_ignore_ascii_case("transfer-encoding")
-        {
-            transfer_encoding = value.trim().to_ascii_lowercase();
-        }
+        framing.add_header(&header)?;
     }
-    anyhow::ensure!(
-        transfer_encoding.is_empty() || transfer_encoding == "chunked",
-        "unsupported llama-server transfer encoding"
-    );
     let mut parser = StreamJsonEventParser::default();
     let mut total_bytes = 0usize;
     let mut buffer = [0u8; 8192];
-    if transfer_encoding == "chunked" {
+    if framing.chunked {
         loop {
             let size_line = bounded_line(&mut reader, MAX_HTTP_HEADER_BYTES)?;
             let size_hex = size_line.split(';').next().unwrap_or("").trim();
@@ -670,6 +1110,7 @@ where
                 "llama-server stream exceeds the byte limit"
             );
             if size == 0 {
+                consume_chunk_trailers(&mut reader)?;
                 break;
             }
             total_bytes += size;
@@ -693,12 +1134,18 @@ where
             }
             total_bytes += read;
             anyhow::ensure!(
-                total_bytes <= MAX_HTTP_RESPONSE_BYTES,
-                "llama-server stream exceeds the byte limit"
+                total_bytes <= framing.content_length.unwrap_or(MAX_HTTP_RESPONSE_BYTES),
+                "llama-server stream exceeds its declared length or byte limit"
             );
             parser.push_bytes(&buffer[..read], &mut on_event)?;
         }
     }
+    anyhow::ensure!(
+        framing
+            .content_length
+            .is_none_or(|length| length == total_bytes),
+        "truncated llama-server content-length stream"
+    );
     parser.finish(&mut on_event)
 }
 
@@ -715,7 +1162,7 @@ fn parse_http_json(raw: &[u8]) -> Result<serde_json::Value> {
         header_end <= MAX_HTTP_HEADER_BYTES,
         "llama-server headers exceed the byte limit"
     );
-    let headers = String::from_utf8_lossy(&raw[..header_end]);
+    let headers = std::str::from_utf8(&raw[..header_end])?;
     let body_bytes = &raw[header_end + 4..];
     let status = headers.lines().next().unwrap_or_default();
     if status.split_whitespace().nth(1) != Some("200") {
@@ -725,12 +1172,19 @@ fn parse_http_json(raw: &[u8]) -> Result<serde_json::Value> {
         );
     }
 
-    let body = if headers
-        .to_ascii_lowercase()
-        .contains("transfer-encoding: chunked")
-    {
+    let mut framing = HttpResponseFraming::default();
+    for header in headers.lines().skip(1) {
+        framing.add_header(header)?;
+    }
+    let body = if framing.chunked {
         decode_chunked_body(body_bytes)?
     } else {
+        anyhow::ensure!(
+            framing
+                .content_length
+                .is_none_or(|length| length == body_bytes.len()),
+            "llama-server response does not match its content length"
+        );
         body_bytes.to_vec()
     };
     serde_json::from_slice(&body).with_context(|| {
@@ -752,6 +1206,13 @@ fn decode_chunked_body(mut body: &[u8]) -> Result<Vec<u8>> {
         let size_hex = size_hex.split(';').next().unwrap_or("").trim();
         let size = usize::from_str_radix(size_hex, 16)?;
         if size == 0 {
+            let remaining = &body[line_end + 2..];
+            let mut trailers = std::io::Cursor::new(remaining);
+            consume_chunk_trailers(&mut trailers)?;
+            anyhow::ensure!(
+                trailers.position() == remaining.len() as u64,
+                "llama-server response contains data after chunk termination"
+            );
             break;
         }
         let chunk_start = line_end + 2;
@@ -908,12 +1369,422 @@ fn trim_ascii(bytes: &[u8]) -> &[u8] {
 mod tests {
     use super::*;
 
+    fn fixture_model(addr: SocketAddr, task: &str) -> LlamaCppModel {
+        let mut manifest = bloomai_core::ModelManifest::default();
+        match task {
+            "embedding" => {
+                manifest
+                    .parameters
+                    .insert("bloom_task".into(), json!("embedding"));
+            }
+            "rerank" => {
+                manifest
+                    .parameters
+                    .insert("bloom_cross_encoder".into(), json!(true));
+            }
+            _ => {}
+        }
+        LlamaCppModel {
+            child: Mutex::new(None),
+            addr,
+            spec_type: "none".into(),
+            metadata: ModelMetadata {
+                id: "fixture".into(),
+                modality: Modality::Text,
+                quantized: true,
+                manifest,
+            },
+        }
+    }
+
+    fn mock_endpoint(
+        path: &'static str,
+        response: &str,
+        sse: bool,
+    ) -> (SocketAddr, thread::JoinHandle<serde_json::Value>) {
+        let listener = TcpListener::bind((DEFAULT_HOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let response = response.to_string();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut reader = BufReader::new(stream);
+            let line = bounded_line(&mut reader, MAX_HTTP_HEADER_BYTES).unwrap();
+            assert_eq!(line.trim(), format!("POST {path} HTTP/1.1"));
+            let mut length = None;
+            loop {
+                let line = bounded_line(&mut reader, MAX_HTTP_HEADER_BYTES).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+            let mut body = vec![0; length.unwrap()];
+            reader.read_exact(&mut body).unwrap();
+            let content_type = if sse {
+                "text/event-stream"
+            } else {
+                "application/json"
+            };
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n",
+                response.len()
+            );
+            reader.get_mut().write_all(header.as_bytes()).unwrap();
+            reader.get_mut().write_all(response.as_bytes()).unwrap();
+            serde_json::from_slice(&body).unwrap()
+        });
+        (addr, worker)
+    }
+
     #[test]
-    fn capability_matches_the_external_completion_surface() {
+    fn completion_controls_are_identical_across_transport_modes() {
+        let schema = json!({"type":"object", "properties":{"answer":{"type":"string"}}, "required":["answer"]});
+        let params = GenerationParams {
+            seed: Some(u32::MAX as u64),
+            top_k: Some(12),
+            presence_penalty: 0.5,
+            frequency_penalty: -1.0,
+            logit_bias: Some([(42, 2.5)].into_iter().collect()),
+            response_format: Some(ResponseFormat::JsonSchema(schema.clone())),
+            ..Default::default()
+        };
+        let mut buffered = completion_body("你好", &params, false).unwrap();
+        let mut streamed = completion_body("你好", &params, true).unwrap();
+        assert_eq!(buffered["json_schema"], schema);
+        assert_eq!(buffered["seed"], u32::MAX);
+        assert_eq!(buffered["logit_bias"], json!([[42, 2.5]]));
+        assert_eq!(buffered["top_k"], 12);
+        buffered.as_object_mut().unwrap().remove("stream");
+        streamed.as_object_mut().unwrap().remove("stream");
+        assert_eq!(buffered, streamed);
+        assert!(
+            completion_body(
+                "x",
+                &GenerationParams {
+                    seed: Some(u64::MAX),
+                    ..params.clone()
+                },
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            completion_body(
+                "x",
+                &GenerationParams {
+                    max_tokens: 0,
+                    ..params
+                },
+                false
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn streams_exactly_one_terminal_and_forwards_json_grammar() {
+        let (addr, worker) = mock_endpoint(
+            "/completion",
+            "data: {\"content\":\"{\\\"ok\\\":true}\",\"stop\":false}\n\ndata: {\"content\":\"\",\"stop\":true}\n\ndata: [DONE]\n\n",
+            true,
+        );
+        let model = fixture_model(addr, "generation");
+        let mut text = String::new();
+        let mut ends = 0;
+        model
+            .infer_stream(
+                ModelInput::Text {
+                    prompt: "你好".into(),
+                },
+                &GenerationParams {
+                    response_format: Some(ResponseFormat::JsonObject),
+                    ..Default::default()
+                },
+                &mut |chunk| {
+                    assert_eq!(ends, 0, "output after terminal event");
+                    match chunk {
+                        OutputChunk::TextDelta(delta) => text.push_str(&delta),
+                        OutputChunk::End => ends += 1,
+                        _ => panic!("unexpected chunk"),
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(text, "{\"ok\":true}");
+        assert_eq!(ends, 1);
+        let request = worker.join().unwrap();
+        assert_eq!(request["json_schema"], json!({"type":"object"}));
+        assert_eq!(request["prompt"], "你好");
+        assert_eq!(request["stream"], true);
+    }
+
+    #[test]
+    fn cancelled_stream_does_not_emit_a_successful_terminal() {
+        let (addr, worker) = mock_endpoint(
+            "/completion",
+            "data: {\"content\":\"first\",\"stop\":false}\n\ndata: {\"content\":\"second\",\"stop\":true}\n\n",
+            true,
+        );
+        let mut chunks = 0;
+        let error = fixture_model(addr, "generation")
+            .infer_stream(
+                ModelInput::Text { prompt: "x".into() },
+                &GenerationParams::default(),
+                &mut |_| {
+                    chunks += 1;
+                    bail!("cancelled by caller")
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.to_string(), "cancelled by caller");
+        assert_eq!(chunks, 1);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn malformed_failed_truncated_and_post_terminal_streams_never_succeed() {
+        for body in [
+            "data: {\"content\":\"partial\",\"stop\":false}\n\n",
+            "data: {\"error\":{\"message\":\"worker failed\"}}\n\n",
+            "data: {\"content\":42,\"stop\":true}\n\n",
+            "data: {\"content\":\"\",\"stop\":\"true\"}\n\n",
+            "data: {\"content\":\"\",\"stop\":true}\n\ndata: {\"content\":\"late\",\"stop\":true}\n\n",
+        ] {
+            let (addr, worker) = mock_endpoint("/completion", body, true);
+            let mut ends = 0;
+            assert!(
+                fixture_model(addr, "generation")
+                    .infer_stream(
+                        ModelInput::Text { prompt: "x".into() },
+                        &GenerationParams::default(),
+                        &mut |chunk| {
+                            if matches!(chunk, OutputChunk::End) {
+                                ends += 1;
+                            }
+                            Ok(())
+                        }
+                    )
+                    .is_err(),
+                "accepted {body}"
+            );
+            assert_eq!(ends, 0);
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_structured_results_before_a_successful_terminal() {
+        let schema = json!({"type":"object", "properties":{"ok":{"type":"boolean"}}, "required":["ok"], "additionalProperties":false});
+        let params = GenerationParams {
+            response_format: Some(ResponseFormat::JsonSchema(schema)),
+            ..Default::default()
+        };
+        for content in [
+            "not JSON",
+            "[]",
+            "{}",
+            "{\"ok\":1}",
+            "{\"ok\":true,\"extra\":1}",
+        ] {
+            let body = format!("data: {}\n\n", json!({"content":content,"stop":true}));
+            let (addr, worker) = mock_endpoint("/completion", &body, true);
+            let mut ended = false;
+            assert!(
+                fixture_model(addr, "generation")
+                    .infer_stream(
+                        ModelInput::Text { prompt: "x".into() },
+                        &params,
+                        &mut |chunk| {
+                            ended |= matches!(chunk, OutputChunk::End);
+                            Ok(())
+                        }
+                    )
+                    .is_err()
+            );
+            assert!(!ended);
+            worker.join().unwrap();
+        }
+        let (addr, worker) = mock_endpoint(
+            "/completion",
+            &json!({"content":"{\"ok\":true}"}).to_string(),
+            false,
+        );
+        assert_eq!(
+            fixture_model(addr, "generation")
+                .complete("x", &params)
+                .unwrap(),
+            "{\"ok\":true}"
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn external_embedding_batch_restores_order_and_preserves_task_isolation() {
+        let (addr, worker) = mock_endpoint(
+            "/v1/embeddings",
+            &json!({"data":[{"index":1,"embedding":[0.0,1.0]},{"index":0,"embedding":[1.0,0.0]}]})
+                .to_string(),
+            false,
+        );
+        let model = fixture_model(addr, "embedding");
+        assert!(model.supports_native_embedding_batch());
+        assert!(!model.supports_native_rerank());
+        assert_eq!(
+            model
+                .embed_batch(&["first".into(), "second".into()])
+                .unwrap(),
+            [vec![1.0, 0.0], vec![0.0, 1.0]]
+        );
+        assert!(
+            model
+                .infer(
+                    ModelInput::Text { prompt: "x".into() },
+                    &GenerationParams::default()
+                )
+                .is_err()
+        );
+        let request = worker.join().unwrap();
+        assert_eq!(request["input"], json!(["first", "second"]));
+        assert_eq!(request["encoding_format"], "float");
+    }
+
+    #[test]
+    fn scalar_embedding_stream_emits_vector_and_one_terminal() {
+        let (addr, worker) = mock_endpoint(
+            "/v1/embeddings",
+            &json!({"data":[{"index":0,"embedding":[0.5,-0.5]}]}).to_string(),
+            false,
+        );
+        let mut chunks = Vec::new();
+        fixture_model(addr, "embedding")
+            .infer_stream(
+                ModelInput::Text { prompt: "x".into() },
+                &GenerationParams::default(),
+                &mut |chunk| {
+                    chunks.push(chunk);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(matches!(&chunks[0], OutputChunk::Embedding(values) if values == &[0.5,-0.5]));
+        assert!(matches!(&chunks[1], OutputChunk::End));
+        assert_eq!(chunks.len(), 2);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn cross_encoder_restores_document_order_without_embedding_fallback() {
+        let (addr, worker) = mock_endpoint("/reranking", &json!({"results":[{"index":1,"relevance_score":0.9},{"index":0,"relevance_score":0.1}]}).to_string(), false);
+        let model = fixture_model(addr, "rerank");
+        assert!(model.supports_native_rerank());
+        assert!(!model.supports_native_embedding_batch());
+        assert!(model.embed_batch(&["x".into()]).is_err());
+        assert_eq!(
+            model
+                .rerank_batch("query", &["low".into(), "high".into()])
+                .unwrap(),
+            [0.1, 0.9]
+        );
+        let request = worker.join().unwrap();
+        assert_eq!(request["query"], "query");
+        assert_eq!(request["top_n"], 2);
+        assert_eq!(request["documents"], json!(["low", "high"]));
+    }
+
+    #[test]
+    fn encoder_result_parsers_fail_closed_for_corrupted_batches() {
+        for response in [
+            json!({"data":[]}),
+            json!({"data":[{"index":0,"embedding":[1.0]},{"index":0,"embedding":[1.0]}]}),
+            json!({"data":[{"index":2,"embedding":[1.0]},{"index":0,"embedding":[1.0]}]}),
+            json!({"data":[{"index":1,"embedding":[1.0]},{"index":0,"embedding":[]}]}),
+            json!({"data":[{"index":1,"embedding":[1.0]},{"index":0,"embedding":[1.0,2.0]}]}),
+            json!({"data":[{"index":1,"embedding":[1e100]},{"index":0,"embedding":[1.0]}]}),
+        ] {
+            assert!(
+                parse_embedding_response(&response, 2).is_err(),
+                "accepted {response}"
+            );
+        }
+        for response in [
+            json!({"results":[]}),
+            json!({"results":[{"index":0,"relevance_score":1.0},{"index":0,"relevance_score":0.0}]}),
+            json!({"results":[{"index":1,"relevance_score":1e100},{"index":0,"relevance_score":1.0}]}),
+            json!({"results":[{"index":1,"score":1.0},{"index":0,"relevance_score":1.0}]}),
+        ] {
+            assert!(
+                parse_rerank_response(&response, 2).is_err(),
+                "accepted {response}"
+            );
+        }
+        assert!(validate_text_batch(&[]).is_err());
+        assert!(validate_text_batch(&vec!["x".into(); MAX_ENCODER_BATCH_ITEMS + 1]).is_err());
+    }
+
+    #[test]
+    fn trusted_encoder_metadata_configures_exclusive_worker_modes() {
+        let model = fixture_model("127.0.0.1:1".parse().unwrap(), "embedding");
+        let mut command = Command::new("llama-server");
+        configure_model_task(&mut command, &model.metadata.manifest, "none").unwrap();
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["--embedding", "--pooling", "mean"]
+        );
+        assert!(configure_model_task(&mut command, &model.metadata.manifest, "draft-mtp").is_err());
+        let model = fixture_model("127.0.0.1:1".parse().unwrap(), "rerank");
+        let mut command = Command::new("llama-server");
+        configure_model_task(&mut command, &model.metadata.manifest, "none").unwrap();
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["--embedding", "--reranking", "--pooling", "rank"]
+        );
+    }
+
+    #[test]
+    fn external_tokenizer_uses_model_special_tokens_and_exact_ids() {
+        let (addr, worker) = mock_endpoint(
+            "/tokenize",
+            &json!({"tokens":[1,42,9000]}).to_string(),
+            false,
+        );
+        assert_eq!(
+            fixture_model(addr, "generation")
+                .tokenize("你好 Bloom")
+                .unwrap()
+                .unwrap(),
+            [1, 42, 9000]
+        );
+        let request = worker.join().unwrap();
+        assert_eq!(request["content"], "你好 Bloom");
+        assert_eq!(request["add_special"], true);
+        assert_eq!(request["parse_special"], true);
+        for tokens in [json!([-1]), json!([u64::MAX]), json!([1.5]), json!(["1"])] {
+            let (addr, worker) =
+                mock_endpoint("/tokenize", &json!({"tokens":tokens}).to_string(), false);
+            assert!(
+                fixture_model(addr, "generation")
+                    .tokenize("x")
+                    .unwrap()
+                    .is_err()
+            );
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn capability_matches_the_external_operations() {
         let capability = LlamaCppEngine.capability();
-        assert!(!capability.supports_embeddings);
-        assert!(!capability.supports_rerank);
-        assert!(!capability.supports_structured_output);
+        assert!(capability.supports_embeddings);
+        assert!(capability.supports_rerank);
+        assert!(capability.supports_structured_output);
         assert!(capability.supports_streaming);
     }
 
@@ -994,8 +1865,68 @@ mod tests {
     }
 
     #[test]
+    fn response_framing_rejects_truncation_and_ambiguous_headers() {
+        for raw in [
+            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\n{\"a\":1}",
+            "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n{\"a\":1}",
+            "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nContent-Length: 7\r\n\r\n{\"a\":1}",
+            "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nTransfer-Encoding: chunked\r\n\r\n7\r\n{\"a\":1}\r\n0\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 7\r\n\r\n7\r\n{\"a\":1}\r\n0\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\n{\"a\":1}",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n7\r\n{\"a\":1}\r\n0\r\n",
+        ] {
+            assert!(parse_http_json(raw.as_bytes()).is_err(), "accepted {raw:?}");
+        }
+        for raw in [
+            "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\ndata: {\"content\":\"\",\"stop\":true}\n\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n",
+        ] {
+            assert!(
+                read_streaming_http_json_events(raw.as_bytes(), |_| Ok(())).is_err(),
+                "accepted {raw:?}"
+            );
+        }
+        let raw = b"HTTP/1.1 200 OK\r\ntRaNsFeR-EnCoDiNg: CHUNKED\r\n\r\n7\r\n{\"a\":1}\r\n0\r\nX-Trailer: yes\r\n\r\n";
+        assert_eq!(parse_http_json(raw).unwrap()["a"], 1);
+    }
+
+    #[test]
+    fn slow_drip_worker_cannot_reset_the_absolute_request_deadline() {
+        let listener = TcpListener::bind((DEFAULT_HOST, 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            loop {
+                if bounded_line(&mut reader, MAX_HTTP_HEADER_BYTES).unwrap() == "\r\n" {
+                    break;
+                }
+            }
+            reader
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 22\r\n\r\n")
+                .unwrap();
+            for byte in b"{\"content\":\"dripping\"}" {
+                if reader.get_mut().write_all(&[*byte]).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(30));
+            }
+        });
+        let started = Instant::now();
+        let result = get(addr, "/health", Duration::from_millis(100));
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "slow drip reset the total request deadline"
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn parses_plain_http_json_response() {
-        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 17\r\n\r\n{\"content\":\"hi\"}";
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\n\r\n{\"content\":\"hi\"}";
         let parsed = parse_http_json(raw).unwrap();
         assert_eq!(parsed["content"], "hi");
     }

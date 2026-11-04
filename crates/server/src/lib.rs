@@ -80,6 +80,7 @@ mod model_provenance;
 mod model_storage;
 mod model_upgrade;
 mod ollama;
+mod openai_choices;
 mod openai_vision;
 mod readiness;
 mod response_store;
@@ -1244,6 +1245,7 @@ mod tests {
     struct TestTextEngine {
         model_id: String,
         emitted_chunks: Arc<AtomicU64>,
+        task: Option<&'static str>,
     }
 
     impl bloomai_engine::Engine for TestTextEngine {
@@ -1264,10 +1266,15 @@ mod tests {
             _model_path: &Path,
             _device: DeviceKind,
         ) -> Result<Box<dyn bloomai_engine::LoadedModel>> {
-            let manifest = bloomai_core::ModelManifest {
+            let mut manifest = bloomai_core::ModelManifest {
                 id: self.model_id.clone(),
                 ..bloomai_core::ModelManifest::default()
             };
+            if let Some(task) = self.task {
+                manifest
+                    .parameters
+                    .insert("bloom_task".to_string(), json!(task));
+            }
             Ok(Box::new(TestTextModel {
                 metadata: bloomai_engine::ModelMetadata {
                     id: self.model_id.clone(),
@@ -1313,6 +1320,91 @@ mod tests {
             for text in ["visible ST", "OP hidden", " never emitted"] {
                 self.emitted_chunks.fetch_add(1, Ordering::Relaxed);
                 sink.on_chunk(OutputChunk::TextDelta(text.to_string()))?;
+            }
+            sink.on_chunk(OutputChunk::End)?;
+            Ok(())
+        }
+    }
+
+    struct ChoiceAuditEngine {
+        seeds: Arc<std::sync::Mutex<Vec<Option<u64>>>>,
+        fail_at: Option<usize>,
+        outputs: Option<Vec<String>>,
+    }
+
+    impl bloomai_engine::Engine for ChoiceAuditEngine {
+        fn name(&self) -> &'static str {
+            "choice-audit"
+        }
+        fn supported_modalities(&self) -> Vec<bloomai_core::Modality> {
+            vec![bloomai_core::Modality::Text]
+        }
+        fn supported_devices(&self) -> Vec<DeviceKind> {
+            vec![DeviceKind::Cpu]
+        }
+        fn load(
+            &self,
+            _path: &Path,
+            _device: DeviceKind,
+        ) -> Result<Box<dyn bloomai_engine::LoadedModel>> {
+            let manifest = bloomai_core::ModelManifest {
+                id: "choice-audit".into(),
+                ..Default::default()
+            };
+            Ok(Box::new(ChoiceAuditModel {
+                metadata: bloomai_engine::ModelMetadata {
+                    id: manifest.id.clone(),
+                    manifest,
+                    modality: bloomai_core::Modality::Text,
+                    quantized: false,
+                },
+                seeds: Arc::clone(&self.seeds),
+                fail_at: self.fail_at,
+                outputs: self.outputs.clone(),
+            }))
+        }
+    }
+
+    struct ChoiceAuditModel {
+        metadata: bloomai_engine::ModelMetadata,
+        seeds: Arc<std::sync::Mutex<Vec<Option<u64>>>>,
+        fail_at: Option<usize>,
+        outputs: Option<Vec<String>>,
+    }
+
+    impl bloomai_engine::LoadedModel for ChoiceAuditModel {
+        fn metadata(&self) -> &bloomai_engine::ModelMetadata {
+            &self.metadata
+        }
+        fn infer(
+            &self,
+            _input: ModelInput,
+            _params: &GenerationParams,
+        ) -> Result<bloomai_engine::ModelOutput> {
+            Err(anyhow!("choice audit uses streaming inference"))
+        }
+        fn infer_stream(
+            &self,
+            _input: ModelInput,
+            params: &GenerationParams,
+            sink: &mut dyn bloomai_engine::model::OutputSink,
+        ) -> Result<()> {
+            let call_index = {
+                let mut seeds = self.seeds.lock().unwrap();
+                let index = seeds.len();
+                seeds.push(params.seed);
+                index
+            };
+            let text = self
+                .outputs
+                .as_ref()
+                .filter(|outputs| !outputs.is_empty())
+                .and_then(|outputs| outputs.get(call_index % outputs.len()))
+                .map(String::as_str)
+                .unwrap_or("piece ");
+            sink.on_chunk(OutputChunk::TextDelta(text.into()))?;
+            if self.fail_at == Some(call_index) {
+                return Err(anyhow!("injected choice failure"));
             }
             sink.on_chunk(OutputChunk::End)?;
             Ok(())
@@ -3101,13 +3193,8 @@ mod tests {
             json!({
                 "model": "default",
                 "messages": [{"role": "user", "content": "Hello"}],
-                "stream": true,
-                "n": 2
-            }),
-            json!({
-                "model": "default",
-                "messages": [{"role": "user", "content": "Hello"}],
                 "n": 2,
+                "stream": true,
                 "response_format": {"type": "json_object"}
             }),
             json!({
@@ -3165,6 +3252,29 @@ mod tests {
             let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(body["error"]["type"], "invalid_request_error");
         }
+
+        let supported_stream = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "messages": [{"role": "user", "content": "Hello"}],
+                            "stream": true, "n": 2
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            supported_stream.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
 
         let admitted = axum::http::Request::builder()
             .method("POST")
@@ -4171,6 +4281,7 @@ mod tests {
                 &TestTextEngine {
                     model_id: "test-ifb-model".to_string(),
                     emitted_chunks: Arc::new(AtomicU64::new(0)),
+                    task: None,
                 },
                 DeviceKind::Cpu,
                 &model_path,
@@ -4277,14 +4388,25 @@ mod tests {
         model_id: &str,
         emitted_chunks: Arc<AtomicU64>,
     ) -> Arc<LoadedRuntime> {
+        test_text_runtime_with_engine(
+            model_path,
+            &TestTextEngine {
+                model_id: model_id.to_string(),
+                emitted_chunks,
+                task: None,
+            },
+        )
+    }
+
+    fn test_text_runtime_with_engine(
+        model_path: PathBuf,
+        engine: &dyn bloomai_engine::Engine,
+    ) -> Arc<LoadedRuntime> {
         std::fs::write(&model_path, b"bounded text fixture").unwrap();
         let model_path = model_path.canonicalize().unwrap();
         let pipeline = Arc::new(
             InferencePipeline::load_standalone_with_context(
-                &TestTextEngine {
-                    model_id: model_id.to_string(),
-                    emitted_chunks,
-                },
+                engine,
                 DeviceKind::Cpu,
                 &model_path,
                 128,
@@ -8044,6 +8166,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tensor_task_readiness_rejects_language_and_encoder_operations_before_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, _receiver) = test_server_state(temp.path().to_path_buf());
+        let emitted = Arc::new(AtomicU64::new(0));
+        let runtime = test_text_runtime_with_engine(
+            temp.path().join("tensor.fixture"),
+            &TestTextEngine {
+                model_id: "test-tensor-model".to_string(),
+                emitted_chunks: Arc::clone(&emitted),
+                task: Some("tensor"),
+            },
+        );
+        state
+            .app
+            .runtime_pool
+            .write()
+            .await
+            .publish_default(Arc::clone(&runtime));
+        state.app.ready.store(true, Ordering::Release);
+        let app = Router::new()
+            .route("/ready", get(handle_ready))
+            .route("/v1/chat/completions", post(handle_chat_completions))
+            .route("/v1/completions", post(handle_completions))
+            .route("/v1/embeddings", post(handle_embeddings))
+            .route("/v1/rerank", post(handle_rerank))
+            .with_state(Arc::clone(&state));
+        let readiness = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/ready")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(readiness.status(), axum::http::StatusCode::OK);
+        let readiness: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(readiness.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(readiness["model_tasks"], json!(["tensor"]));
+        for (uri, body) in [
+            (
+                "/v1/chat/completions",
+                json!({"messages": [{"role": "user", "content": "Hello"}], "max_tokens": 8}),
+            ),
+            (
+                "/v1/completions",
+                json!({"prompt": "Hello", "max_tokens": 8}),
+            ),
+            ("/v1/embeddings", json!({"input": "Hello"})),
+            (
+                "/v1/rerank",
+                json!({"query": "Hello", "documents": ["World"]}),
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(axum::body::Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                "{uri}"
+            );
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["error"]["type"], "unsupported_operation");
+            assert!(
+                !body["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("encoder-only")
+            );
+        }
+        assert_eq!(emitted.load(Ordering::Relaxed), 0);
+        assert_eq!(state.app.metrics.requests_total.load(Ordering::Relaxed), 0);
+        assert_eq!(runtime.active_request_leases.load(Ordering::Acquire), 0);
+        assert!(state.app.cancellations.is_empty());
+        assert_eq!(state.app.semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test]
     async fn readiness_publishes_bounded_active_model_tasks() {
         let embedding_temp = tempfile::tempdir().unwrap();
         let (embedding_state, _) =
@@ -10187,19 +10407,15 @@ mod tests {
             json!({
                 "model": "test-text-model",
                 "messages": [{"role": "user", "content": "Continue"}],
-                "stream": true,
-                "n": 2
-            }),
-            json!({
-                "model": "test-text-model",
-                "messages": [{"role": "user", "content": "Continue"}],
                 "n": 2,
+                "stream": true,
                 "tools": [{"type": "function", "function": {"name": "lookup"}}]
             }),
             json!({
                 "model": "test-text-model",
                 "messages": [{"role": "user", "content": "Continue"}],
                 "n": 2,
+                "stream": true,
                 "response_format": {"type": "json_object"}
             }),
             json!({
@@ -10244,6 +10460,499 @@ mod tests {
             );
         }
         assert_eq!(emitted_chunks.load(Ordering::Relaxed), 12);
+    }
+
+    #[tokio::test]
+    async fn buffered_structured_and_tool_choices_validate_every_candidate() {
+        let schema = json!({
+            "type": "object", "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"], "additionalProperties": false
+        });
+        for mode in [
+            "chat-schema",
+            "chat-json",
+            "chat-tools",
+            "completion-schema",
+        ] {
+            for count in [2_usize, 8] {
+                for invalid_second in [false, true] {
+                    let temp = tempfile::tempdir().unwrap();
+                    let (state, _receiver) = test_server_state(temp.path().to_path_buf());
+                    let seeds = Arc::new(std::sync::Mutex::new(Vec::new()));
+                    let tools = mode == "chat-tools";
+                    let completion = mode == "completion-schema";
+                    let good = if tools {
+                        json!({"type": "function_calls", "calls": [
+                            {"name": "lookup", "arguments": {"ok": true}},
+                            {"name": "lookup", "arguments": {"ok": false}}
+                        ]})
+                        .to_string()
+                    } else {
+                        json!({"ok": true}).to_string()
+                    };
+                    let bad = if tools {
+                        json!({"type": "function_calls", "calls": [
+                            {"name": "lookup", "arguments": {"ok": "wrong type"}}
+                        ]})
+                        .to_string()
+                    } else if mode == "chat-json" {
+                        "[]".to_string()
+                    } else {
+                        json!({"ok": "wrong type"}).to_string()
+                    };
+                    let runtime = test_text_runtime_with_engine(
+                        temp.path().join("choices.fixture"),
+                        &ChoiceAuditEngine {
+                            seeds: Arc::clone(&seeds),
+                            fail_at: None,
+                            outputs: Some(vec![
+                                good.clone(),
+                                if invalid_second { bad } else { good.clone() },
+                            ]),
+                        },
+                    );
+                    let output_tokens = runtime.pipeline.tokenize(&good).unwrap().len();
+                    state
+                        .app
+                        .runtime_pool
+                        .write()
+                        .await
+                        .publish_default(Arc::clone(&runtime));
+                    state.app.ready.store(true, Ordering::Release);
+                    let app = Router::new()
+                        .route("/v1/chat/completions", post(handle_chat_completions))
+                        .route("/v1/completions", post(handle_completions))
+                        .with_state(Arc::clone(&state));
+                    let mut payload = if completion {
+                        json!({"prompt": ["First", "Second"]})
+                    } else {
+                        json!({"messages": [{"role": "user", "content": "Return ok"}]})
+                    };
+                    payload["n"] = json!(count);
+                    payload["max_tokens"] = json!(8);
+                    payload["seed"] = json!(u64::MAX);
+                    if tools {
+                        payload["tools"] = json!([{"type": "function", "function": {
+                            "name": "lookup", "parameters": schema, "strict": true
+                        }}]);
+                        payload["tool_choice"] = json!("required");
+                    } else {
+                        payload["response_format"] = if mode == "chat-json" {
+                            json!({"type": "json_object"})
+                        } else {
+                            json!({"type": "json_schema", "json_schema": schema})
+                        };
+                    }
+                    let response = app
+                        .oneshot(
+                            axum::http::Request::builder()
+                                .method("POST")
+                                .uri(if completion {
+                                    "/v1/completions"
+                                } else {
+                                    "/v1/chat/completions"
+                                })
+                                .header(header::CONTENT_TYPE, "application/json")
+                                .body(axum::body::Body::from(payload.to_string()))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    let status = response.status();
+                    let body: serde_json::Value = serde_json::from_slice(
+                        &axum::body::to_bytes(response.into_body(), usize::MAX)
+                            .await
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    if invalid_second {
+                        assert_eq!(
+                            status,
+                            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                            "{mode}: {body}"
+                        );
+                        assert_eq!(
+                            body["error"]["type"],
+                            if tools {
+                                "invalid_tool_call"
+                            } else {
+                                "invalid_response_format"
+                            }
+                        );
+                        assert!(body.get("choices").is_none());
+                        assert_eq!(state.app.metrics.requests_failed.load(Ordering::Relaxed), 1);
+                        assert_eq!(
+                            state.app.metrics.requests_completed.load(Ordering::Relaxed),
+                            0
+                        );
+                    } else {
+                        assert_eq!(status, axum::http::StatusCode::OK, "{mode}: {body}");
+                        let choices = body["choices"].as_array().unwrap();
+                        let total = count * if completion { 2 } else { 1 };
+                        assert_eq!(choices.len(), total);
+                        let mut ids = std::collections::HashSet::new();
+                        for (index, choice) in choices.iter().enumerate() {
+                            assert_eq!(choice["index"], index);
+                            assert_eq!(
+                                choice["finish_reason"],
+                                if tools { "tool_calls" } else { "stop" }
+                            );
+                            if tools {
+                                let calls = choice["message"]["tool_calls"].as_array().unwrap();
+                                assert_eq!(calls.len(), 2);
+                                for call in calls {
+                                    let id = call["id"].as_str().unwrap();
+                                    tool_calling::validate_tool_call_id(id).unwrap();
+                                    assert!(ids.insert(id.to_string()), "duplicate tool ID: {id}");
+                                }
+                            } else {
+                                let text = if completion {
+                                    &choice["text"]
+                                } else {
+                                    &choice["message"]["content"]
+                                };
+                                assert_eq!(text, &good);
+                            }
+                        }
+                        assert_eq!(body["usage"]["completion_tokens"], output_tokens * total);
+                        assert_eq!(
+                            body["usage"]["total_tokens"].as_u64().unwrap(),
+                            body["usage"]["prompt_tokens"].as_u64().unwrap()
+                                + (output_tokens * total) as u64
+                        );
+                        assert_eq!(
+                            state.app.metrics.requests_completed.load(Ordering::Relaxed),
+                            1
+                        );
+                    }
+                    let total = count * if completion { 2 } else { 1 };
+                    assert_eq!(
+                        *seeds.lock().unwrap(),
+                        (0..total)
+                            .map(|index| Some(u64::MAX.wrapping_add(index as u64)))
+                            .collect::<Vec<_>>()
+                    );
+                    assert_eq!(runtime.active_request_leases.load(Ordering::Acquire), 0);
+                    assert!(state.app.cancellations.is_empty());
+                    assert_eq!(state.app.semaphore.available_permits(), 1);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_streaming_choices_preserve_indices_stops_echo_and_usage() {
+        let temp = tempfile::tempdir().unwrap();
+        let chunks = Arc::new(AtomicU64::new(0));
+        let state =
+            test_server_state_with_text_runtime(temp.path().to_path_buf(), Arc::clone(&chunks))
+                .await;
+        let app = Router::new()
+            .route("/v1/chat/completions", post(handle_chat_completions))
+            .route("/v1/completions", post(handle_completions))
+            .with_state(Arc::clone(&state));
+        for (uri, body, count, chat) in [
+            (
+                "/v1/chat/completions",
+                json!({
+                    "messages": [{"role": "user", "content": "Continue"}],
+                    "stream": true, "n": 2, "max_tokens": 8, "stop": "STOP", "seed": 7,
+                    "stream_options": {"include_usage": true}
+                }),
+                2,
+                true,
+            ),
+            (
+                "/v1/completions",
+                json!({
+                    "prompt": ["First", "Second"], "stream": true,
+                    "n": 2, "max_tokens": 8, "stop": "STOP", "echo": true, "seed": 7
+                }),
+                4,
+                false,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(axum::body::Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let raw = String::from_utf8(
+                axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert_eq!(raw.matches("data: [DONE]").count(), 1);
+            assert!(!raw.contains("hidden"));
+            assert!(!raw.contains("STOP"));
+            let frames = raw
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter(|data| *data != "[DONE]")
+                .map(|data| serde_json::from_str::<serde_json::Value>(data).unwrap())
+                .collect::<Vec<_>>();
+            let id = frames[0]["id"].clone();
+            let created = frames[0]["created"].clone();
+            let mut texts = vec![String::new(); count];
+            let mut ended = vec![false; count];
+            let mut started = vec![0; count];
+            for frame in &frames {
+                assert!(frame.get("error").is_none(), "{frame}");
+                assert_eq!(frame["id"], id);
+                assert_eq!(frame["created"], created);
+                for choice in frame["choices"].as_array().unwrap() {
+                    let index = choice["index"].as_u64().unwrap() as usize;
+                    assert!(!ended[index], "data followed terminal choice");
+                    let content = if chat {
+                        &choice["delta"]["content"]
+                    } else {
+                        &choice["text"]
+                    };
+                    if let Some(text) = content.as_str() {
+                        texts[index].push_str(text);
+                    }
+                    if chat && choice["delta"]["role"] == "assistant" {
+                        started[index] += 1;
+                    }
+                    if !choice["finish_reason"].is_null() {
+                        assert_eq!(choice["finish_reason"], "stop");
+                        ended[index] = true;
+                    }
+                }
+            }
+            assert!(ended.iter().all(|value| *value));
+            if chat {
+                assert_eq!(texts, vec!["visible "; 2]);
+                assert_eq!(started, vec![1; 2]);
+                let usage = &frames.last().unwrap()["usage"];
+                assert!(
+                    frames.last().unwrap()["choices"]
+                        .as_array()
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(usage["completion_tokens"], 2);
+                assert_eq!(
+                    usage["total_tokens"].as_u64().unwrap(),
+                    usage["prompt_tokens"].as_u64().unwrap() + 2
+                );
+            } else {
+                assert_eq!(
+                    texts,
+                    vec![
+                        "Firstvisible ",
+                        "Firstvisible ",
+                        "Secondvisible ",
+                        "Secondvisible "
+                    ]
+                );
+            }
+        }
+        assert_eq!(state.app.semaphore.available_permits(), 1);
+        assert!(state.app.cancellations.is_empty());
+        assert_eq!(
+            state.app.metrics.requests_completed.load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(chunks.load(Ordering::Relaxed), 12);
+    }
+
+    #[tokio::test]
+    async fn multi_choice_stream_failure_stops_later_choices_and_suppresses_usage() {
+        for chat in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let (state, _receiver) = test_server_state(temp.path().to_path_buf());
+            let seeds = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let runtime = test_text_runtime_with_engine(
+                temp.path().join("choices.fixture"),
+                &ChoiceAuditEngine {
+                    seeds: Arc::clone(&seeds),
+                    fail_at: Some(1),
+                    outputs: None,
+                },
+            );
+            state
+                .app
+                .runtime_pool
+                .write()
+                .await
+                .publish_default(Arc::clone(&runtime));
+            state.app.ready.store(true, Ordering::Release);
+            let response = if chat {
+                handle_chat_completions(
+                    State(Arc::clone(&state)),
+                    Json(
+                        serde_json::from_value(json!({
+                            "messages": [{"role": "user", "content": "Continue"}],
+                            "n": 3, "stream": true, "max_tokens": 8, "seed": u64::MAX,
+                            "stream_options": {"include_usage": true}
+                        }))
+                        .unwrap(),
+                    ),
+                )
+                .await
+            } else {
+                handle_completions(
+                    State(Arc::clone(&state)),
+                    Json(
+                        serde_json::from_value(json!({
+                            "prompt": "Continue", "n": 3, "stream": true,
+                            "max_tokens": 8, "seed": u64::MAX
+                        }))
+                        .unwrap(),
+                    ),
+                )
+                .await
+                .into_response()
+            };
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let bytes = tokio::time::timeout(
+                Duration::from_secs(2),
+                axum::body::to_bytes(response.into_body(), usize::MAX),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let raw = String::from_utf8(bytes.to_vec()).unwrap();
+            assert_eq!(raw.matches("data: [DONE]").count(), 1);
+            let frames = raw
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter(|data| *data != "[DONE]")
+                .map(|data| serde_json::from_str::<serde_json::Value>(data).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                frames
+                    .iter()
+                    .filter(|frame| frame.get("error").is_some())
+                    .count(),
+                1
+            );
+            assert!(
+                frames.last().unwrap()["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("injected choice failure")
+            );
+            assert!(frames.iter().all(|frame| frame.get("usage").is_none()));
+            let choices = frames
+                .iter()
+                .filter_map(|frame| frame["choices"].as_array())
+                .flatten()
+                .collect::<Vec<_>>();
+            assert!(
+                choices
+                    .iter()
+                    .any(|choice| choice["index"] == 0 && choice["finish_reason"] == "stop")
+            );
+            assert!(choices.iter().all(|choice| choice["index"] != 2));
+            assert!(
+                choices
+                    .iter()
+                    .filter(|choice| choice["index"] == 1)
+                    .all(|choice| choice["finish_reason"].is_null())
+            );
+            assert_eq!(*seeds.lock().unwrap(), vec![Some(u64::MAX), Some(0)]);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while state.app.semaphore.available_permits() != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(runtime.active_request_leases.load(Ordering::Acquire), 0);
+            assert!(state.app.cancellations.is_empty());
+            assert_eq!(
+                state.app.metrics.requests_completed.load(Ordering::Relaxed),
+                0
+            );
+            assert_eq!(state.app.metrics.requests_failed.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_prompt_choices_use_the_same_seed_offsets_as_buffered_choices() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, _receiver) = test_server_state(temp.path().to_path_buf());
+        let seeds = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runtime = test_text_runtime_with_engine(
+            temp.path().join("choices.fixture"),
+            &ChoiceAuditEngine {
+                seeds: Arc::clone(&seeds),
+                fail_at: None,
+                outputs: None,
+            },
+        );
+        state
+            .app
+            .runtime_pool
+            .write()
+            .await
+            .publish_default(runtime);
+        state.app.ready.store(true, Ordering::Release);
+        for stream in [false, true] {
+            let response = handle_completions(
+                State(Arc::clone(&state)),
+                Json(
+                    serde_json::from_value(json!({
+                        "prompt": ["First", "Second"], "n": 2, "stream": stream,
+                        "max_tokens": 8, "seed": u64::MAX - 1
+                    }))
+                    .unwrap(),
+                ),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                *seeds.lock().unwrap(),
+                vec![Some(u64::MAX - 1), Some(u64::MAX), Some(0), Some(1)]
+            );
+            seeds.lock().unwrap().clear();
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_multi_choice_stream_cancels_and_drains_worker() {
+        let temp = tempfile::tempdir().unwrap();
+        let chunks = Arc::new(AtomicU64::new(0));
+        let state =
+            test_server_state_with_text_runtime(temp.path().to_path_buf(), Arc::clone(&chunks))
+                .await;
+        let payload: ChatRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": "Continue"}],
+            "stream": true, "n": 8, "max_tokens": 8
+        }))
+        .unwrap();
+        let response = handle_chat_completions(State(Arc::clone(&state)), Json(payload)).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        drop(response);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.app.semaphore.available_permits() != 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(state.app.cancellations.is_empty());
+        assert_eq!(
+            state.app.metrics.requests_completed.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(state.app.metrics.requests_failed.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -10367,37 +11076,6 @@ mod tests {
         assert!(body["usage"]["prompt_tokens"].as_u64().unwrap() >= 2);
         assert!(body["usage"]["completion_tokens"].as_u64().unwrap() > 0);
 
-        let response = app
-            .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri("/v1/completions")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(axum::body::Body::from(
-                        json!({
-                            "model": "test-text-model",
-                            "prompt": ["First", "Second"],
-                            "stream": true
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
-        let error: serde_json::Value = serde_json::from_slice(
-            &axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert!(
-            error["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("batched prompts")
-        );
         assert!(emitted_chunks.load(Ordering::Relaxed) > 0);
     }
 

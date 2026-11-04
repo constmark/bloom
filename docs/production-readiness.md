@@ -159,7 +159,8 @@ Review this register together with the [support matrix](support-matrix.md),
 [production checklist](production.md), [security guide](security.md), and
 [release checklist](../RELEASE.md) before promoting a deployment.
 
-The [September project assessment](project-assessment-2026-09.md) records the
-latest repository-wide review, reproduced failures, and follow-up acceptance
-criteria. Performance-budget checks now reject missing or invalid evidence
+The [November capability assessment](project-assessment-2026-11.md) records
+the latest software fixes and remaining capability/evidence inventory. The
+[September assessment](project-assessment-2026-09.md) retains the earlier
+repository-wide review and acceptance criteria. Performance-budget checks now reject missing or invalid evidence
 instead of treating skipped metrics as a passing result.

@@ -594,4 +594,27 @@ mod tests {
         });
         assert!(decode_generation_options(&oversized.to_string()).is_none());
     }
+
+    #[test]
+    fn sampling_settings_survive_persistence_and_reject_corruption() {
+        let options = ChatOptions {
+            top_k: Some(40),
+            presence_penalty: -0.5,
+            frequency_penalty: 0.75,
+            logit_bias: std::collections::BTreeMap::from([(17, -5.0)]),
+            ..Default::default()
+        };
+        let stored = serde_json::to_string(&options).unwrap();
+        assert_eq!(decode_generation_options(&stored), Some(options));
+        for invalid in [
+            r#"{"top_k":0}"#,
+            r#"{"presence_penalty":3}"#,
+            r#"{"frequency_penalty":-3}"#,
+            r#"{"logit_bias":{"1":101}}"#,
+            r#"{"logit_bias":{"01":0}}"#,
+            r#"{"logit_bias":{"1":0,"1":1}}"#,
+        ] {
+            assert!(decode_generation_options(invalid).is_none(), "{invalid}");
+        }
+    }
 }

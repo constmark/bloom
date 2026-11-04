@@ -76,6 +76,91 @@ unsafe extern "C" fn cancel_from_stream_callback_v2(
 }
 
 #[test]
+fn generation_params_fail_closed_through_every_abi_entry_point() {
+    unsafe {
+        let mut error = [0 as c_char; 512];
+        let pipeline = bloom_pipeline_load_v2(
+            bloom_slice(b"."),
+            bloom_slice(b"mock"),
+            bloom_slice(b"cpu"),
+            2048,
+            error.as_mut_ptr(),
+            error.len(),
+        );
+        assert!(!pipeline.is_null());
+        let input = CString::new(r#"{"Text":{"prompt":"hello"}}"#).unwrap();
+        let callback_count = AtomicUsize::new(0);
+        for extension in [
+            r#""top_kk":40"#,
+            r#""top_k":1,"top_k":2"#,
+            r#""response_format":{"type":"text","unknown":true}"#,
+            r#""response_format":{"type":"text","json_schema":{}}"#,
+            r#""response_format":{"type":"json_schema","json_schema":{},"strict":true}"#,
+        ] {
+            let params = CString::new(format!(
+                r#"{{"max_tokens":4,"temperature":0.7,"top_p":0.9,{extension}}}"#
+            ))
+            .unwrap();
+            let mut output = BloomOwnedBuffer::default();
+            assert!(
+                bloom_pipeline_run(
+                    pipeline,
+                    input.as_ptr(),
+                    params.as_ptr(),
+                    error.as_mut_ptr(),
+                    error.len(),
+                )
+                .is_null()
+            );
+            assert_eq!(
+                bloom_pipeline_run_stream(
+                    pipeline,
+                    input.as_ptr(),
+                    params.as_ptr(),
+                    Some(test_stream_callback),
+                    0x12345678usize as *mut std::ffi::c_void,
+                    error.as_mut_ptr(),
+                    error.len(),
+                ),
+                -5
+            );
+            assert_eq!(
+                bloom_pipeline_run_v2(
+                    pipeline,
+                    bloom_slice(input.as_bytes()),
+                    bloom_slice(params.as_bytes()),
+                    &mut output,
+                    error.as_mut_ptr(),
+                    error.len(),
+                ),
+                BLOOM_STATUS_INVALID_PARAMS_JSON
+            );
+            assert!(output.data.is_null());
+            assert_eq!(
+                bloom_pipeline_run_stream_v2(
+                    pipeline,
+                    bloom_slice(input.as_bytes()),
+                    bloom_slice(params.as_bytes()),
+                    Some(test_stream_callback_v2),
+                    (&callback_count as *const AtomicUsize).cast_mut().cast(),
+                    std::ptr::null(),
+                    error.as_mut_ptr(),
+                    error.len(),
+                ),
+                BLOOM_STATUS_INVALID_PARAMS_JSON
+            );
+            assert!(
+                CStr::from_ptr(error.as_ptr())
+                    .to_string_lossy()
+                    .contains("Failed to parse params JSON")
+            );
+        }
+        assert_eq!(callback_count.load(Ordering::Relaxed), 0);
+        bloom_pipeline_free(pipeline);
+    }
+}
+
+#[test]
 fn test_ffi_mock_inference() {
     unsafe {
         // Use "." (current directory) as the path so canonicalization succeeds.

@@ -265,7 +265,8 @@ fn exact_installation_matches(installed: &ModelCatalogEntry, entry: &ModelIndexE
     };
     let expected_file_count = entry.is_package().then_some(entry.files.len());
     let format_matches = installed.format == entry.format
-        || (installed.format == "coreml" && entry.format == "mlmodel");
+        || (installed.format == "coreml" && entry.format == "mlmodel")
+        || (installed.format == "tensorrt" && matches!(entry.format.as_str(), "plan" | "engine"));
     installed.kind == expected_kind
         && format_matches
         && installed.size_complete
@@ -1818,6 +1819,49 @@ mod tests {
                 .unwrap()
                 .contains(&format!("/resolve/{revision}/"))
         );
+    }
+
+    #[test]
+    fn signed_tensorrt_entries_use_exact_immutable_weight_identities() {
+        let now = unix_time().unwrap();
+        let key = signing_key();
+        let revision = "cd".repeat(20);
+        for extension in ["plan", "engine"] {
+            let filename = format!("numeric.{extension}");
+            let mut document: serde_json::Value =
+                serde_json::from_slice(&payload(now, &revision)).unwrap();
+            document["models"][0]["filename"] = serde_json::json!(filename);
+            document["models"][0]["download_url"] = serde_json::json!(format!(
+                "https://huggingface.co/acme/tiny/resolve/{revision}/{filename}"
+            ));
+            let encoded = serde_json::to_vec(&document).unwrap();
+            let snapshot = decode_signed_index(
+                &envelope(&encoded, &key),
+                &keyring(&[key.verifying_key()]),
+                "file",
+                8192,
+                &ModelLicensePolicy::default(),
+                now,
+            )
+            .unwrap();
+            assert_eq!(snapshot.data[0].format, extension);
+            assert_eq!(snapshot.data[0].filename, filename);
+            assert!(snapshot.data[0].downloadable);
+            document["models"][0]["download_url"] =
+                serde_json::json!(format!("https://evil.example/{filename}"));
+            let encoded = serde_json::to_vec(&document).unwrap();
+            assert!(
+                decode_signed_index(
+                    &envelope(&encoded, &key),
+                    &keyring(&[key.verifying_key()]),
+                    "file",
+                    8192,
+                    &ModelLicensePolicy::default(),
+                    now
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

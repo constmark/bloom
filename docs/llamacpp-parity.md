@@ -25,9 +25,13 @@ Advance the pin only after regenerating the inventory and rerunning the cells.
 | Model management | Catalog, import, signed acquisition, preflight, switch and unload | Install/run/list/delete/recover flows are at least as clear as the local reference | Fresh-machine, interrupted-download, replacement and rollback drills |
 | CLI and server | `bloom_infer`, `bloom_server`, OpenAI/Ollama compatibility | Common options, doctor output, health/readiness, and errors are predictable | CLI snapshots, HTTP contract tests, and client smoke tests |
 
-The current `llamacpp` engine starts an external `llama-server`. Until its
-loaded-model operations forward embeddings, reranking, and structured output,
-those capability flags must not be used for routing or support claims.
+The `llamacpp` engine starts an external `llama-server` and now forwards
+text generation, exact tokenization, constrained JSON output, embedding batches,
+and cross-encoder reranking. Encoder routes require explicit trusted package
+task metadata and a compatible worker/model; see the
+[adapter contract](llamacpp-adapter.md). Local HTTP fixtures cover those
+operations, but trained encoder and external-runtime/hardware evidence remains
+required before promoting a deployment cell.
 
 ## Benchmark protocol
 

@@ -45,6 +45,8 @@ libloading = { workspace = true }
 libc = "0.2"
 sha2 = "0.10"
 tempfile = "3"
+# Interpreter-only processor sandbox; no WASI, JIT, or runtime WAT parser.
+wasmi = { version = "=2.0.0", default-features = false, features = ["std", "validate", "stable", "portable-dispatch"] }
 
 [[example]]
 name = "generate_tiny_qwen2_fixture"
@@ -52,3 +54,4 @@ required-features = ["candle-engine"]
 
 [dev-dependencies]
 clap.workspace = true
+wat = { version = "=1.263.0", default-features = false }

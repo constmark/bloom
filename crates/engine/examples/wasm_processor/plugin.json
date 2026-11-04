@@ -1,0 +1,14 @@
+{
+  "metadata": {
+    "name": "bloom.example.replace-z",
+    "version": "1.0.0",
+    "description": "Bounded inline WASM processor example: replace z with Z",
+    "author": "Bloom Contributors",
+    "license": "Apache-2.0",
+    "platforms": ["macos-aarch64", "macos-x86_64", "linux-aarch64", "linux-x86_64", "windows-x86_64"],
+    "min_runtime_version": "0.1.0"
+  },
+  "entry_point": {"type": "wasm", "path": "processor.wasm"},
+  "supported_modalities": ["Text"],
+  "supports_streaming": false
+}

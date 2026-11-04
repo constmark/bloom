@@ -31,15 +31,22 @@ jobs:
             requirements/compat-smoke.txt
             requirements/schema-validation.txt
             requirements/python-package.txt
+            requirements/tensor-runtime-test.txt
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Install pinned official compatibility clients
         run: python -m pip install --disable-pip-version-check -r requirements/compat-smoke.txt
       - name: Install pinned metadata validators
         run: python -m pip install --disable-pip-version-check -r requirements/schema-validation.txt
+      - name: Install numeric bridge test dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements/tensor-runtime-test.txt
+      - name: Test TensorRT numeric bridge contract
+        run: python3 scripts/test_tensorrt_infer.py
       - name: Format
         run: cargo fmt --all -- --check
       - name: Check local Markdown links
-        run: python3 scripts/check_markdown_links.py
+        run: |
+          python3 scripts/check_markdown_links.py
+          python3 scripts/test_markdown_links.py
       - name: Check community metadata
         run: |
           python3 scripts/check_community_metadata.py
@@ -202,7 +209,9 @@ jobs:
             echo "SKIP: nvcc not found; CUDA feature checks require a CUDA runner"
           fi
       - name: Validate JSON artifacts
-        run: ./scripts/validate_json_artifacts.py
+        run: |
+          ./scripts/validate_json_artifacts.py
+          python3 scripts/test_model_catalog_schemas.py
       - name: Test readiness contract validator
         run: python3 scripts/check_readiness_contract.py
       - name: Test release artifact validator
@@ -264,6 +273,9 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Test macOS client contracts
         run: ./scripts/test_macos_client.sh
+      - name: Test real Core ML CPU numeric runtime
+        timeout-minutes: 5
+        run: cargo test -p bloomai-engine --no-default-features --features hardware-tests executor::coreml --locked
       - name: Check (Metal features)
         run: cargo check --workspace --all-targets --features metal --locked
       - name: Clippy

@@ -44,6 +44,7 @@ fn is_bundled_script(path: &Path) -> bool {
             | "openvino_llm_infer.py"
             | "npu_tts_infer.py"
             | "onnxruntime_infer.py"
+            | "tensorrt_infer.py"
             | "mlx_lm_infer.py"
     ) {
         return false;

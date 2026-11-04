@@ -61,6 +61,12 @@ class ReadinessContractTests(unittest.TestCase):
         )
         self.assert_invalid(lambda value: value.__setitem__("object", "health"), "unsupported")
 
+    def test_accepts_numeric_and_cross_encoder_task_identity(self) -> None:
+        for tasks in (["tensor"], ["rerank"], ["embedding", "rerank"]):
+            value = copy.deepcopy(self.valid)
+            value["model_tasks"] = tasks
+            self.assertIs(validate_readiness_document(value), value)
+
     def test_rejects_invalid_protocol_ranges(self) -> None:
         mutations = (
             lambda value: value.__setitem__("protocol_version", True),
@@ -101,7 +107,7 @@ class ReadinessContractTests(unittest.TestCase):
                 lambda value: value.__setitem__("input_modalities", [{"type": "text"}]),
                 "modalities",
             ),
-            (lambda value: value.__setitem__("model_tasks", ["rerank"]), "tasks"),
+            (lambda value: value.__setitem__("model_tasks", ["rerank", "tensor"]), "tasks"),
             (lambda value: value.__setitem__("model_tasks", [{}]), "tasks"),
             (lambda value: value.__setitem__("context_window", 0), "context window"),
             (lambda value: value.__setitem__("in_flight_requests", True), "in-flight"),

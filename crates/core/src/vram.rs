@@ -44,6 +44,7 @@ struct LeaseRecord {
     backend_name: String,
     granted_ram: usize,
     granted_vram: usize,
+    reserved_cache: usize,
     #[allow(dead_code)]
     created_at: Instant,
 }
@@ -128,11 +129,30 @@ impl ResourceCoordinator {
         let needed_ram = ticket.ram_bytes;
         let needed_vram = ticket.vram_bytes;
         let needed_cache = ticket.cache_bytes;
-        // Saturating arithmetic keeps malformed, externally supplied tickets
-        // from wrapping into a tiny allocation and bypassing the budget.
-        let total_needed = needed_ram
-            .saturating_add(needed_vram)
-            .saturating_add(needed_cache);
+        let host_needed =
+            needed_ram
+                .checked_add(needed_cache)
+                .ok_or(ResourceError::BudgetExceeded {
+                    deficit: usize::MAX,
+                })?;
+        let total_needed =
+            host_needed
+                .checked_add(needed_vram)
+                .ok_or(ResourceError::BudgetExceeded {
+                    deficit: usize::MAX,
+                })?;
+        // Impossible requests must not evict existing residents before failing.
+        let deficit = match self.memory_topology {
+            MemoryTopology::Unified | MemoryTopology::SharedSystemMemory => {
+                total_needed.saturating_sub(ram_budget)
+            }
+            MemoryTopology::Discrete | MemoryTopology::RemoteMemory => host_needed
+                .saturating_sub(ram_budget)
+                .max(needed_vram.saturating_sub(vram_budget)),
+        };
+        if deficit > 0 {
+            return Err(ResourceError::BudgetExceeded { deficit });
+        }
         let mut evicted_models: Vec<String> = Vec::new();
         loop {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -146,12 +166,18 @@ impl ResourceCoordinator {
 
             let total_used = inner.ram_allocated.saturating_add(inner.vram_allocated);
             let can_fit = match self.memory_topology {
-                MemoryTopology::Unified | MemoryTopology::SharedSystemMemory => {
-                    total_used.saturating_add(total_needed) <= ram_budget
-                }
+                MemoryTopology::Unified | MemoryTopology::SharedSystemMemory => total_used
+                    .checked_add(total_needed)
+                    .is_some_and(|used| used <= ram_budget),
                 MemoryTopology::Discrete | MemoryTopology::RemoteMemory => {
-                    inner.ram_allocated.saturating_add(needed_ram) <= ram_budget
-                        && inner.vram_allocated.saturating_add(needed_vram) <= vram_budget
+                    inner
+                        .ram_allocated
+                        .checked_add(host_needed)
+                        .is_some_and(|used| used <= ram_budget)
+                        && inner
+                            .vram_allocated
+                            .checked_add(needed_vram)
+                            .is_some_and(|used| used <= vram_budget)
                 }
             };
 
@@ -161,7 +187,7 @@ impl ResourceCoordinator {
                     .preferred_backend
                     .clone()
                     .unwrap_or_else(|| "default".to_string());
-                inner.ram_allocated = inner.ram_allocated.saturating_add(needed_ram);
+                inner.ram_allocated += host_needed;
                 inner.vram_allocated = inner.vram_allocated.saturating_add(needed_vram);
                 let now = Instant::now();
                 let record = ModelResidencyRecord {
@@ -184,6 +210,7 @@ impl ResourceCoordinator {
                         backend_name: backend_name.clone(),
                         granted_ram: needed_ram,
                         granted_vram: needed_vram,
+                        reserved_cache: needed_cache,
                         created_at: now,
                     },
                 );
@@ -237,7 +264,7 @@ impl ResourceCoordinator {
                         .saturating_sub(ram_budget),
                     MemoryTopology::Discrete | MemoryTopology::RemoteMemory => inner
                         .ram_allocated
-                        .saturating_add(needed_ram)
+                        .saturating_add(host_needed)
                         .saturating_sub(ram_budget)
                         .max(
                             inner
@@ -255,7 +282,10 @@ impl ResourceCoordinator {
     pub fn release(&self, lease_id: u64) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(lease) = inner.leases.remove(&lease_id) {
-            inner.ram_allocated = inner.ram_allocated.saturating_sub(lease.granted_ram);
+            inner.ram_allocated = inner
+                .ram_allocated
+                .saturating_sub(lease.granted_ram)
+                .saturating_sub(lease.reserved_cache);
             inner.vram_allocated = inner.vram_allocated.saturating_sub(lease.granted_vram);
             inner.residencies.remove(&lease.model_id);
             tracing::info!(
@@ -272,9 +302,13 @@ impl ResourceCoordinator {
     pub fn release_by_model(&self, model_id: &str) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(record) = inner.residencies.remove(model_id) {
-            inner.ram_allocated = inner.ram_allocated.saturating_sub(record.ram_bytes);
-            inner.vram_allocated = inner.vram_allocated.saturating_sub(record.vram_bytes);
-            inner.leases.remove(&record.lease_id);
+            if let Some(lease) = inner.leases.remove(&record.lease_id) {
+                inner.ram_allocated = inner
+                    .ram_allocated
+                    .saturating_sub(lease.granted_ram)
+                    .saturating_sub(lease.reserved_cache);
+                inner.vram_allocated = inner.vram_allocated.saturating_sub(lease.granted_vram);
+            }
             tracing::info!(
                 "Released model '{}': freed ram={} vram={}",
                 model_id,
@@ -301,7 +335,9 @@ impl ResourceCoordinator {
 
         match self.memory_topology {
             MemoryTopology::Unified | MemoryTopology::SharedSystemMemory
-                if total_used.saturating_add(handle.bytes) > ram_budget =>
+                if total_used
+                    .checked_add(handle.bytes)
+                    .is_none_or(|used| used > ram_budget) =>
             {
                 return Err(ResourceError::InsufficientUnifiedMemory {
                     requested: handle.bytes,
@@ -309,7 +345,10 @@ impl ResourceCoordinator {
                 });
             }
             MemoryTopology::Discrete | MemoryTopology::RemoteMemory
-                if inner.ram_allocated.saturating_add(handle.bytes) > ram_budget =>
+                if inner
+                    .ram_allocated
+                    .checked_add(handle.bytes)
+                    .is_none_or(|used| used > ram_budget) =>
             {
                 return Err(ResourceError::InsufficientRam {
                     requested: handle.bytes,
@@ -452,34 +491,32 @@ impl ResourceCoordinator {
         let mut evicted = Vec::new();
         let mut callbacks = Vec::new();
         let mut removed = false;
-        let mut freed_ram: usize = 0;
-        let mut freed_vram: usize = 0;
-
         let (ram_budget, vram_budget) = self.effective_budget();
 
-        let need_more =
-            |inner: &ResourceCoordinatorInner, freed_ram: usize, freed_vram: usize| -> bool {
-                match self.memory_topology {
-                    MemoryTopology::Unified | MemoryTopology::SharedSystemMemory => {
-                        let total_used = inner.ram_allocated.saturating_add(inner.vram_allocated);
-                        let total_needed = needed_ram
-                            .saturating_add(needed_vram)
-                            .saturating_add(needed_cache);
-                        total_used
-                            .saturating_sub(freed_ram.saturating_add(freed_vram))
-                            .saturating_add(total_needed)
-                            > ram_budget
-                    }
-                    MemoryTopology::Discrete | MemoryTopology::RemoteMemory => {
-                        (inner.ram_allocated.saturating_sub(freed_ram) + needed_ram > ram_budget)
-                            || (inner.vram_allocated.saturating_sub(freed_vram) + needed_vram
-                                > vram_budget)
-                    }
+        let host_needed = needed_ram.saturating_add(needed_cache);
+        let total_needed = host_needed.saturating_add(needed_vram);
+        let need_more = |inner: &ResourceCoordinatorInner| -> bool {
+            match self.memory_topology {
+                MemoryTopology::Unified | MemoryTopology::SharedSystemMemory => inner
+                    .ram_allocated
+                    .checked_add(inner.vram_allocated)
+                    .and_then(|used| used.checked_add(total_needed))
+                    .is_none_or(|used| used > ram_budget),
+                MemoryTopology::Discrete | MemoryTopology::RemoteMemory => {
+                    inner
+                        .ram_allocated
+                        .checked_add(host_needed)
+                        .is_none_or(|used| used > ram_budget)
+                        || inner
+                            .vram_allocated
+                            .checked_add(needed_vram)
+                            .is_none_or(|used| used > vram_budget)
                 }
-            };
+            }
+        };
 
         for candidate in &candidates {
-            if !need_more(inner, freed_ram, freed_vram) {
+            if !need_more(inner) {
                 break;
             }
 
@@ -492,7 +529,6 @@ impl ResourceCoordinator {
                 {
                     removed = true;
                     inner.ram_allocated = inner.ram_allocated.saturating_sub(cache.bytes);
-                    freed_ram += cache.bytes;
                     tracing::info!("Evicted cache handle {} ({} bytes)", handle_id, cache.bytes);
                 }
             } else {
@@ -507,11 +543,14 @@ impl ResourceCoordinator {
                         vram
                     );
                     callbacks.push((id.clone(), record.offload_cb));
-                    inner.ram_allocated = inner.ram_allocated.saturating_sub(record.ram_bytes);
-                    inner.vram_allocated = inner.vram_allocated.saturating_sub(record.vram_bytes);
-                    freed_ram += record.ram_bytes;
-                    freed_vram += record.vram_bytes;
-                    inner.leases.remove(&record.lease_id);
+                    if let Some(lease) = inner.leases.remove(&record.lease_id) {
+                        inner.ram_allocated = inner
+                            .ram_allocated
+                            .saturating_sub(lease.granted_ram)
+                            .saturating_sub(lease.reserved_cache);
+                        inner.vram_allocated =
+                            inner.vram_allocated.saturating_sub(lease.granted_vram);
+                    }
                     evicted.push(id.clone());
                 }
             }
@@ -563,8 +602,9 @@ impl ResourceCoordinator {
                 LeaseRecord {
                     model_id: id.to_string(),
                     backend_name: "uma".to_string(),
-                    granted_ram: size_bytes,
+                    granted_ram: 0,
                     granted_vram: 0,
+                    reserved_cache: 0,
                     created_at: now,
                 },
             );
@@ -644,6 +684,127 @@ mod tests {
 
     fn noop_cb() -> OffloadCallback {
         Arc::new(|| Ok(()))
+    }
+
+    #[test]
+    fn model_cache_is_charged_and_released_for_every_topology() {
+        for topology in [
+            MemoryTopology::Unified,
+            MemoryTopology::SharedSystemMemory,
+            MemoryTopology::Discrete,
+            MemoryTopology::RemoteMemory,
+        ] {
+            for release_by_model in [false, true] {
+                let coord = ResourceCoordinator::new(1000, 1000, topology);
+                let mut ticket = make_ticket("cached", 100, 200, ResourcePriority::Critical);
+                ticket.cache_bytes = 500;
+                let lease = coord.reserve(ticket, noop_cb()).unwrap();
+                assert_eq!(lease.granted_ram, 100);
+                assert_eq!(coord.snapshot().ram_allocated, 600);
+                let models = coord.model_snapshots();
+                assert_eq!(models[0].ram_bytes, 100);
+                assert_eq!(models[0].cache_bytes, 500);
+                let other = make_ticket("other", 500, 0, ResourcePriority::Normal);
+                assert!(coord.reserve(other, noop_cb()).is_err());
+                if release_by_model {
+                    coord.release_by_model("cached");
+                } else {
+                    coord.release(lease.lease_id);
+                }
+                assert_eq!(coord.snapshot().ram_allocated, 0);
+                assert_eq!(coord.snapshot().vram_allocated, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn eviction_reclaims_reserved_cache_without_double_counting() {
+        for topology in [MemoryTopology::Unified, MemoryTopology::Discrete] {
+            let coord = ResourceCoordinator::new(1000, 1000, topology);
+            let mut cached = make_ticket("cached", 100, 0, ResourcePriority::Low);
+            cached.cache_bytes = 600;
+            coord.reserve(cached, noop_cb()).unwrap();
+            coord
+                .reserve(
+                    make_ticket("resident", 200, 0, ResourcePriority::Critical),
+                    noop_cb(),
+                )
+                .unwrap();
+            let lease = coord
+                .reserve(
+                    make_ticket("replacement", 600, 0, ResourcePriority::Normal),
+                    noop_cb(),
+                )
+                .unwrap();
+            assert_eq!(lease.evicted_models, vec!["cached"]);
+            assert_eq!(coord.snapshot().ram_allocated, 800);
+            coord.release(lease.lease_id);
+            assert_eq!(coord.snapshot().ram_allocated, 200);
+        }
+    }
+
+    #[test]
+    fn uncharged_legacy_models_cannot_release_other_reservations() {
+        for release_by_model in [false, true] {
+            let coord = ResourceCoordinator::new_unified(1000);
+            coord
+                .reserve(
+                    make_ticket("charged", 500, 0, ResourcePriority::Critical),
+                    noop_cb(),
+                )
+                .unwrap();
+            coord.request_load("legacy", 900, true, noop_cb()).unwrap();
+            if release_by_model {
+                coord.release_by_model("legacy");
+            } else {
+                coord.release(coord.lease_id_for_model("legacy").unwrap());
+            }
+            assert_eq!(coord.snapshot().ram_allocated, 500);
+        }
+    }
+
+    #[test]
+    fn impossible_or_overflowing_requests_do_not_evict_residents() {
+        for topology in [MemoryTopology::Unified, MemoryTopology::Discrete] {
+            let coord = ResourceCoordinator::new(usize::MAX, usize::MAX, topology);
+            coord
+                .reserve(
+                    make_ticket("resident", 1, 0, ResourcePriority::Normal),
+                    noop_cb(),
+                )
+                .unwrap();
+            let overflowing = make_ticket("overflow", usize::MAX, 1, ResourcePriority::Normal);
+            assert!(coord.reserve(overflowing, noop_cb()).is_err());
+            assert_eq!(coord.snapshot().ram_allocated, 1);
+            assert!(
+                coord
+                    .register_cache(CacheHandle {
+                        handle_id: 1,
+                        model_id: "cache".into(),
+                        cache_kind: CacheKind::KvCache,
+                        bytes: usize::MAX,
+                        priority: ResourcePriority::Normal,
+                    })
+                    .is_err()
+            );
+            assert_eq!(coord.snapshot().ram_allocated, 1);
+        }
+        let coord = ResourceCoordinator::new_unified(100);
+        coord
+            .reserve(
+                make_ticket("resident", 50, 0, ResourcePriority::Normal),
+                noop_cb(),
+            )
+            .unwrap();
+        assert!(
+            coord
+                .reserve(
+                    make_ticket("oversized", 101, 0, ResourcePriority::Normal),
+                    noop_cb()
+                )
+                .is_err()
+        );
+        assert_eq!(coord.snapshot().model_count, 1);
     }
 
     #[test]

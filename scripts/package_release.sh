@@ -173,7 +173,7 @@ done
 # extracted archive can execute Python-backed adapters without depending on
 # the source checkout. Each bridge still requires the operator to install its
 # corresponding Python runtime package.
-for bridge in onnxruntime_infer.py mlx_lm_infer.py fun_asr_infer.py qwen_asr_infer.py openvino_llm_infer.py npu_tts_infer.py; do
+for bridge in tensorrt_infer.py onnxruntime_infer.py mlx_lm_infer.py fun_asr_infer.py qwen_asr_infer.py openvino_llm_infer.py npu_tts_infer.py; do
     cp "${WORKSPACE_DIR}/scripts/${bridge}" "$PKG_DIR/${bridge}"
     chmod +x "$PKG_DIR/${bridge}"
 done

@@ -28,6 +28,7 @@ use bloomai_engine::executor::onnx::OnnxRuntimeEngine;
 use bloomai_engine::executor::openvino::OpenVINOEngine;
 #[cfg(feature = "candle-engine")]
 use bloomai_engine::executor::qwen3_vl::Qwen3VLEngine;
+use bloomai_engine::executor::tensorrt::TensorRtEngine;
 use bloomai_engine::executor::vulkan::VulkanEngine;
 #[cfg(feature = "candle-engine")]
 use bloomai_engine::executor::wan::WanEngine;
@@ -54,6 +55,59 @@ const MAX_FFI_IDENTIFIER_BYTES: usize = 4 * 1024;
 // non-ASCII (for example, CJK) model paths crossing the C ABI.
 const MAX_FFI_MODEL_PATH_BYTES: usize = 128 * 1024;
 const MAX_FFI_JSON_BYTES: usize = 16 * 1024 * 1024;
+
+// Keep the C JSON contract strict even though Rust's shared generation type
+// permits forward-compatible deserialization. A misspelled or unsupported
+// sampling control must never look like successful inference to ABI callers.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FfiGenerationParams {
+    max_tokens: usize,
+    temperature: f64,
+    top_p: f64,
+    #[serde(default)]
+    top_k: Option<usize>,
+    #[serde(default)]
+    presence_penalty: f64,
+    #[serde(default)]
+    frequency_penalty: f64,
+    #[serde(default)]
+    logit_bias: Option<std::collections::BTreeMap<u32, f64>>,
+    seed: Option<u64>,
+    response_format: Option<FfiResponseFormat>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "type", content = "json_schema", deny_unknown_fields)]
+enum FfiResponseFormat {
+    #[serde(rename = "text")]
+    Text,
+    #[serde(rename = "json_object")]
+    JsonObject,
+    #[serde(rename = "json_schema")]
+    JsonSchema(serde_json::Value),
+}
+
+fn parse_generation_params(json: &str) -> Result<GenerationParams, serde_json::Error> {
+    let params: FfiGenerationParams = serde_json::from_str(json)?;
+    Ok(GenerationParams {
+        max_tokens: params.max_tokens,
+        temperature: params.temperature,
+        top_p: params.top_p,
+        top_k: params.top_k,
+        presence_penalty: params.presence_penalty,
+        frequency_penalty: params.frequency_penalty,
+        logit_bias: params.logit_bias,
+        seed: params.seed,
+        response_format: params.response_format.map(|format| match format {
+            FfiResponseFormat::Text => bloomai_core::ResponseFormat::Text,
+            FfiResponseFormat::JsonObject => bloomai_core::ResponseFormat::JsonObject,
+            FfiResponseFormat::JsonSchema(schema) => {
+                bloomai_core::ResponseFormat::JsonSchema(schema)
+            }
+        }),
+    })
+}
 
 /// A borrowed, length-delimited byte sequence used by ABI revision 2.
 #[repr(C)]
@@ -227,6 +281,7 @@ static ENGINE_REGISTRY: once_cell::sync::Lazy<EngineRegistry> = once_cell::sync:
     registry.register("npu-tts", Box::new(NpuTtsEngine));
     registry.register("onnxruntime", Box::new(OnnxRuntimeEngine));
     registry.register("coreml", Box::new(CoreMlEngine));
+    registry.register("tensorrt", Box::new(TensorRtEngine));
     registry.register("mlx", Box::new(MlxEngine));
     registry.register("llamacpp", Box::new(LlamaCppEngine));
     registry.register("laya", Box::new(LayaEngine));
@@ -745,7 +800,7 @@ unsafe fn bloom_pipeline_run_impl(
             }
         };
 
-        let params: GenerationParams = match serde_json::from_str(params_json_str) {
+        let params = match parse_generation_params(params_json_str) {
             Ok(p) => p,
             Err(e) => {
                 write_error(
@@ -892,7 +947,7 @@ unsafe fn bloom_pipeline_run_v2_impl(
             return BLOOM_STATUS_INVALID_INPUT_JSON;
         }
     };
-    let params: GenerationParams = match serde_json::from_str(params_json) {
+    let params = match parse_generation_params(params_json) {
         Ok(value) => value,
         Err(error) => {
             unsafe {
@@ -1054,7 +1109,7 @@ unsafe fn bloom_pipeline_run_stream_impl(
             }
         };
 
-        let params: GenerationParams = match serde_json::from_str(params_json_str) {
+        let params = match parse_generation_params(params_json_str) {
             Ok(p) => p,
             Err(e) => {
                 write_error(
@@ -1197,7 +1252,7 @@ unsafe fn bloom_pipeline_run_stream_v2_impl(
             return BLOOM_STATUS_INVALID_INPUT_JSON;
         }
     };
-    let params: GenerationParams = match serde_json::from_str(params_json) {
+    let params = match parse_generation_params(params_json) {
         Ok(value) => value,
         Err(error) => {
             unsafe {
@@ -1325,6 +1380,23 @@ mod tests {
     use super::{
         BloomSlice, FfiOutputSink, bloom_pipeline_load, bloom_pipeline_load_v2, catch_ffi_panic,
     };
+
+    #[test]
+    fn ffi_generation_contract_preserves_every_shared_control() {
+        let params = bloomai_core::GenerationParams {
+            top_k: Some(40),
+            presence_penalty: -0.5,
+            frequency_penalty: 0.75,
+            logit_bias: Some(std::collections::BTreeMap::from([(17, -100.0)])),
+            seed: Some(42),
+            response_format: Some(bloomai_core::ResponseFormat::JsonSchema(
+                serde_json::json!({"type": "object"}),
+            )),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&params).unwrap();
+        assert_eq!(super::parse_generation_params(&json).unwrap(), params);
+    }
 
     unsafe extern "C" fn capture_callback(
         user_data: *mut std::ffi::c_void,

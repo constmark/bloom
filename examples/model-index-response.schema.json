@@ -81,7 +81,7 @@
         "description": { "type": "string", "minLength": 1, "maxLength": 400 },
         "download_url": { "type": "string", "minLength": 1, "maxLength": 2048 },
         "filename": { "type": "string", "minLength": 1, "maxLength": 255 },
-        "format": { "type": "string", "enum": ["gguf", "onnx", "mlmodel", "transformers"] },
+        "format": { "type": "string", "enum": ["gguf", "onnx", "mlmodel", "plan", "engine", "transformers"] },
         "size_bytes": { "type": "integer", "minimum": 1 },
         "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
         "files": {
@@ -153,7 +153,7 @@
           "required": ["download_url"],
           "not": { "required": ["files"] },
           "properties": {
-            "format": { "enum": ["gguf", "onnx", "mlmodel"] }
+            "format": { "enum": ["gguf", "onnx", "mlmodel", "plan", "engine"] }
           }
         },
         {

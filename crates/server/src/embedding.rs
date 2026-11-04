@@ -216,6 +216,15 @@ async fn execute_embedding_batch_inner(
     let runtime = runtime_lease.runtime();
     let model_id = runtime.model_id.clone();
     let pipeline = Arc::clone(&runtime.pipeline);
+    if bloomai_engine::model_manifest_tasks(&pipeline.metadata().manifest) == ["tensor"] {
+        return Err(EmbeddingExecutionError::new(
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported_operation",
+            format!(
+                "Model '{model_id}' serves numeric tensors and cannot serve embedding or reranking requests. Use its Rust or CLI tensor interface."
+            ),
+        ));
+    }
     let native_rerank = matches!(projection, EmbeddingProjection::Rerank { .. })
         && pipeline.supports_native_rerank();
     if !model_supports_embeddings(&pipeline) && !native_rerank {

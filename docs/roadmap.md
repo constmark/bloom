@@ -80,8 +80,10 @@ final parity claim.
 
 ## Later
 
-- Move ONNX Runtime, CoreML, MLX, Vulkan, and vendor SDK paths from probing to
-  executable adapters where maintainers and hardware are available.
+- Expand executable ONNX Runtime, CoreML CPU numeric, MLX and TensorRT numeric
+  adapters with trained model and target-device evidence. Move Vulkan and other
+  vendor SDK paths from probing to executable adapters where maintainers and
+  hardware are available.
 - Add multi-device execution only after single-device behavior has stable tests
   and benchmarks.
 - Extend native multimodal streaming as model support matures.

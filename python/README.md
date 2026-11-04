@@ -55,7 +55,25 @@ pipeline.generate(
 )
 ```
 
+Both generation methods accept keyword-only sampling controls: `top_k`
+(1–32,768), `presence_penalty` and `frequency_penalty` (−2 through 2), and
+`logit_bias` (up to 1,024 token IDs with bias values of −100 through 100):
+
+```python
+pipeline.generate(
+    "Suggest a title", top_k=40, presence_penalty=0.5,
+    frequency_penalty=0.25, logit_bias={17: -5.0}, seed=42,
+)
+```
+
+Logit-bias keys accept integers or canonical decimal strings from 0 through
+1,000,000. Duplicate IDs, non-finite values, unknown response-format fields,
+and malformed schema-wrapper metadata are rejected before native inference.
+`max_tokens` must be positive and `temperature` must be between 0 and 2.
+Existing positional arguments retain their order.
+
 Streaming buffers at most 64 serialized chunks and 16 MiB of queued bytes.
+Data chunks are dictionaries; the native terminal event is the string `"End"`.
 Slow consumers apply backpressure to native callbacks. Individual chunks over
 16 MiB fail with `BloomInferenceError`. Close partially consumed generators to
 release their workers; leaving the pipeline context also stops its streams and

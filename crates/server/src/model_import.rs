@@ -987,6 +987,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tensorrt_imports_require_verification_and_publish_catalogued_files() {
+        for extension in ["plan", "engine"] {
+            let temp = tempfile::tempdir().unwrap();
+            let manager = manager(temp.path());
+            let filename = format!("numeric.{extension}");
+            let bytes = b"opaque numeric TensorRT plan";
+            manager.begin(request(&filename, bytes)).await.unwrap();
+            manager.append_chunk(&filename, 0, bytes).await.unwrap();
+            assert!(!temp.path().join(&filename).exists());
+            manager.complete(&filename).await.unwrap();
+            let catalog =
+                super::super::model_manager::ModelCatalog::scan(temp.path(), None).unwrap();
+            assert_eq!(catalog.models.len(), 1);
+            assert_eq!(catalog.models[0].format, "tensorrt");
+            assert_eq!(catalog.models[0].id, filename);
+            assert!(catalog.models[0].provenance.is_some());
+            assert!(
+                manager
+                    .begin(request(&filename, b"replacement"))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(fs::read(temp.path().join(&filename)).await.unwrap(), bytes);
+
+            let invalid_name = format!("wrong.{extension}");
+            let mut invalid = request(&invalid_name, bytes);
+            invalid.sha256 = "00".repeat(32);
+            manager.begin(invalid).await.unwrap();
+            manager.append_chunk(&invalid_name, 0, bytes).await.unwrap();
+            assert!(manager.complete(&invalid_name).await.is_err());
+            assert!(!temp.path().join(&invalid_name).exists());
+        }
+    }
+
+    #[tokio::test]
     async fn shared_storage_quota_reserves_the_declared_import_size() {
         let temp = tempfile::tempdir().unwrap();
         fs::write(temp.path().join("installed.gguf"), vec![0_u8; 60])

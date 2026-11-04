@@ -685,6 +685,7 @@ impl ModelOutput {
 impl From<Vec<OutputChunk>> for ModelOutput {
     fn from(chunks: Vec<OutputChunk>) -> Self {
         let mut text = String::new();
+        let mut logits = Vec::new();
         let mut image = None;
         let mut audio_samples = Vec::new();
         let mut audio_sr = 0u32;
@@ -694,6 +695,7 @@ impl From<Vec<OutputChunk>> for ModelOutput {
             match chunk {
                 OutputChunk::TextDelta(delta) => text.push_str(&delta),
                 OutputChunk::Image(bytes) => image = Some(bytes),
+                OutputChunk::Embedding(values) => logits.extend(values),
                 OutputChunk::AudioDelta(samples) => audio_samples.extend(samples),
                 OutputChunk::TtsAudioChunk {
                     samples,
@@ -726,7 +728,11 @@ impl From<Vec<OutputChunk>> for ModelOutput {
         });
         Self {
             text: if text.is_empty() { None } else { Some(text) },
-            logits: None,
+            logits: if logits.is_empty() {
+                None
+            } else {
+                Some(logits)
+            },
             image,
             audio: if audio_samples.is_empty() {
                 None
@@ -942,5 +948,21 @@ mod tests {
             }),
         };
         assert!(output.validate().unwrap_err().contains("does not match"));
+    }
+}
+
+#[cfg(test)]
+mod numeric_collection_tests {
+    use super::*;
+    #[test]
+    fn collecting_numeric_events_preserves_the_returned_vector() {
+        let output = ModelOutput::from(vec![
+            OutputChunk::Embedding(vec![1.25, -2.5]),
+            OutputChunk::End,
+        ]);
+        assert_eq!(output.logits, Some(vec![1.25, -2.5]));
+        assert_eq!(output.text, None);
+        output.validate().unwrap();
+        assert!(ModelOutput::from(vec![OutputChunk::End]).logits.is_none());
     }
 }

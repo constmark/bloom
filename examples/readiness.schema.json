@@ -71,7 +71,11 @@
       "type": "array",
       "maxItems": 3,
       "uniqueItems": true,
-      "items": { "enum": ["generation", "embedding", "rerank"] }
+      "items": { "enum": ["generation", "embedding", "rerank", "tensor"] },
+      "oneOf": [
+        { "const": [] }, { "const": ["generation"] }, { "const": ["embedding"] }, { "const": ["embedding", "rerank"] },
+        { "const": ["rerank"] }, { "const": ["tensor"] }
+      ]
     },
     "context_window": {
       "type": ["integer", "null"],

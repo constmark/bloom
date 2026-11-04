@@ -475,6 +475,7 @@ fn validate_public_report(
             [embedding, rerank] if embedding == "embedding" && rerank == "rerank"
         )
         && !matches!(report.manifest.model_tasks.as_slice(), [rerank] if rerank == "rerank")
+        && !matches!(report.manifest.model_tasks.as_slice(), [tensor] if tensor == "tensor")
     {
         return Err("Model preflight produced an invalid task identity.".to_string());
     }
@@ -1150,9 +1151,30 @@ mod tests {
         assert!(!resident.memory.fits_budget);
         assert!(resident.loadable, "{:?}", resident.load_blocker);
 
-        std::fs::write(temp.path().join("unsupported.mlmodel"), b"coreml").unwrap();
-        let unsupported = manager
-            .inspect_resident("unsupported.mlmodel")
+        std::fs::write(temp.path().join("numeric.mlmodel"), b"coreml").unwrap();
+        let coreml = manager.inspect_resident("numeric.mlmodel").await.unwrap();
+        // Preflight checks routing, not the CoreML payload. macOS now has a
+        // numeric CPU adapter; malformed weights fail at actual model load.
+        assert_eq!(
+            coreml.runtime.support,
+            if cfg!(target_os = "macos") {
+                "native"
+            } else {
+                "unsupported"
+            }
+        );
+        assert_eq!(coreml.manifest.model_tasks, vec!["tensor"]);
+
+        let incompatible_manager = ModelPreflightManager::new(
+            temp.path().to_path_buf(),
+            ModelPreflightConfig {
+                device: DeviceKind::Gpu,
+                ..cpu_config()
+            },
+            test_runtime_memory(),
+        );
+        let unsupported = incompatible_manager
+            .inspect_resident("numeric.mlmodel")
             .await
             .unwrap();
         assert!(!unsupported.loadable);

@@ -7,25 +7,34 @@ import argparse
 import json
 import math
 import pathlib
+import re
 import sys
 from typing import Any
+
+from http_workload import _sanitize_backend_inventory
 
 
 def _positive(value: Any, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name} must be a number")
-    if not math.isfinite(value) or value <= 0:
-        raise ValueError(f"{name} must be positive")
+    try:
+        valid = math.isfinite(value) and value > 0
+    except OverflowError:
+        valid = False
+    if not valid:
+        raise ValueError(f"{name} must be finite and positive")
     return float(value)
 
 
 def _sha256_text(value: Any, name: str) -> str:
-    if not isinstance(value, str) or len(value) != 64:
-        raise ValueError(f"{name} must be a 64-character SHA-256")
-    try:
-        int(value, 16)
-    except ValueError as error:
-        raise ValueError(f"{name} must be hexadecimal") from error
+    if not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{64}", value) is None:
+        raise ValueError(f"{name} must be a 64-character hexadecimal SHA-256")
+    return value.lower()
+
+
+def _positive_int(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
     return value
 
 
@@ -43,7 +52,7 @@ def validate(
     """Validate a workload report and return a bounded validation result."""
     if not isinstance(report, dict):
         raise ValueError("report must be an object")
-    if report.get("schema_version") != 1 or report.get("object") != "bloom.http_workload":
+    if type(report.get("schema_version")) is not int or report.get("schema_version") != 1 or report.get("object") != "bloom.http_workload":
         raise ValueError("unsupported workload report identity")
     if report.get("result") != "pass":
         raise ValueError("workload result is not pass")
@@ -51,6 +60,10 @@ def validate(
     settings = report.get("settings")
     if not isinstance(identity, dict) or not isinstance(settings, dict):
         raise ValueError("report is missing identity or settings")
+    for field in ("backend", "device"):
+        value = identity.get(field)
+        if not isinstance(value, str) or not value.strip() or len(value) > 128:
+            raise ValueError(f"runtime identity {field} is missing or invalid")
     model = identity.get("model")
     if not isinstance(model, dict):
         raise ValueError("model identity is missing sha256")
@@ -66,27 +79,51 @@ def validate(
     if expected_device and identity.get("device") != expected_device:
         raise ValueError("device does not match deployment cell")
 
+    min_duration_seconds = _positive(min_duration_seconds, "min_duration_seconds")
     duration = _positive(settings.get("duration_seconds"), "duration_seconds")
     if duration < min_duration_seconds:
         raise ValueError(
             f"duration_seconds {duration:g} is below required {min_duration_seconds:g}"
         )
-    max_requests = settings.get("max_requests")
-    if not isinstance(max_requests, int) or isinstance(max_requests, bool) or max_requests < 1:
-        raise ValueError("max_requests must be a positive integer")
+    # A requested duration is configuration, not proof that a soak ran. Both
+    # the observed timer and its constituent waves must cover the target.
+    elapsed_ms = _positive(report.get("workload_elapsed_ms"), "workload_elapsed_ms")
+    required_ms = max(duration, min_duration_seconds) * 1000
+    if elapsed_ms + 0.001 < required_ms:
+        raise ValueError("observed workload duration is below the required duration")
+    max_requests = _positive_int(settings.get("max_requests"), "max_requests")
+    min_concurrency_levels = _positive_int(min_concurrency_levels, "min_concurrency_levels")
+    configured_levels = settings.get("concurrency")
+    if not isinstance(configured_levels, list) or not configured_levels:
+        raise ValueError("settings.concurrency must be a non-empty array")
+    for value in configured_levels:
+        _positive_int(value, "settings.concurrency level")
+    if len(set(configured_levels)) != len(configured_levels):
+        raise ValueError("settings.concurrency levels must be distinct")
     waves = report.get("waves")
-    if not isinstance(min_concurrency_levels, int) or min_concurrency_levels < 1:
-        raise ValueError("min_concurrency_levels must be positive")
     if not isinstance(waves, list) or len(waves) < min_concurrency_levels:
         raise ValueError("report does not contain enough concurrency waves")
     levels: list[int] = []
+    wave_elapsed_ms = 0.0
     for wave in waves:
-        if not isinstance(wave, dict) or not isinstance(wave.get("concurrency"), int):
+        if not isinstance(wave, dict):
             raise ValueError("invalid concurrency wave")
-        if wave["concurrency"] not in levels:
-            levels.append(wave["concurrency"])
-        if not isinstance(wave.get("requests"), int) or wave["requests"] < 1:
-            raise ValueError("concurrency wave has no completed requests")
+        level = _positive_int(wave.get("concurrency"), "wave concurrency")
+        if level not in configured_levels:
+            raise ValueError("wave concurrency is not a configured level")
+        if level not in levels:
+            levels.append(level)
+        if _positive_int(wave.get("requests"), "wave requests") != level:
+            raise ValueError("wave requests do not match concurrency")
+        wave_elapsed_ms += _positive(wave.get("elapsed_ms"), "wave elapsed_ms")
+    # Each wave and the overall timer are rounded independently to 0.001 ms.
+    rounding_slack = (len(waves) + 1) * 0.001
+    if wave_elapsed_ms > elapsed_ms + rounding_slack:
+        raise ValueError("wave elapsed time exceeds observed workload duration")
+    if elapsed_ms - wave_elapsed_ms > max(1000.0, elapsed_ms * 0.01):
+        raise ValueError("observed workload duration is not supported by completed waves")
+    if set(levels) != set(configured_levels):
+        raise ValueError("configured concurrency levels were not all exercised")
     if len(levels) < min_concurrency_levels:
         raise ValueError("concurrency waves do not cover enough distinct levels")
     requests_completed = report.get("requests_completed")
@@ -96,6 +133,7 @@ def validate(
         or isinstance(requests_completed, bool)
         or requests_completed <= 0
         or requests_completed != requested_wave_count
+        or requests_completed > max_requests
     ):
         raise ValueError("requests_completed does not match completed concurrency waves")
     completion_tokens = report.get("completion_tokens")
@@ -107,9 +145,10 @@ def validate(
         raise ValueError("completion_tokens is missing or invalid")
 
     disconnect = report.get("disconnect")
-    if not isinstance(disconnect, dict) or not isinstance(disconnect.get("accepted"), int):
+    if not isinstance(disconnect, dict):
         raise ValueError("disconnect recovery evidence is missing")
-    if disconnect["accepted"] < 1 or disconnect.get("post_recovery_request") != "pass":
+    _positive_int(disconnect.get("accepted"), "disconnect accepted")
+    if disconnect.get("post_recovery_request") != "pass":
         raise ValueError("disconnect recovery did not complete")
     _positive(disconnect.get("recovery_ms"), "disconnect recovery_ms")
 
@@ -120,16 +159,34 @@ def validate(
         value = memory.get(field)
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
             raise ValueError(f"host memory field {field} is invalid")
-    if not isinstance(memory.get("drift_bytes"), int):
+    if type(memory.get("drift_bytes")) is not int:
         raise ValueError("host memory drift is missing")
+    if memory["drift_bytes"] != memory["after_recovery_bytes"] - memory["warm_baseline_bytes"]:
+        raise ValueError("host memory drift does not match measured endpoints")
+    if memory["observed_peak_bytes"] < max(memory["warm_baseline_bytes"], memory["after_recovery_bytes"]):
+        raise ValueError("host memory peak is below a measured endpoint")
 
     inventory = report.get("backend_inventory")
     if not isinstance(inventory, dict) or inventory.get("status") not in {"available", "partial"}:
         raise ValueError("physical backend inventory is unavailable")
+    devices = _sanitize_backend_inventory({"object": "list", "devices": inventory.get("devices")})["devices"]
+    available_classes = {
+        entry["capability"]["device_class"].lower().replace("_", "").replace("-", "")
+        for entry in devices if entry["available"] and entry["capability"] is not None
+    }
+    required_classes = {
+        "cpu": {"cpu"}, "gpu": {"integratedgpu", "discretegpu"},
+        "metal": {"integratedgpu", "discretegpu"}, "cuda": {"discretegpu"},
+        "npu": {"npu"}, "intel-npu": {"npu"},
+        "auto": {"cpu", "integratedgpu", "discretegpu", "npu"},
+    }.get(identity["device"].lower())
+    if required_classes is None or not available_classes.intersection(required_classes):
+        raise ValueError("physical inventory does not support the requested device")
     if failure_report is None:
         raise ValueError("failure-injection report is required")
     if (
         not isinstance(failure_report, dict)
+        or type(failure_report.get("schema_version")) is not int
         or failure_report.get("schema_version") != 1
         or failure_report.get("object") != "bloom.deployment_failure_injection"
         or failure_report.get("result") != "pass"
@@ -149,14 +206,14 @@ def validate(
     deployment = failure_report.get("deployment")
     if not isinstance(deployment, dict):
         raise ValueError("failure-injection deployment identity is missing")
-    if deployment.get("server_sha256") != server_sha:
+    if _sha256_text(deployment.get("server_sha256"), "failure-injection server sha256") != server_sha:
         raise ValueError("failure-injection server identity does not match workload")
     if (
         deployment.get("backend") != identity.get("backend")
         or deployment.get("device") != identity.get("device")
     ):
         raise ValueError("failure-injection runtime identity does not match workload")
-    if deployment.get("model_sha256") != model_sha:
+    if _sha256_text(deployment.get("model_sha256"), "failure-injection model sha256") != model_sha:
         raise ValueError("failure-injection model identity does not match workload")
     failure_status = "pass"
     return {
@@ -165,6 +222,7 @@ def validate(
         "result": "evidence_complete",
         "stable_claim": False,
         "duration_seconds": duration,
+        "observed_duration_seconds": elapsed_ms / 1000,
         "concurrency_levels": sorted(levels),
         "model_sha256": model_sha,
         "server_sha256": server_sha,
@@ -177,7 +235,7 @@ def validate(
             "drift_bytes": memory["drift_bytes"],
         },
         "limitations": [
-            "Workload evidence only; model-load, disk-full, interruption, upgrade and rollback drills remain separate gates.",
+            "Physical disk-full and target-host upgrade/rollback drills remain separate gates.",
             "Accelerator memory and token-level TBT are not measured by the HTTP workload.",
         ],
     }

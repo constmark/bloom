@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
+mod wasm;
+pub use wasm::{WASM_PROCESSOR_ABI_VERSION, WasmLimits, WasmProcessor};
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PluginMetadata {
     pub name: String,
@@ -250,6 +253,32 @@ impl PluginManager {
             all(target_os = "windows", target_arch = "x86_64")
         )))]
         return "unknown";
+    }
+
+    /// Load an isolated ABI-v1 WASM processor. No host or WASI imports are linked.
+    /// The returned value implements the existing `Processor` trait and can be
+    /// inserted into `ProcessorRegistry`; execution stays opt-in at this boundary.
+    pub fn load_wasm_processor<P: AsRef<Path>>(
+        manifest: &PluginManifest,
+        base_dir: P,
+        spec: bloomai_core::ProcessorSpec,
+        limits: WasmLimits,
+    ) -> Result<WasmProcessor> {
+        Self::validate_manifest(manifest)?;
+        anyhow::ensure!(
+            manifest.entry_point.entry_type == "wasm",
+            "WASM processors require a wasm entry point"
+        );
+        anyhow::ensure!(
+            spec.name == manifest.metadata.name,
+            "processor name must match its plugin manifest"
+        );
+        let PluginEntryValidation::WasmModule { path } =
+            Self::validate_entry_point(manifest, base_dir)?
+        else {
+            anyhow::bail!("WASM processor entry point is invalid");
+        };
+        WasmProcessor::load(&path, spec, limits)
     }
 
     /// Loads a plugin dynamic library and returns a boxed Engine implementation.

@@ -177,6 +177,15 @@ def _label(locale: str, key: str) -> str:
     return labels.get(key, _LOCALIZED_LABELS["en"].get(key, key))
 
 
+def _is_finite_number(value) -> bool:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
 def _normalize_response_format(
     response_format: Optional[Union[str, Mapping[str, Any]]],
 ) -> Optional[Dict[str, Any]]:
@@ -200,6 +209,11 @@ def _normalize_response_format(
         raise TypeError("response_format must be a mapping, string, or None")
 
     format_type = response_format.get("type")
+    allowed_fields = {"json_schema"} if format_type is None else {"type"}
+    if format_type == "json_schema":
+        allowed_fields.add("json_schema")
+    if set(response_format) - allowed_fields:
+        raise ValueError("response_format contains unsupported fields")
     if format_type is None and set(response_format) == {"json_schema"}:
         schema = response_format["json_schema"]
     elif format_type == "text":
@@ -209,6 +223,23 @@ def _normalize_response_format(
     elif format_type == "json_schema":
         schema = response_format.get("json_schema")
         if isinstance(schema, Mapping) and "schema" in schema:
+            if set(schema) - {"name", "description", "strict", "schema"}:
+                raise ValueError("response_format json_schema contains unsupported wrapper fields")
+            if "name" in schema:
+                name = schema["name"]
+                if (
+                    not isinstance(name, str)
+                    or not 1 <= len(name) <= 64
+                    or not all(c.isascii() and (c.isalnum() or c in "_-") for c in name)
+                ):
+                    raise ValueError("response_format json_schema.name must contain 1 to 64 ASCII letters, digits, underscores, or hyphens")
+            if "description" in schema and (
+                not isinstance(schema["description"], str)
+                or len(schema["description"]) > 1024
+            ):
+                raise ValueError("response_format json_schema.description must be a string of at most 1024 characters")
+            if "strict" in schema and not isinstance(schema["strict"], bool):
+                raise ValueError("response_format json_schema.strict must be a boolean")
             schema = schema["schema"]
     else:
         raise ValueError(
@@ -217,6 +248,35 @@ def _normalize_response_format(
     if not isinstance(schema, Mapping):
         raise ValueError("response_format json_schema must contain a schema object")
     return {"type": "json_schema", "json_schema": dict(schema)}
+
+
+def _normalize_logit_bias(logit_bias):
+    if logit_bias is None:
+        return None
+    if not isinstance(logit_bias, Mapping) or len(logit_bias) > 1024:
+        raise ValueError("logit_bias must be a mapping with at most 1024 token ids")
+    normalized = {}
+    for token, bias in logit_bias.items():
+        if isinstance(token, str):
+            if not token.isascii() or not token.isdecimal() or (len(token) > 1 and token[0] == "0"):
+                raise ValueError("logit_bias token ids must be integers or canonical decimal strings")
+            # Bound conversion before int() so arbitrarily long strings fail
+            # consistently on every supported Python version.
+            if len(token) > 7:
+                raise ValueError("logit_bias token ids must be between 0 and 1000000")
+            token = int(token)
+        if not isinstance(token, int) or isinstance(token, bool) or not 0 <= token <= 1000000:
+            raise ValueError("logit_bias token ids must be between 0 and 1000000")
+        if (
+            not _is_finite_number(bias)
+            or not -100 <= bias <= 100
+        ):
+            raise ValueError("logit_bias values must be finite numbers between -100 and 100")
+        key = str(token)
+        if key in normalized:
+            raise ValueError("logit_bias contains duplicate token ids")
+        normalized[key] = bias
+    return normalized
 
 
 def _bytes_slice(value: bytes):
@@ -492,6 +552,11 @@ class BloomPipeline:
         top_p: float,
         seed: Optional[int],
         response_format: Optional[Union[str, Mapping[str, Any]]] = None,
+        *,
+        top_k: Optional[int] = None,
+        presence_penalty: float = 0.0,
+        frequency_penalty: float = 0.0,
+        logit_bias: Optional[Mapping[Union[int, str], float]] = None,
     ):
         if isinstance(prompt_or_input, str):
             input_data = {"Text": {"prompt": prompt_or_input}}
@@ -500,19 +565,19 @@ class BloomPipeline:
         else:
             raise TypeError("prompt_or_input must be a string or dictionary")
 
-        if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens < 0:
-            raise ValueError("max_tokens must be a non-negative integer")
         if (
-            not isinstance(temperature, (int, float))
-            or isinstance(temperature, bool)
-            or not math.isfinite(temperature)
-            or temperature < 0
+            not isinstance(max_tokens, int)
+            or isinstance(max_tokens, bool)
+            or not 1 <= max_tokens <= (1 << (8 * ctypes.sizeof(ctypes.c_size_t))) - 1
         ):
-            raise ValueError("temperature must be a finite non-negative number")
+            raise ValueError("max_tokens must be a positive native-size integer")
         if (
-            not isinstance(top_p, (int, float))
-            or isinstance(top_p, bool)
-            or not math.isfinite(top_p)
+            not _is_finite_number(temperature)
+            or not 0 <= temperature <= 2
+        ):
+            raise ValueError("temperature must be a finite number between 0 and 2")
+        if (
+            not _is_finite_number(top_p)
             or top_p <= 0
             or top_p > 1
         ):
@@ -527,12 +592,32 @@ class BloomPipeline:
             )
         ):
             raise ValueError("seed must be None or an unsigned 64-bit integer")
+        if top_k is not None and (
+            not isinstance(top_k, int)
+            or isinstance(top_k, bool)
+            or not 1 <= top_k <= 32768
+        ):
+            raise ValueError("top_k must be None or an integer between 1 and 32768")
+        for name, value in (
+            ("presence_penalty", presence_penalty),
+            ("frequency_penalty", frequency_penalty),
+        ):
+            if (
+                not _is_finite_number(value)
+                or not -2 <= value <= 2
+            ):
+                raise ValueError(f"{name} must be a finite number between -2 and 2")
+        native_logit_bias = _normalize_logit_bias(logit_bias)
         native_response_format = _normalize_response_format(response_format)
 
         params_data = {
             "max_tokens": max_tokens,
             "temperature": temperature,
             "top_p": top_p,
+            "top_k": top_k,
+            "presence_penalty": presence_penalty,
+            "frequency_penalty": frequency_penalty,
+            "logit_bias": native_logit_bias,
             "seed": seed,
             # The native GenerationParams type supports text, json_object and
             # json_schema response formats.  Passing this through here keeps
@@ -566,6 +651,11 @@ class BloomPipeline:
         top_p: float = 0.9,
         seed: Optional[int] = None,
         response_format: Optional[Union[str, Mapping[str, Any]]] = None,
+        *,
+        top_k: Optional[int] = None,
+        presence_penalty: float = 0.0,
+        frequency_penalty: float = 0.0,
+        logit_bias: Optional[Mapping[Union[int, str], float]] = None,
     ) -> Dict[str, Any]:
         """
         Run full non-streaming inference.
@@ -577,7 +667,9 @@ class BloomPipeline:
         :return: Decoded ModelOutput dict.
         """
         input_bytes, params_bytes = self._prepare_input_params(
-            prompt_or_input, max_tokens, temperature, top_p, seed, response_format
+            prompt_or_input, max_tokens, temperature, top_p, seed, response_format,
+            top_k=top_k, presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty, logit_bias=logit_bias,
         )
         err_buf = ctypes.create_string_buffer(512)
 
@@ -668,11 +760,18 @@ class BloomPipeline:
         seed: Optional[int] = None,
         response_format: Optional[Union[str, Mapping[str, Any]]] = None,
         timeout: Optional[float] = None,
-    ) -> Generator[Dict[str, Any], None, None]:
+        *,
+        top_k: Optional[int] = None,
+        presence_penalty: float = 0.0,
+        frequency_penalty: float = 0.0,
+        logit_bias: Optional[Mapping[Union[int, str], float]] = None,
+    ) -> Generator[Union[Dict[str, Any], str], None, None]:
         """
         Run streaming inference.
         
         Yields parsed OutputChunks progressively, with bounded backpressure.
+        The native unit variant ``End`` is yielded as the string ``"End"``;
+        data-carrying variants are dictionaries.
         ``timeout`` optionally bounds each wait for the next chunk.  When the
         deadline expires, the stream is stopped and :class:`TimeoutError` is
         raised; the default ``None`` preserves an unbounded wait.
@@ -680,15 +779,15 @@ class BloomPipeline:
         if (
             timeout is not None
             and (
-                not isinstance(timeout, (int, float))
-                or isinstance(timeout, bool)
-                or not math.isfinite(timeout)
+                not _is_finite_number(timeout)
                 or timeout < 0
             )
         ):
             raise ValueError("timeout must be a finite non-negative number or None")
         input_bytes, params_bytes = self._prepare_input_params(
-            prompt_or_input, max_tokens, temperature, top_p, seed, response_format
+            prompt_or_input, max_tokens, temperature, top_p, seed, response_format,
+            top_k=top_k, presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty, logit_bias=logit_bias,
         )
         buffer = StreamBuffer()
         err_buf = ctypes.create_string_buffer(512)
@@ -832,9 +931,9 @@ class BloomPipeline:
                     raise BloomInferenceError(
                         f"{_label(self.locale, 'invalid_chunk')}: {error}"
                     ) from error
-                if not isinstance(value, dict):
+                if not isinstance(value, dict) and value != "End":
                     raise BloomInferenceError(
-                        f"{_label(self.locale, 'invalid_chunk')}: expected a JSON object"
+                        f"{_label(self.locale, 'invalid_chunk')}: expected a JSON object or End"
                     )
                 yield value
         finally:

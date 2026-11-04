@@ -647,6 +647,21 @@ pub(crate) fn chat_output_message(
     }
 }
 
+/// Namespace tool identities by candidate while retaining the established
+/// single-choice/first-choice IDs. Put the candidate prefix first so the
+/// bounded ID suffix cannot truncate away its uniqueness.
+pub(crate) fn chat_output_message_for_choice(
+    request_id: &str,
+    choice_index: usize,
+    output: &ParsedChatOutput,
+) -> serde_json::Value {
+    if choice_index == 0 {
+        chat_output_message(request_id, output)
+    } else {
+        chat_output_message(&format!("choice{choice_index}_{request_id}"), output)
+    }
+}
+
 pub(crate) fn chat_output_finish_reason(
     output: &ParsedChatOutput,
     completion_tokens: usize,

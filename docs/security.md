@@ -222,8 +222,10 @@ A plugin manifest is a capability declaration, not a sandbox.
 - Subprocess plugins inherit an environment and filesystem context unless the
   deployment restricts them.
 - Remote plugins can send model input over the network.
-- WASM manifests are validated, but a sandboxed execution runtime is not yet a
-  default capability.
+- WASM processor calls use the [bounded Wasmi runtime](wasm-plugins.md): no
+  imports/WASI, filesystem or network access; fresh per-call instances; fuel,
+  memory, stack, I/O, concurrency and deadline limits; cooperative cancellation.
+  This contract does not sandbox native, remote or subprocess plugins.
 
 Production deployments should load plugins from an allowlist and keep native
 libraries outside user-writable directories.

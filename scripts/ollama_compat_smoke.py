@@ -387,7 +387,7 @@ def validate_tool_outputs(
         "model": model_id,
         "messages": [user_message],
         "tools": [tool],
-        "options": {"num_predict": max_tokens, "temperature": 0},
+        "options": {"num_predict": max_tokens, "temperature": 0, "top_k": 40},
         "stream": False,
     }
 
@@ -472,7 +472,7 @@ def validate_tool_outputs(
                     "content": "15 C and clear",
                 },
             ],
-            "options": {"num_predict": max_tokens, "temperature": 0},
+            "options": {"num_predict": max_tokens, "temperature": 0, "top_k": 40},
             "stream": False,
         },
         headers=headers,
@@ -1091,7 +1091,7 @@ def main() -> int:
                 {
                     "model": "default",
                     "messages": [{"role": "user", "content": "Do not run."}],
-                    "options": {"top_k": 40},
+                    "options": {"top_k": 0},
                 },
                 headers=headers,
                 allow_http_error=True,

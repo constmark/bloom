@@ -49,7 +49,7 @@ protocol when backward behavior cannot be preserved.
 | `loading` | Whether a model lifecycle operation is in progress |
 | `load_error` | A bounded, path-free public failure summary or `null` |
 | `input_modalities` | Bounded active-model input capability labels |
-| `model_tasks` | Bounded active-model tasks: `generation`, `rerank`, or `embedding` plus `rerank` |
+| `model_tasks` | Bounded active-model tasks: `generation`, `embedding`, `rerank`, `embedding` plus `rerank`, or `tensor` |
 | `context_window` | Positive u64 active-model context limit or `null` |
 | `in_flight_requests` | Process-local admitted inference count as a u64 |
 | `available_permits` | Immediately available inference permits as a platform-independent u64 |
@@ -92,3 +92,9 @@ The endpoint intentionally does not require the `/v1` API key so orchestrators
 and the first UI connection can probe it. It exposes bounded deployment and
 model metadata, so non-local deployments should still restrict it with a
 network ACL or reverse proxy.
+
+Numeric CoreML/TensorRT models advertise `model_tasks: ["tensor"]`. Updated
+clients recognize readiness while disabling text generation and sentence-vector
+controls. Earlier clients that reject unknown task values must be updated before
+using numeric models. This additive task uses the existing version 3 document;
+it does not change the wire shape or make tensor models chat-compatible.

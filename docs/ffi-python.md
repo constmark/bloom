@@ -67,12 +67,33 @@ pipeline.generate(
 )
 ```
 
+Both `generate` and `generate_stream` accept `top_k` (1–32,768),
+`presence_penalty` and `frequency_penalty` (−2 through 2), and `logit_bias`
+(up to 1,024 token IDs, each 0–1,000,000, with a bias of −100 through 100)
+as keyword-only controls. Logit-bias keys may be integers or canonical decimal
+strings; aliases for the same token are rejected. For example:
+
+```python
+pipeline.generate(
+    "Suggest a title", top_k=40, presence_penalty=0.5,
+    frequency_penalty=0.25, logit_bias={17: -5.0}, seed=42,
+)
+```
+
+Controls are validated before entering the native call. `max_tokens` must be
+positive, `temperature` must be finite and between 0 and 2, and `top_p` must be
+greater than 0 and at most 1. Unknown response-format or schema-wrapper fields
+are rejected instead of silently discarded. Existing positional arguments,
+including streaming `timeout`, retain their order.
+
 Calls on one Python pipeline are serialized; consume or close a stream before
 starting another inference on that pipeline. Stream handoff is bounded to 64
 serialized chunks and 16 MiB of queued bytes. A slow consumer backpressures the
 native callback; an individual chunk above 16 MiB raises `BloomInferenceError`
 (revision 2 checks its length before copying native memory). These limits bound
 the handoff queue, not model memory or objects retained by the application.
+Data-carrying stream variants are dictionaries such as `{"TextDelta": "hello"}`;
+the native terminal unit variant is the string `"End"` and is yielded unchanged.
 
 `close()` is idempotent. It stops registered streams, releases blocked
 callbacks, and waits for active native calls before freeing the handle,
@@ -192,6 +213,17 @@ safely.
 Revision 1 consumers use NUL-terminated inputs, release
 `bloom_pipeline_run` output with `bloom_string_free`, and cannot cancel native
 streaming. Its historical stream error-code mapping is unchanged.
+
+Both ABI revisions accept the same generation-parameter JSON fields:
+`max_tokens`, `temperature`, `top_p`, `top_k`, `presence_penalty`,
+`frequency_penalty`, `logit_bias`, `seed`, and `response_format`.
+`max_tokens`, `temperature`, and `top_p` are required; other controls default
+to their native neutral values. Unknown or duplicate generation fields and
+unknown response-format fields fail during parameter decoding. Revision 2
+returns `BLOOM_STATUS_INVALID_PARAMS_JSON`; revision 1 preserves its NULL
+buffered result / `-5` stream result with a diagnostic. This strict JSON
+boundary prevents a misspelled control from producing apparently successful
+inference with unintended defaults.
 
 Run the model-free boundary gates with:
 

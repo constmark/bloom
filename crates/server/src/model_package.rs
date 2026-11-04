@@ -26,9 +26,17 @@ pub(crate) fn validate_package_id(id: &str) -> Result<()> {
     validate_catalog_id(id)?;
     let lower = id.to_ascii_lowercase();
     if id.starts_with('.')
-        || [".gguf", ".onnx", ".mlmodel", ".mlpackage", ".mlmodelc"]
-            .iter()
-            .any(|suffix| lower.ends_with(suffix))
+        || [
+            ".gguf",
+            ".onnx",
+            ".mlmodel",
+            ".mlpackage",
+            ".mlmodelc",
+            ".plan",
+            ".engine",
+        ]
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
     {
         return Err(anyhow!(
             "model package directory must be non-hidden and distinct from single-file model names"

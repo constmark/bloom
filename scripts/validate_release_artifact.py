@@ -46,6 +46,7 @@ REQUIRED_FILES = (
     "openvino_llm_infer.py",
     "npu_tts_infer.py",
     "onnxruntime_infer.py",
+    "tensorrt_infer.py",
     "mlx_lm_infer.py",
     "docs/release-manifest.md",
     "docs/release-quickstart.md",

@@ -23,8 +23,12 @@ def report() -> dict:
             "backend": "candle",
             "device": "cpu",
         },
-        "settings": {"duration_seconds": 7200, "max_requests": 100},
-        "waves": [{"concurrency": 1, "requests": 10}, {"concurrency": 4, "requests": 20}],
+        "settings": {"duration_seconds": 7200, "max_requests": 100, "concurrency": [1, 4]},
+        "workload_elapsed_ms": 7_200_001,
+        "waves": [
+            {"concurrency": level, "requests": level, "elapsed_ms": 600_000}
+            for _ in range(6) for level in (1, 4)
+        ],
         "requests_completed": 30,
         "completion_tokens": 90,
         "disconnect": {"accepted": 2, "recovery_ms": 12.0, "post_recovery_request": "pass"},
@@ -34,7 +38,19 @@ def report() -> dict:
             "after_recovery_bytes": 110,
             "drift_bytes": 10,
         },
-        "backend_inventory": {"status": "available"},
+        "backend_inventory": {
+            "status": "available",
+            "devices": [{
+                "name": "cpu", "available": True, "reason": None, "details": [],
+                "capability": {
+                    "backend_name": "cpu", "vendor": "generic", "device_class": "Cpu",
+                    "memory_topology": "Unified", "max_memory": 1000, "available_memory": 800,
+                    "supported_dtypes": ["F32"], "supported_formats": ["Gguf"],
+                    "supports_mmap": True, "has_quantization_kernels": True,
+                    "supports_streaming": True, "max_batch_tokens": None, "available_parallelism": 4,
+                },
+            }],
+        },
     }
 
 
@@ -69,6 +85,9 @@ class DeploymentCellGateTests(unittest.TestCase):
         }
         result = gate.validate(report(), min_duration_seconds=1, failure_report=failure)
         self.assertEqual(result["failure_injection"], "pass")
+        self.assertEqual(result["observed_duration_seconds"], 7200.001)
+        self.assertEqual(result["concurrency_levels"], [1, 4])
+        self.assertFalse(result["stable_claim"])
 
     def test_rejects_failed_failure_injection(self) -> None:
         failure = {

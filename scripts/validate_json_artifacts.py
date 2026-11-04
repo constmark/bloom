@@ -555,7 +555,7 @@ def basic_validate() -> list[tuple[Path, str]]:
         ],
     )
     preflight_tasks = preflight_data["manifest"]["model_tasks"]
-    if preflight_tasks not in (["generation"], ["embedding", "rerank"]):
+    if preflight_tasks not in (["generation"], ["embedding", "rerank"], ["rerank"], ["tensor"]):
         raise AssertionError(f"{model_preflight_path}: invalid model tasks")
     preflight_memory = preflight_data["memory"]
     if preflight_memory["planned_context_tokens"] != (

@@ -31,7 +31,9 @@ jobs:
       - name: Install pinned metadata validators
         run: python -m pip install --disable-pip-version-check -r requirements/schema-validation.txt
       - name: Validate public JSON artifacts
-        run: python scripts/validate_json_artifacts.py
+        run: |
+          python scripts/validate_json_artifacts.py
+          python scripts/test_model_catalog_schemas.py
       - name: Check local Markdown links
         run: python scripts/check_markdown_links.py
       - name: Check community metadata

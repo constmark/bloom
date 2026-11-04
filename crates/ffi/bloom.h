@@ -77,6 +77,12 @@ BloomPipeline* bloom_pipeline_load_v2(
 /**
  * Run full inference using length-delimited input and output buffers.
  * On success, release output with bloom_buffer_free.
+ * params_json requires max_tokens, temperature and top_p; it also accepts
+ * top_k, presence_penalty, frequency_penalty, logit_bias, seed and
+ * response_format. Unknown/duplicate generation fields and unknown response
+ * format fields return BLOOM_STATUS_INVALID_PARAMS_JSON. The same JSON
+ * contract applies to streaming and to revision 1 entry points (which retain
+ * their historical error codes).
  */
 int32_t bloom_pipeline_run_v2(
     BloomPipeline* pipeline,

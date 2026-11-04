@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import http.server
 import json
 import os
@@ -15,6 +16,7 @@ from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import http_workload as workload  # noqa: E402
+import validate_deployment_cell as cell  # noqa: E402
 
 
 class FakeChat(http.server.BaseHTTPRequestHandler):
@@ -458,6 +460,118 @@ class WorkloadTests(unittest.TestCase):
             WorkloadTests(name).run(result)
         self.assertEqual(result.errors, [])
         self.assertEqual(result.failures, [])
+
+
+class DeploymentCellTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.report = {
+            "schema_version": 1, "object": "bloom.http_workload", "result": "pass",
+            "identity": {"model": {"sha256": "a" * 64}, "server_sha256": "b" * 64,
+                         "backend": "candle", "device": "cpu"},
+            "settings": {"duration_seconds": 7200, "max_requests": 1000,
+                         "concurrency": [1, 2]},
+            "workload_elapsed_ms": 7_200_001,
+            "waves": [{"concurrency": 1, "requests": 1, "elapsed_ms": 3_600_000},
+                      {"concurrency": 2, "requests": 2, "elapsed_ms": 3_600_000}],
+            "requests_completed": 3, "completion_tokens": 6,
+            "disconnect": {"accepted": 2, "recovery_ms": 10,
+                           "post_recovery_request": "pass"},
+            "host_memory": {"warm_baseline_bytes": 100, "after_recovery_bytes": 110,
+                            "observed_peak_bytes": 120, "drift_bytes": 10},
+            "backend_inventory": {"status": "available", "devices": copy.deepcopy(BackendInventory.payload["devices"])},
+        }
+        self.failure = {
+            "schema_version": 1, "object": "bloom.deployment_failure_injection",
+            "result": "pass", "deployment": {"server_sha256": "b" * 64,
+                "model_sha256": "a" * 64, "backend": "candle", "device": "cpu"},
+            "scenarios": {key: {"result": "pass"} for key in
+                          ("invalid_model", "process_interruption", "storage_quota")},
+        }
+
+    def validate(self, report=None, **kwargs):
+        return cell.validate(self.report if report is None else report,
+                             min_duration_seconds=kwargs.pop("min_duration_seconds", 7200),
+                             failure_report=self.failure, **kwargs)
+
+    def test_complete_workload_remains_an_evidence_only_result(self) -> None:
+        result = self.validate(expected_model_sha256="A" * 64)
+        self.assertFalse(result["stable_claim"])
+        self.assertEqual(result["observed_duration_seconds"], 7200.001)
+        self.assertEqual(result["concurrency_levels"], [1, 2])
+
+    def test_requested_duration_cannot_substitute_for_observed_soak(self) -> None:
+        for measured in (None, 1, True, float("nan"), float("inf"), 10 ** 400):
+            with self.subTest(measured=str(measured)):
+                report = copy.deepcopy(self.report)
+                report["workload_elapsed_ms"] = measured
+                with self.assertRaises(ValueError):
+                    self.validate(report)
+        report = copy.deepcopy(self.report)
+        report["waves"][0]["elapsed_ms"] = 1
+        with self.assertRaisesRegex(ValueError, "supported by completed waves"):
+            self.validate(report)
+
+    def test_invalid_thresholds_and_integer_booleans_fail_closed(self) -> None:
+        for threshold in (0, -1, True, float("nan"), float("inf"), 10 ** 400):
+            with self.subTest(threshold=str(threshold)):
+                with self.assertRaises(ValueError):
+                    self.validate(min_duration_seconds=threshold)
+        for path in (("schema_version",), ("waves", 0, "concurrency"),
+                     ("waves", 0, "requests"), ("disconnect", "accepted"),
+                     ("host_memory", "drift_bytes")):
+            report = copy.deepcopy(self.report)
+            target = report
+            for key in path[:-1]:
+                target = target[key]
+            target[path[-1]] = True
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                self.validate(report)
+        with self.assertRaises(ValueError):
+            self.validate(min_concurrency_levels=True)
+
+    def test_counter_and_memory_inconsistencies_are_rejected(self) -> None:
+        cases = [
+            (("settings", "max_requests"), 2),
+            (("settings", "concurrency"), [1, 1]),
+            (("settings", "concurrency"), [1, 2, 4]),
+            (("waves", 0, "concurrency"), -1),
+            (("waves", 1, "requests"), 3),
+            (("waves", 0, "elapsed_ms"), 9_000_000),
+            (("requests_completed",), 2),
+            (("host_memory", "drift_bytes"), 0),
+            (("host_memory", "observed_peak_bytes"), 90),
+            (("backend_inventory", "devices"), []),
+            (("identity", "device"), "gpu"),
+            (("identity", "backend"), None),
+        ]
+        for path, value in cases:
+            report = copy.deepcopy(self.report)
+            target = report
+            for key in path[:-1]:
+                target = target[key]
+            target[path[-1]] = value
+            with self.subTest(path=path, value=value), self.assertRaises(ValueError):
+                self.validate(report)
+
+    def test_hashes_require_exact_hexadecimal_digest(self) -> None:
+        for digest in ("+" + "a" * 63, " " + "a" * 63, "a" * 63 + "\n", "１" * 64):
+            report = copy.deepcopy(self.report)
+            report["identity"]["model"]["sha256"] = digest
+            with self.subTest(digest=digest), self.assertRaises(ValueError):
+                self.validate(report)
+
+    def test_failure_evidence_must_match_the_measured_cell(self) -> None:
+        for path, value in ((("schema_version",), True),
+                            (("deployment", "server_sha256"), "c" * 64),
+                            (("deployment", "device"), "gpu"),
+                            (("scenarios", "storage_quota", "result"), "fail")):
+            failure = copy.deepcopy(self.failure)
+            target = failure
+            for key in path[:-1]:
+                target = target[key]
+            target[path[-1]] = value
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                cell.validate(self.report, min_duration_seconds=7200, failure_report=failure)
 
 
 if __name__ == "__main__":

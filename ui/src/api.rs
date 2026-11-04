@@ -1,6 +1,6 @@
 //! OpenAI-compatible API client for the Bloom server, plus SSE streaming.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 
 use futures_util::FutureExt;
@@ -30,6 +30,7 @@ pub const MAX_SYSTEM_PROMPT_CHARS: usize = 65_536;
 pub const MAX_STOP_SEQUENCES: usize = 4;
 pub const MAX_STOP_SEQUENCE_CHARS: usize = 1_024;
 pub const MAX_STOP_SEQUENCES_BYTES: usize = 16 * 1_024;
+pub const MAX_LOGIT_BIAS_BYTES: usize = 64 * 1024;
 pub const MAX_BASE_URL_CHARS: usize = 2_048;
 pub const MAX_API_KEY_CHARS: usize = 4_096;
 pub const MAX_IMAGE_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
@@ -58,7 +59,6 @@ const MAX_READINESS_MODEL_CHARS: usize = 256;
 const MAX_READINESS_ERROR_CHARS: usize = 512;
 const MAX_READINESS_MODALITIES: usize = 16;
 const MAX_READINESS_MODALITY_CHARS: usize = 64;
-const MAX_READINESS_MODEL_TASKS: usize = 3;
 const MAX_MODEL_IMPORT_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_MODEL_PREFLIGHT_RESPONSE_BYTES: usize = 256 * 1024;
 const MODEL_PREFLIGHT_SCHEMA_VERSION: u32 = 1;
@@ -134,6 +134,15 @@ pub struct ChatOptions {
     pub max_tokens: usize,
     pub temperature: f64,
     pub top_p: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<usize>,
+    pub presence_penalty: f64,
+    pub frequency_penalty: f64,
+    #[serde(
+        deserialize_with = "deserialize_logit_bias",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub logit_bias: BTreeMap<u32, f64>,
     pub seed: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stop_sequences: Vec<String>,
@@ -184,6 +193,10 @@ impl Default for ChatOptions {
             max_tokens: 512,
             temperature: 0.7,
             top_p: 0.9,
+            top_k: None,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            logit_bias: BTreeMap::new(),
             seed: None,
             stop_sequences: Vec::new(),
             system_prompt: String::new(),
@@ -204,6 +217,21 @@ impl ChatOptions {
         if !self.top_p.is_finite() || !(0.0 < self.top_p && self.top_p <= 1.0) {
             return Err("Top P must be greater than 0 and at most 1.".into());
         }
+        if self
+            .top_k
+            .is_some_and(|value| !(1..=32_768).contains(&value))
+        {
+            return Err("Top K must be blank or between 1 and 32768.".into());
+        }
+        for (label, value) in [
+            ("Presence penalty", self.presence_penalty),
+            ("Frequency penalty", self.frequency_penalty),
+        ] {
+            if !value.is_finite() || !(-2.0..=2.0).contains(&value) {
+                return Err(format!("{label} must be between -2 and 2."));
+            }
+        }
+        validate_logit_bias(&self.logit_bias)?;
         validate_stop_sequences(&self.stop_sequences)?;
         if self.system_prompt.chars().count() > MAX_SYSTEM_PROMPT_CHARS {
             return Err(format!(
@@ -235,6 +263,101 @@ impl ChatOptions {
             }
         }
     }
+}
+
+pub fn parse_top_k_setting(value: &str) -> Result<Option<usize>, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|value| (1..=32_768).contains(value))
+        .map(Some)
+        .ok_or_else(|| "Top K must be blank or a whole number between 1 and 32768.".into())
+}
+
+fn validate_logit_bias(biases: &BTreeMap<u32, f64>) -> Result<(), String> {
+    if biases.len() > 1_024 {
+        return Err("Logit bias cannot contain more than 1024 token IDs.".into());
+    }
+    if biases.iter().any(|(token, bias)| {
+        *token > 1_000_000 || !bias.is_finite() || !(-100.0..=100.0).contains(bias)
+    }) {
+        return Err(
+            "Logit bias token IDs must be between 0 and 1000000 and values between -100 and 100."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn deserialize_logit_bias<'de, D>(deserializer: D) -> Result<BTreeMap<u32, f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct BiasVisitor;
+    impl<'de> serde::de::Visitor<'de> for BiasVisitor {
+        type Value = BTreeMap<u32, f64>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("an object mapping unique token IDs to numeric biases")
+        }
+
+        fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+        where
+            M: serde::de::MapAccess<'de>,
+        {
+            let mut biases = BTreeMap::new();
+            while let Some((key, bias)) = access.next_entry::<String, f64>()? {
+                let token = key.parse::<u32>().map_err(serde::de::Error::custom)?;
+                if token.to_string() != key || biases.insert(token, bias).is_some() {
+                    return Err(serde::de::Error::custom(
+                        "Logit bias requires unique canonical decimal token IDs.",
+                    ));
+                }
+                // Enforce the limit while decoding rather than allocating an
+                // arbitrarily large persisted object before validation.
+                validate_logit_bias(&biases).map_err(serde::de::Error::custom)?;
+            }
+            Ok(biases)
+        }
+    }
+    deserializer.deserialize_map(BiasVisitor)
+}
+
+pub fn parse_logit_bias_setting(text: &str) -> Result<BTreeMap<u32, f64>, String> {
+    if text.len() > MAX_LOGIT_BIAS_BYTES {
+        return Err(format!(
+            "Logit bias cannot exceed {MAX_LOGIT_BIAS_BYTES} bytes."
+        ));
+    }
+    if text.trim().is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    #[derive(Deserialize)]
+    struct BiasSetting(#[serde(deserialize_with = "deserialize_logit_bias")] BTreeMap<u32, f64>);
+    serde_json::from_str::<BiasSetting>(text)
+        .map(|setting| setting.0)
+        .map_err(|error| format!("Logit bias must be a valid token-ID JSON object: {error}"))
+}
+
+fn validate_image_chat_options(options: &ChatOptions) -> Result<(), String> {
+    if options.response_format != ResponseFormatMode::Text {
+        return Err("Structured output is currently available for text chat only.".to_string());
+    }
+    if !options.stop_sequences.is_empty() {
+        return Err("Stop sequences are currently available for text chat only.".to_string());
+    }
+    if options.top_k.is_some()
+        || options.presence_penalty != 0.0
+        || options.frequency_penalty != 0.0
+        || !options.logit_bias.is_empty()
+    {
+        return Err("Top K, penalties, and logit bias are currently available for text chat only. Clear these settings before image chat.".to_string());
+    }
+    Ok(())
 }
 
 fn validate_stop_sequences(sequences: &[String]) -> Result<(), String> {
@@ -467,6 +590,12 @@ struct ChatRequest<'a> {
     temperature: f64,
     top_p: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    top_k: Option<usize>,
+    presence_penalty: f64,
+    frequency_penalty: f64,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    logit_bias: &'a BTreeMap<u32, f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     seed: Option<u64>,
     stop: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -692,15 +821,9 @@ impl Readiness {
         {
             return Err("readiness input modalities are invalid".to_string());
         }
-        let mut unique_tasks = HashSet::new();
-        if self.model_tasks.len() > MAX_READINESS_MODEL_TASKS
-            || self.model_tasks.iter().any(|task| {
-                !matches!(task.as_str(), "generation" | "embedding" | "rerank")
-                    || !unique_tasks.insert(task.as_str())
-            })
-            || (unique_tasks.contains("rerank")
-                && !unique_tasks.contains("embedding")
-                && !matches!(self.model_tasks.as_slice(), [task] if task == "rerank"))
+        if !self.model_tasks.is_empty()
+            && !matches!(self.model_tasks.as_slice(), [task] if task == "embedding")
+            && validate_model_tasks(&self.model_tasks).is_err()
         {
             return Err("readiness model tasks are invalid".to_string());
         }
@@ -1626,6 +1749,7 @@ impl ModelPreflightReport {
 fn validate_model_tasks(tasks: &[String]) -> Result<(), String> {
     let valid = matches!(tasks, [generation] if generation == "generation")
         || matches!(tasks, [rerank] if rerank == "rerank")
+        || matches!(tasks, [tensor] if tensor == "tensor")
         || matches!(tasks, [embedding, rerank] if embedding == "embedding" && rerank == "rerank");
     if valid {
         Ok(())
@@ -1734,7 +1858,7 @@ impl ModelCatalog {
             if !matches!(model.kind.as_str(), "file" | "directory")
                 || !matches!(
                     model.format.as_str(),
-                    "gguf" | "onnx" | "coreml" | "bloom" | "transformers" | "openvino"
+                    "gguf" | "onnx" | "coreml" | "tensorrt" | "bloom" | "transformers" | "openvino"
                 )
             {
                 return Err(
@@ -3291,7 +3415,7 @@ fn validate_index_filename(filename: &str, format: &str) -> Result<(), String> {
         || filename.contains(['/', '\\', '%'])
         || !matches!(
             expected_format.as_deref(),
-            Some("gguf" | "onnx" | "mlmodel")
+            Some("gguf" | "onnx" | "mlmodel" | "plan" | "engine")
         )
         || expected_format.as_deref() != Some(format)
     {
@@ -3341,9 +3465,17 @@ fn valid_package_directory(value: &str) -> bool {
         && !value.starts_with('.')
         && !value.contains(['/', '\\', '%'])
         && !value.chars().any(char::is_control)
-        && ![".gguf", ".onnx", ".mlmodel", ".mlpackage", ".mlmodelc"]
-            .iter()
-            .any(|suffix| lower.ends_with(suffix))
+        && ![
+            ".gguf",
+            ".onnx",
+            ".mlmodel",
+            ".mlpackage",
+            ".mlmodelc",
+            ".plan",
+            ".engine",
+        ]
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
 }
 
 fn validate_package_filename(value: &str) -> Result<(), String> {
@@ -4053,7 +4185,7 @@ impl ModelDownloadSource {
                     .rsplit_once('.')
                     .map(|(_, extension)| extension.to_ascii_lowercase())
                     .as_deref(),
-                Some("gguf" | "onnx" | "mlmodel")
+                Some("gguf" | "onnx" | "mlmodel" | "plan" | "engine")
             )
         {
             return Err("model download source returned an invalid filename".to_string());
@@ -4497,16 +4629,7 @@ where
     options.validate().map_err(ChatStreamError::Request)?;
     validate_stream_model_id(model)?;
     validate_multimodal_request(prompt, attachment).map_err(ChatStreamError::Request)?;
-    if options.response_format != ResponseFormatMode::Text {
-        return Err(ChatStreamError::Request(
-            "Structured output is currently available for text chat only.".to_string(),
-        ));
-    }
-    if !options.stop_sequences.is_empty() {
-        return Err(ChatStreamError::Request(
-            "Stop sequences are currently available for text chat only.".to_string(),
-        ));
-    }
+    validate_image_chat_options(&options).map_err(ChatStreamError::Request)?;
     let url = format!(
         "{}/v1/multimodal/upload",
         cfg.base_url.trim_end_matches('/')
@@ -4636,6 +4759,7 @@ fn encode_chat_request(
     messages: &[ChatMessage],
     options: &ChatOptions,
 ) -> Result<String, String> {
+    options.validate()?;
     validate_chat_messages(messages)?;
     let body = ChatRequest {
         model,
@@ -4647,6 +4771,10 @@ fn encode_chat_request(
         max_tokens: options.max_tokens,
         temperature: options.temperature,
         top_p: options.top_p,
+        top_k: options.top_k,
+        presence_penalty: options.presence_penalty,
+        frequency_penalty: options.frequency_penalty,
+        logit_bias: &options.logit_bias,
         seed: options.seed,
         stop: &options.stop_sequences,
         response_format: options.response_format_payload()?,
@@ -4674,12 +4802,7 @@ pub fn preflight_chat_submission(
     options.validate()?;
     validate_model_id(model)?;
     if let Some(attachment) = attachment {
-        if options.response_format != ResponseFormatMode::Text {
-            return Err("Structured output is currently available for text chat only.".to_string());
-        }
-        if !options.stop_sequences.is_empty() {
-            return Err("Stop sequences are currently available for text chat only.".to_string());
-        }
+        validate_image_chat_options(options)?;
         let prompt = format_multimodal_prompt(messages)?;
         validate_multimodal_request(&prompt, attachment)?;
         Ok(Some(prompt))
@@ -6819,7 +6942,116 @@ mod tests {
         assert_eq!(legacy.response_format, ResponseFormatMode::Text);
         assert!(legacy.json_schema.is_empty());
         assert!(legacy.stop_sequences.is_empty());
+        assert_eq!(legacy.top_k, None);
+        assert_eq!(legacy.presence_penalty, 0.0);
+        assert_eq!(legacy.frequency_penalty, 0.0);
+        assert!(legacy.logit_bias.is_empty());
         assert!(legacy.validate().is_ok());
+    }
+
+    #[test]
+    fn sampling_settings_validate_without_silent_fallback() {
+        assert_eq!(parse_top_k_setting(" ").unwrap(), None);
+        assert_eq!(parse_top_k_setting(" 40 ").unwrap(), Some(40));
+        for text in ["0", "-1", "32769", "2.5", "NaN", "184467440737095516160"] {
+            assert!(parse_top_k_setting(text).is_err(), "{text}");
+        }
+        assert_eq!(
+            parse_logit_bias_setting(r#"{"0":-100,"1000000":100}"#).unwrap(),
+            BTreeMap::from([(0, -100.0), (1_000_000, 100.0)])
+        );
+        assert!(parse_logit_bias_setting("").unwrap().is_empty());
+        assert!(parse_logit_bias_setting("{}").unwrap().is_empty());
+        for text in [
+            "null",
+            "[]",
+            r#"{"1":true}"#,
+            r#"{"1":101}"#,
+            r#"{"-1":0}"#,
+            r#"{"1000001":0}"#,
+            r#"{"01":0}"#,
+            r#"{"1":0,"1":1}"#,
+            r#"{"1":NaN}"#,
+        ] {
+            assert!(parse_logit_bias_setting(text).is_err(), "{text}");
+        }
+        let many = BTreeMap::from_iter((0..1025).map(|token| (token, 0.0)));
+        assert!(parse_logit_bias_setting(&serde_json::to_string(&many).unwrap()).is_err());
+        assert!(parse_logit_bias_setting(&" ".repeat(MAX_LOGIT_BIAS_BYTES + 1)).is_err());
+
+        for options in [
+            ChatOptions {
+                top_k: Some(0),
+                ..Default::default()
+            },
+            ChatOptions {
+                top_k: Some(32_769),
+                ..Default::default()
+            },
+            ChatOptions {
+                presence_penalty: f64::NAN,
+                ..Default::default()
+            },
+            ChatOptions {
+                frequency_penalty: 2.1,
+                ..Default::default()
+            },
+            ChatOptions {
+                logit_bias: BTreeMap::from([(1, f64::INFINITY)]),
+                ..Default::default()
+            },
+        ] {
+            assert!(options.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn sampling_controls_are_encoded_for_text_and_rejected_for_image_chat() {
+        let cfg = test_connection("http://localhost", "");
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "Hello".into(),
+        }];
+        let options = ChatOptions {
+            top_k: Some(40),
+            presence_penalty: -0.5,
+            frequency_penalty: 0.75,
+            logit_bias: BTreeMap::from([(17, -5.0)]),
+            ..Default::default()
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&encode_chat_request("tiny.gguf", &messages, &options).unwrap())
+                .unwrap();
+        assert_eq!(value["top_k"], 40);
+        assert_eq!(value["presence_penalty"], -0.5);
+        assert_eq!(value["frequency_penalty"], 0.75);
+        assert_eq!(value["logit_bias"], serde_json::json!({"17": -5.0}));
+        let attachment = test_attachment("photo.png", "image/png", 8);
+        for active in [
+            ChatOptions {
+                top_k: options.top_k,
+                ..Default::default()
+            },
+            ChatOptions {
+                presence_penalty: options.presence_penalty,
+                ..Default::default()
+            },
+            ChatOptions {
+                frequency_penalty: options.frequency_penalty,
+                ..Default::default()
+            },
+            ChatOptions {
+                logit_bias: options.logit_bias.clone(),
+                ..Default::default()
+            },
+        ] {
+            assert!(preflight_chat_submission(&cfg, "tiny.gguf", &messages, &active, None).is_ok());
+            assert!(
+                preflight_chat_submission(&cfg, "tiny.gguf", &messages, &active, Some(&attachment))
+                    .unwrap_err()
+                    .contains("text chat only")
+            );
+        }
     }
 
     #[test]
@@ -6843,6 +7075,50 @@ mod tests {
         assert!(source.verification_ready);
         assert_eq!(source.size_bytes, Some(483116416));
         assert!(source.warning.is_none());
+    }
+
+    #[test]
+    fn tensorrt_catalog_download_and_signed_index_contracts_are_consistent() {
+        for extension in ["plan", "engine"] {
+            let filename = format!("numeric.{extension}");
+            let mut catalog: serde_json::Value =
+                serde_json::from_str(include_str!("../../examples/model-catalog.json")).unwrap();
+            catalog["data"][0]["id"] = serde_json::json!(filename);
+            catalog["data"][0]["format"] = serde_json::json!("tensorrt");
+            catalog["active_model"]["catalog_id"] = serde_json::json!(filename);
+            assert_eq!(
+                decode_model_catalog(&catalog.to_string()).unwrap().data[0].format,
+                "tensorrt"
+            );
+            let commit = "ab".repeat(20);
+            let mut source = serde_json::json!({
+                "object": "bloom.model_download_source",
+                "download_url": format!("https://huggingface.co/acme/repo/resolve/{commit}/{filename}"),
+                "filename": filename, "size_bytes": 4096, "sha256": "cd".repeat(32),
+                "commit_hash": commit, "verification_ready": true, "warning": null
+            });
+            assert!(
+                decode_model_download_source(&source.to_string())
+                    .unwrap()
+                    .verification_ready
+            );
+            source["download_url"] = serde_json::json!(format!("https://evil.example/{filename}"));
+            assert!(decode_model_download_source(&source.to_string()).is_err());
+            let mut index: serde_json::Value =
+                serde_json::from_str(include_str!("../../examples/model-index-response.json"))
+                    .unwrap();
+            index["data"][0]["filename"] = serde_json::json!(filename);
+            index["data"][0]["format"] = serde_json::json!(extension);
+            index["data"][0]["download_url"] = serde_json::json!(format!(
+                "https://huggingface.co/acme/repo/resolve/{commit}/{filename}"
+            ));
+            assert_eq!(
+                decode_model_index(&index.to_string()).unwrap().data[0].format,
+                extension
+            );
+            assert!(!valid_package_directory(&filename));
+            assert!(validate_index_filename(&format!("../{filename}"), extension).is_err());
+        }
     }
 
     #[test]
@@ -7191,6 +7467,15 @@ mod tests {
             vec!["rerank"]
         );
 
+        let mut tensor = valid_readiness_value();
+        tensor["model_tasks"] = serde_json::json!(["tensor"]);
+        assert_eq!(
+            decode_readiness(&tensor.to_string()).unwrap().model_tasks,
+            vec!["tensor"]
+        );
+        tensor["model_tasks"] = serde_json::json!(["tensor", "generation"]);
+        assert!(decode_readiness(&tensor.to_string()).is_err());
+
         let mut missing = valid_readiness_value();
         missing.as_object_mut().unwrap().remove("model_tasks");
         assert!(
@@ -7442,6 +7727,10 @@ mod tests {
             max_tokens: 64,
             temperature: 0.7,
             top_p: 0.9,
+            top_k: None,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            logit_bias: &BTreeMap::new(),
             seed: None,
             stop: &stop,
             response_format: None,

@@ -377,7 +377,7 @@ def validate_structured_output_round_trips(
     auth_headers: dict[str, str],
     *,
     max_tokens: int,
-) -> dict[str, str]:
+) -> dict[str, object]:
     expected = {"ok": True}
     schema = {
         "type": "object",
@@ -555,7 +555,75 @@ def validate_structured_output_round_trips(
         "responses_json_object": "ok",
         "responses_json_schema": "ok",
         "responses_stream": "ok",
+        "multiple_choices": validate_buffered_schema_choices(
+            base_url, model_id, auth_headers, max_tokens=max_tokens,
+            response_format=chat_formats[1],
+        ),
     }
+
+
+def require_buffered_candidate_envelope(response: dict, model_id: str, count: int) -> list[dict]:
+    choices = response.get("choices")
+    usage = response.get("usage")
+    if (
+        response.get("model") != model_id
+        or not isinstance(choices, list)
+        or len(choices) != count
+        or [choice.get("index") for choice in choices] != list(range(count))
+        or not isinstance(usage, dict)
+        or not isinstance(usage.get("prompt_tokens"), int)
+        or not isinstance(usage.get("completion_tokens"), int)
+        or usage["completion_tokens"] <= 0
+        or usage.get("total_tokens") != usage["prompt_tokens"] + usage["completion_tokens"]
+    ):
+        raise AssertionError(f"invalid buffered candidate envelope: {response}")
+    return choices
+
+
+def validate_buffered_schema_choices(
+    base_url: str, model_id: str, auth_headers: dict[str, str],
+    *, max_tokens: int, response_format: dict,
+) -> dict:
+    def check(response: dict, *, chat: bool) -> None:
+        for choice in require_buffered_candidate_envelope(response, model_id, 2 if chat else 4):
+            content = choice.get("message", {}).get("content") if chat else choice.get("text")
+            if choice.get("finish_reason") != "stop" or json.loads(content) != {"ok": True}:
+                raise AssertionError(f"invalid structured candidate: {response}")
+
+    for chat in [True, False]:
+        payload = {
+            "model": model_id, "max_tokens": max_tokens, "temperature": 0,
+            "seed": 42, "n": 2, "response_format": response_format,
+        }
+        if chat:
+            payload["messages"] = [{"role": "user", "content": "Return ok as JSON."}]
+        else:
+            payload["prompt"] = ["Return ok as JSON.", "Return ok again."]
+        check(request_json(
+            f"{base_url}/v1/{'chat/completions' if chat else 'completions'}",
+            payload, timeout=60.0, headers=auth_headers,
+        ), chat=chat)
+
+    sdk = "skipped"
+    try:
+        from openai import OpenAI
+    except ImportError:
+        pass
+    else:
+        api_key = auth_headers.get("Authorization", "Bearer bloom-smoke").removeprefix("Bearer ")
+        with OpenAI(base_url=f"{base_url}/v1", api_key=api_key, timeout=60) as client:
+            check(client.chat.completions.create(
+                model=model_id, messages=[{"role": "user", "content": "Return ok as JSON."}],
+                n=2, max_tokens=max_tokens, temperature=0, seed=42,
+                response_format=response_format,
+            ).model_dump(mode="json"), chat=True)
+            check(client.completions.create(
+                model=model_id, prompt=["Return ok as JSON.", "Return ok again."],
+                n=2, max_tokens=max_tokens, temperature=0, seed=42,
+                extra_body={"response_format": response_format},
+            ).model_dump(mode="json"), chat=False)
+        sdk = "ok"
+    return {"chat_choices": 2, "completion_choices": 4, "sdk": sdk}
 
 
 def validate_function_tool_round_trips(
@@ -564,7 +632,7 @@ def validate_function_tool_round_trips(
     auth_headers: dict[str, str],
     *,
     max_tokens: int,
-) -> dict[str, str]:
+) -> dict[str, object]:
     chat_tool = {
         "type": "function",
         "function": {
@@ -634,6 +702,41 @@ def validate_function_tool_round_trips(
     if chat.get("model") != model_id:
         raise AssertionError(f"function call reported the wrong model: {chat}")
     chat_call = require_chat_call(chat, streamed=False)
+
+    def check_multiple_calls(response: dict) -> None:
+        ids = set()
+        for choice in require_buffered_candidate_envelope(response, model_id, 2):
+            call = require_chat_call({"choices": [choice]}, streamed=False)
+            if call["id"] in ids:
+                raise AssertionError(f"tool candidates reused a call ID: {response}")
+            ids.add(call["id"])
+
+    multiple_payload = dict(chat_payload, n=2, seed=42)
+    check_multiple_calls(request_json(
+        f"{base_url}/v1/chat/completions", multiple_payload,
+        timeout=60.0, headers=auth_headers,
+    ))
+    legacy_payload = {key: value for key, value in multiple_payload.items()
+                      if key not in {"tools", "tool_choice"}}
+    legacy_payload["functions"] = [chat_tool["function"]]
+    legacy_payload["function_call"] = {"name": "get_weather"}
+    check_multiple_calls(request_json(
+        f"{base_url}/v1/chat/completions", legacy_payload,
+        timeout=60.0, headers=auth_headers,
+    ))
+    multiple_sdk = "skipped"
+    try:
+        from openai import OpenAI
+    except ImportError:
+        pass
+    else:
+        api_key = auth_headers.get("Authorization", "Bearer bloom-smoke").removeprefix("Bearer ")
+        with OpenAI(base_url=f"{base_url}/v1", api_key=api_key, timeout=60) as client:
+            check_multiple_calls(client.chat.completions.create(
+                **multiple_payload,
+            ).model_dump(mode="json"))
+        multiple_sdk = "ok"
+
 
     streaming_payload = dict(chat_payload)
     streaming_payload["stream"] = True
@@ -832,6 +935,7 @@ def validate_function_tool_round_trips(
         "responses_stream": "ok",
         "responses_continuation": "ok",
         "retained_state": "ok",
+        "multiple_choices": {"count": 2, "sdk": multiple_sdk, "legacy_alias": "ok"},
     }
 
 
@@ -847,6 +951,86 @@ def validate_openai_sdk_model_resource(model: object, expected_id: str) -> None:
         or created <= 0
     ):
         raise AssertionError(f"official OpenAI client decoded an invalid model: {model!r}")
+
+
+def check_streaming_choices(
+    base_url: str,
+    model_id: str,
+    payload: dict,
+    auth_headers: dict[str, str],
+    api_key: str,
+) -> dict:
+    """Require native streams to preserve every candidate and terminal event."""
+    chat_payload = {**payload, "n": 2, "stream": True,
+                    "stream_options": {"include_usage": True}}
+    events = request_sse(f"{base_url}/v1/chat/completions", chat_payload,
+                         timeout=60.0, headers=auth_headers)
+    if events.count("[DONE]") != 1 or events[-1] != "[DONE]":
+        raise AssertionError("multi-choice stream omitted its unique terminal event")
+    texts = ["", ""]
+    finished = set()
+    usage = None
+    for event in events[:-1]:
+        frame = json.loads(event)
+        if "error" in frame:
+            raise AssertionError(f"multi-choice generation failed: {frame}")
+        if frame["model"] != model_id:
+            raise AssertionError("multi-choice stream changed model identity")
+        if not frame["choices"]:
+            usage = frame.get("usage")
+        for choice in frame["choices"]:
+            index = choice["index"]
+            if index not in (0, 1) or index in finished:
+                raise AssertionError(f"invalid choice ordering: {frame}")
+            texts[index] += choice["delta"].get("content") or ""
+            if choice["finish_reason"] is not None:
+                finished.add(index)
+    if finished != {0, 1} or not all(texts) or not usage:
+        raise AssertionError("multi-choice stream lost content, usage or a terminal choice")
+    if usage["total_tokens"] != usage["prompt_tokens"] + usage["completion_tokens"]:
+        raise AssertionError("multi-choice stream reported inconsistent token usage")
+
+    completion_events = request_sse(f"{base_url}/v1/completions", {
+        "model": model_id, "prompt": ["Hello", "Hello"], "n": 2,
+        "max_tokens": payload["max_completion_tokens"], "temperature": 0,
+        "stream": True, "echo": True,
+    }, timeout=60.0, headers=auth_headers)
+    if completion_events.count("[DONE]") != 1 or completion_events[-1] != "[DONE]":
+        raise AssertionError("batched completion stream omitted its terminal event")
+    completion_texts = ["", "", "", ""]
+    finished = set()
+    for event in completion_events[:-1]:
+        frame = json.loads(event)
+        if "error" in frame:
+            raise AssertionError(f"batched completion generation failed: {frame}")
+        for choice in frame["choices"]:
+            index = choice["index"]
+            if index not in range(4) or index in finished:
+                raise AssertionError(f"invalid prompt-major choice ordering: {frame}")
+            completion_texts[index] += choice["text"]
+            if choice["finish_reason"] is not None:
+                finished.add(index)
+    if finished != set(range(4)) or not all(text.startswith("Hello") for text in completion_texts):
+        raise AssertionError("batched completion stream lost prompt echo or candidate terminal")
+
+    result = {"chat_choices": 2, "completion_choices": 4, "sdk": "skipped"}
+    try:
+        from openai import OpenAI
+    except ImportError:
+        return result
+    with OpenAI(base_url=f"{base_url}/v1", api_key=api_key) as client:
+        finished = set()
+        with client.chat.completions.create(**chat_payload) as stream:
+            for frame in stream:
+                for choice in frame.choices:
+                    if choice.index not in (0, 1) or choice.index in finished:
+                        raise AssertionError("OpenAI SDK decoded an invalid candidate index")
+                    if choice.finish_reason is not None:
+                        finished.add(choice.index)
+        if finished != {0, 1}:
+            raise AssertionError("OpenAI SDK lost a candidate terminal")
+    result["sdk"] = "ok"
+    return result
 
 
 def request_openai_sdk_model_free(
@@ -2417,6 +2601,13 @@ def main() -> int:
                 f"expected {args.expected_output!r}, got {streamed_text!r}"
             )
 
+        streaming_choices = (
+            {"status": "unsupported_with_continuous_batching"}
+            if args.enable_ifb else check_streaming_choices(
+                base_url, model_id, payload, auth_headers, args.api_key or "bloom-smoke"
+            )
+        )
+
         sdk = request_openai_sdk_response_stream(
             base_url,
             model_id,
@@ -2434,6 +2625,7 @@ def main() -> int:
                     "model_count": len(models["data"]),
                     "backend_count": len(backend_rows),
                     "stream_events": len(events),
+                    "streaming_choices": streaming_choices,
                     "semantic_output": "validated"
                     if args.expected_output is not None
                     else "not_requested",

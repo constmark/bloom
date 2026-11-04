@@ -150,7 +150,9 @@ keys and malformed signatures, selects the configured key by the envelope's
 
 A version 1 entry has one top-level `download_url`, `filename`, `size_bytes`,
 and `sha256`. Its destination is one direct catalog child ending in `.gguf`,
-`.onnx`, or `.mlmodel`. Version 2 may also carry this single-file shape for
+`.onnx`, `.mlmodel`, `.plan`, or `.engine`. TensorRT file entries retain their
+`plan` or `engine` suffix as the index format and map to catalog format
+`tensorrt`. Version 2 may also carry this single-file shape for
 forward-compatible publishers, but it does not change the installation
 semantics.
 

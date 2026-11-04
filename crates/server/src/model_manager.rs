@@ -254,7 +254,7 @@ pub(crate) fn validate_model_filename(id: &str) -> Result<()> {
     validate_catalog_id(id)?;
     if id.starts_with('.') || model_file_format(Path::new(id)).is_none() {
         return Err(anyhow!(
-            "model filename must be a non-hidden GGUF, ONNX, or Core ML filename"
+            "model filename must be a non-hidden GGUF, ONNX, Core ML, or TensorRT (.plan/.engine) filename"
         ));
     }
     Ok(())
@@ -270,6 +270,7 @@ fn model_file_format(path: &Path) -> Option<&'static str> {
         Some("gguf") => Some("gguf"),
         Some("onnx") => Some("onnx"),
         Some("mlmodel") => Some("coreml"),
+        Some("plan" | "engine") => Some("tensorrt"),
         _ => None,
     }
 }
@@ -343,7 +344,7 @@ fn directory_format(path: &Path) -> Result<Option<&'static str>> {
 fn model_format_priority(format: &str) -> u8 {
     match format {
         "gguf" => 4,
-        "onnx" | "coreml" => 3,
+        "onnx" | "coreml" | "tensorrt" => 3,
         "transformers" => 2,
         _ => 1,
     }
@@ -433,6 +434,36 @@ mod tests {
         assert_eq!(catalog.models[1].id, "tiny.gguf");
         assert_eq!(catalog.models[1].size_bytes, 4);
         assert!(catalog.models[1].size_complete);
+    }
+
+    #[test]
+    fn tensorrt_files_and_directories_are_catalogued_without_loading_weights() {
+        let temp = tempfile::tempdir().unwrap();
+        for filename in ["numeric.plan", "NUMERIC.ENGINE"] {
+            assert!(validate_model_filename(filename).is_ok());
+            fs::write(temp.path().join(filename), b"opaque TensorRT plan").unwrap();
+            let resolved = ModelCatalog::resolve(temp.path(), filename).unwrap();
+            assert_eq!(resolved, temp.path().join(filename).canonicalize().unwrap());
+        }
+        let package = temp.path().join("numeric-package");
+        fs::create_dir(&package).unwrap();
+        fs::write(package.join("model.engine"), b"plan").unwrap();
+        let catalog = ModelCatalog::scan(temp.path(), None).unwrap();
+        assert_eq!(catalog.models.len(), 3);
+        assert!(
+            catalog
+                .models
+                .iter()
+                .all(|model| model.format == "tensorrt")
+        );
+        for invalid in [
+            ".hidden.plan",
+            "../numeric.engine",
+            "folder/numeric.plan",
+            "numeric.engine/hidden",
+        ] {
+            assert!(validate_model_filename(invalid).is_err());
+        }
     }
 
     #[test]

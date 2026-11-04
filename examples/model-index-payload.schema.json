@@ -154,7 +154,7 @@
               "type": "string",
               "minLength": 1,
               "maxLength": 255,
-              "pattern": "^[^./\\\\%][^/\\\\%]*\\.(gguf|onnx|mlmodel)$"
+              "pattern": "^[^./\\\\%][^/\\\\%]*\\.(gguf|onnx|mlmodel|plan|engine)$"
             }
           }
         },

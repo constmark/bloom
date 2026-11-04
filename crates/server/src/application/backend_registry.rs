@@ -14,6 +14,7 @@ use bloomai_engine::executor::onnx::OnnxRuntimeEngine;
 use bloomai_engine::executor::openvino::OpenVINOEngine;
 #[cfg(feature = "candle-engine")]
 use bloomai_engine::executor::qwen3_vl::Qwen3VLEngine;
+use bloomai_engine::executor::tensorrt::TensorRtEngine;
 use bloomai_engine::executor::vulkan::VulkanEngine;
 #[cfg(feature = "candle-engine")]
 use bloomai_engine::executor::wan::WanEngine;
@@ -126,6 +127,7 @@ pub(crate) fn engine_registry() -> EngineRegistry {
     registry.register("npu-tts", Box::new(NpuTtsEngine));
     registry.register("onnxruntime", Box::new(OnnxRuntimeEngine));
     registry.register("coreml", Box::new(CoreMlEngine));
+    registry.register("tensorrt", Box::new(TensorRtEngine));
     registry.register("mlx", Box::new(MlxEngine));
     registry.register("vulkan", Box::new(VulkanEngine));
     registry.register("llamacpp", Box::new(LlamaCppEngine));
@@ -158,6 +160,8 @@ pub(crate) fn select_backend_name(
             "openvino".to_string()
         } else if has_format(bloomai_core::ModelFormat::CoreMl) {
             "coreml".to_string()
+        } else if has_format(bloomai_core::ModelFormat::TensorRtEngine) {
+            "tensorrt".to_string()
         } else if has_format(bloomai_core::ModelFormat::Mlx) {
             "mlx".to_string()
         } else if has_format(bloomai_core::ModelFormat::VulkanSpirv) {

@@ -10,6 +10,44 @@ called out in release notes.
 
 ### Reliability and distribution
 
+- Execute WASM processors through the existing registry using a versioned ABI,
+  fresh instances, fuel/memory/stack/I/O/concurrency budgets, deadlines and
+  cancellation; reject imports, WASI, start sections and local-file references.
+- Replace CoreML inspection-only behavior with bounded real macOS CPU numeric
+  execution, using embedded Swift and system CoreML. Add real GLM/Scaler gates.
+- Add a bounded TensorRT 10.x/CUDA numeric Python bridge, exact plan-digest
+  binding, typed probes, named tensor/dtype/shape checks and cleanup regressions.
+  Register the previously disconnected TensorRT module in CLI/server/FFI;
+  remove fake plan construction and attention success. NVIDIA execution remains
+  a target-hardware gate.
+- Preserve numeric CLI buffered/streamed output and full --json payloads;
+  identify numeric models as a separate tensor task across readiness, preflight,
+  clients and memory estimates, without enabling chat or sentence embeddings.
+- Extend buffered direct structured Chat/Completions and function-tool Chat to
+  n=1..8, validating every candidate and generating unique tool-call identities.
+
+- Execute external llama.cpp embedding batches, cross-encoder reranking,
+  exact tokenization and constrained JSON output, with trusted task isolation,
+  strict bounded result validation and a single checked stream terminal.
+  External HTTP fixtures cover the protocol; trained runtime evidence remains
+  required for support promotion.
+- Expose top-k, presence/frequency penalties and logit bias throughout browser
+  settings, validation, request serialization and backward-compatible storage.
+
+- Extend direct OpenAI text streaming to `n=1..8` and legacy prompt arrays,
+  retaining prompt-major indices, per-choice stop/echo/terminal handling,
+  deterministic seed offsets, aggregate Chat usage, bounded backpressure,
+  whole-request cancellation, and runtime leases until worker drain.
+- Complete Python sampling parity (`top_k`, presence/frequency penalties and
+  `logit_bias`), reject unknown FFI generation fields, and accept Rust's legal
+  `"End"` stream event in the SDK instead of failing successful generations.
+- Charge cache reservations in resource admission and reclaim them on unload
+  and eviction; protect resource estimates and budgets against overflow and
+  preserve existing models when a new reservation cannot fit.
+- Require measured workload duration, consistent concurrency/request and memory
+  evidence, usable physical devices, and strict hashes before deployment-cell
+  promotion; configured duration alone can no longer satisfy the soak gate.
+
 - Add bounded OpenAI/Ollama presence and frequency penalties to the shared
   generation contract and Candle sampler, including history-aware greedy and
   temperature sampling paths. Add bounded OpenAI `logit_bias` support and

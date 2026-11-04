@@ -124,11 +124,7 @@ struct BloomReadiness: Decodable {
         else {
             throw ValidationError.invalid("readiness input modalities are invalid")
         }
-        let taskSet = Set(modelTasks)
-        guard modelTasks.count <= 3,
-              taskSet.count == modelTasks.count,
-              modelTasks.allSatisfy({ $0 == "generation" || $0 == "embedding" || $0 == "rerank" }),
-              !taskSet.contains("rerank") || taskSet.contains("embedding")
+        guard [[], ["generation"], ["embedding"], ["embedding", "rerank"], ["rerank"], ["tensor"]].contains(modelTasks)
         else {
             throw ValidationError.invalid("readiness model tasks are invalid")
         }

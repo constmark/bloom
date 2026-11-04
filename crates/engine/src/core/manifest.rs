@@ -12,6 +12,7 @@ use bloomai_core::{
 
 const GENERATION_MODEL_TASKS: &[&str] = &["generation"];
 const ENCODER_MODEL_TASKS: &[&str] = &["embedding", "rerank"];
+const TENSOR_MODEL_TASKS: &[&str] = &["tensor"];
 const CROSS_ENCODER_MODEL_TASKS: &[&str] = &["rerank"];
 const MAX_MODEL_DIRECTORY_ENTRIES: usize = 65_536;
 const MAX_SAFETENSORS_SHARDS: usize = 1_024;
@@ -29,7 +30,9 @@ const VALIDATED_SAFETENSORS_ELEMENT_COUNT: &str = "_bloom_validated_safetensors_
 /// Other families may opt into the encoder runtime through Bloom's trusted
 /// `bloom_task` manifest metadata.
 pub fn model_manifest_tasks(manifest: &ModelManifest) -> &'static [&'static str] {
-    if model_manifest_is_cross_encoder(manifest) {
+    if model_manifest_is_tensor(manifest) {
+        TENSOR_MODEL_TASKS
+    } else if model_manifest_is_cross_encoder(manifest) {
         CROSS_ENCODER_MODEL_TASKS
     } else if model_manifest_supports_embeddings(manifest) {
         ENCODER_MODEL_TASKS
@@ -38,9 +41,18 @@ pub fn model_manifest_tasks(manifest: &ModelManifest) -> &'static [&'static str]
     }
 }
 
+fn model_manifest_is_tensor(manifest: &ModelManifest) -> bool {
+    manifest
+        .parameters
+        .get("bloom_task")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|task| task.eq_ignore_ascii_case("tensor"))
+}
+
 /// Whether a trusted model manifest selects Bloom's embedding runtime.
 pub fn model_manifest_supports_embeddings(manifest: &ModelManifest) -> bool {
-    !model_manifest_is_cross_encoder(manifest)
+    !model_manifest_is_tensor(manifest)
+        && !model_manifest_is_cross_encoder(manifest)
         && (manifest.family == ModelFamily::Bert
             || manifest
                 .parameters
@@ -56,6 +68,9 @@ pub fn model_manifest_supports_embeddings(manifest: &ModelManifest) -> bool {
 /// classifier head; they must never be routed through the bi-encoder mean
 /// pooling path.
 pub fn model_manifest_is_cross_encoder(manifest: &ModelManifest) -> bool {
+    if model_manifest_is_tensor(manifest) {
+        return false;
+    }
     manifest
         .parameters
         .get("bloom_encoder_kind")
@@ -275,7 +290,9 @@ fn estimate_memory_with_weight_dtype(
     // KV Cache: 2 (key & value) * num_layers * num_kv_heads * head_dim * bytes_per_element
     let computed_kv_per_token = 2 * num_layers * num_kv_heads * head_dim * bytes_per_element;
 
-    let kv_per_token: usize = if manifest.family == ModelFamily::Bert {
+    let kv_per_token: usize = if manifest.family == ModelFamily::Bert
+        || model_manifest_tasks(manifest) == TENSOR_MODEL_TASKS
+    {
         0
     } else if manifest.parameters.contains_key("num_hidden_layers")
         || manifest.parameters.contains_key("num_layers")
@@ -320,49 +337,63 @@ fn estimate_memory_with_weight_dtype(
         weight_bytes
     };
 
-    let (host_weight_bytes, device_weight_bytes, offloaded_layers, total_bytes, memory_scope) =
-        if let Some(layers) = device_layers {
-            let offloaded_layers = layers.min(num_layers);
-            if let Some(nl) = NonZero::new(num_layers) {
-                let device_weight = weight_bytes.saturating_mul(offloaded_layers) / nl.get();
-                let non_offloaded_weight = weight_bytes.saturating_sub(device_weight);
-                let host_weight = if mmap_residency_applied {
-                    non_offloaded_weight.saturating_mul(30) / 100
-                } else {
-                    non_offloaded_weight
-                };
-                let device_kv = kv_cache_bytes.saturating_mul(offloaded_layers) / nl.get();
-                (
-                    host_weight,
-                    device_weight,
-                    Some(offloaded_layers),
-                    device_weight
-                        .saturating_add(device_kv)
-                        .saturating_add(temp_tensor_bytes),
-                    "accelerator-resident estimate with layer offload".to_string(),
-                )
+    let (
+        mut host_weight_bytes,
+        device_weight_bytes,
+        offloaded_layers,
+        mut total_bytes,
+        mut memory_scope,
+    ) = if let Some(layers) = device_layers {
+        let offloaded_layers = layers.min(num_layers);
+        if let Some(nl) = NonZero::new(num_layers) {
+            let device_weight = weight_bytes.saturating_mul(offloaded_layers) / nl.get();
+            let non_offloaded_weight = weight_bytes.saturating_sub(device_weight);
+            let host_weight = if mmap_residency_applied {
+                non_offloaded_weight.saturating_mul(30) / 100
             } else {
-                (
-                    resident_weight_bytes,
-                    0,
-                    Some(0),
-                    resident_weight_bytes
-                        .saturating_add(kv_cache_bytes)
-                        .saturating_add(temp_tensor_bytes),
-                    "host-resident estimate".to_string(),
-                )
-            }
+                non_offloaded_weight
+            };
+            let device_kv = kv_cache_bytes.saturating_mul(offloaded_layers) / nl.get();
+            (
+                host_weight,
+                device_weight,
+                Some(offloaded_layers),
+                device_weight
+                    .saturating_add(device_kv)
+                    .saturating_add(temp_tensor_bytes),
+                "accelerator-resident estimate with layer offload".to_string(),
+            )
         } else {
             (
                 resident_weight_bytes,
                 0,
-                None,
+                Some(0),
                 resident_weight_bytes
                     .saturating_add(kv_cache_bytes)
                     .saturating_add(temp_tensor_bytes),
                 "host-resident estimate".to_string(),
             )
-        };
+        }
+    } else {
+        (
+            resident_weight_bytes,
+            0,
+            None,
+            resident_weight_bytes
+                .saturating_add(kv_cache_bytes)
+                .saturating_add(temp_tensor_bytes),
+            "host-resident estimate".to_string(),
+        )
+    };
+
+    // A numeric external worker retains serialized plan bytes while its GPU
+    // engine is resident. Account for that host copy in addition to device weights.
+    if model_manifest_is_tensor(manifest) && target_device == Some(DeviceKind::Gpu) {
+        let extra_host = stored_weight_bytes.saturating_sub(host_weight_bytes);
+        host_weight_bytes = host_weight_bytes.max(stored_weight_bytes);
+        total_bytes = total_bytes.saturating_add(extra_host);
+        memory_scope = "numeric plan host copy plus accelerator-resident estimate".to_string();
+    }
 
     MemoryEstimate {
         weight_bytes,
@@ -2725,6 +2756,9 @@ fn infer_from_coreml(model_path: &Path, coreml_path: &Path) -> Result<ModelManif
         .runtime_hints
         .preferred_backends
         .push("coreml".to_string());
+    manifest
+        .parameters
+        .insert("bloom_task".into(), serde_json::json!("tensor"));
     Ok(manifest)
 }
 
@@ -2778,8 +2812,8 @@ fn infer_from_tensorrt(model_path: &Path, engine_path: &Path) -> Result<ModelMan
         family: ModelFamily::Custom("tensorrt".to_string()),
         primary_dtype: DType::F16,
         io_schema: ModelIoSchema {
-            inputs: vec![Modality::Text],
-            outputs: vec![Modality::Text],
+            inputs: vec![Modality::Multi],
+            outputs: vec![Modality::Multi],
         },
         license: Some("unknown".to_string()),
         ..ModelManifest::default()
@@ -2804,6 +2838,9 @@ fn infer_from_tensorrt(model_path: &Path, engine_path: &Path) -> Result<ModelMan
         .runtime_hints
         .preferred_backends
         .push("tensorrt".to_string());
+    manifest
+        .parameters
+        .insert("bloom_task".into(), serde_json::json!("tensor"));
     Ok(manifest)
 }
 
@@ -3624,7 +3661,7 @@ mod tests {
         assert_eq!(manifest.family, ModelFamily::Custom("tensorrt".to_string()));
         assert_eq!(manifest.files[0].format, ModelFormat::TensorRtEngine);
         assert_eq!(manifest.files[0].name, "llama.plan");
-        assert_eq!(manifest.io_schema.inputs, vec![Modality::Text]);
+        assert_eq!(manifest.io_schema.inputs, vec![Modality::Multi]);
         assert!(
             manifest
                 .runtime_hints
@@ -4896,5 +4933,47 @@ mod tests {
         write_string(buf, key);
         buf.extend_from_slice(&10u32.to_le_bytes());
         buf.extend_from_slice(&val.to_le_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tensor_task_tests {
+    use super::*;
+    #[test]
+    fn numeric_packages_and_explicit_task_are_not_generation_or_encoders() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["model.mlmodel", "model.plan"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"runtime validates contents").unwrap();
+            let manifest = load_manifest(&path).unwrap();
+            assert_eq!(model_manifest_tasks(&manifest), ["tensor"]);
+            assert!(!model_manifest_supports_embeddings(&manifest));
+            let estimate = estimate_memory(&manifest, 123);
+            assert_eq!(estimate.kv_cache_bytes, 0);
+            assert_eq!(estimate.kv_cache_bytes_per_token, 0);
+            let gpu = estimate_memory_for_device(&manifest, 123, DeviceKind::Gpu);
+            assert_eq!(gpu.kv_cache_bytes, 0);
+            assert!(gpu.host_weight_bytes >= manifest.files[0].size_bytes);
+            assert!(
+                gpu.total_bytes
+                    >= gpu
+                        .host_weight_bytes
+                        .saturating_add(gpu.device_weight_bytes)
+                        .saturating_add(gpu.temp_tensor_bytes)
+            );
+        }
+        let mut manifest = ModelManifest {
+            family: ModelFamily::Bert,
+            ..ModelManifest::default()
+        };
+        manifest
+            .parameters
+            .insert("bloom_task".into(), serde_json::json!("tensor"));
+        manifest
+            .parameters
+            .insert("bloom_cross_encoder".into(), serde_json::json!(true));
+        assert_eq!(model_manifest_tasks(&manifest), ["tensor"]);
+        assert!(!model_manifest_supports_embeddings(&manifest));
+        assert!(!model_manifest_is_cross_encoder(&manifest));
     }
 }

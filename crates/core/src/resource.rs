@@ -15,11 +15,72 @@ pub struct ResourceTicket {
     pub model_id: String,
     pub ram_bytes: usize,
     pub vram_bytes: usize,
+    /// Host-memory cache reserved for this model, charged in addition to RAM.
     pub cache_bytes: usize,
     pub priority: ResourcePriority,
     pub strategy: ResidencyStrategy,
     pub preferred_backend: Option<String>,
     pub fallback_backends: Vec<String>,
+}
+
+// Oversized or overflowing metadata must produce an unfulfillable estimate,
+// never a wrapped small reservation. Keep both constructors on one policy.
+fn estimated_weight_bytes(manifest: &ModelManifest) -> usize {
+    let file_sum = manifest
+        .files
+        .iter()
+        .try_fold(0usize, |sum, file| sum.checked_add(file.size_bytes))
+        .unwrap_or(usize::MAX);
+    if file_sum > 0 {
+        return file_sum;
+    }
+    let minimum = manifest
+        .memory_profile
+        .min_ram_bytes
+        .max(manifest.memory_profile.min_vram_bytes);
+    if minimum > 0 {
+        return minimum;
+    }
+    let parameter = |name: &str, fallback: usize| -> Option<usize> {
+        match manifest
+            .parameters
+            .get(name)
+            .and_then(|value| value.as_u64())
+        {
+            Some(value) => usize::try_from(value).ok(),
+            None => Some(fallback),
+        }
+    };
+    let estimate = || -> Option<usize> {
+        let layers = parameter("num_hidden_layers", parameter("num_layers", 0)?)?;
+        let hidden = parameter("hidden_size", 0)?;
+        if layers == 0 || hidden == 0 {
+            return Some(GIB as usize);
+        }
+        let intermediate = match manifest
+            .parameters
+            .get("intermediate_size")
+            .and_then(|value| value.as_u64())
+        {
+            Some(value) => usize::try_from(value).ok()?,
+            None => hidden.checked_mul(4)?,
+        };
+        let vocab = parameter("vocab_size", 32000)?;
+        let attention = hidden.checked_mul(hidden)?.checked_mul(4)?;
+        let feedforward = hidden.checked_mul(intermediate)?.checked_mul(3)?;
+        let per_layer = attention.checked_add(feedforward)?;
+        let embeddings = vocab.checked_mul(hidden)?.checked_mul(2)?;
+        let params = layers.checked_mul(per_layer)?.checked_add(embeddings)?;
+        match manifest.primary_dtype {
+            crate::types::DType::F32 => params.checked_mul(4),
+            crate::types::DType::Q8 | crate::types::DType::I8 => Some(params),
+            crate::types::DType::Q4 | crate::types::DType::I4 | crate::types::DType::NF4 => {
+                Some(params / 2 + params % 2)
+            }
+            _ => params.checked_mul(2),
+        }
+    };
+    estimate().unwrap_or(usize::MAX)
 }
 
 impl ResourceTicket {
@@ -30,60 +91,7 @@ impl ResourceTicket {
         let mut vram_bytes = manifest.memory_profile.recommended_vram_bytes;
 
         if ram_bytes == 0 && vram_bytes == 0 {
-            let file_sum: usize = manifest.files.iter().map(|f| f.size_bytes).sum();
-            let mut weight_bytes = if file_sum > 0 {
-                file_sum
-            } else {
-                manifest
-                    .memory_profile
-                    .min_ram_bytes
-                    .max(manifest.memory_profile.min_vram_bytes)
-            };
-
-            // Estimate from parameters if available
-            if weight_bytes == 0 {
-                let num_layers = manifest
-                    .parameters
-                    .get("num_hidden_layers")
-                    .or_else(|| manifest.parameters.get("num_layers"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as usize;
-                let hidden_size = manifest
-                    .parameters
-                    .get("hidden_size")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as usize;
-                if num_layers > 0 && hidden_size > 0 {
-                    let intermediate_size = manifest
-                        .parameters
-                        .get("intermediate_size")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or((hidden_size * 4) as u64)
-                        as usize;
-                    let vocab_size = manifest
-                        .parameters
-                        .get("vocab_size")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(32000) as usize;
-                    let params_per_layer =
-                        4 * hidden_size * hidden_size + 3 * hidden_size * intermediate_size;
-                    let total_params = num_layers * params_per_layer + 2 * vocab_size * hidden_size;
-                    let bytes_per_weight = match manifest.primary_dtype {
-                        crate::types::DType::F32 => 4.0,
-                        crate::types::DType::F16 | crate::types::DType::BF16 => 2.0,
-                        crate::types::DType::Q8 | crate::types::DType::I8 => 1.0,
-                        crate::types::DType::Q4
-                        | crate::types::DType::I4
-                        | crate::types::DType::NF4 => 0.5,
-                        _ => 2.0,
-                    };
-                    weight_bytes = (total_params as f64 * bytes_per_weight) as usize;
-                }
-            }
-
-            if weight_bytes == 0 {
-                weight_bytes = GIB as usize; // 1 GB fallback
-            }
+            let weight_bytes = estimated_weight_bytes(manifest);
 
             let preferred_gpu = manifest.runtime_hints.preferred_backends.iter().any(|b| {
                 let b_lower = b.to_lowercase();
@@ -92,9 +100,9 @@ impl ResourceTicket {
             let temp_bytes = weight_bytes / 10;
             if preferred_gpu {
                 ram_bytes = 0;
-                vram_bytes = weight_bytes + temp_bytes;
+                vram_bytes = weight_bytes.saturating_add(temp_bytes);
             } else {
-                ram_bytes = weight_bytes + temp_bytes;
+                ram_bytes = weight_bytes.saturating_add(temp_bytes);
                 vram_bytes = 0;
             }
         }
@@ -128,87 +136,35 @@ impl ResourceTicket {
         let mut vram_bytes = manifest.memory_profile.recommended_vram_bytes;
 
         if ram_bytes == 0 && vram_bytes == 0 {
-            let file_sum: usize = manifest.files.iter().map(|f| f.size_bytes).sum();
-            let mut weight_bytes = if file_sum > 0 {
-                file_sum
-            } else {
-                manifest
-                    .memory_profile
-                    .min_ram_bytes
-                    .max(manifest.memory_profile.min_vram_bytes)
-            };
-
-            // Estimate from parameters if available
-            if weight_bytes == 0 {
-                let num_layers = manifest
-                    .parameters
-                    .get("num_hidden_layers")
-                    .or_else(|| manifest.parameters.get("num_layers"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as usize;
-                let hidden_size = manifest
-                    .parameters
-                    .get("hidden_size")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as usize;
-                if num_layers > 0 && hidden_size > 0 {
-                    let intermediate_size = manifest
-                        .parameters
-                        .get("intermediate_size")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or((hidden_size * 4) as u64)
-                        as usize;
-                    let vocab_size = manifest
-                        .parameters
-                        .get("vocab_size")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(32000) as usize;
-                    let params_per_layer =
-                        4 * hidden_size * hidden_size + 3 * hidden_size * intermediate_size;
-                    let total_params = num_layers * params_per_layer + 2 * vocab_size * hidden_size;
-                    let bytes_per_weight = match manifest.primary_dtype {
-                        crate::types::DType::F32 => 4.0,
-                        crate::types::DType::F16 | crate::types::DType::BF16 => 2.0,
-                        crate::types::DType::Q8 | crate::types::DType::I8 => 1.0,
-                        crate::types::DType::Q4
-                        | crate::types::DType::I4
-                        | crate::types::DType::NF4 => 0.5,
-                        _ => 2.0,
-                    };
-                    weight_bytes = (total_params as f64 * bytes_per_weight) as usize;
-                }
-            }
-
-            if weight_bytes == 0 {
-                weight_bytes = GIB as usize; // 1 GB fallback
-            }
+            let weight_bytes = estimated_weight_bytes(manifest);
 
             // Apply mmap residency discount (30% physical resident memory multiplier)
-            let weight_resident = if strategy == ResidencyStrategy::Mmap {
-                weight_bytes * 30 / 100
-            } else {
-                weight_bytes
-            };
+            let weight_resident =
+                if strategy == ResidencyStrategy::Mmap && weight_bytes != usize::MAX {
+                    weight_bytes / 100 * 30 + weight_bytes % 100 * 30 / 100
+                } else {
+                    weight_bytes
+                };
 
             let temp_bytes = weight_bytes / 10;
 
             match capability.memory_topology {
                 MemoryTopology::Unified | MemoryTopology::SharedSystemMemory => {
-                    ram_bytes = weight_resident + temp_bytes;
+                    ram_bytes = weight_resident.saturating_add(temp_bytes);
                     vram_bytes = 0;
                 }
                 MemoryTopology::Discrete => {
                     if strategy == ResidencyStrategy::Offload {
                         ram_bytes = 0;
-                        vram_bytes = weight_bytes + temp_bytes;
+                        vram_bytes = weight_bytes.saturating_add(temp_bytes);
                     } else {
-                        ram_bytes = weight_resident + temp_bytes;
+                        ram_bytes = weight_resident.saturating_add(temp_bytes);
                         vram_bytes = 0;
                     }
                 }
                 MemoryTopology::RemoteMemory => {
                     ram_bytes = 0;
-                    vram_bytes = weight_bytes + temp_bytes;
+                    vram_bytes = weight_bytes.saturating_add(temp_bytes);
                 }
             }
         }
@@ -233,7 +189,9 @@ impl ResourceTicket {
 
     /// Total memory footprint (for UMA unified budget checks).
     pub fn total_bytes(&self) -> usize {
-        self.ram_bytes + self.vram_bytes + self.cache_bytes
+        self.ram_bytes
+            .saturating_add(self.vram_bytes)
+            .saturating_add(self.cache_bytes)
     }
 }
 
@@ -331,6 +289,39 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn overflowing_model_metadata_never_wraps_into_a_small_estimate() {
+        let mut manifest = make_test_manifest("huge", 0, 0);
+        manifest
+            .parameters
+            .insert("num_hidden_layers".into(), serde_json::json!(u64::MAX));
+        manifest
+            .parameters
+            .insert("hidden_size".into(), serde_json::json!(u64::MAX));
+        for dtype in [crate::DType::F32, crate::DType::F16, crate::DType::Q4] {
+            manifest.primary_dtype = dtype;
+            assert_eq!(estimated_weight_bytes(&manifest), usize::MAX);
+            assert_eq!(
+                ResourceTicket::from_manifest(&manifest, ResourcePriority::Normal).total_bytes(),
+                usize::MAX
+            );
+        }
+        manifest.files = vec![
+            crate::manifest::ModelFile {
+                name: "model.safetensors".into(),
+                format: crate::ModelFormat::Safetensors,
+                size_bytes: usize::MAX,
+                hash_sha256: None,
+                required: true,
+            };
+            2
+        ];
+        assert_eq!(estimated_weight_bytes(&manifest), usize::MAX);
+        let mut ticket = ResourceTicket::from_manifest(&manifest, ResourcePriority::Normal);
+        ticket.cache_bytes = 1;
+        assert_eq!(ticket.total_bytes(), usize::MAX);
     }
 
     #[test]

@@ -1217,7 +1217,10 @@ mod tests {
                 .unwrap(),
             old_weights
         );
-        assert_eq!(fs::read(staged.join("config.json")).await.unwrap(), new_config);
+        assert_eq!(
+            fs::read(staged.join("config.json")).await.unwrap(),
+            new_config
+        );
         let provenance = read_provenance(temp.path(), "model-package", old_size)
             .unwrap()
             .unwrap();

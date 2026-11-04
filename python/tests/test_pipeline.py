@@ -1,4 +1,5 @@
 import ctypes
+import json
 import os
 import subprocess
 import sys
@@ -200,22 +201,120 @@ class BloomPipelineTests(unittest.TestCase):
 
         invalid_arguments = [
             {"max_tokens": -1},
+            {"max_tokens": 0},
+            {"max_tokens": 1 << (8 * ctypes.sizeof(ctypes.c_size_t))},
             {"temperature": float("nan")},
             {"temperature": True},
+            {"temperature": 2.1},
+            {"temperature": 10 ** 400},
             {"top_p": 0},
             {"top_p": 1.1},
             {"top_p": True},
+            {"top_p": 10 ** 400},
             {"seed": -1},
+            {"top_k": 0},
+            {"top_k": True},
+            {"top_k": 32769},
+            {"top_k": 2.5},
+            {"presence_penalty": float("inf")},
+            {"presence_penalty": -2.1},
+            {"frequency_penalty": True},
+            {"frequency_penalty": 2.1},
+            {"frequency_penalty": 10 ** 400},
+            {"logit_bias": []},
+            {"logit_bias": {True: 1}},
+            {"logit_bias": {1: float("nan")}},
+            {"logit_bias": {1: 101}},
+            {"logit_bias": {1: 10 ** 400}},
+            {"logit_bias": {1000001: 1}},
+            {"logit_bias": {"01": 1}},
+            {"logit_bias": {"1": 1, 1: 2}},
+            {"logit_bias": {"1" * 5000: 1}},
+            {"logit_bias": dict.fromkeys(range(1025), 0)},
         ]
         for arguments in invalid_arguments:
             with self.subTest(arguments=arguments):
                 with self.assertRaises(ValueError):
                     pipeline.generate("hello", **arguments)
+                with self.assertRaises(ValueError):
+                    next(pipeline.generate_stream("hello", **arguments))
+        self.assertFalse(self.fake_lib.stream_started.is_set())
+        self.assertEqual(self.fake_lib.freed_buffers, 0)
         with self.assertRaises(TypeError):
             pipeline.generate(["not", "a", "model", "input"])
         with self.assertRaises(ValueError):
             pipeline.generate({"Text": {"prompt": float("nan")}})
         pipeline.close()
+
+    def test_sampling_controls_reach_both_native_abi_revisions_and_modes(self):
+        expected = {
+            "top_k": 40,
+            "presence_penalty": -0.5,
+            "frequency_penalty": 0.75,
+            "logit_bias": {"0": -100, "1000000": 100},
+        }
+        for v2 in (False, True):
+            with self.subTest(v2=v2):
+                captured = []
+                self.fake_lib._bloom_uses_v2 = v2
+                suffix = "_v2" if v2 else ""
+                for function in ("bloom_pipeline_run", "bloom_pipeline_run_stream"):
+                    native_function = getattr(self.fake_lib, function + suffix)
+                    original = native_function.implementation
+
+                    def capture(*args, original=original):
+                        params = args[2]
+                        if v2:
+                            params = ctypes.string_at(params.data, params.len)
+                        captured.append(json.loads(params))
+                        return original(*args)
+
+                    native_function.implementation = capture
+                with pipeline_module.BloomPipeline(".", engine="mock") as pipeline:
+                    arguments = dict(expected, logit_bias={0: -100, "1000000": 100})
+                    pipeline.generate("hello", **arguments)
+                    list(pipeline.generate_stream("hello", **arguments))
+                self.assertEqual(len(captured), 2)
+                for params in captured:
+                    for name, value in expected.items():
+                        self.assertEqual(params[name], value)
+
+    def test_response_format_rejects_ignored_semantics(self):
+        invalid_formats = [
+            {"type": "text", "json_schema": {"type": "object"}},
+            {"type": "json_object", "strict": True},
+            {"type": "json_schema", "unknown": 1, "json_schema": {}},
+            {"type": "json_schema", "json_schema": {"schema": {}, "unknown": 1}},
+            {"type": "json_schema", "json_schema": {"schema": {}, "strict": "true"}},
+            {"type": "json_schema", "json_schema": {"schema": {}, "name": "名字"}},
+            {"type": "json_schema", "json_schema": {"schema": {}, "description": 1}},
+        ]
+        for response_format in invalid_formats:
+            with self.subTest(response_format=response_format):
+                with self.assertRaises(ValueError):
+                    pipeline_module._normalize_response_format(response_format)
+
+    def test_stream_preserves_native_end_variant_for_both_abi_revisions(self):
+        for v2 in (False, True):
+            with self.subTest(v2=v2):
+                self.fake_lib._bloom_uses_v2 = v2
+
+                def stream(_p, _i, _a, callback, *_rest):
+                    for value in (b'{"TextDelta":"hello"}', b'"End"'):
+                        if v2:
+                            chunk = ctypes.create_string_buffer(value)
+                            callback(None, ctypes.cast(chunk, ctypes.POINTER(ctypes.c_uint8)), len(value))
+                        else:
+                            callback(None, value)
+                    return 0
+
+                function = "bloom_pipeline_run_stream_v2" if v2 else "bloom_pipeline_run_stream"
+                getattr(self.fake_lib, function).implementation = stream
+                with pipeline_module.BloomPipeline(".", engine="mock") as pipeline:
+                    self.assertEqual(
+                        list(pipeline.generate_stream("hello")),
+                        [{"TextDelta": "hello"}, "End"],
+                    )
 
     def test_constructor_rejects_nul_terminated_identifiers(self):
         for arguments in (
@@ -477,7 +576,7 @@ class BloomPipelineTests(unittest.TestCase):
         self.assertEqual(self.fake_lib.freed_tokens, 1)
 
     def test_invalid_stream_encoding_or_json_cancels_native_worker(self):
-        for value in (b"\xff", b"not-json", b"null"):
+        for value in (b"\xff", b"not-json", b"null", b'"unknown"', b"42"):
             with self.subTest(value=value):
                 def invalid(_p, _i, _a, callback, *_rest):
                     chunk = ctypes.create_string_buffer(value)

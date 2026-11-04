@@ -41,6 +41,14 @@ The response contains:
 - exact installed, staged, reserved, committed, quota, and cleanup accounting;
 - the current cancellable integrity-verification state.
 
+TensorRT single-file weights ending in `.plan` or `.engine` are recognized as
+catalog format `tensorrt`, including directories containing such a model.
+Browser imports, verified downloads, signed discovery and inventory restoration
+use the existing authenticated, SHA-256-verified lifecycle. Recognition does
+not validate the serialized engine or make a CUDA runtime available; loading
+still requires the TensorRT adapter and matching hardware. Tensor-only models
+remain isolated from Chat, embedding, and reranking operations.
+
 The browser limits the complete response to 16 MiB before decoding. The server
 also bounds direct-child inspection and fails the scan instead of returning a
 partial catalog when its published-model or inspection ceiling is exceeded.
