@@ -228,7 +228,12 @@ fn parse_llama_rope_scaling(
 ) -> Result<Option<candle_transformers::models::llama::Llama3RopeConfig>> {
     let Some(value) = config
         .get("rope_scaling")
-        .or_else(|| config.get("rope_parameters"))
+        .filter(|value| !value.is_null())
+        .or_else(|| {
+            config
+                .get("rope_parameters")
+                .filter(|value| !value.is_null())
+        })
         .cloned()
     else {
         return Ok(None);
@@ -4302,6 +4307,66 @@ mod tests {
 
         let invalid = serde_json::json!({ "model_type": "invalid_model" });
         assert_eq!(ModelType::from_config(&invalid), None);
+    }
+
+    #[test]
+    fn llama_rope_scaling_accepts_absent_and_null_options() {
+        for config in [
+            serde_json::json!({}),
+            serde_json::json!({"rope_scaling": null}),
+            serde_json::json!({"rope_parameters": null}),
+            serde_json::json!({"rope_scaling": null, "rope_parameters": null}),
+        ] {
+            assert!(parse_llama_rope_scaling(&config).unwrap().is_none());
+            let normalized = normalize_native_text_config(config);
+            assert!(parse_llama_rope_scaling(&normalized).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn llama_rope_scaling_preserves_aliases_precedence_and_invalid_errors() {
+        let modern = serde_json::json!({
+            "rope_type": "llama3", "factor": 8.0,
+            "low_freq_factor": 1.0, "high_freq_factor": 4.0,
+            "original_max_position_embeddings": 8192
+        });
+        for scaling in [None, Some(serde_json::Value::Null)] {
+            let mut config = serde_json::json!({"model_type": "llama", "rope_parameters": modern});
+            if let Some(scaling) = scaling {
+                config["rope_scaling"] = scaling;
+            }
+            for config in [config.clone(), normalize_native_text_config(config)] {
+                assert_eq!(
+                    parse_llama_rope_scaling(&config).unwrap().unwrap().factor,
+                    8.0
+                );
+            }
+        }
+        let mut legacy = modern.clone();
+        legacy.as_object_mut().unwrap().remove("rope_type");
+        legacy["type"] = serde_json::json!("llama3");
+        legacy["factor"] = serde_json::json!(4.0);
+        let config = serde_json::json!({"rope_scaling": legacy, "rope_parameters": modern});
+        assert_eq!(
+            parse_llama_rope_scaling(&config).unwrap().unwrap().factor,
+            4.0
+        );
+
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!(false),
+            serde_json::json!("llama3"),
+            serde_json::json!([]),
+        ] {
+            // A malformed explicit value must not silently fall back to a
+            // valid alias, nor be treated as an absent configuration.
+            for config in [
+                serde_json::json!({"rope_scaling": invalid, "rope_parameters": modern}),
+                serde_json::json!({"rope_scaling": null, "rope_parameters": invalid}),
+            ] {
+                assert!(parse_llama_rope_scaling(&config).is_err());
+            }
+        }
     }
 
     #[test]
