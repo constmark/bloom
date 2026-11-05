@@ -427,6 +427,7 @@ mod tests {
         DeviceCapability, MemoryTopology, ModelFile, ModelIoSchema, ModelMemoryProfile, PowerState,
         RuntimeHints, ThermalState, constants::GIB,
     };
+    #[cfg(unix)]
     use std::time::Instant;
 
     fn cpu_capability() -> DeviceCapability {
