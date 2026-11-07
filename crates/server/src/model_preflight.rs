@@ -950,6 +950,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "candle-engine")]
     #[tokio::test]
     async fn supported_cpu_manifest_is_loadable() {
         let temp = tempfile::tempdir().unwrap();
@@ -984,6 +985,34 @@ mod tests {
                 )
             })
         );
+    }
+
+    #[cfg(not(feature = "candle-engine"))]
+    #[tokio::test]
+    async fn native_candle_manifest_is_rejected_even_with_available_memory() {
+        let temp = tempfile::tempdir().unwrap();
+        write_supported_manifest(temp.path(), "tiny");
+        let manager = ModelPreflightManager::new(
+            temp.path().to_path_buf(),
+            cpu_config(),
+            test_runtime_memory(),
+        );
+        for report in [
+            manager.inspect("tiny").await.unwrap(),
+            manager.inspect_resident("tiny").await.unwrap(),
+        ] {
+            assert!(!report.loadable);
+            assert!(report.memory.fits_budget);
+            assert_eq!(report.runtime.selected_engine, "candle");
+            assert_eq!(report.runtime.support, "unsupported");
+            assert_eq!(report.runtime.engine_maturity, "skeleton");
+            assert!(
+                report
+                    .load_blocker
+                    .as_deref()
+                    .is_some_and(|message| { message.contains("not compiled") })
+            );
+        }
     }
 
     #[tokio::test]
@@ -1026,13 +1055,14 @@ mod tests {
     #[tokio::test]
     async fn impossible_memory_reservation_blocks_queue_admission() {
         let temp = tempfile::tempdir().unwrap();
-        write_supported_manifest(temp.path(), "tiny");
+        // Exercise memory policy independently of the optional native Candle engine.
+        std::fs::write(temp.path().join("tiny.onnx"), b"onnx").unwrap();
         let mut config = cpu_config();
         config.reserve_memory_bytes = Some(usize::MAX);
         let manager =
             ModelPreflightManager::new(temp.path().to_path_buf(), config, test_runtime_memory());
 
-        let report = manager.inspect("tiny").await.unwrap();
+        let report = manager.inspect("tiny.onnx").await.unwrap();
 
         assert!(!report.loadable);
         assert!(!report.memory.fits_budget);
@@ -1048,7 +1078,8 @@ mod tests {
     #[tokio::test]
     async fn disabling_page_touch_does_not_bypass_hard_runtime_admission() {
         let temp = tempfile::tempdir().unwrap();
-        write_supported_manifest(temp.path(), "tiny");
+        // Exercise memory policy independently of the optional native Candle engine.
+        std::fs::write(temp.path().join("tiny.onnx"), b"onnx").unwrap();
         let mut config = cpu_config();
         config.disable_memory_prealloc = true;
         let manager = ModelPreflightManager::new(
@@ -1057,7 +1088,7 @@ mod tests {
             RuntimeMemoryPlanner::for_test(1, 0, bloomai_core::MemoryTopology::Unified),
         );
 
-        let report = manager.inspect("tiny").await.unwrap();
+        let report = manager.inspect("tiny.onnx").await.unwrap();
 
         assert!(!report.loadable);
         assert!(!report.memory.preallocation_enabled);
@@ -1098,8 +1129,9 @@ mod tests {
     #[tokio::test]
     async fn released_runtime_budget_is_reflected_immediately() {
         let temp = tempfile::tempdir().unwrap();
-        write_supported_manifest(temp.path(), "tiny");
-        let manifest = bloomai_engine::load_manifest(&temp.path().join("tiny")).unwrap();
+        // Exercise memory policy independently of the optional native Candle engine.
+        std::fs::write(temp.path().join("tiny.onnx"), b"onnx").unwrap();
+        let manifest = bloomai_engine::load_manifest(&temp.path().join("tiny.onnx")).unwrap();
         let sizing = test_runtime_memory();
         let estimate = sizing.planned_estimate(&manifest).unwrap();
         let footprint = sizing.footprint(&manifest, &estimate).unwrap();
@@ -1121,14 +1153,14 @@ mod tests {
             .unwrap();
         let manager = ModelPreflightManager::new(temp.path().to_path_buf(), cpu_config(), planner);
 
-        let blocked = manager.inspect("tiny").await.unwrap();
+        let blocked = manager.inspect("tiny.onnx").await.unwrap();
         assert!(!blocked.loadable);
         assert_eq!(
             blocked.memory.host_required_bytes,
             as_u64(footprint.host_bytes)
         );
         drop(resident);
-        let released = manager.inspect("tiny").await.unwrap();
+        let released = manager.inspect("tiny.onnx").await.unwrap();
 
         assert!(released.loadable, "{:?}", released.load_blocker);
         assert_eq!(released.memory.host_committed_bytes, 0);
@@ -1137,15 +1169,16 @@ mod tests {
     #[tokio::test]
     async fn resident_selection_ignores_only_incremental_memory_failure() {
         let temp = tempfile::tempdir().unwrap();
-        write_supported_manifest(temp.path(), "tiny");
+        // Exercise memory policy independently of the optional native Candle engine.
+        std::fs::write(temp.path().join("tiny.onnx"), b"onnx").unwrap();
         let manager = ModelPreflightManager::new(
             temp.path().to_path_buf(),
             cpu_config(),
             RuntimeMemoryPlanner::for_test(1, 0, bloomai_core::MemoryTopology::Unified),
         );
 
-        let candidate = manager.inspect("tiny").await.unwrap();
-        let resident = manager.inspect_resident("tiny").await.unwrap();
+        let candidate = manager.inspect("tiny.onnx").await.unwrap();
+        let resident = manager.inspect_resident("tiny.onnx").await.unwrap();
 
         assert!(!candidate.loadable);
         assert!(!resident.memory.fits_budget);

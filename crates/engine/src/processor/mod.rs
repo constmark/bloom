@@ -125,6 +125,11 @@ impl Processor for TokenizerProcessor {
                     out.push(DataBlock::Tokens(encoding.get_ids().to_vec()));
                 }
                 DataBlock::Tokens(ids) => {
+                    anyhow::ensure!(
+                        ids.iter()
+                            .all(|id| self.tokenizer.id_to_token(*id).is_some()),
+                        "token sequence contains an unknown token ID"
+                    );
                     let text = self
                         .tokenizer
                         .decode(&ids, true)
@@ -797,6 +802,12 @@ mod tests {
             let tokenizer = tokenizers::Tokenizer::new(model);
             let processor = TokenizerProcessor::new("test.tokenizer", tokenizer);
             assert_eq!(processor.name(), "test.tokenizer");
+            assert!(
+                processor
+                    .process(vec![DataBlock::Tokens(vec![u32::MAX])])
+                    .is_err(),
+                "unknown token IDs must not silently decode to empty text"
+            );
 
             let blocks = vec![DataBlock::Text("hello".to_string())];
             let out = processor.process(blocks).unwrap();

@@ -15,7 +15,7 @@ fn non_generation_model_response(model_id: &str) -> axum::response::Response {
         axum::http::StatusCode::UNPROCESSABLE_ENTITY,
         "unsupported_operation",
         format!(
-            "Model '{model_id}' does not support text generation. Use the model's advertised embedding, reranking, or tensor operations; tensor models run through the Rust or CLI interface."
+            "Model '{model_id}' does not support text generation. Use the model's advertised embedding, reranking, or tensor operations; tensor models use POST /v1/tensors/infer."
         ),
     )
 }
@@ -235,7 +235,10 @@ pub(crate) async fn handle_observability(
                         "kv_cache_stats",
                         "model_management",
                         "observability",
-                        "cancellation"
+                        "cancellation",
+                        "tokenization",
+                        "tensor_inference",
+                        "audio_transcriptions"
                     ]
                 },
                 "lifecycle": if ready { "ready" } else { "unhealthy" },

@@ -1,5 +1,8 @@
 # Numeric inference from the CLI
 
+HTTP consumers can use the bounded [tensor inference API](tensor-api.md) with
+the same active model and numeric input contract.
+
 `bloom_infer` preserves numeric tensor input as JSON for models declaring the
 `tensor` task. CoreML accepts a flat number array matching its fixed input
 shape; TensorRT accepts the named shape/data contract documented by its

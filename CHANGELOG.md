@@ -10,6 +10,30 @@ called out in release notes.
 
 ### Reliability and distribution
 
+- Add exact `/v1/tokenize` and `/v1/detokenize` operations without fabricated
+  fallback IDs, with bounded model-owned tokenizer execution and vocabulary
+  validation. Add the optional `LoadedModel::detokenize` method (defaulting to
+  unsupported) and exact pipeline helpers without requiring adapter changes.
+- Expose numeric CoreML/TensorRT execution through `/v1/tensors/infer` with
+  validated flat/named inputs and finite numeric output; preserve worker-owned
+  admission and runtime leases after disconnect.
+- Add bounded WAV `/v1/audio/transcriptions` with JSON/text responses and
+  explicit rejection of unsupported transcription controls.
+- Forward native tokenizer/tensor operations through the Elderwand worker
+  proxy, preserving query controls and transcription multipart bytes.
+
+- Keep memory leases charged until model offload succeeds; prevent concurrent
+  or reentrant double eviction and preserve failed/panicking residents.
+- Correct inverse-cost KV eviction, reject invalid admission thresholds, and
+  reject token/chunk arithmetic overflow before altering existing sessions.
+- Parse internal SSE incrementally across legal line endings and require exact
+  native rerank score cardinality before top-N selection.
+- Keep readiness snapshots consistent during model replacement and failure;
+  validate the desktop launcher's full readiness handshake, configuration,
+  response budgets and child-process cleanup.
+- Isolate macOS generation/connection lifecycles from stale async results and
+  bound readiness/SSE reads; extend the native regression harness.
+
 - Execute WASM processors through the existing registry using a versioned ABI,
   fresh instances, fuel/memory/stack/I/O/concurrency budgets, deadlines and
   cancellation; reject imports, WASI, start sections and local-file references.

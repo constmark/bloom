@@ -2017,22 +2017,38 @@ impl InferenceScheduler {
             )
             .into());
         }
+        // Validate before admission can cancel other sessions or the pool can
+        // allocate storage. A wrapped token count is not a smaller request.
+        let num_tokens = request
+            .prompt_tokens
+            .len()
+            .checked_add(request.params.max_tokens)
+            .ok_or_else(|| {
+                BloomError::InvalidInput(
+                    "request token count exceeds platform capacity".to_string(),
+                )
+            })?;
 
         // HBM Admission Control & Eviction
         if self.config.enabled {
+            let threshold = self.config.kv_eviction.admission_threshold;
+            if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+                return Err(BloomError::SchedulingFailed(
+                    "KV cache admission threshold must be finite and in [0, 1]".to_string(),
+                )
+                .into());
+            }
             let metrics = self.kv_pool.get_metrics();
-            let block_size = 16;
-            let active_tokens = metrics.active_blocks * block_size;
-            let total_tokens = metrics.total_blocks * block_size;
 
             let mut eviction_mgr = self
                 .kv_eviction_manager
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            let num_tokens = request.prompt_tokens.len() + request.params.max_tokens;
 
-            // Check admission
-            match eviction_mgr.check_admission(active_tokens, total_tokens) {
+            // Utilization is the same ratio in blocks or tokens. Work in the
+            // pool's native units instead of assuming a 16-token block size
+            // and risking overflow for large/custom pool metrics.
+            match eviction_mgr.check_admission(metrics.active_blocks, metrics.total_blocks) {
                 AdmissionResult::Rejected { reason, .. } => {
                     // Only collect session metadata on the rejection path. Most submissions
                     // are admitted, so keeping this scan out of the hot path avoids locking

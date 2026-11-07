@@ -57,6 +57,7 @@ use bloomai_engine::{
 };
 
 mod application;
+mod audio;
 mod catalog_lock;
 mod chat_template;
 mod cli;
@@ -86,6 +87,9 @@ mod readiness;
 mod response_store;
 mod server_state;
 mod shutdown;
+mod sse;
+mod tensor;
+mod tokenization;
 mod tool_calling;
 mod ui;
 
@@ -134,6 +138,33 @@ use shutdown::{
     wait_for_shutdown_notification,
 };
 use tool_calling::*;
+
+/// Shared composition for bounded native operation extensions. The parent
+/// `/v1` router applies authentication, protocol errors and correlation policy.
+fn extension_routes(max_upload_bytes: usize) -> Router<Arc<ServerState>> {
+    Router::new()
+        .route(
+            "/tokenize",
+            post(tokenization::handle_tokenize).layer(DefaultBodyLimit::max(
+                tokenization::MAX_TOKENIZATION_BODY_BYTES,
+            )),
+        )
+        .route(
+            "/detokenize",
+            post(tokenization::handle_detokenize).layer(DefaultBodyLimit::max(
+                tokenization::MAX_TOKENIZATION_BODY_BYTES,
+            )),
+        )
+        .route(
+            "/tensors/infer",
+            post(tensor::handle_tensor_infer)
+                .layer(DefaultBodyLimit::max(tensor::MAX_TENSOR_BODY_BYTES)),
+        )
+        .route(
+            "/audio/transcriptions",
+            post(audio::handle_transcription).layer(DefaultBodyLimit::max(max_upload_bytes)),
+        )
+}
 
 const MODEL_INDEX_STATE_DIRECTORY: &str = "model-index-watermarks";
 const HTTP_REQUEST_ID_HEADER: &str = "x-request-id";
@@ -867,6 +898,7 @@ async fn run_server(
         .route("/completions", post(handle_completions))
         .route("/embeddings", post(handle_embeddings))
         .route("/rerank", post(handle_rerank))
+        .merge(extension_routes(args.max_upload_bytes))
         .route("/multimodal/stream", post(handle_multimodal_stream))
         .route(
             "/multimodal/upload",
@@ -4191,7 +4223,110 @@ mod tests {
         assert!(helpers::validate_context_budget(usize::MAX, 1, usize::MAX).is_err());
     }
 
-    fn test_server_state(
+    #[tokio::test]
+    async fn native_operation_routes_share_authentication_and_protocol_boundaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut state, _receiver) = test_server_state(temp.path().to_path_buf());
+        Arc::get_mut(&mut state).unwrap().api_key = Some("operation-test-key".into());
+        let routes = extension_routes(1024).route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            require_api_key,
+        ));
+        let app = Router::new()
+            .nest("/v1", routes)
+            .with_state(state)
+            .layer(middleware::from_fn(normalize_protocol_error_response))
+            .layer(middleware::from_fn(prevent_dynamic_response_caching))
+            .layer(middleware::from_fn(publish_authentication_challenge))
+            .layer(middleware::from_fn(correlate_http_request));
+        for path in [
+            "/v1/tokenize",
+            "/v1/detokenize",
+            "/v1/tensors/infer",
+            "/v1/audio/transcriptions",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::UNAUTHORIZED,
+                "{path}"
+            );
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            assert!(response.headers().contains_key(HTTP_REQUEST_ID_HEADER));
+            assert!(response.headers().contains_key(header::WWW_AUTHENTICATE));
+        }
+        for (path, content_type, body) in [
+            ("/v1/tokenize", "application/json", "{"),
+            ("/v1/detokenize", "application/json", "{"),
+            ("/v1/tensors/infer", "application/json", "{"),
+            (
+                "/v1/audio/transcriptions",
+                "multipart/form-data",
+                "bad multipart",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header(header::AUTHORIZATION, "Bearer operation-test-key")
+                        .header(header::CONTENT_TYPE, content_type)
+                        .body(axum::body::Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::BAD_REQUEST,
+                "{path}"
+            );
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(value["error"]["message"].is_string());
+        }
+        for (path, limit) in [
+            ("/v1/tokenize", tokenization::MAX_TOKENIZATION_BODY_BYTES),
+            ("/v1/detokenize", tokenization::MAX_TOKENIZATION_BODY_BYTES),
+            ("/v1/tensors/infer", tensor::MAX_TENSOR_BODY_BYTES),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header(header::AUTHORIZATION, "Bearer operation-test-key")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(axum::body::Body::from(" ".repeat(limit + 1)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                "{path}"
+            );
+        }
+    }
+
+    pub(crate) fn test_server_state(
         models_root: PathBuf,
     ) -> (Arc<ServerState>, mpsc::Receiver<ModelLoadRequest>) {
         test_server_state_with_imports(models_root, None)
@@ -4244,6 +4379,7 @@ mod tests {
             .publish_default(runtime);
         assert!(previous.is_empty());
         state.app.ready.store(true, Ordering::Release);
+        state.app.load_progress.store(100, Ordering::Release);
         (state, native_batch_calls)
     }
 
@@ -4262,6 +4398,7 @@ mod tests {
             .publish_default(runtime);
         assert!(previous.is_empty());
         state.app.ready.store(true, Ordering::Release);
+        state.app.load_progress.store(100, Ordering::Release);
         state
     }
 
@@ -4398,7 +4535,7 @@ mod tests {
         )
     }
 
-    fn test_text_runtime_with_engine(
+    pub(crate) fn test_text_runtime_with_engine(
         model_path: PathBuf,
         engine: &dyn bloomai_engine::Engine,
     ) -> Arc<LoadedRuntime> {
@@ -8166,6 +8303,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn readiness_preserves_its_contract_during_resident_model_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = test_server_state_with_text_runtime(
+            temp.path().to_path_buf(),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await;
+        for (loading, progress, failed) in [
+            (true, 0, false),
+            (true, 100, false),
+            (false, 0, true),
+            (false, 100, true),
+            (false, 99, false),
+        ] {
+            state.app.load_in_progress.store(loading, Ordering::Release);
+            state.app.load_progress.store(progress, Ordering::Release);
+            *state.app.load_error.write().await = failed.then(|| "replacement failed".into());
+            let response = handle_ready(State(Arc::clone(&state))).await;
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            );
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["status"], "not_ready");
+            assert_eq!(body["loading"], loading);
+            assert_eq!(body["progress"], progress);
+            assert_eq!(!body["load_error"].is_null(), failed);
+            assert_ne!(body["model"], "not loaded");
+            // The diagnostic boundary must not close admission to the retained
+            // runtime or disturb requests already using it.
+            assert!(state.app.ready.load(Ordering::Acquire));
+            assert!(state.app.lease_runtime(None).await.unwrap().is_some());
+        }
+        state.app.load_progress.store(100, Ordering::Release);
+        *state.app.load_error.write().await = None;
+        assert_eq!(
+            handle_ready(State(Arc::clone(&state))).await.status(),
+            axum::http::StatusCode::OK
+        );
+        state.app.runtime_pool.write().await.remove_default();
+        assert_eq!(
+            handle_ready(State(state)).await.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
     async fn tensor_task_readiness_rejects_language_and_encoder_operations_before_admission() {
         let temp = tempfile::tempdir().unwrap();
         let (state, _receiver) = test_server_state(temp.path().to_path_buf());
@@ -8185,6 +8374,7 @@ mod tests {
             .await
             .publish_default(Arc::clone(&runtime));
         state.app.ready.store(true, Ordering::Release);
+        state.app.load_progress.store(100, Ordering::Release);
         let app = Router::new()
             .route("/ready", get(handle_ready))
             .route("/v1/chat/completions", post(handle_chat_completions))
@@ -9076,13 +9266,18 @@ mod tests {
     #[tokio::test]
     async fn model_switch_endpoint_queues_only_catalog_entries() {
         let temp = tempfile::tempdir().unwrap();
-        let model_path = write_test_model_manifest(temp.path(), "tiny");
+        let model_path = {
+            // This tests admission/queueing, not a compiled native loader.
+            let path = temp.path().join("tiny.onnx");
+            std::fs::write(&path, b"metadata-only ONNX fixture").unwrap();
+            path
+        };
         let (state, mut receiver) = test_server_state(temp.path().to_path_buf());
 
         let response = handle_model_switch(
             State(Arc::clone(&state)),
             Json(ModelSwitchRequest {
-                id: "tiny".to_string(),
+                id: "tiny.onnx".to_string(),
             }),
         )
         .await;
@@ -9090,21 +9285,29 @@ mod tests {
         assert_eq!(response.status(), axum::http::StatusCode::ACCEPTED);
         assert!(state.app.load_in_progress.load(Ordering::Acquire));
         assert!(!state.app.ready.load(Ordering::Acquire));
-        let queued = receiver.recv().await.unwrap();
+        let queued = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("load must be queued without blocking")
+            .unwrap();
         assert_eq!(queued.path, model_path.canonicalize().unwrap());
-        assert_eq!(queued.catalog_id.as_deref(), Some("tiny"));
+        assert_eq!(queued.catalog_id.as_deref(), Some("tiny.onnx"));
     }
 
     #[tokio::test]
     async fn repeated_model_switch_joins_the_same_inflight_load() {
         let temp = tempfile::tempdir().unwrap();
-        write_test_model_manifest(temp.path(), "tiny");
+        {
+            // This tests admission/queueing, not a compiled native loader.
+            let path = temp.path().join("tiny.onnx");
+            std::fs::write(&path, b"metadata-only ONNX fixture").unwrap();
+            path
+        };
         let (state, mut receiver) = test_server_state(temp.path().to_path_buf());
 
         let first = handle_model_switch(
             State(Arc::clone(&state)),
             Json(ModelSwitchRequest {
-                id: "tiny".to_string(),
+                id: "tiny.onnx".to_string(),
             }),
         )
         .await;
@@ -9113,7 +9316,7 @@ mod tests {
         let second = handle_model_switch(
             State(Arc::clone(&state)),
             Json(ModelSwitchRequest {
-                id: "tiny".to_string(),
+                id: "tiny.onnx".to_string(),
             }),
         )
         .await;
@@ -9504,19 +9707,26 @@ mod tests {
     #[tokio::test]
     async fn ollama_activation_queues_an_inactive_catalog_model_and_waits_for_completion() {
         let temp = tempfile::tempdir().unwrap();
-        let model_path = write_test_model_manifest(temp.path(), "tiny")
-            .canonicalize()
-            .unwrap();
+        let model_path = {
+            // This tests admission/queueing, not a compiled native loader.
+            let path = temp.path().join("tiny.onnx");
+            std::fs::write(&path, b"metadata-only ONNX fixture").unwrap();
+            path
+        }
+        .canonicalize()
+        .unwrap();
         let (state, mut receiver) = test_server_state(temp.path().to_path_buf());
         let activation_state = Arc::clone(&state);
-        let activation =
-            tokio::spawn(
-                async move { ollama::activate_ollama_model(&activation_state, "tiny").await },
-            );
+        let activation = tokio::spawn(async move {
+            ollama::activate_ollama_model(&activation_state, "tiny.onnx").await
+        });
 
-        let queued = receiver.recv().await.unwrap();
+        let queued = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("load must be queued without blocking")
+            .unwrap();
         assert_eq!(queued.path, model_path);
-        assert_eq!(queued.catalog_id.as_deref(), Some("tiny"));
+        assert_eq!(queued.catalog_id.as_deref(), Some("tiny.onnx"));
         assert!(!activation.is_finished());
 
         let mut ready_runtime = test_text_runtime(
@@ -9540,9 +9750,14 @@ mod tests {
     #[tokio::test]
     async fn ollama_long_activation_does_not_hold_the_residency_registry() {
         let temp = tempfile::tempdir().unwrap();
-        let model_path = write_test_model_manifest(temp.path(), "slow")
-            .canonicalize()
-            .unwrap();
+        let model_path = {
+            // This tests admission/queueing, not a compiled native loader.
+            let path = temp.path().join("slow.onnx");
+            std::fs::write(&path, b"metadata-only ONNX fixture").unwrap();
+            path
+        }
+        .canonicalize()
+        .unwrap();
         let (state, mut receiver) = test_server_state(temp.path().to_path_buf());
         let app = Router::new()
             .nest("/api", ollama_api_router(Arc::clone(&state)))
@@ -9557,7 +9772,7 @@ mod tests {
                         .header(header::CONTENT_TYPE, "application/json")
                         .body(axum::body::Body::from(
                             json!({
-                                "model": "slow",
+                                "model": "slow.onnx",
                                 "prompt": "",
                                 "keep_alive": -1,
                                 "stream": false
@@ -9570,7 +9785,10 @@ mod tests {
                 .unwrap()
         });
 
-        let queued = receiver.recv().await.unwrap();
+        let queued = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("load must be queued without blocking")
+            .unwrap();
         assert_eq!(queued.path, model_path);
         assert!(state.ollama_residency.try_lock().is_ok());
         let processes = tokio::time::timeout(
@@ -9594,7 +9812,7 @@ mod tests {
         let runtime = Arc::get_mut(&mut ready_runtime).unwrap();
         runtime.model_id = "slow-runtime".to_string();
         runtime.source_path = model_path;
-        runtime.catalog_id = Some("slow".to_string());
+        runtime.catalog_id = Some("slow.onnx".to_string());
         assert!(
             state
                 .app
@@ -9649,7 +9867,7 @@ mod tests {
             json!(["generation"])
         );
         assert_eq!(body["data"]["runtime"]["selected_engine"], "candle");
-        assert_eq!(body["data"]["loadable"], true);
+        assert_eq!(body["data"]["loadable"], cfg!(feature = "candle-engine"));
         assert_eq!(body["data"]["memory"]["scope"], "aggregate_unified");
         assert!(body["data"]["memory"]["host_required_bytes"].is_u64());
         assert!(body["data"]["memory"]["host_limit_bytes"].is_u64());

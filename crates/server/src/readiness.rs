@@ -46,12 +46,6 @@ pub(crate) async fn handle_ready(
     memory.refresh_ram();
     let memory_pressure_high = memory.is_high_pressure();
     let runtime = state.app.runtime_pool.read().await.default_runtime();
-    let ready = state.app.ready.load(Ordering::Acquire)
-        && runtime
-            .as_ref()
-            .is_none_or(|runtime| !state.app.runtime_is_revoked(runtime))
-        && available_permits > 0
-        && !memory_pressure_high;
     let model = runtime
         .as_ref()
         .map(|runtime| runtime.model_id.as_str())
@@ -76,6 +70,23 @@ pub(crate) async fn handle_ready(
         .as_ref()
         .map(|runtime| runtime.pipeline.context_size() as u64);
     let load_failed = state.app.load_error.read().await.is_some();
+    let progress = state.app.load_progress.load(Ordering::Relaxed);
+    let loading = state.app.load_in_progress.load(Ordering::Relaxed);
+    // Inference admission intentionally remains open on the resident model
+    // while a replacement loads or fails. The public readiness contract is
+    // stricter: its status must agree with the exact fields in this snapshot.
+    let ready = state.app.ready.load(Ordering::Acquire)
+        && runtime
+            .as_ref()
+            .is_some_and(|runtime| !state.app.runtime_is_revoked(runtime))
+        && model != "not loaded"
+        && progress == 100
+        && !loading
+        && !load_failed
+        && !model_tasks.is_empty()
+        && context_window.is_some_and(|window| window > 0)
+        && available_permits > 0
+        && !memory_pressure_high;
     let body = ReadinessSnapshot {
         schema_version: READINESS_SCHEMA_VERSION,
         object: READINESS_OBJECT,
@@ -84,9 +95,9 @@ pub(crate) async fn handle_ready(
         maximum_ui_protocol_version: MAXIMUM_UI_PROTOCOL_VERSION,
         server_version: env!("CARGO_PKG_VERSION"),
         status: if ready { "ready" } else { "not_ready" },
-        progress: state.app.load_progress.load(Ordering::Relaxed),
+        progress,
         model,
-        loading: state.app.load_in_progress.load(Ordering::Relaxed),
+        loading,
         load_error: load_failed.then_some(
             "Model load failed. See the authenticated model-management endpoint for details.",
         ),

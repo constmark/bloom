@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 
 struct DesktopMessage: Identifiable, Equatable {
     enum Role: String {
@@ -44,9 +45,12 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
-    @Published var serverURL = UserDefaults.standard.string(forKey: "bloom.serverURL")
-        ?? "http://127.0.0.1:3000"
-    @Published var apiKey = ""
+    @Published var serverURL: String {
+        didSet { if serverURL != oldValue { invalidateConnection() } }
+    }
+    @Published var apiKey = "" {
+        didSet { if apiKey != oldValue { invalidateConnection() } }
+    }
     @Published private(set) var connectionState: ConnectionState = .disconnected
     @Published private(set) var modelName: String?
     @Published private(set) var contextWindow: UInt64?
@@ -57,7 +61,20 @@ final class ChatViewModel: ObservableObject {
     @Published private(set) var metrics: GenerationMetrics?
 
     private var generationTask: Task<Void, Never>?
+    private var activeGenerationID: UUID?
+    private var connectionID = UUID()
+    private var connectedClient: (any BloomAPITransport)?
+    private let makeClient: (String, String) throws -> any BloomAPITransport
+    private let defaults: UserDefaults
     private var automationStarted = false
+
+    init(defaults: UserDefaults = .standard, makeClient: @escaping (String, String) throws -> any BloomAPITransport = {
+        try BloomAPIClient(serverURL: $0, apiKey: $1)
+    }) {
+        self.defaults = defaults
+        serverURL = defaults.string(forKey: "bloom.serverURL") ?? "http://127.0.0.1:3000"
+        self.makeClient = makeClient
+    }
 
     var canSend: Bool {
         connectionState == .ready
@@ -82,19 +99,26 @@ final class ChatViewModel: ObservableObject {
 
     func connect() async {
         guard !isGenerating else { return }
+        let attemptID = UUID()
+        connectionID = attemptID
+        connectedClient = nil
+        let requestedURL = serverURL
         connectionState = .connecting
         errorMessage = nil
         modelName = nil
         contextWindow = nil
 
         do {
-            let client = try BloomAPIClient(serverURL: serverURL, apiKey: apiKey)
+            let client = try makeClient(requestedURL, apiKey)
             let readiness = try await client.readiness()
-            UserDefaults.standard.set(serverURL, forKey: "bloom.serverURL")
+            guard connectionID == attemptID else { return }
+            try Task.checkCancellation()
+            defaults.set(requestedURL, forKey: "bloom.serverURL")
             modelName = readiness.model
             contextWindow = readiness.contextWindow
 
             if readiness.supportsChat {
+                connectedClient = client
                 connectionState = .ready
             } else if readiness.loading {
                 connectionState = .loading(readiness.progress)
@@ -105,6 +129,11 @@ final class ChatViewModel: ObservableObject {
                     ?? "The server is reachable, but no generation model is ready."
             }
         } catch {
+            guard connectionID == attemptID else { return }
+            if Task.isCancelled || error is CancellationError {
+                invalidateConnection()
+                return
+            }
             connectionState = .failed
             errorMessage = Self.describe(error)
         }
@@ -112,7 +141,7 @@ final class ChatViewModel: ObservableObject {
 
     func send() {
         let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard canSend, !prompt.isEmpty, let modelName else { return }
+        guard canSend, !prompt.isEmpty, let modelName, let client = connectedClient else { return }
 
         errorMessage = nil
         metrics = nil
@@ -123,11 +152,13 @@ final class ChatViewModel: ObservableObject {
         }
         let assistantID = UUID()
         messages.append(DesktopMessage(id: assistantID, role: .assistant, content: ""))
+        activeGenerationID = assistantID
         isGenerating = true
 
         generationTask = Task { [weak self] in
             guard let self else { return }
             await self.performGeneration(
+                client: client,
                 model: modelName,
                 requestMessages: requestMessages,
                 assistantID: assistantID
@@ -136,9 +167,12 @@ final class ChatViewModel: ObservableObject {
     }
 
     func stop() {
+        let assistantID = activeGenerationID
+        activeGenerationID = nil
         generationTask?.cancel()
         generationTask = nil
         isGenerating = false
+        if let assistantID { removeEmptyAssistant(assistantID) }
     }
 
     func clearConversation() {
@@ -149,6 +183,7 @@ final class ChatViewModel: ObservableObject {
     }
 
     private func performGeneration(
+        client: any BloomAPITransport,
         model: String,
         requestMessages: [APIChatMessage],
         assistantID: UUID
@@ -158,9 +193,9 @@ final class ChatViewModel: ObservableObject {
         var usage: ChatCompletionChunk.Usage?
 
         do {
-            let client = try BloomAPIClient(serverURL: serverURL, apiKey: apiKey)
+            try Task.checkCancellation()
             try await client.streamChat(model: model, messages: requestMessages) { [weak self] chunk in
-                guard let self else { return }
+                guard let self, self.activeGenerationID == assistantID, !Task.isCancelled else { return }
                 usage = chunk.usage ?? usage
                 let content = chunk.choices.first?.delta.content ?? ""
                 guard !content.isEmpty else { return }
@@ -172,6 +207,7 @@ final class ChatViewModel: ObservableObject {
                 }
             }
 
+            guard activeGenerationID == assistantID, !Task.isCancelled else { return }
             let finished = Date()
             metrics = GenerationMetrics(
                 promptTokens: usage?.promptTokens,
@@ -179,23 +215,32 @@ final class ChatViewModel: ObservableObject {
                 ttftMilliseconds: firstTokenAt.map { $0.timeIntervalSince(started) * 1_000 },
                 elapsedMilliseconds: finished.timeIntervalSince(started) * 1_000
             )
-        } catch is CancellationError {
-            if let index = messages.firstIndex(where: { $0.id == assistantID }),
-               messages[index].content.isEmpty
-            {
-                messages.remove(at: index)
-            }
         } catch {
-            errorMessage = Self.describe(error)
-            if let index = messages.firstIndex(where: { $0.id == assistantID }),
-               messages[index].content.isEmpty
-            {
-                messages.remove(at: index)
+            guard activeGenerationID == assistantID else { return }
+            if !Task.isCancelled && !(error is CancellationError) {
+                errorMessage = Self.describe(error)
             }
+            removeEmptyAssistant(assistantID)
         }
 
+        guard activeGenerationID == assistantID else { return }
+        activeGenerationID = nil
         isGenerating = false
         generationTask = nil
+    }
+
+    private func removeEmptyAssistant(_ id: UUID) {
+        if let index = messages.firstIndex(where: { $0.id == id }), messages[index].content.isEmpty {
+            messages.remove(at: index)
+        }
+    }
+
+    private func invalidateConnection() {
+        connectionID = UUID()
+        connectedClient = nil
+        modelName = nil
+        contextWindow = nil
+        connectionState = .disconnected
     }
 
     private static func describe(_ error: Error) -> String {

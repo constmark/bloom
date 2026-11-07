@@ -278,8 +278,17 @@ pub(crate) fn rank_embedding_documents(
 
 pub(crate) fn rank_native_rerank_scores(
     scores: &[f32],
+    document_count: usize,
     top_n: usize,
 ) -> std::result::Result<Vec<RerankScore>, String> {
+    // Validate the entire backend result before top_n can hide missing or
+    // extra scores. Every score must retain its request document identity.
+    if scores.len() != document_count {
+        return Err(format!(
+            "Native rerank returned {} scores for {document_count} documents.",
+            scores.len()
+        ));
+    }
     if scores.is_empty() {
         return Err("Native rerank returned no scores.".to_string());
     }
@@ -376,12 +385,22 @@ mod tests {
 
     #[test]
     fn native_rerank_scores_are_finite_bounded_and_stable() {
-        let scores = rank_native_rerank_scores(&[0.1, 0.9, 0.9], 2).unwrap();
+        let scores = rank_native_rerank_scores(&[0.1, 0.9, 0.9], 3, 2).unwrap();
         assert_eq!(scores[0].index, 1);
         assert_eq!(scores[1].index, 2);
         assert!((scores[0].relevance_score - 0.9_f64).abs() < 1e-6);
-        assert!(rank_native_rerank_scores(&[f32::NAN], 1).is_err());
-        assert!(rank_native_rerank_scores(&[], 1).is_err());
-        assert!(rank_native_rerank_scores(&[0.1], 0).is_err());
+        assert!(rank_native_rerank_scores(&[f32::NAN], 1, 1).is_err());
+        assert!(rank_native_rerank_scores(&[], 0, 1).is_err());
+        assert!(rank_native_rerank_scores(&[0.1], 1, 0).is_err());
+    }
+
+    #[test]
+    fn native_rerank_rejects_missing_or_extra_scores_before_top_n_selection() {
+        // Both cases used to return a plausible top result while silently
+        // scoring the wrong document set.
+        assert!(rank_native_rerank_scores(&[0.9], 2, 1).is_err());
+        assert!(rank_native_rerank_scores(&[0.9, 0.1, 0.2], 2, 1).is_err());
+        // A malformed score outside the selected top_n must also fail closed.
+        assert!(rank_native_rerank_scores(&[0.9, f32::NAN], 2, 1).is_err());
     }
 }

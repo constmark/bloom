@@ -25,7 +25,8 @@ python3 scripts/check_toolchain_consistency.py
 ```
 
 `rust-toolchain.toml` pins the compiler used for current development and release
-validation. This is not an MSRV declaration. Update the toolchain file, every
+validation and is also declared as the workspace minimum Rust version. Update
+the workspace `rust-version`, toolchain file, every
 `dtolnay/rust-toolchain` workflow reference, and the Docker builder tag in one
 change; the consistency check rejects partial updates.
 

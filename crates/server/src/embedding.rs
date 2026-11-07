@@ -221,7 +221,7 @@ async fn execute_embedding_batch_inner(
             axum::http::StatusCode::UNPROCESSABLE_ENTITY,
             "unsupported_operation",
             format!(
-                "Model '{model_id}' serves numeric tensors and cannot serve embedding or reranking requests. Use its Rust or CLI tensor interface."
+                "Model '{model_id}' serves numeric tensors and cannot serve embedding or reranking requests. Use POST /v1/tensors/infer."
             ),
         ));
     }
@@ -314,7 +314,7 @@ async fn execute_embedding_batch_inner(
                 EmbeddingProjection::Rerank { top_n } => top_n,
                 _ => unreachable!(),
             };
-            return rank_native_rerank_scores(&scores, top_n)
+            return rank_native_rerank_scores(&scores, documents.len(), top_n)
                 .map(EmbeddingBatchOutput::Rerank)
                 .map_err(EmbeddingWorkerError::InvalidOutput);
         }

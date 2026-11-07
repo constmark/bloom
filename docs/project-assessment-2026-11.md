@@ -31,6 +31,103 @@ The follow-up closes these additional implementation gaps:
 | Numeric acquisition | TensorRT .plan/.engine verified import/download, catalog scan/resolve, source inspection and signed-index publication/consumption; browser validators and file pickers share the contract | Two-suffix transaction, exact identity, schema positive/negative and UI tests preserve operator authorization, source-host, SHA-256, quota and no-overwrite checks. Acquisition does not establish GPU execution. |
 | Numeric task/output | Tensor task identity, zero KV accounting, readiness/preflight/client validation and generation isolation; CLI preserves numeric buffered/stream output and --json envelopes; collecting numeric stream chunks retains their vectors | macOS client, UI, Rust/CLI and protocol regressions distinguish numeric prediction from generation and sentence embeddings. See [CLI](numeric-cli.md). |
 
+## Continuation — 2026-11-07: lifecycle and streaming reliability
+
+A cross-layer source review found additional defects despite the existing
+passing suites. This pass preserves the in-progress Laya changes and focuses
+on observable failures, resource ownership and regression coverage.
+
+| Area | Defect | Implemented correction |
+| --- | --- | --- |
+| Resource eviction | Failed or panicking offload callbacks had already released their memory accounting; concurrent reservations could reuse memory still occupied by the model | Retain RAM/VRAM/cache and residency until successful offload, exclude in-flight lease IDs, skip failed victims within a reservation, and commit by lease identity. Reentrant callbacks remain outside the coordinator lock. |
+| KV scheduling | Aegaeon scoring multiplied by cache cost despite the intended inverse-cost policy; invalid thresholds bypassed admission; large chunk/token counts overflowed | Divide by cache cost, reject non-finite/out-of-range thresholds, count zero-capacity rejections, skip empty victims, saturate telemetry and check request token arithmetic before any eviction. |
+| Server streaming | Internal SSE framing repeatedly scanned/copied accumulated data and omitted legal line endings and empty data fields | Single-pass incremental framing with existing size/UTF-8/truncation limits; split-boundary, mixed CR/LF/CRLF and large-frame regressions. |
+| Reranking | Missing/extra backend scores could be concealed by top-N projection | Require exactly one score per input document before sorting or projection. |
+| Readiness | Replacing a resident model could publish `ready` with loading/progress/error fields that violated the client's contract | Derive HTTP readiness from the published snapshot, returning 503 during replacement/failure while preserving the old runtime's inference lease. |
+| Desktop launcher | Any HTTP 200/503 was accepted; fragmented responses failed; config-file ports and short `-p` were ignored; errors could leave the server child alive | Validate the complete schema-v3 document and HTTP status within header/body/time budgets, honor the server configuration and CLI overrides, register signal handlers before child creation, and own cleanup through a drop guard. |
+| Native macOS client | Stop-and-resend let stale requests clear newer state; edited connection settings reused old readiness; readiness/SSE could buffer without limits | Isolate generation and connection identities, snapshot the validated client, invalidate edited credentials/endpoints, cap readiness while reading, and parse bounded complete SSE events incrementally. |
+
+The native regression harness now exercises asynchronous stale-success/error,
+connection cancellation, bounded response parsing and real URLSession protocol
+fixtures without adding an XCTest dependency. The launcher uses the packaged
+readiness example as a fixture and tests missing fields, incompatible ranges,
+inconsistent state, truncation, fragmentation, configuration and child reaping.
+
+Validation on macOS/aarch64 with Rust 1.97.1:
+
+- Workspace: **1,218 passed**, zero failures/ignored cases, including doc tests.
+- Strict workspace/all-target Clippy (`-D warnings -A missing_docs`), default
+  formatting and no-default-feature/all-target checking passed.
+- Elderwand integration workspace: **936 passed**, including doc tests.
+- Web UI: **144 passed**. Python SDK: **31 run**, one native-library case
+  skipped. Tooling scripts: **149 run**, three environment-gated cases skipped.
+- Native macOS parser/readiness/async lifecycle checks and Swift build passed.
+- Generated, untrained Qwen2 single-file/sharded, IFB, embedding, rerank,
+  structured-output and function-call HTTP smoke gates passed. The optional
+  Ollama Python SDK was unavailable and its subchecks were skipped; this run
+  does not claim that SDK coverage.
+- A real no-model server launched on a config-file port passed the launcher's
+  bounded handshake; SIGTERM reached the child, both exited successfully and
+  the listening socket closed.
+- Architecture, readiness-contract, JSON artifact, toolchain consistency and
+  local Markdown-link gates passed. The shell initially selected Homebrew Rust
+  1.94 despite the installed pin; final Rust checks explicitly used the pinned
+  toolchain. A concurrent intermediate build invalidated a doctest artifact;
+  the serial full rerun above passed.
+
+Remaining product gaps include the native macOS client's chat-only workspace
+(no persistent conversations, model management or encoder UI), the declared but
+unused KV `retention_ratio` policy, large scheduler/executor modules, and the
+model/hardware/evidence inventory below. These are not represented as completed
+features or stable deployment claims.
+
+## Interface completion — 2026-11-07
+
+This follow-up adds four executable HTTP routes while reusing the existing
+engine contracts and request/runtime lifecycle:
+
+| Interface | Implemented behavior | Explicit boundary |
+| --- | --- | --- |
+| `POST /v1/tokenize` | Exact model-owned token IDs and count, versioned response and exact model identity | No word-count approximation, chat templating or invented IDs; 256 KiB text and 65,536 tokens. See [contract](tokenization-api.md). |
+| `POST /v1/detokenize` | Exact decoding with vocabulary validation on Candle and declared tokenizer processors | Special-token/normalization behavior belongs to the adapter; unsupported decoding fails explicitly. |
+| `POST /v1/tensors/infer` | CoreML flat arrays and TensorRT named tensors, checked dimensions, preserved integer JSON and finite flat output | Numeric output is not an embedding and has no invented dimensional shape; target vendor runtime remains required. See [contract](tensor-api.md). |
+| `POST /v1/audio/transcriptions` | Multipart WAV input and JSON/text transcription with exact model selection and bounded output | PCM16 mono, 8–48 kHz, nonempty recording up to 60 seconds; unsupported controls/formats fail explicitly. See [contract](audio-transcriptions.md). |
+
+All routes share authentication, protocol error normalization, correlation and
+no-store policies. Blocking workers retain the exact model lease and concurrency
+permit until execution finishes after disconnect or cancellation. Numeric/audio
+results do not inflate generated language-token counters. WAV parsing validates
+bounded metadata before admission; decoded floats are allocated only inside the
+admitted blocking worker. ASR partial snapshots and final deltas do not duplicate
+text, and an empty delta cannot erase a prior snapshot.
+
+The Elderwand remote proxy now forwards tokenizer/tensor routes, preserves
+query controls for worker rejection, and forwards transcription multipart bytes
+unchanged. Invalid query requests do not trigger model switches. Multipart
+model selection stays with the active worker rather than parsing audio bytes
+as JSON. Worker discovery lists the new available interfaces.
+
+Real CoreML startup exposed a stale server allowlist: the adapters already
+reported verified CPU-only/CoreML and CUDA/TensorRT placement, but strict server
+admission rejected their names. The allowlist now includes both while retaining
+the adapter probes, exact physical-device check and memory accounting.
+
+Default workspace regression passes **1,238 tests**. Engine/server tests with
+no default features pass **879 tests**; this also fixes existing preflight
+fixtures that incorrectly assumed Candle was compiled and could wait forever
+for rejected model loads. Lifecycle/memory tests now use ONNX metadata fixtures,
+while feature-off tests explicitly assert native Candle rejection. Elderwand
+integration passes **939 tests**, including native-route proxy checks.
+
+The reproducible [HTTP smoke script](../scripts/native_operation_smoke.py) uses
+an isolated configuration, local existing models and no downloads. A generated
+untrained Qwen2 fixture verifies exact tokenization/decoding plus authenticated
+HTTP and task-isolation behavior. A real macOS CoreML CPU affine model also
+passes the HTTP route with `[1,2,3] -> [4.5]`, including exact model identity,
+authentication, unsupported-field/query rejection and tokenizer task isolation.
+Broader trained tokenizer coverage, TensorRT
+GPU execution and trained ASR quality remain target-specific evidence gates.
+
 ## Remaining capability inventory
 
 | Domain | Still incomplete | Required closure |

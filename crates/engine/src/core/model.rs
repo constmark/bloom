@@ -186,6 +186,12 @@ pub trait LoadedModel: Send + Sync {
         None
     }
 
+    /// Exact token decoding when supported by the adapter. Unsupported adapters
+    /// return `None`; invalid token IDs must return an error, not disappear.
+    fn detokenize(&self, _tokens: &[u32]) -> Option<Result<String>> {
+        None
+    }
+
     /// Export the current model state (KV cache, latent state, audio
     /// window, etc.) as an opaque blob for migration across backends.
     ///

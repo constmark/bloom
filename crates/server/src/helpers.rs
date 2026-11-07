@@ -1489,77 +1489,7 @@ pub(crate) struct ResponsesSseEvent {
     pub data: serde_json::Value,
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct ChatSseDecoder {
-    pending: Vec<u8>,
-}
-
-impl ChatSseDecoder {
-    pub(crate) fn push(&mut self, bytes: &[u8]) -> std::result::Result<Vec<String>, String> {
-        if bytes.len() > MAX_RESPONSES_STREAM_FRAME_BYTES {
-            return Err(format!(
-                "The internal chat stream emitted a transport chunk larger than {MAX_RESPONSES_STREAM_FRAME_BYTES} bytes."
-            ));
-        }
-        self.pending.extend_from_slice(bytes);
-        let mut data_events = Vec::new();
-        while let Some((frame_end, separator_len)) = sse_frame_boundary(&self.pending) {
-            if frame_end > MAX_RESPONSES_STREAM_FRAME_BYTES {
-                return Err(format!(
-                    "The internal chat stream emitted an SSE frame larger than {MAX_RESPONSES_STREAM_FRAME_BYTES} bytes."
-                ));
-            }
-            let tail = self.pending.split_off(frame_end + separator_len);
-            let frame = std::mem::replace(&mut self.pending, tail);
-            if let Some(data) = sse_frame_data(&frame[..frame_end])? {
-                data_events.push(data);
-            }
-        }
-        if self.pending.len() > MAX_RESPONSES_STREAM_FRAME_BYTES {
-            return Err(format!(
-                "The internal chat stream contains an unterminated SSE frame larger than {MAX_RESPONSES_STREAM_FRAME_BYTES} bytes."
-            ));
-        }
-        Ok(data_events)
-    }
-
-    pub(crate) fn finish(&self) -> std::result::Result<(), String> {
-        if self.pending.iter().all(u8::is_ascii_whitespace) {
-            Ok(())
-        } else {
-            Err("The internal chat stream ended with an incomplete SSE frame.".to_string())
-        }
-    }
-}
-
-fn sse_frame_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
-    for index in 0..bytes.len() {
-        if bytes.get(index..index + 4) == Some(b"\r\n\r\n") {
-            return Some((index, 4));
-        }
-        if bytes.get(index..index + 2) == Some(b"\n\n") {
-            return Some((index, 2));
-        }
-    }
-    None
-}
-
-fn sse_frame_data(frame: &[u8]) -> std::result::Result<Option<String>, String> {
-    let text = std::str::from_utf8(frame)
-        .map_err(|_| "The internal chat stream emitted invalid UTF-8 SSE data.".to_string())?;
-    let mut data = String::new();
-    for raw_line in text.split('\n') {
-        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
-        let Some(value) = line.strip_prefix("data:") else {
-            continue;
-        };
-        if !data.is_empty() {
-            data.push('\n');
-        }
-        data.push_str(value.strip_prefix(' ').unwrap_or(value));
-    }
-    Ok((!data.is_empty()).then_some(data))
-}
+pub(crate) use crate::sse::ChatSseDecoder;
 
 fn parse_streamed_chat_tool_calls(
     value: &serde_json::Value,

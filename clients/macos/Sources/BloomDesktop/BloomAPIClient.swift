@@ -1,6 +1,15 @@
 import Foundation
 
-struct BloomAPIClient {
+protocol BloomAPITransport {
+    @MainActor func readiness() async throws -> BloomReadiness
+    @MainActor func streamChat(
+        model: String,
+        messages: [APIChatMessage],
+        onChunk: (ChatCompletionChunk) -> Void
+    ) async throws
+}
+
+struct BloomAPIClient: BloomAPITransport {
     private static let maxReadinessResponseBytes = 64 * 1024
 
     let serverURL: URL
@@ -33,20 +42,25 @@ struct BloomAPIClient {
         request.cachePolicy = .reloadIgnoringLocalCacheData
         applyHeaders(to: &request)
 
-        let (data, response) = try await session.data(for: request)
+        let (bytes, response) = try await session.bytes(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw BloomClientError.invalidHTTPResponse
         }
         guard (200 ... 599).contains(http.statusCode) else {
             throw BloomClientError.invalidHTTPResponse
         }
+        var data = Data()
+        for try await byte in bytes {
+            try Task.checkCancellation()
+            guard data.count < Self.maxReadinessResponseBytes else {
+                throw BloomClientError.incompatibleServer
+            }
+            data.append(byte)
+        }
         guard http.statusCode == 200 || http.statusCode == 503 else {
             throw BloomClientError.http(http.statusCode, Self.errorMessage(from: data))
         }
 
-        guard data.count <= Self.maxReadinessResponseBytes else {
-            throw BloomClientError.incompatibleServer
-        }
         do {
             let readiness = try JSONDecoder().decode(BloomReadiness.self, from: data)
             try readiness.validate()
@@ -94,11 +108,15 @@ struct BloomAPIClient {
             }
             throw BloomClientError.http(http.statusCode, Self.errorMessage(from: errorData))
         }
+        guard http.mimeType?.lowercased() == "text/event-stream" else {
+            throw BloomClientError.malformedStream
+        }
 
         var receivedDone = false
-        for try await line in bytes.lines {
+        var parser = SSEParser()
+        for try await byte in bytes {
             try Task.checkCancellation()
-            guard let event = SSEParser.parse(line: line) else {
+            guard let event = try parser.append(byte) else {
                 continue
             }
             switch event {

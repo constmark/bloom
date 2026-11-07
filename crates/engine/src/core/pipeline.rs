@@ -522,6 +522,57 @@ impl InferencePipeline {
         self.memory_estimate.as_ref()
     }
 
+    /// Encode with an actual model tokenizer, never a token-count approximation.
+    /// `None` means no exact tokenizer is exposed; `Some(Err(_))` preserves a
+    /// backend failure without falling back to fabricated token IDs.
+    pub fn tokenize_exact(&self, text: &str) -> Option<Result<Vec<u32>>> {
+        if let Some(result) = self.model.tokenize(text) {
+            return Some(result);
+        }
+        let registry = self.model.processors()?;
+        let spec = registry
+            .specs()
+            .into_iter()
+            .find(|spec| spec.kind == bloomai_core::ProcessorKind::TextTokenizer)?;
+        Some((|| {
+            let processor = registry.get(&spec.name)?;
+            let mut blocks =
+                processor.process(vec![crate::io::DataBlock::Text(text.to_string())])?;
+            match blocks.pop().filter(|_| blocks.is_empty()) {
+                Some(crate::io::DataBlock::Tokens(tokens)) => Ok(tokens),
+                _ => Err(BloomError::Engine(
+                    "tokenizer did not return exactly one token sequence".into(),
+                )
+                .into()),
+            }
+        })())
+    }
+
+    /// Decode with an actual model tokenizer, without a text approximation.
+    /// Special-token handling is owned by the model adapter.
+    pub fn detokenize_exact(&self, tokens: &[u32]) -> Option<Result<String>> {
+        if let Some(result) = self.model.detokenize(tokens) {
+            return Some(result);
+        }
+        let registry = self.model.processors()?;
+        let spec = registry
+            .specs()
+            .into_iter()
+            .find(|spec| spec.kind == bloomai_core::ProcessorKind::TextTokenizer)?;
+        Some((|| {
+            let processor = registry.get(&spec.name)?;
+            let mut blocks =
+                processor.process(vec![crate::io::DataBlock::Tokens(tokens.to_vec())])?;
+            match blocks.pop().filter(|_| blocks.is_empty()) {
+                Some(crate::io::DataBlock::Text(text)) => Ok(text),
+                _ => Err(BloomError::Engine(
+                    "tokenizer did not return exactly one text value".into(),
+                )
+                .into()),
+            }
+        })())
+    }
+
     /// Tokenize text with the exact tokenizer owned by the loaded model.
     /// Processor-based tokenizers remain supported for non-Candle backends;
     /// the final approximation is only for engines that expose neither.
@@ -549,20 +600,9 @@ impl InferencePipeline {
 
     /// Detokenize token IDs back into a string using model processors
     pub fn detokenize(&self, tokens: &[u32]) -> Result<String> {
-        if let Some(registry) = self.model.processors() {
-            for name in registry.specs().iter().map(|s| &s.name) {
-                if name.contains("tokenizer")
-                    && let Ok(proc) = registry.get(name)
-                {
-                    let blocks =
-                        proc.process(vec![crate::io::DataBlock::Tokens(tokens.to_vec())])?;
-                    if let Some(crate::io::DataBlock::Text(text)) = blocks.first() {
-                        return Ok(text.clone());
-                    }
-                }
-            }
-        }
-        Err(BloomError::Engine("No tokenizer processor found".into()).into())
+        self.detokenize_exact(tokens).unwrap_or_else(|| {
+            Err(BloomError::Engine("No tokenizer processor found".into()).into())
+        })
     }
 }
 
@@ -724,6 +764,26 @@ mod tests {
                 video: None,
             })
         }
+    }
+
+    #[test]
+    fn exact_tokenization_never_exposes_the_legacy_approximation() {
+        let model = DummyEngine {
+            loaded: Arc::new(AtomicBool::new(false)),
+            actual_device: None,
+        }
+        .load(Path::new("unused"), DeviceKind::Cpu)
+        .unwrap();
+        let pipeline = InferencePipeline {
+            model: Arc::from(model),
+            lease: None,
+            memory_estimate: None,
+            context_size: 128,
+            device: DeviceKind::Cpu,
+        };
+        assert_eq!(pipeline.tokenize("two words").unwrap(), vec![0, 0]);
+        assert!(pipeline.tokenize_exact("two words").is_none());
+        assert!(pipeline.detokenize_exact(&[0, 0]).is_none());
     }
 
     #[test]

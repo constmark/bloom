@@ -12,6 +12,9 @@
 //! bloom_desktop -- --models-dir ~/.bloom/models --device auto
 //! ```
 
+#[path = "bloom_desktop/readiness.rs"]
+mod readiness;
+
 use std::ffi::OsString;
 use std::io::{self, Read};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -88,21 +91,22 @@ fn run(args: Args) -> Result<()> {
         );
     }
 
-    let mut child = spawn_server(&server_bin, &args.server_args)?;
     let signals = start_signal_listener()?;
+    let mut owned_child = OwnedChild(spawn_server(&server_bin, &args.server_args)?);
+    let child = &mut owned_child.0;
     match wait_for_server(
-        &mut child,
+        child,
         &target,
         Duration::from_secs(args.wait_seconds),
         &signals,
     ) {
         Ok(true) => {}
         Ok(false) => {
-            let status = wait_for_child_after_shutdown(&mut child, &signals)?;
+            let status = wait_for_child_after_shutdown(child, &signals)?;
             return report_exit(status);
         }
         Err(error) => {
-            terminate_child(&mut child);
+            terminate_child(child);
             return Err(error);
         }
     }
@@ -115,8 +119,19 @@ fn run(args: Args) -> Result<()> {
     }
     eprintln!("Bloom UI is available at {url}; press Ctrl-C to stop the server.");
 
-    let status = wait_for_child(&mut child, &signals)?;
+    let status = wait_for_child(child, &signals)?;
     report_exit(status)
+}
+
+/// Kill and reap on every error path, including signal-listener failure.
+struct OwnedChild(Child);
+
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+            terminate_child(&mut self.0);
+        }
+    }
 }
 
 fn spawn_server(server_bin: &Path, server_args: &[OsString]) -> Result<Child> {
@@ -197,23 +212,35 @@ fn readiness_probe(target: &ServerTarget) -> io::Result<()> {
         use std::io::Write;
         write!(
             stream,
-            "GET /ready HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-            host_header
+            "GET /ready HTTP/1.0\r\nHost: {}:{}\r\nConnection: close\r\n\r\n",
+            host_header, target.port
         )?;
-        let mut response = [0_u8; 256];
-        let count = stream.read(&mut response)?;
-        let line = std::str::from_utf8(&response[..count]).unwrap_or_default();
-        let status = line
-            .strip_prefix("HTTP/")
-            .and_then(|rest| rest.split_whitespace().nth(1))
-            .and_then(|value| value.parse::<u16>().ok());
-        return match status {
-            Some(200 | 503) => Ok(()),
-            Some(code) => Err(io::Error::other(format!(
-                "Bloom readiness returned HTTP {code}"
-            ))),
-            None => Err(io::Error::other("Bloom readiness response was malformed")),
-        };
+        // Read to the HTTP/1.0 connection close, with both byte and wall-clock
+        // budgets. A single TCP read is not a complete HTTP status or JSON body.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let mut response = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "readiness probe timed out",
+                ));
+            }
+            stream.set_read_timeout(Some(remaining))?;
+            let count = stream.read(&mut chunk)?;
+            if count == 0 {
+                break;
+            }
+            if response.len() + count > readiness::MAX_RESPONSE_BYTES {
+                return Err(io::Error::other(
+                    "Bloom readiness response exceeds byte limit",
+                ));
+            }
+            response.extend_from_slice(&chunk[..count]);
+        }
+        return readiness::validate_response(&response);
     }
     Err(last_error.unwrap_or_else(|| io::Error::other("could not connect to Bloom")))
 }
@@ -289,6 +316,7 @@ fn receive_signal(signals: &Receiver<SignalEvent>) -> Result<Option<SignalEvent>
 
 fn start_signal_listener() -> Result<Receiver<SignalEvent>> {
     let (sender, receiver) = mpsc::channel();
+    let (installed, ready) = mpsc::channel();
     thread::Builder::new()
         .name("bloom-desktop-signals".to_string())
         .spawn(move || {
@@ -308,7 +336,7 @@ fn start_signal_listener() -> Result<Receiver<SignalEvent>> {
             let error_sender = sender.clone();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 runtime.block_on(async move {
-                    if let Err(error) = process_signal_loop(sender).await {
+                    if let Err(error) = process_signal_loop(sender, installed).await {
                         let _ = error_sender.send(SignalEvent::ListenerError(error));
                     }
                 });
@@ -322,16 +350,25 @@ fn start_signal_listener() -> Result<Receiver<SignalEvent>> {
             }
         })
         .context("failed to start desktop signal listener")?;
+    // Do not spawn the server until signal handlers actually exist. A parent
+    // killed by the default signal action cannot run its child cleanup guard.
+    ready
+        .recv_timeout(Duration::from_secs(5))
+        .context("desktop signal listener did not become ready")?;
     Ok(receiver)
 }
 
-async fn process_signal_loop(sender: mpsc::Sender<SignalEvent>) -> Result<(), String> {
+async fn process_signal_loop(
+    sender: mpsc::Sender<SignalEvent>,
+    installed: mpsc::Sender<()>,
+) -> Result<(), String> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
         let mut interrupt = signal(SignalKind::interrupt()).map_err(|error| error.to_string())?;
         let mut terminate = signal(SignalKind::terminate()).map_err(|error| error.to_string())?;
         let mut hangup = signal(SignalKind::hangup()).map_err(|error| error.to_string())?;
+        let _ = installed.send(());
         loop {
             tokio::select! {
                 signal = interrupt.recv() => signal.map(|_| ()).ok_or_else(|| "SIGINT listener closed".to_string()),
@@ -350,6 +387,7 @@ async fn process_signal_loop(sender: mpsc::Sender<SignalEvent>) -> Result<(), St
         let mut break_signal = ctrl_break().map_err(|error| error.to_string())?;
         let mut close = ctrl_close().map_err(|error| error.to_string())?;
         let mut shutdown = ctrl_shutdown().map_err(|error| error.to_string())?;
+        let _ = installed.send(());
         loop {
             tokio::select! {
                 signal = interrupt.recv() => signal,
@@ -365,6 +403,7 @@ async fn process_signal_loop(sender: mpsc::Sender<SignalEvent>) -> Result<(), St
     }
     #[cfg(not(any(unix, windows)))]
     {
+        let _ = installed.send(());
         loop {
             tokio::signal::ctrl_c()
                 .await
@@ -416,8 +455,40 @@ fn default_server_binary() -> Option<PathBuf> {
 }
 
 fn server_target(args: &[OsString]) -> Result<ServerTarget> {
-    let mut host = DEFAULT_HOST.to_string();
-    let mut port = DEFAULT_PORT;
+    let config_path = config_argument(args)?;
+    let config =
+        bloomai_app::load_config(&bloomai_app::resolve_config_path(config_path.as_deref())?)?;
+    server_target_with_config(args, &config.server)
+}
+
+fn config_argument(args: &[OsString]) -> Result<Option<PathBuf>> {
+    let mut config = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].to_string_lossy();
+        if arg == "--config" {
+            index += 1;
+            config = Some(PathBuf::from(
+                args.get(index)
+                    .ok_or_else(|| anyhow!("--config requires a value"))?,
+            ));
+        } else if let Some(value) = arg.strip_prefix("--config=") {
+            config = Some(PathBuf::from(value));
+        }
+        index += 1;
+    }
+    Ok(config)
+}
+
+fn server_target_with_config(
+    args: &[OsString],
+    config: &bloomai_app::ServerConfig,
+) -> Result<ServerTarget> {
+    let mut host = config
+        .host
+        .clone()
+        .unwrap_or_else(|| DEFAULT_HOST.to_string());
+    let mut port = config.port.unwrap_or(DEFAULT_PORT);
     let mut index = 0;
     while index < args.len() {
         let arg = args[index].to_string_lossy();
@@ -430,7 +501,7 @@ fn server_target(args: &[OsString]) -> Result<ServerTarget> {
                 .into_owned();
         } else if let Some(value) = arg.strip_prefix("--host=") {
             host = value.to_string();
-        } else if arg == "--port" {
+        } else if arg == "--port" || arg == "-p" {
             index += 1;
             port = args
                 .get(index)
@@ -438,7 +509,11 @@ fn server_target(args: &[OsString]) -> Result<ServerTarget> {
                 .to_string_lossy()
                 .parse()
                 .context("--port must be a valid u16")?;
-        } else if let Some(value) = arg.strip_prefix("--port=") {
+        } else if let Some(value) = arg
+            .strip_prefix("--port=")
+            .or_else(|| arg.strip_prefix("-p="))
+            .or_else(|| arg.strip_prefix("-p").filter(|v| !v.is_empty()))
+        {
             port = value.parse().context("--port must be a valid u16")?;
         }
         index += 1;
@@ -555,7 +630,8 @@ mod tests {
     #[test]
     fn target_defaults_to_loopback_port() {
         assert_eq!(
-            server_target(&[]).expect("default target"),
+            server_target_with_config(&[], &bloomai_app::ServerConfig::default())
+                .expect("default target"),
             ServerTarget {
                 host: DEFAULT_HOST.to_string(),
                 port: DEFAULT_PORT,
@@ -591,6 +667,51 @@ mod tests {
         assert_eq!(display_host("::"), "[::1]");
     }
 
+    #[test]
+    fn target_uses_config_and_short_port_overrides() {
+        let config = bloomai_app::ServerConfig {
+            host: Some("0.0.0.0".into()),
+            port: Some(4010),
+            ..Default::default()
+        };
+        assert_eq!(server_target_with_config(&[], &config).unwrap().port, 4010);
+        for args in [
+            os_args(&["-p", "4011"]),
+            os_args(&["-p4011"]),
+            os_args(&["-p=4011"]),
+        ] {
+            assert_eq!(
+                server_target_with_config(&args, &config).unwrap().port,
+                4011
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"server":{"host":"0.0.0.0","port":4010}}"#).unwrap();
+        let args = vec![OsString::from("--config"), path.into_os_string()];
+        assert_eq!(
+            server_target(&args).unwrap(),
+            ServerTarget {
+                host: "0.0.0.0".into(),
+                port: 4010
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_child_reaps_process_on_error_paths() {
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id() as libc::pid_t;
+        drop(OwnedChild(child));
+        let result = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+        assert_eq!(result, -1);
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+
     fn read_probe_request(stream: &mut TcpStream) {
         let mut request = Vec::new();
         let mut chunk = [0_u8; 256];
@@ -611,9 +732,15 @@ mod tests {
         let worker = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept probe request");
             read_probe_request(&mut stream);
-            stream
-                .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
-                .expect("write probe response");
+            let body = include_str!("../../../../examples/readiness.json");
+            let response = format!(
+                "HTTP/1.0 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            // Exercise fragmented status, headers and body over real TCP.
+            for part in response.as_bytes().chunks(7) {
+                stream.write_all(part).expect("write probe response");
+            }
         });
         readiness_probe(&ServerTarget {
             host: DEFAULT_HOST.to_string(),

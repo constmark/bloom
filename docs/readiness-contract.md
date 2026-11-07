@@ -68,6 +68,19 @@ archives. `scripts/test_server_http_boundary.py` validates the exact staged
 binary's HTTP status, identity, required fields, cache directive, and request
 correlation before an archive is created.
 
+## Desktop launcher behavior
+
+The cross-platform launcher validates the same schema-v3 identity, required
+fields, protocol range, bounded values and ready-state invariants before opening
+the browser. HTTP 200 must carry `ready`; HTTP 503 must carry `not_ready`, so an
+empty catalog remains launchable. Each local HTTP/1.0 probe is bounded to 16 KiB
+of headers, 64 KiB of JSON and a 500 ms response-read deadline. Truncated JSON,
+unrelated health endpoints and incompatible protocols never signal success.
+
+A replacement load or retained load error returns `not_ready` even when the
+previous runtime remains available for inference; readiness describes deployment
+health and does not revoke the previous runtime's owned leases.
+
 ## Browser behavior
 
 The Bloom UI validates the complete required envelope within a 64 KiB response

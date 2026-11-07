@@ -73,7 +73,9 @@ impl ChunkedPrefillState {
             return None;
         }
         let start = self.filled_tokens;
-        let end = (start + self.chunk_size).min(self.prompt_tokens.len());
+        let end = start
+            .saturating_add(self.chunk_size)
+            .min(self.prompt_tokens.len());
         Some((start, &self.prompt_tokens[start..end]))
     }
 
@@ -236,6 +238,24 @@ pub struct PrefillChunk {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maximum_chunk_size_survives_partial_scheduling() {
+        let mut queue = ChunkedPrefillQueue::new(ChunkedPrefillConfig {
+            enabled: true,
+            chunk_size: usize::MAX,
+            ..Default::default()
+        });
+        queue.submit("bounded".into(), vec![10, 20, 30]);
+        for (offset, token) in [10, 20, 30].into_iter().enumerate() {
+            let chunks = queue.schedule_chunks(1);
+            assert_eq!(chunks.len(), 1);
+            assert_eq!(chunks[0].chunk_start, offset);
+            assert_eq!(chunks[0].tokens, vec![token]);
+            assert_eq!(chunks[0].is_final, offset == 2);
+        }
+        assert_eq!(queue.pending_count(), 0);
+    }
 
     #[test]
     fn chunked_prefill_state_basic() {

@@ -7,17 +7,14 @@ private func require(_ condition: @autoclosure () -> Bool, _ message: String) {
 }
 
 let expectedPayload = Data("{\"choices\":[]}".utf8)
+var basicParser = SSEParser()
+let basicEvents = try ": keepalive\nevent: message\ndata: {\"choices\":[]}\n\ndata: [DONE]\r\n\r\n".utf8.compactMap {
+    try basicParser.append($0)
+}
 require(
-    SSEParser.parse(line: "data: {\"choices\":[]}") == .data(expectedPayload),
-    "SSE data payload was not parsed"
+    basicEvents == [.data(expectedPayload), .done],
+    "SSE data, completion, comments, and ignored fields were not parsed"
 )
-require(
-    SSEParser.parse(line: "data: [DONE]\r") == .done,
-    "SSE completion marker was not parsed"
-)
-require(SSEParser.parse(line: ": keepalive") == nil, "SSE comment was not ignored")
-require(SSEParser.parse(line: "event: message") == nil, "Unknown SSE field was not ignored")
-require(SSEParser.parse(line: "") == nil, "Empty SSE line was not ignored")
 
 private func decodeReadiness(_ fixture: String) -> BloomReadiness {
     do {
@@ -253,3 +250,6 @@ let tensorModel = decodeReadiness(
 )
 require(tensorModel.isCompatible, "Tensor readiness should be accepted")
 require(!tensorModel.supportsChat, "Numeric model must not enable chat")
+
+try await runRegressionChecks()
+print("Bloom Desktop stream and lifecycle regression checks passed")

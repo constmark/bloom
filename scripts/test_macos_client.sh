@@ -17,6 +17,8 @@ mkdir -p "${CHECK_DIR}"
 swiftc \
     "${CLIENT_DIR}/Sources/BloomDesktop/APIModels.swift" \
     "${CLIENT_DIR}/Sources/BloomDesktop/BloomAPIClient.swift" \
+    "${CLIENT_DIR}/Sources/BloomDesktop/ChatViewModel.swift" \
+    "${CLIENT_DIR}/Tests/BloomDesktopChecks/RegressionChecks.swift" \
     "${CLIENT_DIR}/Tests/BloomDesktopChecks/main.swift" \
     -o "${CHECK_BIN}"
 "${CHECK_BIN}"

@@ -2798,6 +2798,20 @@ impl LoadedModel for CandleTextModel {
         )
     }
 
+    fn detokenize(&self, tokens: &[u32]) -> Option<Result<String>> {
+        Some((|| {
+            anyhow::ensure!(
+                tokens
+                    .iter()
+                    .all(|id| self.tokenizer.id_to_token(*id).is_some()),
+                "token sequence contains an unknown token ID"
+            );
+            self.tokenizer
+                .decode(tokens, true)
+                .map_err(|error| anyhow!("failed to decode tokens: {error}"))
+        })())
+    }
+
     fn infer(&self, input: ModelInput, params: &GenerationParams) -> Result<ModelOutput> {
         let mut text_parts = Vec::new();
         self.infer_stream(input, params, &mut |chunk: crate::io::OutputChunk| {

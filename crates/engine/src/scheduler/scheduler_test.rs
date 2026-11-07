@@ -596,6 +596,60 @@ mod tests {
     }
 
     #[test]
+    fn oversized_submission_preserves_existing_requests_and_releases_identity() {
+        for enabled in [false, true] {
+            let pool = Arc::new(MockKvPool::new(10));
+            let scheduler = InferenceScheduler::with_config(
+                Arc::new(MockExecutor),
+                pool.clone(),
+                CoreTokenSchedulingConfig {
+                    enabled,
+                    ..Default::default()
+                },
+            );
+            scheduler.submit(request_for_cleanup("existing")).unwrap();
+            let before = scheduler.queue_stats();
+            let mut oversized = request_for_cleanup("oversized");
+            oversized.params.max_tokens = usize::MAX;
+            let error = scheduler.submit(oversized).unwrap_err();
+            assert!(error.to_string().contains("token count exceeds"));
+            assert_eq!(scheduler.queue_stats(), before);
+            assert_eq!(pool.free_slots.lock().unwrap().len(), 9);
+            assert!(
+                !scheduler
+                    .live_request_ids
+                    .lock()
+                    .unwrap()
+                    .contains("oversized")
+            );
+            // A failed attempt must not permanently poison the request ID.
+            scheduler.submit(request_for_cleanup("oversized")).unwrap();
+            assert_eq!(pool.free_slots.lock().unwrap().len(), 8);
+        }
+    }
+
+    #[test]
+    fn invalid_kv_admission_threshold_never_allocates() {
+        for threshold in [f64::NAN, f64::INFINITY, -0.1, 1.1] {
+            let pool = Arc::new(MockKvPool::new(10));
+            let mut config = CoreTokenSchedulingConfig::default();
+            config.kv_eviction.admission_threshold = threshold;
+            let scheduler =
+                InferenceScheduler::with_config(Arc::new(MockExecutor), pool.clone(), config);
+            assert!(
+                scheduler
+                    .submit(request_for_cleanup("invalid-config"))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("admission threshold")
+            );
+            assert_eq!(pool.free_slots.lock().unwrap().len(), 10);
+            assert_eq!(scheduler.queue_stats(), (0, 0, 0));
+            assert!(scheduler.live_request_ids.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
     fn duplicate_submission_preserves_owner_and_terminal_id_can_be_reused() {
         for chunked in [false, true] {
             let pool = Arc::new(BloomKvCachePool::new(4, 8));

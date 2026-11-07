@@ -39,7 +39,8 @@ pub struct KvEvictionConfig {
     /// Eviction strategy.
     #[serde(default)]
     pub policy: KvEvictionPolicy,
-    /// Reject new requests when HBM utilization exceeds this threshold.
+    /// Reject new requests when HBM utilization reaches this threshold.
+    /// Must be finite and in [0, 1]; invalid thresholds reject all admissions.
     #[serde(default = "default_admission_threshold")]
     pub admission_threshold: f64,
     /// Minimum fraction of the KV cache to retain during eviction.
@@ -116,12 +117,12 @@ impl KvSessionInfo {
 }
 
 /// Aegaeon eviction score; lower scores are evicted first.
-/// `score = age * value * cost`; older, higher-value, smaller-cache sessions are protected.
+/// `score = age * value / cost`; older, higher-value, smaller-cache sessions are protected.
 fn aegaeon_score(session: &KvSessionInfo, default_token_value: f64) -> f64 {
     let age = session.age_secs();
     let value = session.token_value(default_token_value);
     let cost = session.session_cost().max(1.0);
-    age * value * cost
+    age * value / cost
 }
 
 /// Eviction candidate used in a priority queue.
@@ -212,7 +213,22 @@ impl KvEvictionManager {
         current_kv_tokens: usize,
         max_kv_tokens: usize,
     ) -> AdmissionResult {
+        if !self.config.admission_threshold.is_finite()
+            || !(0.0..=1.0).contains(&self.config.admission_threshold)
+        {
+            self.total_rejections = self.total_rejections.saturating_add(1);
+            return AdmissionResult::Rejected {
+                current_utilization: if max_kv_tokens == 0 {
+                    1.0
+                } else {
+                    current_kv_tokens as f64 / max_kv_tokens as f64
+                },
+                threshold: 0.0,
+                reason: "KV cache admission threshold must be finite and in [0, 1]".to_string(),
+            };
+        }
         if max_kv_tokens == 0 {
+            self.total_rejections = self.total_rejections.saturating_add(1);
             return AdmissionResult::Rejected {
                 current_utilization: 1.0,
                 threshold: self.config.admission_threshold,
@@ -222,7 +238,7 @@ impl KvEvictionManager {
 
         let utilization = current_kv_tokens as f64 / max_kv_tokens as f64;
         if utilization >= self.config.admission_threshold {
-            self.total_rejections += 1;
+            self.total_rejections = self.total_rejections.saturating_add(1);
             AdmissionResult::Rejected {
                 current_utilization: utilization,
                 threshold: self.config.admission_threshold,
@@ -249,6 +265,10 @@ impl KvEvictionManager {
         let mut heap = BinaryHeap::new();
 
         for session in sessions {
+            // Cancelling an empty session cannot relieve cache pressure.
+            if session.kv_cache_tokens == 0 {
+                continue;
+            }
             let score = match self.config.policy {
                 KvEvictionPolicy::AegaeonScore => {
                     aegaeon_score(session, self.config.default_token_value)
@@ -280,9 +300,11 @@ impl KvEvictionManager {
         while freed < tokens_to_free {
             match heap.pop() {
                 Some(candidate) => {
-                    freed += candidate.kv_cache_tokens;
-                    self.total_evictions += 1;
-                    self.total_evicted_tokens += candidate.kv_cache_tokens;
+                    freed = freed.saturating_add(candidate.kv_cache_tokens);
+                    self.total_evictions = self.total_evictions.saturating_add(1);
+                    self.total_evicted_tokens = self
+                        .total_evicted_tokens
+                        .saturating_add(candidate.kv_cache_tokens);
                     decisions.push(EvictionDecision {
                         request_id: candidate.request_id,
                         freed_tokens: candidate.kv_cache_tokens,
@@ -368,6 +390,66 @@ mod tests {
         let result = mgr.check_admission(900, 1000);
         assert!(matches!(result, AdmissionResult::Rejected { .. }));
         assert_eq!(mgr.total_rejections(), 1);
+    }
+
+    #[test]
+    fn admission_rejects_invalid_thresholds_and_counts_zero_capacity() {
+        for threshold in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 1.1] {
+            let mut manager = KvEvictionManager::new(KvEvictionConfig {
+                admission_threshold: threshold,
+                ..Default::default()
+            });
+            for current_tokens in [0, 100] {
+                let AdmissionResult::Rejected { threshold, .. } =
+                    manager.check_admission(current_tokens, 100)
+                else {
+                    panic!("invalid admission threshold must fail closed");
+                };
+                assert!(threshold.is_finite());
+            }
+            assert_eq!(manager.total_rejections(), 2);
+        }
+        let mut manager = KvEvictionManager::new(KvEvictionConfig::default());
+        assert!(matches!(
+            manager.check_admission(0, 0),
+            AdmissionResult::Rejected { .. }
+        ));
+        assert_eq!(manager.total_rejections(), 1);
+    }
+
+    #[test]
+    fn aegaeon_score_evicts_larger_cache_at_equal_age_and_value() {
+        let small = make_session("small", 5, 100, 10000, 100, Some(1.0));
+        let mut large = small.clone();
+        large.request_id = "large".into();
+        large.kv_cache_tokens = 1000;
+        let mut manager = KvEvictionManager::new(KvEvictionConfig::default());
+        assert!(manager.score_session(&large) < manager.score_session(&small));
+        let decisions = manager.select_eviction_victims(&[small, large], 1000);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].request_id, "large");
+    }
+
+    #[test]
+    fn eviction_skips_sessions_without_cache_and_saturates_accounting() {
+        let mut manager = KvEvictionManager::new(KvEvictionConfig {
+            policy: KvEvictionPolicy::Priority,
+            ..Default::default()
+        });
+        let sessions = [
+            make_session("empty", 0, 0, 1000, 50, None),
+            make_session("large", 1, usize::MAX - 1, 1000, 50, None),
+            make_session("small", 2, 2, 1000, 50, None),
+        ];
+        let decisions = manager.select_eviction_victims(&sessions, usize::MAX);
+        assert_eq!(decisions.len(), 2);
+        assert_eq!(decisions[0].request_id, "large");
+        assert_eq!(decisions[1].request_id, "small");
+        assert_eq!(manager.total_evicted_tokens(), usize::MAX);
+        // Cumulative telemetry must remain valid across eviction passes too.
+        manager.select_eviction_victims(&sessions[2..], 1);
+        assert_eq!(manager.total_evicted_tokens(), usize::MAX);
+        assert_eq!(manager.total_evictions(), 3);
     }
 
     #[test]

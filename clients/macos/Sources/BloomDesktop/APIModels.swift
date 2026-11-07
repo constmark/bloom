@@ -259,25 +259,62 @@ enum SSEEvent: Equatable {
     case done
 }
 
-enum SSEParser {
-    static func parse(line: String) -> SSEEvent? {
-        let normalized = line.hasSuffix("\r") ? String(line.dropLast()) : line
-        guard !normalized.isEmpty, !normalized.hasPrefix(":"), normalized.hasPrefix("data:") else {
-            return nil
-        }
+struct SSEParser {
+    // Bound the raw event, including ignored fields and comments. Parsing bytes
+    // directly avoids AsyncBytes.lines retaining an unbounded unfinished line.
+    static let maximumEventBytes = 1024 * 1024
+    private var line = Data()
+    private var payload = Data()
+    private var hasData = false
+    private var eventBytes = 0
+    private var skipLF = false
+    private var firstLine = true
 
-        var payload = String(normalized.dropFirst("data:".count))
-        if payload.first == " " {
-            payload.removeFirst()
+    mutating func append(_ byte: UInt8) throws -> SSEEvent? {
+        if skipLF {
+            skipLF = false
+            if byte == 0x0A { return nil }
         }
-        if payload == "[DONE]" {
-            return .done
+        eventBytes += 1
+        guard eventBytes <= Self.maximumEventBytes else {
+            throw BloomClientError.streamLimitExceeded
         }
-        guard let data = payload.data(using: .utf8) else {
+        if byte == 0x0D || byte == 0x0A {
+            skipLF = byte == 0x0D
+            return try finishLine()
+        }
+        line.append(byte)
+        return nil
+    }
+
+    private mutating func finishLine() throws -> SSEEvent? {
+        defer { line.removeAll(keepingCapacity: true) }
+        if firstLine {
+            firstLine = false
+            if line.starts(with: [0xEF, 0xBB, 0xBF]) { line.removeFirst(3) }
+        }
+        guard String(data: line, encoding: .utf8) != nil else {
+            throw BloomClientError.malformedStream
+        }
+        if line.isEmpty {
+            eventBytes = 0
+            guard hasData else { return nil }
+            let data = payload
+            payload = Data()
+            hasData = false
+            return data == Data("[DONE]".utf8) ? .done : .data(data)
+        }
+        guard line == Data("data".utf8) || line.starts(with: Data("data:".utf8)) else {
             return nil
         }
-        return .data(data)
+        var value = line.dropFirst(min(5, line.count))
+        if value.first == 0x20 { value = value.dropFirst() }
+        if hasData { payload.append(0x0A) }
+        payload.append(contentsOf: value)
+        hasData = true
+        return nil
     }
+
 }
 
 enum BloomClientError: LocalizedError {
@@ -289,6 +326,7 @@ enum BloomClientError: LocalizedError {
     case streamError(String)
     case malformedStream
     case streamEndedWithoutDone
+    case streamLimitExceeded
 
     var errorDescription: String? {
         switch self {
@@ -308,6 +346,8 @@ enum BloomClientError: LocalizedError {
             return "The server returned malformed streaming data."
         case .streamEndedWithoutDone:
             return "The streaming response ended without a completion marker."
+        case .streamLimitExceeded:
+            return "The server returned a streaming event larger than the 1 MiB limit."
         }
     }
 }

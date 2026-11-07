@@ -39,6 +39,9 @@ See the [edge-engine goal](docs/edge-engine-goal.md),
 - Ollama-compatible discovery, signed-index verified pull, guarded model
   deletion, chat, generate, embedding, structured-output, and function-tool
   endpoints
+- Exact [tokenization APIs](docs/tokenization-api.md), bounded
+  [numeric tensor inference](docs/tensor-api.md), and WAV
+  [audio transcriptions](docs/audio-transcriptions.md)
 - Streaming generation and an interactive terminal mode
 - CPU, Metal, and CUDA execution through Candle
 - GGUF and Hugging Face-style model package support

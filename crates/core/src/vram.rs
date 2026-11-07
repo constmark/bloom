@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
@@ -35,6 +35,9 @@ struct ResourceCoordinatorInner {
     residencies: HashMap<String, ModelResidencyRecord>,
     leases: HashMap<u64, LeaseRecord>,
     caches: HashMap<u64, CacheRecord>,
+    /// Leases whose callbacks are running outside the mutex. Their residency
+    /// and accounting stay live until successful offload or explicit release.
+    evicting_leases: HashSet<u64>,
 }
 
 /// Internal lightweight lease record (the public BackendLease is constructed on demand).
@@ -59,13 +62,12 @@ struct CacheRecord {
     priority: ResourcePriority,
 }
 
-/// Resources removed while satisfying a reservation. Offload callbacks are
+/// Resources selected while satisfying a reservation. Offload callbacks are
 /// carried out after the coordinator mutex is released so user callbacks may
 /// safely inspect or update the coordinator without deadlocking it.
 struct EvictionBatch {
-    models: Vec<String>,
-    callbacks: Vec<(String, OffloadCallback)>,
-    removed: bool,
+    callbacks: Vec<(String, u64, OffloadCallback)>,
+    progressed: bool,
 }
 
 impl ResourceCoordinator {
@@ -81,6 +83,7 @@ impl ResourceCoordinator {
                 residencies: HashMap::new(),
                 leases: HashMap::new(),
                 caches: HashMap::new(),
+                evicting_leases: HashSet::new(),
             }),
             next_lease_id: AtomicU64::new(1),
             next_cache_id: AtomicU64::new(1),
@@ -154,6 +157,9 @@ impl ResourceCoordinator {
             return Err(ResourceError::BudgetExceeded { deficit });
         }
         let mut evicted_models: Vec<String> = Vec::new();
+        // Do not repeatedly invoke a failing callback in the same reservation.
+        // A later reservation may retry after the model's external state heals.
+        let mut failed_evictions = HashSet::new();
         loop {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -235,27 +241,45 @@ impl ResourceCoordinator {
                 });
             }
 
-            let batch = self.try_evict(&mut inner, needed_ram, needed_vram, needed_cache)?;
-            evicted_models.extend(batch.models);
+            let batch = self.try_evict(
+                &mut inner,
+                needed_ram,
+                needed_vram,
+                needed_cache,
+                &failed_evictions,
+            )?;
             drop(inner);
 
             // Never invoke model code while holding the coordinator mutex.
-            for (model_id, callback) in batch.callbacks {
+            for (model_id, lease_id, callback) in batch.callbacks {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback()));
                 match result {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => {
+                        // Commit by lease identity: a callback can explicitly
+                        // release its lease and load a replacement with the
+                        // same model ID without this completion removing it.
+                        self.release(lease_id);
+                        evicted_models.push(model_id);
+                    }
                     Ok(Err(error)) => {
+                        failed_evictions.insert(lease_id);
                         tracing::error!("Failed to evict model '{}': {}", model_id, error);
                     }
                     Err(_) => {
+                        failed_evictions.insert(lease_id);
                         tracing::error!(
-                            "Eviction callback panicked for model '{}'; continuing",
+                            "Eviction callback panicked for model '{}'; retaining reservation",
                             model_id
                         );
                     }
                 }
+                self.inner
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .evicting_leases
+                    .remove(&lease_id);
             }
-            if !batch.removed {
+            if !batch.progressed {
                 let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
                 let total_used = inner.ram_allocated.saturating_add(inner.vram_allocated);
                 let deficit = match self.memory_topology {
@@ -443,6 +467,7 @@ impl ResourceCoordinator {
         needed_ram: usize,
         needed_vram: usize,
         needed_cache: usize,
+        failed_evictions: &HashSet<u64>,
     ) -> Result<EvictionBatch, ResourceError> {
         let _span =
             tracing::info_span!("vram.evict", needed_ram, needed_vram, needed_cache).entered();
@@ -453,6 +478,8 @@ impl ResourceCoordinator {
         for (id, record) in &inner.residencies {
             if record.priority == ResourcePriority::Critical
                 || record.strategy == ResidencyStrategy::Resident
+                || inner.evicting_leases.contains(&record.lease_id)
+                || failed_evictions.contains(&record.lease_id)
             {
                 continue;
             }
@@ -488,9 +515,8 @@ impl ResourceCoordinator {
             })
         });
 
-        let mut evicted = Vec::new();
         let mut callbacks = Vec::new();
-        let mut removed = false;
+        let mut progressed = false;
         let (ram_budget, vram_budget) = self.effective_budget();
 
         let host_needed = needed_ram.saturating_add(needed_cache);
@@ -527,39 +553,30 @@ impl ResourceCoordinator {
                 if let Ok(handle_id) = id.parse::<u64>()
                     && let Some(cache) = inner.caches.remove(&handle_id)
                 {
-                    removed = true;
+                    progressed = true;
                     inner.ram_allocated = inner.ram_allocated.saturating_sub(cache.bytes);
                     tracing::info!("Evicted cache handle {} ({} bytes)", handle_id, cache.bytes);
                 }
-            } else {
-                let removed_record = inner.residencies.remove(id);
-                if let Some(record) = removed_record {
-                    removed = true;
-                    tracing::info!(
-                        "Evicting model '{}' (priority={:?}, ram={}, vram={})",
-                        id,
-                        priority,
-                        ram,
-                        vram
-                    );
-                    callbacks.push((id.clone(), record.offload_cb));
-                    if let Some(lease) = inner.leases.remove(&record.lease_id) {
-                        inner.ram_allocated = inner
-                            .ram_allocated
-                            .saturating_sub(lease.granted_ram)
-                            .saturating_sub(lease.reserved_cache);
-                        inner.vram_allocated =
-                            inner.vram_allocated.saturating_sub(lease.granted_vram);
-                    }
-                    evicted.push(id.clone());
-                }
+            } else if let Some(record) = inner.residencies.get(id) {
+                progressed = true;
+                tracing::info!(
+                    "Evicting model '{}' (priority={:?}, ram={}, vram={})",
+                    id,
+                    priority,
+                    ram,
+                    vram
+                );
+                callbacks.push((id.clone(), record.lease_id, record.offload_cb.clone()));
+                inner.evicting_leases.insert(record.lease_id);
+                // Account only confirmed releases. Select one callback at
+                // a time, then re-evaluate capacity after it completes.
+                break;
             }
         }
 
         Ok(EvictionBatch {
-            models: evicted,
             callbacks,
-            removed,
+            progressed,
         })
     }
 
@@ -881,19 +898,215 @@ mod tests {
         let coord = ResourceCoordinator::new(1000, 1000, MemoryTopology::Discrete);
         let callback: OffloadCallback =
             std::sync::Arc::new(|| -> Result<(), String> { panic!("simulated offload failure") });
-        coord
+        let original = coord
             .reserve(
                 make_ticket("panic-model", 800, 0, ResourcePriority::Low),
                 callback,
             )
             .unwrap();
-        let lease = coord
+        assert!(
+            coord
+                .reserve(
+                    make_ticket("after-panic", 400, 0, ResourcePriority::Normal),
+                    noop_cb(),
+                )
+                .is_err()
+        );
+        assert_eq!(coord.snapshot().ram_allocated, 800);
+        assert_eq!(
+            coord.lease_id_for_model("panic-model"),
+            Some(original.lease_id)
+        );
+        // Explicitly confirmed release permits recovery after a failed offload.
+        coord.release(original.lease_id);
+        coord
             .reserve(
-                make_ticket("after-panic", 400, 0, ResourcePriority::Normal),
+                make_ticket("after-release", 400, 0, ResourcePriority::Normal),
                 noop_cb(),
             )
             .unwrap();
-        assert_eq!(lease.evicted_models, vec!["panic-model"]);
+    }
+
+    #[test]
+    fn failed_offload_retains_ram_vram_and_cache_for_every_topology() {
+        for topology in [
+            MemoryTopology::Unified,
+            MemoryTopology::SharedSystemMemory,
+            MemoryTopology::Discrete,
+            MemoryTopology::RemoteMemory,
+        ] {
+            let coord = ResourceCoordinator::new(1000, 1000, topology);
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let callback_attempts = attempts.clone();
+            let mut original = make_ticket("retained", 400, 300, ResourcePriority::Low);
+            original.cache_bytes = 200;
+            let lease = coord
+                .reserve(
+                    original,
+                    Arc::new(move || {
+                        callback_attempts.fetch_add(1, Ordering::SeqCst);
+                        Err("device refused offload".into())
+                    }),
+                )
+                .unwrap();
+            assert!(
+                coord
+                    .reserve(
+                        make_ticket("replacement", 700, 200, ResourcePriority::Normal),
+                        noop_cb(),
+                    )
+                    .is_err()
+            );
+            let snapshot = coord.snapshot();
+            assert_eq!(snapshot.ram_allocated, 600);
+            assert_eq!(snapshot.vram_allocated, 300);
+            assert_eq!(snapshot.model_count, 1);
+            assert_eq!(snapshot.lease_count, 1);
+            assert_eq!(coord.lease_id_for_model("retained"), Some(lease.lease_id));
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn failed_offload_can_skip_to_another_candidate_without_uncharging_failure() {
+        let coord = ResourceCoordinator::new_unified(1000);
+        coord
+            .reserve(
+                make_ticket("failed", 500, 0, ResourcePriority::Low),
+                Arc::new(|| Err("busy".into())),
+            )
+            .unwrap();
+        coord
+            .reserve(
+                make_ticket("available", 400, 0, ResourcePriority::Normal),
+                noop_cb(),
+            )
+            .unwrap();
+        let lease = coord
+            .reserve(
+                make_ticket("replacement", 400, 0, ResourcePriority::High),
+                noop_cb(),
+            )
+            .unwrap();
+        assert_eq!(lease.evicted_models, vec!["available"]);
+        assert!(coord.lease_id_for_model("failed").is_some());
+        assert_eq!(coord.snapshot().ram_allocated, 900);
+    }
+
+    #[test]
+    fn in_flight_offload_keeps_capacity_charged_and_prevents_duplicate_callbacks() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let coord = Arc::new(ResourceCoordinator::new_unified(1000));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let resume_rx = Mutex::new(resume_rx);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let callback_attempts = attempts.clone();
+        coord
+            .reserve(
+                make_ticket("offloading", 800, 0, ResourcePriority::Low),
+                Arc::new(move || {
+                    callback_attempts.fetch_add(1, Ordering::SeqCst);
+                    started_tx.send(()).unwrap();
+                    resume_rx.lock().unwrap().recv().unwrap();
+                    Ok(())
+                }),
+            )
+            .unwrap();
+        let worker_coord = coord.clone();
+        let worker = std::thread::spawn(move || {
+            worker_coord.reserve(
+                make_ticket("replacement", 400, 0, ResourcePriority::Normal),
+                noop_cb(),
+            )
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let during = coord.snapshot();
+        let competitor = coord.reserve(
+            make_ticket("competitor", 300, 0, ResourcePriority::Normal),
+            noop_cb(),
+        );
+        resume_tx.send(()).unwrap();
+        let replacement = worker.join().unwrap().unwrap();
+        assert_eq!(during.ram_allocated, 800);
+        assert_eq!(during.model_count, 1);
+        assert!(competitor.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(replacement.evicted_models, vec!["offloading"]);
+        assert_eq!(coord.snapshot().ram_allocated, 400);
+    }
+
+    #[test]
+    fn offload_callback_can_reenter_reserve_without_reusing_unreleased_capacity() {
+        let coord = Arc::new(ResourceCoordinator::new_unified(1000));
+        let callback_coord = Arc::downgrade(&coord);
+        let observed_charge = Arc::new(AtomicUsize::new(0));
+        let callback_charge = observed_charge.clone();
+        let reentrant_rejected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let callback_rejected = reentrant_rejected.clone();
+        coord
+            .reserve(
+                make_ticket("offloading", 800, 0, ResourcePriority::Low),
+                Arc::new(move || {
+                    let coord = callback_coord.upgrade().unwrap();
+                    callback_charge.store(coord.snapshot().ram_allocated, Ordering::SeqCst);
+                    callback_rejected.store(
+                        coord
+                            .reserve(
+                                make_ticket("reentrant", 400, 0, ResourcePriority::Normal),
+                                noop_cb(),
+                            )
+                            .is_err(),
+                        Ordering::SeqCst,
+                    );
+                    Ok(())
+                }),
+            )
+            .unwrap();
+        let lease = coord
+            .reserve(
+                make_ticket("replacement", 400, 0, ResourcePriority::Normal),
+                noop_cb(),
+            )
+            .unwrap();
+        assert_eq!(observed_charge.load(Ordering::SeqCst), 800);
+        assert!(reentrant_rejected.load(Ordering::SeqCst));
+        assert_eq!(lease.evicted_models, vec!["offloading"]);
+        assert_eq!(coord.snapshot().ram_allocated, 400);
+    }
+
+    #[test]
+    fn successful_offload_completion_cannot_release_a_same_name_replacement() {
+        let coord = Arc::new(ResourceCoordinator::new_unified(1000));
+        let callback_coord = Arc::downgrade(&coord);
+        let original = coord
+            .reserve(
+                make_ticket("identity", 800, 0, ResourcePriority::Low),
+                Arc::new(move || {
+                    let coord = callback_coord.upgrade().unwrap();
+                    coord.release_by_model("identity");
+                    coord
+                        .reserve(
+                            make_ticket("identity", 600, 0, ResourcePriority::Critical),
+                            noop_cb(),
+                        )
+                        .unwrap();
+                    Ok(())
+                }),
+            )
+            .unwrap();
+        coord
+            .reserve(
+                make_ticket("new-model", 400, 0, ResourcePriority::Normal),
+                noop_cb(),
+            )
+            .unwrap();
+        let replacement_id = coord.lease_id_for_model("identity").unwrap();
+        assert_ne!(original.lease_id, replacement_id);
+        assert_eq!(coord.snapshot().ram_allocated, 1000);
+        assert_eq!(coord.snapshot().model_count, 2);
     }
 
     #[test]

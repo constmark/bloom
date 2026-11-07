@@ -167,6 +167,15 @@ and call/result lifecycle follow the
 and
 [Chat Completions reference](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create).
 
+## Audio transcriptions
+
+`POST /v1/audio/transcriptions` accepts a bounded multipart `file` and `model`
+for an already loaded audio-capable runtime. The implemented subset accepts
+PCM16 mono WAV at 8–48 kHz, at most 60 seconds, with JSON `{"text":"..."}` or
+plain-text results. Unknown or unsupported controls fail explicitly. See the
+[audio transcription contract](audio-transcriptions.md) for exact limits,
+parameter handling, lifecycle ownership and validation scope.
+
 ## Responses API
 
 `POST /v1/responses` provides a text adapter over the same active model and
