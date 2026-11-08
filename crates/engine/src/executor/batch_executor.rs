@@ -53,6 +53,8 @@ pub struct CandleBatchExecutor {
     max_prefill_batch: usize,
     /// Maximum batch size for decode phase.
     max_decode_batch: usize,
+    /// Advertised separately from a scheduling-only batch closure.
+    dense_batch: bool,
     /// Optional paged attention cache storage.
     cache: Option<Arc<PagedAttentionCache>>,
     /// Optional per-layer KV bridge. When absent the model's internal KV cache
@@ -77,7 +79,7 @@ pub struct CandleBatchExecutor {
     #[cfg(test)]
     speculative_mode: Option<SpeculativeMode>,
     /// Optional tokenizer for token-to-text decoding during generation.
-    tokenizer: Option<tokenizers::Tokenizer>,
+    tokenizer: Option<Arc<tokenizers::Tokenizer>>,
     /// Speculative decoding strategies indexed by request KV handle.
     speculative_strategies: Arc<Mutex<HashMap<usize, Box<dyn SpeculativeStrategy>>>>,
 }
@@ -145,6 +147,7 @@ impl CandleBatchExecutor {
             device,
             max_prefill_batch,
             max_decode_batch,
+            dense_batch: false,
             cache: None,
             kv_hook: None,
             prepare_request: None,
@@ -160,15 +163,29 @@ impl CandleBatchExecutor {
 
     /// Set an optional batched forward function.
     pub fn with_forward_batch_fn(
+        mut self,
+        forward_batch_fn: Box<
+            dyn Fn(&Tensor, &[usize], &[usize], &[usize]) -> Result<Tensor> + Send + Sync,
+        >,
+    ) -> Self {
+        self.dense_batch = false;
+        if let Some(ref mut model) = *self.model.lock().unwrap_or_else(|e| e.into_inner()) {
+            model.forward_batch_fn = Some(forward_batch_fn);
+        }
+        self
+    }
+
+    /// Register a closure that implements a real same-shape tensor batch.
+    /// Merely iterating over requests must use `with_forward_batch_fn`.
+    pub fn with_dense_forward_batch_fn(
         self,
         forward_batch_fn: Box<
             dyn Fn(&Tensor, &[usize], &[usize], &[usize]) -> Result<Tensor> + Send + Sync,
         >,
     ) -> Self {
-        if let Some(ref mut model) = *self.model.lock().unwrap_or_else(|e| e.into_inner()) {
-            model.forward_batch_fn = Some(forward_batch_fn);
-        }
-        self
+        let mut executor = self.with_forward_batch_fn(forward_batch_fn);
+        executor.dense_batch = true;
+        executor
     }
 
     /// Set an optional paged attention cache.
@@ -205,10 +222,21 @@ impl CandleBatchExecutor {
 
     /// Set vocabulary and tokenizer for structured generation / grammar filtering.
     pub fn with_vocab_and_tokenizer(
-        mut self,
+        self,
         vocab_strings: Vec<String>,
         eos_token_ids: Vec<u32>,
         tokenizer: Option<tokenizers::Tokenizer>,
+    ) -> Self {
+        self.with_shared_vocab_and_tokenizer(vocab_strings, eos_token_ids, tokenizer.map(Arc::new))
+    }
+
+    /// Reuse the startup tokenizer's dictionaries and merges without another
+    /// resident deep copy when constructing a batch runtime.
+    pub fn with_shared_vocab_and_tokenizer(
+        mut self,
+        vocab_strings: Vec<String>,
+        eos_token_ids: Vec<u32>,
+        tokenizer: Option<Arc<tokenizers::Tokenizer>>,
     ) -> Self {
         self.vocab_strings = vocab_strings;
         self.eos_token_ids = eos_token_ids;
@@ -268,6 +296,7 @@ impl CandleBatchExecutor {
             device,
             max_prefill_batch,
             max_decode_batch,
+            dense_batch: false,
             cache: None,
             kv_hook: None,
             prepare_request: None,
@@ -1063,6 +1092,10 @@ impl CandleBatchExecutor {
 }
 
 impl EngineExecutor for CandleBatchExecutor {
+    fn supports_dense_batch(&self) -> bool {
+        self.dense_batch
+    }
+
     fn clear_request_state(&self, handle: usize) {
         self.clear_speculative_strategy(handle);
     }

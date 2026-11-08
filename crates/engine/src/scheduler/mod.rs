@@ -339,6 +339,57 @@ impl BloomKvCachePool {
         }
     }
 
+    /// Terminal release without retaining an inactive prefix-cache entry.
+    /// External controllers use this when their request lease owns all KV bytes.
+    pub fn discard(&self, handle: usize) {
+        let evicted = {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            let Some(request_id) = state.handle_to_request_id.remove(&handle) else {
+                return;
+            };
+            state.request_id_to_handle.remove(&request_id);
+            state.lru_list.retain(|id| id != &request_id);
+            let mut evicted = Vec::new();
+            if let Some(record) = state.active_requests.remove(&request_id) {
+                for (index, block) in record.blocks.into_iter().enumerate() {
+                    let remaining = state
+                        .block_ref_counts
+                        .get(&block)
+                        .copied()
+                        .unwrap_or(1)
+                        .saturating_sub(1);
+                    if remaining == 0 {
+                        state.block_ref_counts.remove(&block);
+                        if let Some(prefix) = record.prefixes.get(index)
+                            && state.block_table.get(prefix) == Some(&block)
+                        {
+                            state.block_table.remove(prefix);
+                        }
+                        evicted.push(block);
+                    } else {
+                        state.block_ref_counts.insert(block, remaining);
+                    }
+                }
+            }
+            state.update_block_counts(self.total_blocks);
+            evicted
+        };
+        if let Some(callback) = self
+            .on_free
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+        {
+            callback(handle);
+        }
+        self.notify_evicted(&evicted);
+        // Do not expose recycled IDs until old tensor/wrapper callbacks have
+        // finished. Otherwise a racing allocation could lose its newly written KV.
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.free_blocks.extend(evicted);
+        state.update_block_counts(self.total_blocks);
+    }
+
     pub fn set_on_free<F>(&self, f: F)
     where
         F: Fn(usize) + Send + Sync + 'static,
@@ -1178,6 +1229,13 @@ pub trait Scheduler: Send + Sync {
 pub trait EngineExecutor: Send + Sync {
     fn execute(&self, batch: ExecutionBatch) -> Result<BatchResult>;
     fn max_batch_size(&self, phase: ExecutionPhase) -> usize;
+
+    /// True only when compatible requests can run in one model tensor
+    /// forward. This promises same-length, same-position dense batching,
+    /// not ragged batching; unsupported shapes may execute independently.
+    fn supports_dense_batch(&self) -> bool {
+        false
+    }
 
     /// Release executor-local state associated with a scheduler KV handle.
     ///

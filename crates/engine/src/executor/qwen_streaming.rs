@@ -1,6 +1,8 @@
 // Streaming attention entry points mirror the model's separate state tensors.
 #![allow(clippy::too_many_arguments)]
 
+#[cfg(test)]
+pub(crate) mod dense_batch_tests;
 mod moe;
 pub(crate) use moe::MoeConfig;
 use moe::{FeedForward, SparseMoe};
@@ -837,7 +839,9 @@ impl StreamingQwenModel {
         let mask: Vec<_> = (0..tgt)
             .flat_map(|i| (0..(tgt + offset)).map(move |j| if j <= i + offset { 0. } else { minf }))
             .collect();
-        Tensor::from_slice(&mask, (b, 1, tgt, tgt + offset), &self.device)?.to_dtype(self.dtype)
+        Tensor::from_slice(&mask, (1, 1, tgt, tgt + offset), &self.device)?
+            .broadcast_as((b, 1, tgt, tgt + offset))?
+            .to_dtype(self.dtype)
     }
 }
 
@@ -846,6 +850,10 @@ pub struct QwenStreamingModelForCausalLM {
     base: StreamingQwenModel,
     lm_head: StreamingLinear,
     pub offloaded_layers: Option<usize>,
+    // Only forks of one immutable weight set can share a dense forward.
+    weight_family: Arc<()>,
+    #[cfg(test)]
+    pub(crate) forward_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl QwenStreamingModelForCausalLM {
@@ -904,10 +912,137 @@ impl QwenStreamingModelForCausalLM {
             base,
             lm_head,
             offloaded_layers,
+            weight_family: Arc::new(()),
+            #[cfg(test)]
+            forward_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
+    /// Whether this model implements one tensor forward across same-length,
+    /// same-position requests. Ragged sequences, MoE and quantized KV retain
+    /// their independent-request execution path.
+    pub fn supports_dense_batch(&self) -> bool {
+        !self.base.layers.is_empty()
+            && self.base.layers.iter().all(|layer| {
+                layer.self_attn.kv_cache_dtype == KvCacheDType::F16
+                    && matches!(layer.mlp, FeedForward::Dense(_))
+            })
+    }
+
+    /// Execute a single `[requests, tokens]` forward with private request KV.
+    /// All models must be forks of the same weights, with one sequence per
+    /// cache and exactly `offset` cached tokens. Cache changes are committed
+    /// only after the forward and every independent KV copy succeed.
+    ///
+    /// This is dense batching, not a ragged/paged attention kernel. Packing
+    /// and copying KV adds transient memory proportional to the full history.
+    pub fn forward_dense_batch(
+        models: &mut [&mut Self],
+        input: &Tensor,
+        offset: usize,
+    ) -> Result<Tensor> {
+        let (batch, tokens) = input.dims2()?;
+        if batch < 2 || batch != models.len() || tokens == 0 {
+            candle_core::bail!("dense batch requires at least two nonempty request rows");
+        }
+        let first = &models[0];
+        for model in models.iter() {
+            if !model.supports_dense_batch()
+                || !Arc::ptr_eq(&first.weight_family, &model.weight_family)
+                || first.offloaded_layers != model.offloaded_layers
+                || !first.base.device.same_device(&model.base.device)
+            {
+                candle_core::bail!("dense batch requires compatible forks of one dense model");
+            }
+            for layer in &model.base.layers {
+                let attention = &layer.self_attn;
+                match (attention.kv_cache.k(), attention.kv_cache.v()) {
+                    (None, None) if offset == 0 => {}
+                    (Some(k), Some(v))
+                        if k.dims() == [1, attention.num_kv_heads, offset, attention.head_dim]
+                            && v.dims() == k.dims() => {}
+                    _ => candle_core::bail!("dense batch KV does not match its start position"),
+                }
+            }
+        }
+        let mut combined = first.fork_with_empty_kv();
+        if offset > 0 {
+            for (layer_index, layer) in combined.base.layers.iter_mut().enumerate() {
+                let keys = models
+                    .iter()
+                    .map(|model| {
+                        model.base.layers[layer_index]
+                            .self_attn
+                            .kv_cache
+                            .k()
+                            .ok_or_else(|| {
+                                candle_core::Error::Msg("dense batch key cache missing".into())
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let values = models
+                    .iter()
+                    .map(|model| {
+                        model.base.layers[layer_index]
+                            .self_attn
+                            .kv_cache
+                            .v()
+                            .ok_or_else(|| {
+                                candle_core::Error::Msg("dense batch value cache missing".into())
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                layer
+                    .self_attn
+                    .kv_cache
+                    .append(&Tensor::cat(&keys, 0)?, &Tensor::cat(&values, 0)?)?;
+            }
+        }
+
+        // There is exactly one model forward here; batch dimensions flow
+        // through the projections, attention and feed-forward matrices.
+        let logits = combined.forward(input, offset)?;
+        let mut private_caches = Vec::with_capacity(batch);
+        for row in 0..batch {
+            let mut layers = Vec::with_capacity(combined.base.layers.len());
+            for layer in &combined.base.layers {
+                let cache = &layer.self_attn.kv_cache;
+                // contiguous() alone may retain a view of other requests.
+                // copy() may clone the entire backing storage on CPU/Metal.
+                // force_contiguous() copies just the logical row and resets
+                // its offset, giving each owner a compact private allocation.
+                let keys = cache
+                    .k()
+                    .ok_or_else(|| {
+                        candle_core::Error::Msg("dense forward returned no keys".into())
+                    })?
+                    .narrow(0, row, 1)?
+                    .force_contiguous()?;
+                let values = cache
+                    .v()
+                    .ok_or_else(|| {
+                        candle_core::Error::Msg("dense forward returned no values".into())
+                    })?
+                    .narrow(0, row, 1)?
+                    .force_contiguous()?;
+                let mut cache = ConcatKvCache::new(2);
+                cache.append(&keys, &values)?;
+                layers.push(cache);
+            }
+            private_caches.push(layers);
+        }
+        for (model, caches) in models.iter_mut().zip(private_caches) {
+            for (layer, cache) in model.base.layers.iter_mut().zip(caches) {
+                layer.self_attn.kv_cache = cache;
+            }
+        }
+        Ok(logits)
+    }
+
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
+        #[cfg(test)]
+        self.forward_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let input_device = input.to_device(&self.base.device)?;
         let (b, l) = input_device.dims2()?;
         let flat_input = input_device.flatten_all()?;
@@ -1197,7 +1332,9 @@ impl QwenStreamingModelForCausalLM {
         }
         let k_slice = k.narrow(2, start_pos, seq_len)?;
         let v_slice = v.narrow(2, start_pos, seq_len)?;
-        Ok((k_slice, v_slice))
+        // A paged mirror must not retain a whole historical backing buffer
+        // for every block. Compact logical slices keep retained KV linear.
+        Ok((k_slice.force_contiguous()?, v_slice.force_contiguous()?))
     }
 
     pub fn inject_kv_tensor(

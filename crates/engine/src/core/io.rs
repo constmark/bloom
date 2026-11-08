@@ -254,6 +254,12 @@ impl InferenceRequest {
 pub enum OutputChunk {
     TextDelta(String),
     Tokens(Vec<u32>),
+    /// Cumulative exact input and accepted output IDs (including EOS). Emitted
+    /// before text so stop/disconnect sinks retain the sampled token count.
+    TokenUsage {
+        input_tokens: usize,
+        output_tokens: usize,
+    },
     AudioDelta(Vec<f32>),
     Image(Vec<u8>),
     Embedding(Vec<f32>),
@@ -462,7 +468,7 @@ impl OutputChunk {
                 }
                 Ok(())
             }
-            Self::End => Ok(()),
+            Self::TokenUsage { .. } | Self::End => Ok(()),
         }
     }
 }

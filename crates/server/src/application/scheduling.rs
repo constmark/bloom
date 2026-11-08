@@ -141,6 +141,7 @@ pub(super) fn build_scheduling_runtime(
             num_kv_heads,
             head_dim,
             long_context_policy,
+            experimental_dense_batch: false,
         },
     )?;
     let mut scheduling_config = TokenSchedulingConfig {

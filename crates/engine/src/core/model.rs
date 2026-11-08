@@ -28,6 +28,13 @@ pub struct ModelMetadata {
     pub manifest: ModelManifest,
 }
 
+/// Embeddings and optional exact unpadded input-ID count from one operation.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EmbeddingBatchOutput {
+    pub embeddings: Vec<Vec<f32>>,
+    pub prompt_tokens: Option<u64>,
+}
+
 pub trait OutputSink: Send + Sync {
     fn on_chunk(&mut self, chunk: OutputChunk) -> Result<()>;
 }
@@ -64,6 +71,11 @@ pub trait LoadedModel: Send + Sync {
 
     fn clear_kv_cache(&self) {}
 
+    /// Token IDs that terminate autoregressive generation for this model.
+    fn eos_token_ids(&self) -> &[u32] {
+        &[]
+    }
+
     fn metadata(&self) -> &ModelMetadata;
     fn infer(&self, input: ModelInput, params: &GenerationParams) -> Result<ModelOutput>;
     fn infer_stream(
@@ -89,6 +101,22 @@ pub trait LoadedModel: Send + Sync {
     /// input.
     fn supports_native_embedding_batch(&self) -> bool {
         false
+    }
+
+    /// Exact encoder input token count (including specials, excluding batch
+    /// padding). Unsupported models must not substitute a text estimate.
+    fn embedding_token_count(&self, _inputs: &[String]) -> Option<Result<u64>> {
+        None
+    }
+
+    /// Backends that receive native usage with their vectors override this
+    /// method, avoiding a second tokenizer request or shared mutable counters.
+    fn embed_batch_with_usage(&self, inputs: &[String]) -> Result<EmbeddingBatchOutput> {
+        let prompt_tokens = self.embedding_token_count(inputs).transpose()?;
+        Ok(EmbeddingBatchOutput {
+            embeddings: self.embed_batch(inputs)?,
+            prompt_tokens,
+        })
     }
 
     /// Produce one embedding for every input while preserving input order.

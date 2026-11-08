@@ -1015,7 +1015,7 @@ impl CandleEngine {
             config: config.clone(),
             model_type,
             model: model_holder, // Keeps weights offloaded initially to preserve budget
-            tokenizer,
+            tokenizer: Arc::new(tokenizer),
             vocab_strings,
             device,
             device_kind,
@@ -1539,6 +1539,27 @@ impl QwenModelWrapper {
         }
     }
 
+    /// Collect target logits for every verifier position. Most wrapped Candle
+    /// models expose only the final position from a multi-token forward, so
+    /// treating that result as a sequence silently misvalidates draft tokens.
+    /// This correctness fallback performs real sequential forwards; it does
+    /// not claim speculative acceleration without a native all-logits path.
+    fn forward_verifier_logits(
+        &mut self,
+        tokens: &[u32],
+        start_pos: usize,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let mut rows = Vec::with_capacity(tokens.len());
+        for (offset, token) in tokens.iter().enumerate() {
+            let input = Tensor::new(&[[*token]], device)?;
+            rows.push(CandleTextModel::logits_for_last_position(
+                self.forward(&input, start_pos + offset)?,
+            )?);
+        }
+        Ok(Tensor::stack(&rows, 0)?)
+    }
+
     pub fn clear_kv_cache(&mut self) {
         match self {
             QwenModelWrapper::Qwen2(m) => m.clear_kv_cache(),
@@ -1761,7 +1782,7 @@ struct CandleTextModel {
     config: serde_json::Value,
     model_type: ModelType,
     model: Arc<Mutex<Option<QwenModelWrapper>>>,
-    tokenizer: tokenizers::Tokenizer,
+    tokenizer: Arc<tokenizers::Tokenizer>,
     vocab_strings: Vec<String>,
     device: Device,
     device_kind: DeviceKind,
@@ -2598,15 +2619,6 @@ impl CandleTextModel {
         }
     }
 
-    fn logits_sequence(logits: Tensor) -> Result<Tensor> {
-        let logits = logits.squeeze(0)?;
-        if logits.rank() == 1 {
-            Ok(logits.unsqueeze(0)?)
-        } else {
-            Ok(logits)
-        }
-    }
-
     fn greedy_token(logits: &Tensor) -> Result<u32> {
         let logits = logits.to_dtype(DType::F32)?;
         let logits_vec = logits.to_vec1::<f32>()?;
@@ -2621,7 +2633,7 @@ impl CandleTextModel {
     /// Convert a `[seq_len, vocab_size]` (or `[vocab_size]`) logits tensor into
     /// a `Vec<Vec<f32>>` for rejection sampling.
     ///
-    /// `logits_sequence` already squeezes the batch dim, so the input here is
+    /// `forward_verifier_logits` removes the batch dim, so the input here is
     /// either rank-2 (`[seq, vocab]`) or rank-1 (`[vocab]` for a single position).
     fn verifier_logits_to_vecs(logits: &Tensor) -> Result<Vec<Vec<f32>>> {
         let logits = logits.to_dtype(DType::F32)?;
@@ -2705,6 +2717,9 @@ impl CandleForwardModel for CandleTextModel {
 }
 
 impl crate::batching::BatchModel for CandleTextModel {
+    fn dense_memory_plan(&self) -> Result<crate::batching::DenseMemoryPlan> {
+        batching::memory_plan(self)
+    }
     fn build_executor(
         self: Arc<Self>,
         kv_pool: Arc<crate::BloomKvCachePool>,
@@ -2765,12 +2780,30 @@ impl LoadedModel for CandleTextModel {
         }
     }
 
+    fn eos_token_ids(&self) -> &[u32] {
+        &self.eos_token_ids
+    }
+
     fn metadata(&self) -> &ModelMetadata {
         &self.metadata
     }
 
     fn supports_native_embedding_batch(&self) -> bool {
         self.model_type == ModelType::Bert && !self.is_cross_encoder_model()
+    }
+
+    fn embedding_token_count(&self, inputs: &[String]) -> Option<Result<u64>> {
+        self.supports_native_embedding_batch().then(|| {
+            inputs.iter().try_fold(0u64, |total, text| {
+                let encoding = self
+                    .tokenizer
+                    .encode(text.as_str(), true)
+                    .map_err(|error| anyhow!("failed to tokenize encoder input: {error}"))?;
+                total
+                    .checked_add(encoding.len() as u64)
+                    .ok_or_else(|| anyhow!("encoder token count overflows"))
+            })
+        })
     }
 
     fn embed_batch(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
@@ -2916,6 +2949,21 @@ impl CandleTextModel {
         params: &GenerationParams,
         sink: &mut dyn crate::model::OutputSink,
     ) -> Result<()> {
+        let speculative_mode = if self.is_embedding_model() {
+            SpeculativeMode::None
+        } else {
+            SpeculativeMode::from_env()?
+        };
+        self.infer_tokens_stream_with_speculation(token_ids, params, sink, speculative_mode)
+    }
+
+    fn infer_tokens_stream_with_speculation(
+        &self,
+        token_ids: Vec<u32>,
+        params: &GenerationParams,
+        sink: &mut dyn crate::model::OutputSink,
+        speculative_mode: SpeculativeMode,
+    ) -> Result<()> {
         let start_time = std::time::Instant::now();
         let mut total_draft_tokens = 0usize;
         let mut total_accepted_tokens = 0usize;
@@ -3010,6 +3058,10 @@ impl CandleTextModel {
             return Ok(());
         }
 
+        sink.on_chunk(crate::io::OutputChunk::TokenUsage {
+            input_tokens: token_ids.len(),
+            output_tokens: 0,
+        })?;
         let mut logits_processor = {
             use candle_transformers::generation::Sampling;
             let sampling = if params.temperature <= 1e-7 {
@@ -3048,7 +3100,6 @@ impl CandleTextModel {
         let mut all_tokens = token_ids.clone();
         let mut prev_text = String::new();
         let mut next_token = 0;
-        let speculative_mode = SpeculativeMode::from_env()?;
         if matches!(speculative_mode, SpeculativeMode::Mtp { .. }) {
             return Err(anyhow!(
                 "speculative=mtp is unavailable in the Candle backend; \
@@ -3150,6 +3201,10 @@ impl CandleTextModel {
         }
         drop(_span_prefill);
 
+        sink.on_chunk(crate::io::OutputChunk::TokenUsage {
+            input_tokens: token_ids.len(),
+            output_tokens: 1,
+        })?;
         if !self.eos_token_ids.contains(&next_token) {
             all_tokens.push(next_token);
             current_prefix_guard.push(next_token);
@@ -3206,13 +3261,10 @@ impl CandleTextModel {
                         verify_tokens.push(last);
                         verify_tokens.extend_from_slice(&proposed);
 
-                        let input_ids =
-                            Tensor::new(verify_tokens.as_slice(), &self.device)?.unsqueeze(0)?;
                         let verifier_logits = model_guard
                             .as_mut()
                             .ok_or_else(|| anyhow!("model is not loaded"))?
-                            .forward(&input_ids, start_pos)?;
-                        let verifier_logits = Self::logits_sequence(verifier_logits)?;
+                            .forward_verifier_logits(&verify_tokens, start_pos, &self.device)?;
 
                         // Decide acceptance and the correction/bonus token.
                         //
@@ -3249,16 +3301,27 @@ impl CandleTextModel {
                             (accepted, None)
                         };
 
+                        // Verifier acceptance does not override EOS: drafts
+                        // after the first accepted EOS are not generated output.
+                        let eos_index = proposed[..accepted]
+                            .iter()
+                            .position(|token| self.eos_token_ids.contains(token));
+                        let accepted_output = eos_index.map_or(accepted, |index| index + 1);
+                        let visible_accepted = eos_index.unwrap_or(accepted);
                         total_draft_tokens += proposed.len();
-                        total_accepted_tokens += accepted;
+                        total_accepted_tokens += accepted_output;
 
                         start_pos += verify_tokens.len();
-                        if accepted > 0 {
-                            let accepted_tokens = &proposed[..accepted];
+                        if accepted_output > 0 {
+                            let accepted_tokens = &proposed[..visible_accepted];
                             all_tokens.extend_from_slice(accepted_tokens);
                             current_prefix_guard.extend_from_slice(accepted_tokens);
                             strategy.update_context(accepted_tokens);
-                            generated += accepted;
+                            generated += accepted_output;
+                            sink.on_chunk(crate::io::OutputChunk::TokenUsage {
+                                input_tokens: token_ids.len(),
+                                output_tokens: generated,
+                            })?;
                             self.decode_and_emit_delta(
                                 &all_tokens,
                                 token_ids.len(),
@@ -3267,6 +3330,13 @@ impl CandleTextModel {
                             )?;
                         }
 
+                        if eos_index.is_some() {
+                            // The verifier forwarded draft tokens beyond EOS.
+                            // Do not advertise that physical cache as a reusable
+                            // prefix; the next request must reset it completely.
+                            current_prefix_guard.clear();
+                            break;
+                        }
                         if generated >= params.max_tokens {
                             break;
                         }
@@ -3328,6 +3398,10 @@ impl CandleTextModel {
                             )?
                         };
 
+                        sink.on_chunk(crate::io::OutputChunk::TokenUsage {
+                            input_tokens: token_ids.len(),
+                            output_tokens: generated + 1,
+                        })?;
                         if self.eos_token_ids.contains(&next_tok) {
                             break;
                         }
@@ -3377,6 +3451,10 @@ impl CandleTextModel {
                 )?;
                 start_pos += 1;
 
+                sink.on_chunk(crate::io::OutputChunk::TokenUsage {
+                    input_tokens: token_ids.len(),
+                    output_tokens: generated + 1,
+                })?;
                 if self.eos_token_ids.contains(&next_tok) {
                     break;
                 }
@@ -3393,7 +3471,7 @@ impl CandleTextModel {
         }
 
         let compute_ms = start_time.elapsed().as_millis() as u64;
-        let spec_mode = SpeculativeMode::from_env().unwrap_or(SpeculativeMode::None);
+        let spec_mode = speculative_mode;
         let spec_acceptance_rate = if total_draft_tokens > 0 {
             Some(total_accepted_tokens as f64 / total_draft_tokens as f64)
         } else {
@@ -5198,3 +5276,11 @@ mod tests {
         assert_eq!(dfa_nested.state, DfaState::ValueEnd);
     }
 }
+
+#[cfg(test)]
+#[path = "candle/usage_tests.rs"]
+mod usage_tests;
+
+#[cfg(test)]
+#[path = "candle/encoder_usage_tests.rs"]
+mod encoder_usage_tests;

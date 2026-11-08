@@ -455,6 +455,13 @@ impl InferencePipeline {
         self.model.embed_batch(inputs)
     }
 
+    pub fn run_embedding_batch_with_usage(
+        &self,
+        inputs: &[String],
+    ) -> Result<crate::model::EmbeddingBatchOutput> {
+        self.model.embed_batch_with_usage(inputs)
+    }
+
     pub fn supports_native_rerank(&self) -> bool {
         self.model.supports_native_rerank()
     }
@@ -507,6 +514,11 @@ impl InferencePipeline {
     /// scheduler that creates separately accounted per-request wrappers.
     pub fn release_idle_weights(&self) {
         self.model.release_idle_weights();
+    }
+
+    /// Whether the loaded model exposes real scheduler-driven forward passes.
+    pub fn supports_batching(&self) -> bool {
+        Arc::clone(&self.model).batch_model().is_some()
     }
 
     pub fn context_size(&self) -> usize {

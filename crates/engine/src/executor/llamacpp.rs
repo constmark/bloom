@@ -286,6 +286,13 @@ impl LoadedModel for LlamaCppModel {
     }
 
     fn embed_batch(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+        Ok(self.embed_batch_with_usage(inputs)?.embeddings)
+    }
+
+    fn embed_batch_with_usage(
+        &self,
+        inputs: &[String],
+    ) -> Result<crate::model::EmbeddingBatchOutput> {
         anyhow::ensure!(
             self.supports_native_embedding_batch(),
             "the loaded llama.cpp model is not an embedding model"
@@ -300,7 +307,10 @@ impl LoadedModel for LlamaCppModel {
             }),
             DEFAULT_COMPLETION_TIMEOUT,
         )?;
-        parse_embedding_response(&response, inputs.len())
+        Ok(crate::model::EmbeddingBatchOutput {
+            embeddings: parse_embedding_response(&response, inputs.len())?,
+            prompt_tokens: parse_embedding_usage(&response)?,
+        })
     }
 
     fn supports_native_rerank(&self) -> bool {
@@ -598,6 +608,46 @@ fn finite_f32(value: &serde_json::Value) -> Result<f32> {
         "llama-server returned a non-finite float32 value"
     );
     Ok(number)
+}
+
+fn parse_embedding_usage(response: &serde_json::Value) -> Result<Option<u64>> {
+    let Some(usage) = response.get("usage").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        usage.is_object(),
+        "llama-server embedding usage must be an object"
+    );
+    let Some(count) = usage.get("prompt_tokens").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let count = count
+        .as_u64()
+        .ok_or_else(|| anyhow!("llama-server returned invalid embedding token usage"))?;
+    let estimated = usage
+        .get("estimated")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| anyhow!("llama-server returned invalid usage.estimated"))
+        })
+        .transpose()?
+        .unwrap_or(false);
+    let source = usage
+        .get("source")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| anyhow!("llama-server returned invalid usage.source"))
+        })
+        .transpose()?;
+    // Explicitly estimated third-party usage must not become model_tokens.
+    if estimated || source.is_some_and(|source| source != "model_tokens") {
+        return Ok(None);
+    }
+    Ok(Some(count))
 }
 
 fn parse_embedding_response(response: &serde_json::Value, count: usize) -> Result<Vec<Vec<f32>>> {
@@ -1654,6 +1704,43 @@ mod tests {
         let request = worker.join().unwrap();
         assert_eq!(request["input"], json!(["first", "second"]));
         assert_eq!(request["encoding_format"], "float");
+    }
+
+    #[test]
+    fn embedding_usage_is_read_from_the_same_native_response() {
+        let (addr, worker) = mock_endpoint(
+            "/v1/embeddings",
+            &json!({
+                "data":[{"index":1,"embedding":[0.0,1.0]},{"index":0,"embedding":[1.0,0.0]}],
+                "usage":{"prompt_tokens":17,"total_tokens":17}
+            })
+            .to_string(),
+            false,
+        );
+        let result = fixture_model(addr, "embedding")
+            .embed_batch_with_usage(&["a".into(), "b".into()])
+            .unwrap();
+        assert_eq!(result.prompt_tokens, Some(17));
+        assert_eq!(result.embeddings, [vec![1.0, 0.0], vec![0.0, 1.0]]);
+        worker.join().unwrap();
+        for usage in [
+            json!(null),
+            json!({}),
+            json!({"prompt_tokens":4,"estimated":true}),
+            json!({"prompt_tokens":4,"source":"text_estimate"}),
+        ] {
+            assert_eq!(
+                parse_embedding_usage(&json!({"usage":usage})).unwrap(),
+                None
+            );
+        }
+        for usage in [
+            json!(5),
+            json!({"prompt_tokens":-1}),
+            json!({"prompt_tokens":1.5}),
+        ] {
+            assert!(parse_embedding_usage(&json!({"usage":usage})).is_err());
+        }
     }
 
     #[test]

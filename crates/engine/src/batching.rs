@@ -2,6 +2,10 @@
 //! implementation details to application layers. Worker lifetime and process shutdown
 //! remain the caller's responsibility.
 
+#[path = "batching_memory.rs"]
+mod memory;
+pub use memory::DenseMemoryPlan;
+
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
@@ -19,17 +23,33 @@ pub struct BatchExecutorConfig {
     pub num_kv_heads: usize,
     pub head_dim: usize,
     pub long_context_policy: LongContextPolicy,
+    /// Explicit experimental opt-in. Full-history KV packing and batch
+    /// attention scratch require the caller to reserve the reported memory plan.
+    pub experimental_dense_batch: bool,
 }
 
 /// Backend-neutral execution capability implemented only by batchable models.
 /// Tensor layout, wrapper ownership, tokenization, and KV hooks stay in the adapter.
 pub trait BatchModel: Send + Sync {
+    fn dense_memory_plan(&self) -> Result<DenseMemoryPlan> {
+        anyhow::bail!("this batch model has no audited dense memory bound")
+    }
     fn build_executor(
         self: Arc<Self>,
         kv_pool: Arc<BloomKvCachePool>,
         cachemesh: Option<Arc<CacheMesh>>,
         config: BatchExecutorConfig,
     ) -> Result<Arc<dyn EngineExecutor>>;
+}
+
+/// Inspect before constructing templates or request KV. Unknown backends fail
+/// closed instead of claiming an unverified temporary-memory bound.
+pub fn dense_memory_plan(pipeline: &InferencePipeline) -> Result<DenseMemoryPlan> {
+    pipeline
+        .shared_model()
+        .batch_model()
+        .ok_or_else(|| anyhow!("model is not batchable"))?
+        .dense_memory_plan()
 }
 
 /// Build a batch executor using the loaded model's capability, after checking
@@ -74,6 +94,14 @@ impl EngineExecutor for PipelineBatchExecutor {
 
     fn max_batch_size(&self, phase: crate::scheduler::ExecutionPhase) -> usize {
         self.executor.max_batch_size(phase)
+    }
+
+    fn supports_dense_batch(&self) -> bool {
+        self.executor.supports_dense_batch()
+    }
+
+    fn clear_request_state(&self, handle: usize) {
+        self.executor.clear_request_state(handle);
     }
 
     fn prepare_prefill(&self, handle: usize, prompt_len: usize) -> Result<usize> {
@@ -143,6 +171,7 @@ mod tests {
             num_kv_heads: 1,
             head_dim: 4,
             long_context_policy: LongContextPolicy::Full,
+            experimental_dense_batch: false,
         }
     }
 

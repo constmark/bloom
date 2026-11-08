@@ -19,6 +19,115 @@ import json
 import os
 import sys
 from typing import Any
+from pathlib import Path
+
+
+def _embedding_encoder(session: Any, model_path: str, config: dict[str, Any]):
+    """Load only the package tokenizer: no remote code or text-based counts."""
+    from tokenizers import Tokenizer
+
+    if config.get("pooling") not in {"mean", "cls", "none"}:
+        raise ValueError("embedding pooling must be mean, cls or none")
+    maximum = config.get("max_length")
+    if type(maximum) is not int or not 1 <= maximum <= 32768:
+        raise ValueError("embedding max_length must be between 1 and 32768")
+    pad_id = config.get("pad_token_id")
+    if type(pad_id) is not int or not 0 <= pad_id <= 2**32 - 1:
+        raise ValueError("embedding pad_token_id must be a token ID")
+    for key in ("truncate", "normalize"):
+        if type(config.get(key, False)) is not bool:
+            raise ValueError(f"embedding {key} must be boolean")
+    inputs = session.get_inputs()
+    names = {meta.name for meta in inputs}
+    if "input_ids" not in names or names - {"input_ids", "attention_mask", "token_type_ids"}:
+        raise ValueError("encoder requires input_ids and supports only attention_mask/token_type_ids")
+    for meta in inputs:
+        if meta.type not in {"tensor(int64)", "tensor(int32)"} or len(meta.shape) != 2:
+            raise ValueError("encoder inputs must be rank-2 integer token tensors")
+    outputs = {meta.name for meta in session.get_outputs()}
+    if config.get("output_name") not in outputs:
+        raise ValueError("configured embedding output_name is absent from the graph")
+    tokenizer = Tokenizer.from_file(str(Path(model_path).parent / "tokenizer.json"))
+    if tokenizer.id_to_token(pad_id) is None:
+        raise ValueError("pad_token_id is absent from the package tokenizer")
+    # Package postprocessing/special tokens remain intact. Padding and
+    # truncation are explicit export settings rather than hidden JSON defaults.
+    tokenizer.no_padding()
+    tokenizer.no_truncation()
+    if config.get("truncate", False):
+        tokenizer.enable_truncation(max_length=maximum)
+    return tokenizer
+
+
+def _embed(session: Any, model_path: str, request: dict[str, Any]) -> dict[str, Any]:
+    import numpy as np
+
+    config = request.get("config", {})
+    tokenizer = _embedding_encoder(session, model_path, config)
+    texts = request.get("inputs")
+    if not isinstance(texts, list) or not 1 <= len(texts) <= 128:
+        raise ValueError("embedding input must contain 1 to 128 strings")
+    if any(not isinstance(text, str) or not text.strip() or len(text.encode("utf-8")) > 32768 for text in texts):
+        raise ValueError("embedding inputs must be nonempty strings of at most 32 KiB")
+    encodings = tokenizer.encode_batch(texts, add_special_tokens=True)
+    lengths = [len(encoding.ids) for encoding in encodings]
+    if any(length == 0 or length > config["max_length"] for length in lengths):
+        raise ValueError("encoded input exceeds max_length; explicit truncate is required")
+    metas = session.get_inputs()
+    static_lengths = {meta.shape[1] for meta in metas if isinstance(meta.shape[1], int)}
+    if len(static_lengths) > 1:
+        raise ValueError("encoder inputs have inconsistent static sequence lengths")
+    width = next(iter(static_lengths), max(lengths))
+    if width <= 0 or width > 32768 or width < max(lengths):
+        raise ValueError("encoder static sequence length is incompatible with encoded input")
+    if any(isinstance(meta.shape[0], int) and meta.shape[0] != len(texts) for meta in metas):
+        raise ValueError("encoder static batch dimension does not match request")
+    if "attention_mask" not in {meta.name for meta in metas} and any(length != width for length in lengths):
+        raise ValueError("padded encoder batches require an attention_mask input")
+    ids = np.full((len(texts), width), config["pad_token_id"], dtype=np.int64)
+    mask = np.zeros_like(ids)
+    types = np.zeros_like(ids)
+    for row, encoding in enumerate(encodings):
+        length = lengths[row]
+        ids[row, :length] = encoding.ids
+        mask[row, :length] = encoding.attention_mask
+        types[row, :length] = encoding.type_ids
+    if np.any((mask != 0) & (mask != 1)) or np.any(mask.sum(axis=1) == 0):
+        raise ValueError("tokenizer produced invalid encoder attention masks")
+    arrays = {"input_ids": ids, "attention_mask": mask, "token_type_ids": types}
+    feed = {}
+    for meta in metas:
+        values = arrays[meta.name]
+        if meta.type == "tensor(int32)" and np.any(values > np.iinfo(np.int32).max):
+            raise ValueError("token IDs do not fit graph int32 inputs")
+        feed[meta.name] = values.astype(np.int32 if meta.type == "tensor(int32)" else np.int64)
+    # This count is derived from the exact IDs/mask passed to this run. It
+    # includes special tokens and respects truncation; batch padding is excluded.
+    prompt_tokens = int(mask.sum())
+    result = np.asarray(session.run([config["output_name"]], feed)[0])
+    if result.dtype.kind != "f" or result.shape[0] != len(texts):
+        raise ValueError("encoder output must be a floating tensor with the requested batch")
+    pooling = config["pooling"]
+    if pooling == "none":
+        if result.ndim != 2:
+            raise ValueError("pooling=none requires a rank-2 pooled embedding output")
+        vectors = result.astype(np.float32)
+    else:
+        if result.ndim != 3 or result.shape[1] != width:
+            raise ValueError("mean/cls pooling requires rank-3 token hidden states")
+        values = result.astype(np.float32)
+        vectors = values[:, 0, :] if pooling == "cls" else (
+            (values * mask[:, :, None]).sum(axis=1) / mask.sum(axis=1)[:, None]
+        )
+    if vectors.shape[1] == 0 or vectors.size > 16 * 1024 * 1024 or not np.isfinite(vectors).all():
+        raise ValueError("encoder returned invalid embedding values")
+    if config.get("normalize", False):
+        norms = np.linalg.norm(vectors.astype(np.float64), axis=1, keepdims=True)
+        if not np.isfinite(norms).all() or np.any(norms <= np.finfo(np.float64).eps):
+            raise ValueError("cannot normalize zero/nonfinite embedding")
+        vectors = vectors / norms
+    return {"embeddings": vectors.tolist(), "prompt_tokens": prompt_tokens,
+            "usage_source": "input_ids_attention_mask"}
 
 
 def _provider_configuration(requested: str, device: str) -> tuple[str, dict[str, str]]:
@@ -136,6 +245,7 @@ def main() -> int:
     parser.add_argument("--device", default="CPU")
     parser.add_argument("--provider", default="")
     parser.add_argument("--probe", action="store_true")
+    parser.add_argument("--embedding-config")
     args = parser.parse_args()
 
     try:
@@ -154,6 +264,8 @@ def main() -> int:
         )
         session, provider = _session(args.model_path, args.device, requested_provider, ort)
         if args.probe:
+            if args.embedding_config:
+                _embedding_encoder(session, args.model_path, json.loads(args.embedding_config))
             print(
                 json.dumps(
                     {"ok": True, "device": args.device.upper(), "provider": provider}
@@ -161,6 +273,9 @@ def main() -> int:
             )
             return 0
         request = json.load(sys.stdin)
+        if request.get("operation") == "embed":
+            print(json.dumps(_embed(session, args.model_path, request), allow_nan=False))
+            return 0
         inputs = session.get_inputs()
         if not inputs:
             raise RuntimeError("ONNX model has no inputs")

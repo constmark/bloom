@@ -23,6 +23,8 @@ use crate::{
 
 pub struct OnnxRuntimeEngine;
 
+mod embedding;
+
 const DEFAULT_BRIDGE_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_BRIDGE_TIMEOUT_SECS: u64 = 3_600;
 const MAX_BRIDGE_STDOUT_BYTES: usize = 64 * 1024 * 1024;
@@ -150,7 +152,7 @@ impl Engine for OnnxRuntimeEngine {
             supported_modalities: self.supported_modalities(),
             supports_streaming: false,
             supports_quantized_models: true,
-            supports_embeddings: false,
+            supports_embeddings: true,
             supports_rerank: false,
             supports_structured_output: false,
             max_context_tokens: None,
@@ -184,7 +186,9 @@ impl Engine for OnnxRuntimeEngine {
         let script = script_path();
         crate::core::security::validate_external_script(&script)?;
         let expected_provider = provider_name(device)?;
-        let probe = run_probe(&python, &script, &onnx_file, device)?;
+        let manifest = crate::manifest_adapter::load_manifest(model_path)?;
+        let embedding = embedding::Config::from_manifest(&manifest)?;
+        let probe = run_probe(&python, &script, &onnx_file, device, embedding.as_ref())?;
         if probe.device != device_label(device) || probe.provider != expected_provider {
             return Err(anyhow!(
                 "ONNX Runtime probe selected device/provider {}/{} but Bloom requested {}/{}",
@@ -194,7 +198,6 @@ impl Engine for OnnxRuntimeEngine {
                 expected_provider
             ));
         }
-        let manifest = crate::manifest_adapter::load_manifest(model_path).unwrap_or_default();
         let metadata = ModelMetadata {
             id: onnx_file
                 .file_stem()
@@ -211,6 +214,7 @@ impl Engine for OnnxRuntimeEngine {
             device,
             provider: probe.provider,
             metadata,
+            embedding,
         }))
     }
 }
@@ -221,6 +225,7 @@ struct OnnxRuntimeModel {
     device: DeviceKind,
     provider: String,
     metadata: ModelMetadata,
+    embedding: Option<embedding::Config>,
 }
 
 impl LoadedModel for OnnxRuntimeModel {
@@ -237,7 +242,64 @@ impl LoadedModel for OnnxRuntimeModel {
         input: ModelInput,
         _params: &bloomai_core::GenerationParams,
     ) -> Result<ModelOutput> {
-        let request = serde_json::to_vec(&input)?;
+        if self.embedding.is_some() {
+            let ModelInput::Text { prompt } = input else {
+                anyhow::bail!("ONNX embedding models require text input");
+            };
+            let mut output = self.embed_batch(&[prompt])?;
+            return Ok(ModelOutput {
+                logits: Some(output.remove(0)),
+                text: None,
+                image: None,
+                audio: None,
+                video: None,
+            });
+        }
+        serde_json::from_value(self.bridge(&serde_json::to_value(input)?)?).map_err(Into::into)
+    }
+
+    fn supports_native_embedding_batch(&self) -> bool {
+        self.embedding.is_some()
+    }
+
+    fn embed_batch(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+        Ok(self.embed_batch_with_usage(inputs)?.embeddings)
+    }
+
+    fn embed_batch_with_usage(
+        &self,
+        inputs: &[String],
+    ) -> Result<crate::model::EmbeddingBatchOutput> {
+        let config = self
+            .embedding
+            .as_ref()
+            .ok_or_else(|| anyhow!("ONNX model has no explicit embedding configuration"))?;
+        embedding::validate_inputs(inputs)?;
+        let response = self
+            .bridge(&serde_json::json!({"operation":"embed", "inputs":inputs, "config":config}))?;
+        embedding::parse_response(response, inputs.len(), config.max_length)
+    }
+
+    fn infer_stream(
+        &self,
+        input: ModelInput,
+        params: &bloomai_core::GenerationParams,
+        sink: &mut dyn OutputSink,
+    ) -> Result<()> {
+        let output = self.infer(input, params)?;
+        if let Some(text) = output.text {
+            sink.on_chunk(OutputChunk::TextDelta(text))?;
+        }
+        if let Some(logits) = output.logits {
+            sink.on_chunk(OutputChunk::Embedding(logits))?;
+        }
+        sink.on_chunk(OutputChunk::End)
+    }
+}
+
+impl OnnxRuntimeModel {
+    fn bridge(&self, request: &serde_json::Value) -> Result<serde_json::Value> {
+        let request = serde_json::to_vec(request)?;
         let mut command = Command::new(&self.python);
         command
             .env("PYTHONIOENCODING", "utf-8")
@@ -279,22 +341,6 @@ impl LoadedModel for OnnxRuntimeModel {
         serde_json::from_str(stdout.trim()).map_err(|error| {
             anyhow!("ONNX Runtime bridge returned invalid JSON: {error}; output={stdout:?}")
         })
-    }
-
-    fn infer_stream(
-        &self,
-        input: ModelInput,
-        params: &bloomai_core::GenerationParams,
-        sink: &mut dyn OutputSink,
-    ) -> Result<()> {
-        let output = self.infer(input, params)?;
-        if let Some(text) = output.text {
-            sink.on_chunk(OutputChunk::TextDelta(text))?;
-        }
-        if let Some(logits) = output.logits {
-            sink.on_chunk(OutputChunk::Embedding(logits))?;
-        }
-        sink.on_chunk(OutputChunk::End)
     }
 }
 
@@ -340,7 +386,13 @@ fn provider_name(device: DeviceKind) -> Result<&'static str> {
     }
 }
 
-fn run_probe(python: &Path, script: &Path, model: &Path, device: DeviceKind) -> Result<OnnxProbe> {
+fn run_probe(
+    python: &Path,
+    script: &Path,
+    model: &Path,
+    device: DeviceKind,
+    embedding: Option<&embedding::Config>,
+) -> Result<OnnxProbe> {
     let mut command = Command::new(python);
     command
         .env("PYTHONIOENCODING", "utf-8")
@@ -353,6 +405,11 @@ fn run_probe(python: &Path, script: &Path, model: &Path, device: DeviceKind) -> 
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(config) = embedding {
+        command
+            .arg("--embedding-config")
+            .arg(serde_json::to_string(config)?);
+    }
     let output = run_bridge(&mut command, &[])?;
     if output.stdout_exceeded || output.stderr_exceeded {
         return Err(anyhow!(

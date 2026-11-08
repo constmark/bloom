@@ -11,6 +11,59 @@ use bloomai_core::BloomError;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
+#[cfg(test)]
+mod dense_batch_tests;
+
+pub(super) fn memory_plan(model: &CandleTextModel) -> Result<crate::batching::DenseMemoryPlan> {
+    anyhow::ensure!(
+        model.device.is_cpu()
+            && !candle_core::utils::has_accelerate()
+            && !candle_core::utils::has_mkl(),
+        "dense memory admission currently supports audited CPU/F32 GEMM, not opaque GPU/BLAS workspaces"
+    );
+    anyhow::ensure!(
+        matches!(
+            model.model_type,
+            super::ModelType::Qwen2 | super::ModelType::Qwen3
+        ) && model.gguf_file_path.is_none()
+            && model
+                .config
+                .get("quantization_config")
+                .is_none_or(serde_json::Value::is_null),
+        "dense memory admission requires unquantized Safetensors Qwen2/Qwen3"
+    );
+    anyhow::ensure!(
+        !KvCacheDtype::from_env().needs_dequant()
+            && std::env::var("BLOOM_KV_CACHE_DTYPE")
+                .unwrap_or_default()
+                .to_lowercase()
+                != "int4",
+        "dense memory admission requires unquantized KV"
+    );
+    anyhow::ensure!(
+        model.config["hidden_act"].as_str() == Some("silu"),
+        "dense memory admission currently audits the SiLU Qwen feed-forward path"
+    );
+    model.weight_artifacts.verify()?;
+    let paths = crate::core::manifest::resolve_hf_safetensors_files(&model.model_path)?;
+    anyhow::ensure!(!paths.is_empty(), "dense model has no safetensors files");
+    let file_bytes = paths.iter().try_fold(0usize, |total, path| {
+        let bytes = usize::try_from(std::fs::metadata(path)?.len())?;
+        total
+            .checked_add(bytes)
+            .ok_or_else(|| anyhow!("weight file size overflows"))
+    })?;
+    let vocabulary_bytes = model
+        .vocab_strings
+        .iter()
+        .try_fold(0usize, |total, token| {
+            total
+                .checked_add(token.len() + std::mem::size_of::<String>())
+                .ok_or_else(|| anyhow!("vocabulary size overflows"))
+        })?;
+    crate::batching::DenseMemoryPlan::cpu_qwen(&model.config, file_bytes, vocabulary_bytes)
+}
+
 pub(super) fn build(
     model: Arc<CandleTextModel>,
     kv_pool: Arc<BloomKvCachePool>,
@@ -24,6 +77,7 @@ pub(super) fn build(
         num_kv_heads,
         head_dim,
         long_context_policy,
+        experimental_dense_batch: experimental_dense,
     } = config;
     // Clone the exact device used by the weights; a fresh GPU device with the
     // same ordinal does not necessarily have the same Candle identity.
@@ -41,12 +95,18 @@ pub(super) fn build(
         );
     }
 
-    // A streaming model keeps immutable weights in mmap-backed tensors and
+    // A streaming model keeps immutable weights in shared tensors and
     // owns only its KV state mutably.  Forking one empty-KV template per
     // request shares those weights instead of reopening every safetensors
     // shard for each admitted sequence.  This is the same residency model a
     // single-node serving engine needs for continuous batching.
-    let streaming_template = if model.uses_streaming_variant() || use_paged_kv {
+    let native_dense = experimental_dense
+        && matches!(
+            model.model_type,
+            super::ModelType::Qwen2 | super::ModelType::Qwen3
+        )
+        && !crate::core::manifest::resolve_hf_safetensors_files(&model.model_path)?.is_empty();
+    let streaming_template = if model.uses_streaming_variant() || use_paged_kv || native_dense {
         model.weight_artifacts.verify()?;
         let loaded = {
             let source = model
@@ -79,6 +139,11 @@ pub(super) fn build(
         None
     };
 
+    let has_native_kv = streaming_template.is_some();
+    let dense_batch = experimental_dense
+        && streaming_template
+            .as_ref()
+            .is_some_and(|model| model.supports_dense_batch());
     let request_models = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
         usize,
         Arc<std::sync::Mutex<QwenModelWrapper>>,
@@ -140,9 +205,7 @@ pub(super) fn build(
                     input_ids.device(),
                 )?);
             }
-            if cu_seqlens.len() != batch_size + 1 {
-                return Err(anyhow!("invalid continuous-batching sequence offsets"));
-            }
+            validate_batch_layout(input_ids, start_positions, kv_handles, cu_seqlens)?;
             let mut models_to_run = Vec::with_capacity(batch_size);
             {
                 let mut models = request_models_for_batch
@@ -164,70 +227,14 @@ pub(super) fn build(
                     models_to_run.push(Arc::clone(model));
                 }
             }
-            let run_request = |index: usize,
-                               model: &Arc<std::sync::Mutex<QwenModelWrapper>>|
-             -> Result<candle_core::Tensor> {
-                let start = cu_seqlens[index];
-                let end = cu_seqlens[index + 1];
-                let sequence_len = end.checked_sub(start).ok_or_else(|| {
-                    anyhow!("continuous-batching sequence offsets are not ordered")
-                })?;
-                let start_pos = start_positions.get(index).copied().unwrap_or(0);
-                let request_input = input_ids.narrow(0, start, sequence_len)?.unsqueeze(0)?;
-                model
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .forward(&request_input, start_pos)
-            };
-
-            // Candle does not expose a ragged Qwen forward kernel here. CPU
-            // requests can still make real progress concurrently because each
-            // handle owns a private KV state while immutable streaming weights
-            // are shared. Keep the GPU path serialized: parallel CUDA launches
-            // would compete for one admitted context and generally regress
-            // latency without a dedicated stream/graph scheduler.
-            let request_logits = if input_ids.device().is_cpu()
-                && batch_size > 1
-                && batch_size
-                    <= std::thread::available_parallelism()
-                        .map(|parallelism| parallelism.get().saturating_mul(2))
-                        .unwrap_or(2)
-            {
-                let slots = (0..batch_size)
-                    .map(|_| Mutex::new(None))
-                    .collect::<Vec<Mutex<Option<Result<candle_core::Tensor>>>>>();
-                std::thread::scope(|scope| {
-                    for (index, model) in models_to_run.iter().enumerate() {
-                        let slot = &slots[index];
-                        scope.spawn(move || {
-                            let result = run_request(index, model);
-                            *slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(result);
-                        });
-                    }
-                });
-                slots
-                    .into_iter()
-                    .map(|slot| {
-                        slot.into_inner()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .ok_or_else(|| anyhow!("CPU batch worker did not finish"))?
-                    })
-                    .collect::<Result<Vec<_>>>()?
-            } else {
-                models_to_run
-                    .iter()
-                    .enumerate()
-                    .map(|(index, model)| run_request(index, model))
-                    .collect::<Result<Vec<_>>>()?
-            };
-
-            let mut logits = Vec::with_capacity(batch_size);
-            for result in request_logits {
-                logits.push(final_token_logits(result)?);
-            }
-            // Each request contributes one vocabulary vector, regardless of
-            // whether its model returns [1, vocab] or [1, sequence, vocab].
-            candle_core::Tensor::stack(&logits, 0).map_err(Into::into)
+            forward_request_batch(
+                input_ids,
+                start_positions,
+                kv_handles,
+                cu_seqlens,
+                &models_to_run,
+                dense_batch,
+            )
         },
     );
 
@@ -266,13 +273,17 @@ pub(super) fn build(
             .with_cache(Arc::clone(&paged_cache))
             .with_prepare_request(prepare_request)
             .with_restored_prefix_handles(Arc::clone(&restored_prefix_handles))
-            .with_vocab_and_tokenizer(
+            .with_shared_vocab_and_tokenizer(
                 model.vocab_strings.clone(),
                 model.eos_token_ids.clone(),
-                Some(model.tokenizer.clone()),
-            )
-            .with_forward_batch_fn(forward_batch_fn);
-        if use_paged_kv || model.uses_streaming_variant() {
+                Some(Arc::clone(&model.tokenizer)),
+            );
+        let base = if dense_batch {
+            base.with_dense_forward_batch_fn(forward_batch_fn)
+        } else {
+            base.with_forward_batch_fn(forward_batch_fn)
+        };
+        if has_native_kv {
             let hook = Arc::new(CandleKvHook::new(
                 Arc::clone(&request_models),
                 num_layers,
@@ -304,6 +315,151 @@ pub(super) fn build(
     });
 
     Ok(executor)
+}
+
+fn validate_batch_layout(
+    input: &candle_core::Tensor,
+    positions: &[usize],
+    handles: &[usize],
+    offsets: &[usize],
+) -> Result<()> {
+    if positions.len() != handles.len()
+        || offsets.len() != handles.len() + 1
+        || offsets.first() != Some(&0)
+        || offsets.last().copied() != Some(input.dim(0)?)
+        || offsets.windows(2).any(|pair| pair[0] >= pair[1])
+        || handles.iter().copied().collect::<HashSet<_>>().len() != handles.len()
+    {
+        anyhow::bail!("invalid continuous-batching layout or duplicate KV handles");
+    }
+    Ok(())
+}
+
+fn forward_request_batch(
+    input_ids: &candle_core::Tensor,
+    start_positions: &[usize],
+    kv_handles: &[usize],
+    cu_seqlens: &[usize],
+    models: &[Arc<Mutex<QwenModelWrapper>>],
+    dense_batch: bool,
+) -> Result<candle_core::Tensor> {
+    validate_batch_layout(input_ids, start_positions, kv_handles, cu_seqlens)?;
+    let batch_size = models.len();
+    if batch_size != kv_handles.len() {
+        anyhow::bail!("continuous-batching model count mismatch");
+    }
+    if dense_batch
+        && batch_size > 1
+        && start_positions
+            .iter()
+            .all(|position| *position == start_positions[0])
+        && cu_seqlens
+            .windows(2)
+            .all(|pair| pair[1] - pair[0] == cu_seqlens[1])
+    {
+        // Deterministic lock ordering also protects callers outside the
+        // executor's serialization lock. Duplicate handles are rejected above.
+        let mut order = (0..batch_size).collect::<Vec<_>>();
+        order.sort_unstable_by_key(|&index| kv_handles[index]);
+        let mut guards = order
+            .iter()
+            .map(|&index| {
+                (
+                    index,
+                    models[index]
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()),
+                )
+            })
+            .collect::<Vec<_>>();
+        guards.sort_unstable_by_key(|(index, _)| *index);
+        let mut streaming = guards
+            .iter_mut()
+            .filter_map(|(_, model)| match &mut **model {
+                QwenModelWrapper::Streaming(model) if model.supports_dense_batch() => Some(model),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if streaming.len() == batch_size {
+            let input = input_ids.reshape((batch_size, cu_seqlens[1]))?;
+            let logits = QwenStreamingModelForCausalLM::forward_dense_batch(
+                &mut streaming,
+                &input,
+                start_positions[0],
+            )?;
+            tracing::debug!(
+                batch_size,
+                tokens_per_request = cu_seqlens[1],
+                "executed one dense model forward"
+            );
+            return Ok(logits.squeeze(1)?);
+        }
+    }
+
+    let run_request = |index: usize,
+                       model: &Arc<std::sync::Mutex<QwenModelWrapper>>|
+     -> Result<candle_core::Tensor> {
+        let start = cu_seqlens[index];
+        let end = cu_seqlens[index + 1];
+        let sequence_len = end
+            .checked_sub(start)
+            .ok_or_else(|| anyhow!("continuous-batching sequence offsets are not ordered"))?;
+        let start_pos = start_positions.get(index).copied().unwrap_or(0);
+        let request_input = input_ids.narrow(0, start, sequence_len)?.unsqueeze(0)?;
+        model
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .forward(&request_input, start_pos)
+    };
+
+    // Candle does not expose a ragged Qwen forward kernel here. CPU
+    // requests can still make real progress concurrently because each
+    // handle owns a private KV state while immutable streaming weights
+    // are shared. Keep the GPU path serialized: parallel CUDA launches
+    // would compete for one admitted context and generally regress
+    // latency without a dedicated stream/graph scheduler.
+    let request_logits = if input_ids.device().is_cpu()
+        && batch_size > 1
+        && batch_size
+            <= std::thread::available_parallelism()
+                .map(|parallelism| parallelism.get().saturating_mul(2))
+                .unwrap_or(2)
+    {
+        let slots = (0..batch_size)
+            .map(|_| Mutex::new(None))
+            .collect::<Vec<Mutex<Option<Result<candle_core::Tensor>>>>>();
+        std::thread::scope(|scope| {
+            for (index, model) in models.iter().enumerate() {
+                let slot = &slots[index];
+                scope.spawn(move || {
+                    let result = run_request(index, model);
+                    *slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(result);
+                });
+            }
+        });
+        slots
+            .into_iter()
+            .map(|slot| {
+                slot.into_inner()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .ok_or_else(|| anyhow!("CPU batch worker did not finish"))?
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        models
+            .iter()
+            .enumerate()
+            .map(|(index, model)| run_request(index, model))
+            .collect::<Result<Vec<_>>>()?
+    };
+
+    let mut logits = Vec::with_capacity(batch_size);
+    for result in request_logits {
+        logits.push(final_token_logits(result)?);
+    }
+    // Each request contributes one vocabulary vector, regardless of
+    // whether its model returns [1, vocab] or [1, sequence, vocab].
+    candle_core::Tensor::stack(&logits, 0).map_err(Into::into)
 }
 
 fn new_request_model(
