@@ -5,6 +5,7 @@ mod browser;
 mod chat;
 mod i18n;
 mod markdown;
+mod sse;
 mod storage;
 
 use api::{
@@ -748,6 +749,7 @@ fn build_chat_history(options: &ChatOptions, messages: &[DisplayMessage]) -> Vec
 
 #[component]
 fn App() -> Element {
+    let _button_activation_focus = use_hook(browser::capture_button_activation);
     let config = use_signal(storage::load_connection);
     let mut locale = use_signal(storage::load_locale);
     let (mut conversations, mut conversation_storage_notice_state) = use_hook(|| {
@@ -1462,7 +1464,9 @@ fn App() -> Element {
                                         aria_label: "Delete conversation",
                                         title: "Delete conversation",
                                         onclick: move |_| pending_delete.set(Some(id)),
-                                        "×"
+                                        svg { "aria-hidden": "true", width: "12", height: "12", view_box: "0 0 12 12",
+                                            path { d: "M2 2l8 8M10 2l-8 8", stroke: "currentColor", stroke_width: "1.5", stroke_linecap: "round" }
+                                        }
                                     }
                                 }
                             }
@@ -1595,7 +1599,11 @@ fn App() -> Element {
                                 "☰"
                             }
                         }
-                        div { class: "brand-logo", "B" }
+                        div { class: "brand-logo", aria_hidden: "true",
+                            svg { width: "1em", height: "1em", view_box: "0 0 24 24", fill: "currentColor",
+                                path { fill_rule: "evenodd", d: "M6 3h7c3 0 5 1.8 5 4.5c0 1.6-.8 3-2.1 3.7 1.8.7 2.9 2.2 2.9 4.3 0 3.2-2.3 5.5-5.8 5.5H6V3zM9 6v4h4c1.3 0 2-.8 2-2s-.7-2-2-2H9zM9 13v5h4c1.8 0 2.8-1 2.8-2.5S14.8 13 13 13H9z" }
+                            }
+                        }
                         div {
                             h1 { class: "brand-title", "Bloom" }
                             div { class: "brand-sub",
@@ -5368,7 +5376,11 @@ fn MessageList(
         return rsx! {
             div { class: "messages",
                 div { class: "empty-state",
-                    div { class: "empty-state-mark", "B" }
+                    div { class: "empty-state-mark", aria_hidden: "true",
+                            svg { width: "1em", height: "1em", view_box: "0 0 24 24", fill: "currentColor",
+                                path { fill_rule: "evenodd", d: "M6 3h7c3 0 5 1.8 5 4.5c0 1.6-.8 3-2.1 3.7 1.8.7 2.9 2.2 2.9 4.3 0 3.2-2.3 5.5-5.8 5.5H6V3zM9 6v4h4c1.3 0 2-.8 2-2s-.7-2-2-2H9zM9 13v5h4c1.8 0 2.8-1 2.8-2.5S14.8 13 13 13H9z" }
+                            }
+                        }
                     div { class: "empty-state-eyebrow", "{copy.home_eyebrow}" }
                     h2 { "{copy.home_title}" }
                     p { class: "empty-state-lead", "{copy.home_body}" }

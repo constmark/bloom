@@ -88,6 +88,26 @@ class ReleaseWorkflowSecurityTests(unittest.TestCase):
         )
         self.assert_rejected(mutated, "must contain exactly one actions/attest step")
 
+    def test_rejects_release_without_required_ci(self) -> None:
+        for before, after, error in (
+            ("    needs: checks", "    needs: []", "build must require successful checks"),
+            ("    needs: build", "    needs: []", "github-release must require successful build"),
+            ("./.github/workflows/ci.yml", "./.github/workflows/unrelated.yml", "same-revision CI"),
+            ("    needs: checks", "    needs: checks\n    if: always()", "must not bypass"),
+            ("    name: Required release checks", "    name: Required release checks\n    if: false", "must not be skipped"),
+        ):
+            with self.subTest(before=before, after=after):
+                self.assert_rejected(self.workflow.replace(before, after, 1), error)
+
+    def test_rejects_unverified_ui_tool_downloads(self) -> None:
+        for required in (
+            " --features no-downloads",
+            "python scripts/install_ui_toolchain.py",
+            'NO_DOWNLOADS: "1"',
+        ):
+            with self.subTest(required=required):
+                self.assert_rejected(self.workflow.replace(required, "", 1), "fail-closed toolchain")
+
 
 if __name__ == "__main__":
     unittest.main()

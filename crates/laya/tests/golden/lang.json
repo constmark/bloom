@@ -1,0 +1,502 @@
+[
+  {
+    "input": "I was charged twice, please refund",
+    "script": "latin",
+    "language": "en",
+    "is_english": true,
+    "language_undecided": false,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "The quick brown fox jumps over the lazy dog.",
+    "script": "latin",
+    "language": "en",
+    "is_english": true,
+    "language_undecided": false,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "Mein Konto wurde zweimal belastet",
+    "script": "latin",
+    "language": "de",
+    "is_english": false,
+    "language_undecided": false,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "Je voudrais annuler mon abonnement, merci beaucoup",
+    "script": "latin",
+    "language": "fr",
+    "is_english": false,
+    "language_undecided": false,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "Quiero cancelar mi suscripcion y necesito ayuda",
+    "script": "latin",
+    "language": "es",
+    "is_english": false,
+    "language_undecided": false,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "Voce pode me mandar a nota fiscal?",
+    "script": "latin",
+    "language": "pt",
+    "is_english": false,
+    "language_undecided": false,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "Ho bisogno di aiuto con la mia fattura, grazie",
+    "script": "latin",
+    "language": "it",
+    "is_english": false,
+    "language_undecided": false,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "Ik wil mijn account opzeggen alstublieft",
+    "script": "latin",
+    "language": null,
+    "is_english": true,
+    "language_undecided": true,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "Vreau sa anulez abonamentul meu foarte repede",
+    "script": "latin",
+    "language": "ro",
+    "is_english": false,
+    "language_undecided": false,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "Ami tomake ekta message pathacchi, kintu somossa hocche",
+    "script": "latin",
+    "language": "bn",
+    "is_english": false,
+    "language_undecided": false,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "私は二重に請求されました",
+    "script": "kana",
+    "language": null,
+    "is_english": false,
+    "language_undecided": true,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 1.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "मुझे दो बार शुल्क लिया गया",
+    "script": "devanagari",
+    "language": null,
+    "is_english": false,
+    "language_undecided": true,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 1.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "저는 두 번 청구되었습니다",
+    "script": "hangul",
+    "language": null,
+    "is_english": false,
+    "language_undecided": true,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 1.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "Меня дважды списали деньги",
+    "script": "cyrillic",
+    "language": null,
+    "is_english": false,
+    "language_undecided": true,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 1.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "لقد تم خصم المبلغ مرتين",
+    "script": "arabic",
+    "language": null,
+    "is_english": false,
+    "language_undecided": true,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 1.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "ฉันถูกเรียกเก็บเงินสองครั้ง",
+    "script": "thai",
+    "language": null,
+    "is_english": false,
+    "language_undecided": true,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 1.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "Δύο φορές χρεώθηκα",
+    "script": "greek",
+    "language": null,
+    "is_english": false,
+    "language_undecided": true,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 1.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "நான் இருமுறை கட்டணம் வசூலிக்கப்பட்டேன்",
+    "script": "tamil",
+    "language": null,
+    "is_english": false,
+    "language_undecided": true,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 1.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "https://github.com/foo/bar and user@acme.com",
+    "script": "latin",
+    "language": "en",
+    "is_english": true,
+    "language_undecided": false,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "v1.2.3 U.S.A. e.g. i.e.",
+    "script": "latin",
+    "language": null,
+    "is_english": true,
+    "language_undecided": true,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "Set alpha to 0.05 and beta to 0.1",
+    "script": "latin",
+    "language": "en",
+    "is_english": true,
+    "language_undecided": false,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "OK",
+    "script": "latin",
+    "language": null,
+    "is_english": true,
+    "language_undecided": true,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "",
+    "script": "unknown",
+    "language": null,
+    "is_english": true,
+    "language_undecided": true,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "Dmitri Petrovich Savitsky wrote the report",
+    "script": "latin",
+    "language": "en",
+    "is_english": true,
+    "language_undecided": false,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "Bonjour, je m'appelle Jean et j'habite a Paris",
+    "script": "latin",
+    "language": "fr",
+    "is_english": false,
+    "language_undecided": false,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "Necesito ayuda con mi factura por favor",
+    "script": "latin",
+    "language": "es",
+    "is_english": false,
+    "language_undecided": false,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "Deu erro 500 no endpoint de login depois do update",
+    "script": "latin",
+    "language": "pt",
+    "is_english": false,
+    "language_undecided": false,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "Обвинение предъявлено вчера в суде Москвы",
+    "script": "cyrillic",
+    "language": null,
+    "is_english": false,
+    "language_undecided": true,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 1.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "混合 text with English brand names like Apple",
+    "script": "latin",
+    "language": "en",
+    "is_english": true,
+    "language_undecided": false,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 0.0556,
+    "mixed_segment": null
+  },
+  {
+    "input": "Türkçe metin çok güzel ve ilginç bir dil",
+    "script": "latin",
+    "language": "az",
+    "is_english": false,
+    "language_undecided": false,
+    "diacritic_rate": 0.125,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "Je voudrais annuler mon abonnement car je ne suis pas satisfait du service.\nThe subscription management page keeps throwing an error whenever I click the cancel button and nothing happens after several tries on different browsers and devices today",
+    "script": "latin",
+    "language": "fr",
+    "is_english": false,
+    "language_undecided": false,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": "Je voudrais annuler mon abonnement car je ne suis pas satisfait du service."
+  },
+  {
+    "input": "Please refund the duplicate charge on my account.\nTraceback: os.path failed in round(el, 2) at non_english line 42 of the payment module during the retry",
+    "script": "latin",
+    "language": "en",
+    "is_english": true,
+    "language_undecided": false,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "Please send Jose the invoice and the refund for his order today",
+    "script": "latin",
+    "language": "en",
+    "is_english": true,
+    "language_undecided": false,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "Please send José the invoice and the refund for his order today",
+    "script": "latin",
+    "language": "en",
+    "is_english": true,
+    "language_undecided": false,
+    "diacritic_rate": 0.0159,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "I would like a refund for the résumé service I paid for twice this month",
+    "script": "latin",
+    "language": "en",
+    "is_english": true,
+    "language_undecided": false,
+    "diacritic_rate": 0.0278,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "We met at the café for a naïve chat about the résumé and the soirée plans",
+    "script": "latin",
+    "language": null,
+    "is_english": false,
+    "language_undecided": true,
+    "diacritic_rate": 0.0685,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "Jag har blivit debiterad två gånger och vill ha pengarna tillbaka nu",
+    "script": "latin",
+    "language": "sv",
+    "is_english": false,
+    "language_undecided": false,
+    "diacritic_rate": 0.0294,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "jag behöver hjälp med min faktura",
+    "script": "latin",
+    "language": "sv",
+    "is_english": false,
+    "language_undecided": false,
+    "diacritic_rate": 0.0606,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "kan inte logga in",
+    "script": "latin",
+    "language": "sv",
+    "is_english": false,
+    "language_undecided": false,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "glömt mitt lösenord",
+    "script": "latin",
+    "language": "sv",
+    "is_english": false,
+    "language_undecided": false,
+    "diacritic_rate": 0.1053,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "min konto kommer ja",
+    "script": "latin",
+    "language": null,
+    "is_english": false,
+    "language_undecided": true,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "MON DES EST LA",
+    "script": "latin",
+    "language": null,
+    "is_english": true,
+    "language_undecided": true,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "STORES LOS ANGELES LAS VEGAS EL PASO CLOSED",
+    "script": "latin",
+    "language": null,
+    "is_english": true,
+    "language_undecided": true,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "WIE SPÄT IST ES IN KÖLN",
+    "script": "latin",
+    "language": null,
+    "is_english": false,
+    "language_undecided": true,
+    "diacritic_rate": 0.087,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "WIE SPAET IST ES IN KOELN",
+    "script": "latin",
+    "language": null,
+    "is_english": true,
+    "language_undecided": true,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "ПРИВЕТ MON DES EST LA",
+    "script": "latin",
+    "language": "fr",
+    "is_english": false,
+    "language_undecided": false,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 0.3529,
+    "mixed_segment": null
+  },
+  {
+    "input": "sag mir das HEUTIGE DATUM",
+    "script": "latin",
+    "language": "de",
+    "is_english": false,
+    "language_undecided": false,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "quiero cancelar mi PEDIDO POR FAVOR",
+    "script": "latin",
+    "language": "es",
+    "is_english": false,
+    "language_undecided": false,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "Please refund my order\nMON DES EST LA",
+    "script": "latin",
+    "language": "en",
+    "is_english": true,
+    "language_undecided": false,
+    "diacritic_rate": 0.0,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  },
+  {
+    "input": "Cảm ơn bạn nhiều",
+    "script": "latin",
+    "language": null,
+    "is_english": false,
+    "language_undecided": true,
+    "diacritic_rate": 0.25,
+    "non_latin_fraction": 0.0,
+    "mixed_segment": null
+  }
+]

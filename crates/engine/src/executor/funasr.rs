@@ -303,6 +303,7 @@ impl Engine for FunASREngine {
             }
         };
 
+        let inference_timeout = asr_inference_timeout(std::env::var_os("BLOOM_ASR_TIMEOUT_SECS"))?;
         // Only the unit-test build may construct a simulated ASR runtime.
         let skip_daemon = cfg!(test);
 
@@ -314,6 +315,7 @@ impl Engine for FunASREngine {
                 _runtime: runtime,
                 metadata,
                 processors,
+                inference_timeout,
                 child: None,
                 stdin: None,
                 stdout: None,
@@ -337,6 +339,7 @@ impl Engine for FunASREngine {
             _runtime: runtime,
             metadata,
             processors,
+            inference_timeout,
             child: Some(Arc::new(Mutex::new(child))),
             stdin: Some(Arc::new(Mutex::new(stdin))),
             stdout: Some(Arc::new(Mutex::new(stdout))),
@@ -351,7 +354,7 @@ type AsrDaemon = (
 );
 
 fn spawn_asr_daemon(command: &mut Command, timeout: std::time::Duration) -> Result<AsrDaemon> {
-    let mut child = crate::core::process::ChildGuard::spawn(command)?;
+    let mut child = crate::core::process::ChildGuard::spawn_bounded(command)?;
     let stderr = child
         .stderr
         .take()
@@ -386,6 +389,106 @@ fn spawn_asr_daemon(command: &mut Command, timeout: std::time::Duration) -> Resu
     Ok((child, stdin, BufReader::new(stdout)))
 }
 
+fn asr_inference_timeout(value: Option<std::ffi::OsString>) -> Result<std::time::Duration> {
+    let Some(value) = value else {
+        return Ok(std::time::Duration::from_secs(300));
+    };
+    let seconds = value
+        .to_str()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| (1..=3_600).contains(seconds))
+        .ok_or_else(|| anyhow!("BLOOM_ASR_TIMEOUT_SECS must be an integer between 1 and 3600"))?;
+    Ok(std::time::Duration::from_secs(seconds))
+}
+
+/// One request owns both pipes until its watchdog has settled. In particular,
+/// a completed request's timer must never kill the next request's daemon.
+struct AsrRequestDeadline {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    worker: Option<std::thread::JoinHandle<bool>>,
+}
+
+impl AsrRequestDeadline {
+    fn start(
+        child: Arc<Mutex<crate::core::process::ChildGuard>>,
+        timeout: std::time::Duration,
+    ) -> Result<Self> {
+        let (stop, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("bloom-asr-deadline".into())
+            .spawn(move || {
+                if receiver.recv_timeout(timeout) == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                {
+                    let mut child = child.lock().unwrap_or_else(|error| error.into_inner());
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    true
+                } else {
+                    false
+                }
+            })?;
+        Ok(Self {
+            stop: Some(stop),
+            worker: Some(worker),
+        })
+    }
+
+    fn finish(&mut self) -> bool {
+        self.stop.take();
+        self.worker
+            .take()
+            .is_some_and(|worker| worker.join().unwrap_or(true))
+    }
+}
+
+impl Drop for AsrRequestDeadline {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+fn exchange_asr_request(
+    child: &Arc<Mutex<crate::core::process::ChildGuard>>,
+    stdin: &mut impl Write,
+    stdout: &mut impl BufRead,
+    request: &serde_json::Value,
+    timeout: std::time::Duration,
+) -> Result<String> {
+    if child
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .try_wait()?
+        .is_some()
+    {
+        return Err(anyhow!(
+            "ASR daemon has exited; reload the model to restart it"
+        ));
+    }
+    let mut deadline = AsrRequestDeadline::start(Arc::clone(child), timeout)?;
+    let response = (|| -> Result<String> {
+        writeln!(stdin, "{request}")?;
+        stdin.flush()?;
+        let mut line = String::new();
+        Read::take(stdout, 1024 * 1024 + 1).read_line(&mut line)?;
+        anyhow::ensure!(
+            line.len() <= 1024 * 1024 && line.ends_with('\n'),
+            "ASR response is oversized or incomplete"
+        );
+        Ok(line)
+    })();
+    if deadline.finish() {
+        return Err(anyhow!(
+            "ASR inference exceeded its deadline; reload the model to restart the daemon"
+        ));
+    }
+    if response.is_err() {
+        let mut child = child.lock().unwrap_or_else(|error| error.into_inner());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    response
+}
+
 struct FunASRModel {
     _model_path: std::path::PathBuf,
     _device: String,
@@ -393,6 +496,7 @@ struct FunASRModel {
     _runtime: AsrRuntime,
     metadata: ModelMetadata,
     processors: crate::processor::ProcessorRegistry,
+    inference_timeout: std::time::Duration,
     child: Option<Arc<Mutex<crate::core::process::ChildGuard>>>,
     stdin: Option<Arc<Mutex<std::process::ChildStdin>>>,
     stdout: Option<Arc<Mutex<BufReader<std::process::ChildStdout>>>>,
@@ -486,25 +590,17 @@ impl LoadedModel for FunASRModel {
         // write/read locks permit concurrent callers to consume each other's text.
         let mut stdin = stdin_mutex.lock().unwrap_or_else(|e| e.into_inner());
         let mut stdout = stdout_mutex.lock().unwrap_or_else(|e| e.into_inner());
-        let response = (|| -> Result<String> {
-            writeln!(stdin, "{}", request_json)?;
-            stdin.flush()?;
-            let mut line = String::new();
-            Read::take(&mut *stdout, 1024 * 1024 + 1).read_line(&mut line)?;
-            anyhow::ensure!(
-                line.len() <= 1024 * 1024 && line.ends_with('\n'),
-                "ASR response is oversized or incomplete"
-            );
-            Ok(line)
-        })();
-        if response.is_err()
-            && let Some(child) = &self.child
-        {
-            let mut child = child.lock().unwrap_or_else(|error| error.into_inner());
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        let line = response?;
+        let child = self
+            .child
+            .as_ref()
+            .ok_or_else(|| anyhow!("ASR daemon is unavailable"))?;
+        let line = exchange_asr_request(
+            child,
+            &mut *stdin,
+            &mut *stdout,
+            &request_json,
+            self.inference_timeout,
+        )?;
         drop(stdout);
         drop(stdin);
 
@@ -673,6 +769,79 @@ mod tests {
         }
 
         assert_eq!(decoded, input_str);
+    }
+
+    #[test]
+    fn inference_timeout_is_bounded() {
+        assert_eq!(asr_inference_timeout(None).unwrap().as_secs(), 300);
+        for value in ["0", "3601", "18446744073709551615", "NaN", ""] {
+            assert!(asr_inference_timeout(Some(value.into())).is_err());
+        }
+        for value in ["1", "3600"] {
+            assert_eq!(
+                asr_inference_timeout(Some(value.into()))
+                    .unwrap()
+                    .as_secs()
+                    .to_string(),
+                value
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_inference_deadline_kills_hung_worker_and_inherited_pipes() {
+        // The shell and its child both retain stdout. Killing only the shell
+        // would leave read_line blocked until the descendant exits.
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "printf 'READY\\n' >&2; read request; sleep 30 & wait"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let (child, mut stdin, mut stdout) =
+            spawn_asr_daemon(&mut command, std::time::Duration::from_secs(2)).unwrap();
+        let child = Arc::new(Mutex::new(child));
+        let start = std::time::Instant::now();
+        let error = exchange_asr_request(
+            &child,
+            &mut stdin,
+            &mut stdout,
+            &serde_json::json!({}),
+            std::time::Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("deadline"));
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        assert!(child.lock().unwrap().try_wait().unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_daemon_deadline_does_not_kill_a_reused_worker() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf 'READY\\n' >&2; while read request; do printf '{\"status\":\"ok\",\"text\":\"hello\"}\\n'; done"])
+            .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let (child, mut stdin, mut stdout) =
+            spawn_asr_daemon(&mut command, std::time::Duration::from_secs(2)).unwrap();
+        let child = Arc::new(Mutex::new(child));
+        for _ in 0..2 {
+            let response = exchange_asr_request(
+                &child,
+                &mut stdin,
+                &mut stdout,
+                &serde_json::json!({}),
+                std::time::Duration::from_millis(100),
+            )
+            .unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&response).unwrap()["text"],
+                "hello"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            assert!(child.lock().unwrap().try_wait().unwrap().is_none());
+        }
     }
 
     #[cfg(unix)]

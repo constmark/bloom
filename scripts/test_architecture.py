@@ -41,6 +41,13 @@ class ArchitectureTests(unittest.TestCase):
     def test_frontend_cannot_link_native_runtime(self):
         self.assertTrue(self.add_dependency("bloom-ui", "bloomai-engine"))
 
+    def test_laya_is_a_leaf_dependency_owned_by_engine(self):
+        self.assertEqual(self.add_dependency("bloomai-engine", "bloomai-laya"), [])
+        self.assertTrue(self.add_dependency("bloomai-server", "bloomai-laya"))
+        self.assertTrue(self.add_dependency("bloomai-laya", "bloomai-core"))
+        self.assertTrue(self.add_dependency("bloomai-laya", "axum"))
+        self.assertTrue(self.add_dependency("bloomai-laya", "clap"))
+
     def test_transport_and_tensor_dependencies_are_owned(self):
         self.assertTrue(self.add_dependency("bloomai-engine", "axum"))
         self.assertTrue(self.add_dependency("bloomai-server", "candle-core"))

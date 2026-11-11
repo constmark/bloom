@@ -1,0 +1,27 @@
+services:
+  bloom:
+    image: ${BLOOM_IMAGE:?Set the verified immutable_reference from container-release.json}
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 256
+    mem_limit: 4g
+    cpus: 2
+    tmpfs:
+      - /tmp:rw,nosuid,noexec,size=64m
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      BLOOM_API_KEY: ${BLOOM_API_KEY:?Set a long random inference credential}
+      BLOOM_OPERATOR_API_KEY: ${BLOOM_OPERATOR_API_KEY:?Set a different long random operator credential}
+      BLOOM_STRICT_MEMORY_BUDGET: "1"
+      BLOOM_STRICT_SECURITY: "1"
+      BLOOM_MODELS_DIR: /var/lib/bloom/models
+      BLOOM_MAX_MODEL_STORAGE_BYTES: "21474836480"
+    volumes:
+      - bloom-data:/var/lib/bloom
+    restart: unless-stopped
+    stop_grace_period: 40s
+volumes:
+  bloom-data:

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use anyhow::{Result, anyhow, bail};
 use bloomai_core::{Modality, ProcessorKind, ProcessorSpec};
 
-use crate::io::DataBlock;
+use crate::io::{DataBlock, MAX_AUDIO_SAMPLES, MAX_IMAGE_BYTES, MAX_TENSOR_VALUES};
 
 pub trait Processor: Send + Sync {
     fn name(&self) -> &str;
@@ -283,14 +283,16 @@ impl Processor for AudioProcessor {
 
     fn process(&self, blocks: Vec<DataBlock>) -> Result<Vec<DataBlock>> {
         let mut out = Vec::new();
+        let mut staged_files = Vec::new();
         for block in blocks {
             match block {
                 DataBlock::AudioPcm {
                     mut samples,
                     mut sample_rate,
                 } => {
-                    if sample_rate == 0 {
-                        bail!("audio sample_rate must be greater than zero");
+                    validate_pcm(&samples, sample_rate)?;
+                    if !self.config.vad_threshold.is_finite() {
+                        bail!("audio VAD threshold must be finite");
                     }
                     if let Some(target_rate) = self.config.target_sample_rate {
                         samples = resample_linear(&samples, sample_rate, target_rate)?;
@@ -303,6 +305,7 @@ impl Processor for AudioProcessor {
                             self.config.min_speech_samples,
                         );
                     }
+                    validate_pcm(&samples, sample_rate)?;
                     if !self.config.write_wav {
                         out.push(DataBlock::AudioPcm {
                             samples,
@@ -310,57 +313,71 @@ impl Processor for AudioProcessor {
                         });
                         continue;
                     }
-                    let temp_dir = std::env::temp_dir();
-                    let filename = format!(
-                        "bloom_audio_pcm_{}.wav",
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)?
-                            .as_nanos()
-                    );
-                    let path = temp_dir.join(filename);
-                    write_wav_file(&path, &samples, sample_rate)?;
+                    // Create the file atomically with private permissions. A timestamp
+                    // plus File::create permits symlink overwrite in a shared temp dir.
+                    let mut file = tempfile::Builder::new()
+                        .prefix("bloom_audio_pcm_")
+                        .suffix(".wav")
+                        .tempfile()?;
+                    write_wav(&mut file, &samples, sample_rate)?;
                     out.push(DataBlock::AudioFile {
-                        path: path.to_string_lossy().to_string(),
+                        path: file.path().to_string_lossy().to_string(),
                         language: None,
                     });
+                    staged_files.push(file);
                 }
                 other => out.push(other),
             }
+        }
+        // A later invalid block must not strand an earlier generated WAV.
+        // Successful AudioFile outputs transfer cleanup responsibility to the caller.
+        for file in staged_files {
+            file.keep()?;
         }
         Ok(out)
     }
 }
 
-fn resample_linear(samples: &[f32], source_rate: u32, target_rate: u32) -> Result<Vec<f32>> {
-    if target_rate == 0 {
-        bail!("target audio sample_rate must be greater than zero");
+fn validate_pcm(samples: &[f32], sample_rate: u32) -> Result<()> {
+    if !(8_000..=192_000).contains(&sample_rate) {
+        bail!("audio sample_rate must be between 8000 and 192000 Hz");
     }
-    if source_rate == target_rate || samples.is_empty() {
+    if samples.is_empty() || samples.len() > MAX_AUDIO_SAMPLES {
+        bail!("audio must contain between 1 and {MAX_AUDIO_SAMPLES} samples");
+    }
+    if samples.iter().any(|sample| !sample.is_finite()) {
+        bail!("audio contains a non-finite sample");
+    }
+    Ok(())
+}
+
+fn resample_linear(samples: &[f32], source_rate: u32, target_rate: u32) -> Result<Vec<f32>> {
+    validate_pcm(samples, source_rate)?;
+    if !(8_000..=192_000).contains(&target_rate) {
+        bail!("target audio sample_rate must be between 8000 and 192000 Hz");
+    }
+    if source_rate == target_rate {
         return Ok(samples.to_vec());
     }
 
-    let target_len = ((samples.len() as u128 * target_rate as u128)
-        .saturating_add((source_rate / 2) as u128)
-        / source_rate as u128) as usize;
-    if target_len == 0 {
-        return Ok(Vec::new());
+    let target_len = (samples.len() as u128 * target_rate as u128 + (source_rate / 2) as u128)
+        / source_rate as u128;
+    if target_len == 0 || target_len > MAX_AUDIO_SAMPLES as u128 {
+        bail!("resampled audio must contain between 1 and {MAX_AUDIO_SAMPLES} samples");
     }
-    if samples.len() == 1 {
-        return Ok(vec![samples[0]; target_len]);
-    }
-
-    let scale = source_rate as f32 / target_rate as f32;
-    let mut out = vec![0.0f32; target_len];
-    let len = samples.len();
+    let target_len = usize::try_from(target_len)?;
+    let mut out = Vec::with_capacity(target_len);
     for i in 0..target_len {
-        let pos = (i as f32) * scale;
-        let left = pos as usize;
-        let right = if left + 1 < len { left + 1 } else { len - 1 };
-        let frac = pos - (left as f32);
-
-        let val_left = samples[left];
-        let val_right = samples[right];
-        out[i] = val_left * (1.0 - frac) + val_right * frac;
+        // Integer coordinates prevent f32 rounding from selecting samples[len]
+        // at the tail of a long clip; f64 interpolation cannot overflow f32 inputs.
+        let position = i as u64 * u64::from(source_rate);
+        let left = (position / u64::from(target_rate)) as usize;
+        let left = left.min(samples.len() - 1);
+        let right = (left + 1).min(samples.len() - 1);
+        let frac = (position % u64::from(target_rate)) as f64 / f64::from(target_rate);
+        out.push(
+            (f64::from(samples[left]) * (1.0 - frac) + f64::from(samples[right]) * frac) as f32,
+        );
     }
     Ok(out)
 }
@@ -394,10 +411,16 @@ pub(crate) fn write_wav_file(
     samples: &[f32],
     sample_rate: u32,
 ) -> Result<()> {
-    use std::fs::File;
-    use std::io::Write;
+    validate_pcm(samples, sample_rate)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    write_wav(&mut file, samples, sample_rate)
+}
 
-    let mut file = File::create(path)?;
+fn write_wav(file: &mut impl std::io::Write, samples: &[f32], sample_rate: u32) -> Result<()> {
+    validate_pcm(samples, sample_rate)?;
     let num_channels = 1u16;
     let bits_per_sample = 16u16;
     let bytes_per_sample = bits_per_sample / 8;
@@ -545,21 +568,37 @@ impl Processor for ImageProcessor {
         for block in blocks {
             match block {
                 DataBlock::Image { bytes, mime } => {
-                    if bytes.is_empty() {
-                        return Err(anyhow!("Empty image bytes received in ImageProcessor"));
+                    if bytes.is_empty() || bytes.len() > MAX_IMAGE_BYTES {
+                        bail!("image must contain between 1 and {MAX_IMAGE_BYTES} bytes");
                     }
-                    if self.config.target_width == 0 || self.config.target_height == 0 {
-                        bail!("image target dimensions must be greater than zero");
-                    }
-                    if self.config.std.contains(&0.0) {
-                        bail!("image normalization std values must be non-zero");
+                    validate_image_size(self.config.target_width, self.config.target_height)?;
+                    if self.config.normalize_to_tensor {
+                        let values = u64::from(self.config.target_width)
+                            * u64::from(self.config.target_height)
+                            * 3;
+                        if values > MAX_TENSOR_VALUES as u64 {
+                            bail!("image tensor exceeds the {MAX_TENSOR_VALUES}-value limit");
+                        }
+                        validate_image_normalization(self.config.mean, self.config.std)?;
                     }
                     let format = match mime.as_str() {
                         "image/png" => image::ImageFormat::Png,
                         "image/jpeg" | "image/jpg" => image::ImageFormat::Jpeg,
-                        _ => image::ImageFormat::Jpeg,
+                        _ => bail!("image processor supports only PNG and JPEG MIME types"),
                     };
-                    let img = image::load_from_memory_with_format(&bytes, format)
+                    let (width, height) =
+                        image::io::Reader::with_format(std::io::Cursor::new(&bytes), format)
+                            .into_dimensions()?;
+                    validate_image_size(width, height)?;
+                    let mut reader =
+                        image::io::Reader::with_format(std::io::Cursor::new(&bytes), format);
+                    let mut limits = image::io::Limits::default();
+                    limits.max_image_width = Some(MAX_PROCESSOR_IMAGE_DIMENSION);
+                    limits.max_image_height = Some(MAX_PROCESSOR_IMAGE_DIMENSION);
+                    limits.max_alloc = Some(MAX_PROCESSOR_IMAGE_PIXELS * 8);
+                    reader.limits(limits);
+                    let img = reader
+                        .decode()
                         .map_err(|e| anyhow!("Failed to decode image: {}", e))?;
                     let resized = if self.config.preserve_aspect_ratio {
                         img.resize(
@@ -586,10 +625,12 @@ impl Processor for ImageProcessor {
                     resized
                         .write_to(&mut cursor, format)
                         .map_err(|e| anyhow!("Failed to encode resized image: {}", e))?;
-                    out.push(DataBlock::Image {
+                    let image = DataBlock::Image {
                         bytes: cursor.into_inner(),
                         mime,
-                    });
+                    };
+                    image.validate().map_err(anyhow::Error::msg)?;
+                    out.push(image);
                 }
                 other => out.push(other),
             }
@@ -598,17 +639,46 @@ impl Processor for ImageProcessor {
     }
 }
 
+const MAX_PROCESSOR_IMAGE_DIMENSION: u32 = 16_384;
+const MAX_PROCESSOR_IMAGE_PIXELS: u64 = 16_777_216;
+
+fn validate_image_size(width: u32, height: u32) -> Result<()> {
+    if width == 0
+        || height == 0
+        || width > MAX_PROCESSOR_IMAGE_DIMENSION
+        || height > MAX_PROCESSOR_IMAGE_DIMENSION
+        || u64::from(width) * u64::from(height) > MAX_PROCESSOR_IMAGE_PIXELS
+    {
+        bail!("image dimensions exceed the supported pixel or dimension limit");
+    }
+    Ok(())
+}
+
+fn validate_image_normalization(mean: [f32; 3], std: [f32; 3]) -> Result<()> {
+    for (mean, std) in mean.into_iter().zip(std) {
+        if !mean.is_finite() || !std.is_finite() || std == 0.0 {
+            bail!("image normalization requires finite means and finite non-zero std values");
+        }
+        for endpoint in [0.0, 1.0] {
+            if !(((endpoint - f64::from(mean)) / f64::from(std)) as f32).is_finite() {
+                bail!("image normalization would produce non-finite tensor values");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn image_to_chw_tensor(img: &image::DynamicImage, mean: [f32; 3], std: [f32; 3]) -> Vec<f32> {
     let rgb = img.to_rgb8();
     let (width, height) = rgb.dimensions();
     let plane = width as usize * height as usize;
     let mut tensor = vec![0.0f32; plane * 3];
 
-    let mut scale = [0.0f32; 3];
-    let mut bias = [0.0f32; 3];
+    let mut scale = [0.0f64; 3];
+    let mut bias = [0.0f64; 3];
     for c in 0..3 {
-        scale[c] = 1.0 / (255.0 * std[c]);
-        bias[c] = -mean[c] / std[c];
+        scale[c] = 1.0 / (255.0 * f64::from(std[c]));
+        bias[c] = -f64::from(mean[c]) / f64::from(std[c]);
     }
 
     let raw_pixels = rgb.as_raw();
@@ -617,13 +687,13 @@ fn image_to_chw_tensor(img: &image::DynamicImage, mean: [f32; 3], std: [f32; 3])
     let (g_part, b_part) = rest.split_at_mut(plane);
 
     for idx in 0..plane {
-        r_part[idx] = (raw_pixels[idx * 3] as f32) * scale[0] + bias[0];
+        r_part[idx] = ((raw_pixels[idx * 3] as f64) * scale[0] + bias[0]) as f32;
     }
     for idx in 0..plane {
-        g_part[idx] = (raw_pixels[idx * 3 + 1] as f32) * scale[1] + bias[1];
+        g_part[idx] = ((raw_pixels[idx * 3 + 1] as f64) * scale[1] + bias[1]) as f32;
     }
     for idx in 0..plane {
-        b_part[idx] = (raw_pixels[idx * 3 + 2] as f32) * scale[2] + bias[2];
+        b_part[idx] = ((raw_pixels[idx * 3 + 2] as f64) * scale[2] + bias[2]) as f32;
     }
 
     tensor
@@ -700,6 +770,14 @@ mod tests {
                 assert_eq!(*language, None);
                 let path = std::path::Path::new(path);
                 assert!(path.exists());
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    assert_eq!(
+                        std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                        0o600
+                    );
+                }
                 let _ = std::fs::remove_file(path);
             }
             _ => panic!("Expected AudioFile block"),
@@ -791,6 +869,133 @@ mod tests {
         assert_eq!(
             spec.parameters.get("normalize_to_tensor"),
             Some(&serde_json::json!(true))
+        );
+    }
+
+    #[test]
+    fn audio_processor_rejects_invalid_pcm_and_unbounded_resampling() {
+        let processor = AudioProcessor::with_config(
+            "audio",
+            AudioProcessorConfig {
+                write_wav: false,
+                ..Default::default()
+            },
+        );
+        for (samples, sample_rate) in [
+            (vec![0.0], 0),
+            (vec![0.0], u32::MAX),
+            (vec![f32::NAN], 16_000),
+            (vec![f32::INFINITY], 16_000),
+            (Vec::new(), 16_000),
+        ] {
+            assert!(
+                processor
+                    .process(vec![DataBlock::AudioPcm {
+                        samples,
+                        sample_rate
+                    }])
+                    .is_err()
+            );
+        }
+        assert!(resample_linear(&[0.0], 8_000, u32::MAX).is_err());
+        // A bounded input can still expand beyond the output admission limit.
+        let samples = vec![0.0; MAX_AUDIO_SAMPLES / 24 + 1];
+        assert!(resample_linear(&samples, 8_000, 192_000).is_err());
+        let out = resample_linear(&[f32::MAX, -f32::MAX], 8_000, 192_000).unwrap();
+        assert_eq!(out.len(), 48);
+        assert!(out.iter().all(|value| value.is_finite()));
+        assert_eq!(out[47], -f32::MAX);
+    }
+
+    #[test]
+    fn wav_writer_preserves_existing_files_and_rejects_invalid_input_before_creation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("existing.wav");
+        std::fs::write(&path, b"preserve me").unwrap();
+        assert!(write_wav_file(&path, &[0.0], 16_000).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"preserve me");
+        let invalid = directory.path().join("invalid.wav");
+        assert!(write_wav_file(&invalid, &[f32::NAN], 16_000).is_err());
+        assert!(!invalid.exists());
+        #[cfg(unix)]
+        {
+            let link = directory.path().join("link.wav");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            assert!(write_wav_file(&link, &[0.0], 16_000).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), b"preserve me");
+        }
+    }
+
+    #[test]
+    fn image_processor_rejects_oversized_resize_and_invalid_normalization_before_decode() {
+        let block = || DataBlock::Image {
+            bytes: vec![1],
+            mime: "image/png".into(),
+        };
+        for (width, height) in [(0, 1), (u32::MAX, 1), (8_192, 8_192)] {
+            let processor = ImageProcessor::new("image").with_target_size(width, height);
+            let error = processor.process(vec![block()]).unwrap_err().to_string();
+            assert!(error.contains("dimensions"), "{error}");
+        }
+        let processor = ImageProcessor::new("image")
+            .with_target_size(4_096, 4_096)
+            .with_tensor_normalization([0.0; 3], [1.0; 3]);
+        assert!(
+            processor
+                .process(vec![block()])
+                .unwrap_err()
+                .to_string()
+                .contains("tensor exceeds")
+        );
+        for (mean, std) in [
+            ([f32::NAN; 3], [1.0; 3]),
+            ([0.0; 3], [f32::INFINITY; 3]),
+            ([0.0; 3], [0.0; 3]),
+            ([0.0; 3], [f32::from_bits(1); 3]),
+        ] {
+            let processor = ImageProcessor::new("image").with_tensor_normalization(mean, std);
+            assert!(
+                processor
+                    .process(vec![block()])
+                    .unwrap_err()
+                    .to_string()
+                    .contains("normalization")
+            );
+        }
+    }
+
+    #[test]
+    fn image_processor_bounds_decoded_dimensions_and_requires_supported_mime() {
+        // JPEG SOF dimensions can be inspected without decoding pixel data.
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(1, 1))
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+        let offset = bytes
+            .windows(2)
+            .position(|pair| pair == [0xff, 0xc0])
+            .unwrap();
+        bytes[offset + 5..offset + 7].copy_from_slice(&16_385u16.to_be_bytes());
+        let error = ImageProcessor::new("image")
+            .process(vec![DataBlock::Image {
+                bytes: bytes.clone(),
+                mime: "image/jpeg".into(),
+            }])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("dimensions"), "{error}");
+        assert!(
+            ImageProcessor::new("image")
+                .process(vec![DataBlock::Image {
+                    bytes,
+                    mime: "application/octet-stream".into(),
+                }])
+                .unwrap_err()
+                .to_string()
+                .contains("MIME")
         );
     }
 

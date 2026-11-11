@@ -870,7 +870,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if sum(levels) > args.max_requests:
         raise ValueError("max-requests must cover one wave at every concurrency level")
     api_key = secrets.token_urlsafe(24)
-    environment = os.environ.copy()
+    environment = {key: value for key, value in os.environ.items()
+                   if not key.startswith("BLOOM_")}
     environment["BLOOM_API_KEY"] = api_key
     environment["RUST_LOG"] = "bloom_server=info"
     with tempfile.TemporaryDirectory(prefix="bloom-workload-") as temporary:
@@ -884,7 +885,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 else 0
             )
             process = subprocess.Popen(
-                [str(binary), "--model", str(model), "--models-dir", str(directory / "models"),
+                [str(binary), "--config", str(directory / "isolated-config.json"),
+                 "--model", str(model), "--models-dir", str(directory / "models"),
+                 "--strict-memory-budget",
                  "--host", "127.0.0.1", "--port", "0", "--backend", args.backend,
                  "--device", args.device, "--max-concurrent", str(max(levels)),
                  "--timeout", str(max(1, int(args.request_timeout) + 1))],
@@ -918,6 +921,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 deadline = time.monotonic() + args.duration_seconds
                 stats_elapsed = 0.0
                 request_count = 0
+                last_progress = 0.0
                 while request_count + sum(levels) <= args.max_requests:
                     for level in levels:
                         wave_started = time.monotonic()
@@ -936,6 +940,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         # their latency cannot improve or penalize throughput.
                         stats_started = time.monotonic()
                         runtime_stats.capture_after_wave(len(waves))
+                        progress_output = getattr(args, "progress_output", None)
+                        if progress_output and time.monotonic() - last_progress >= 30:
+                            # Progress is observational and excluded from measured
+                            # request time, just like runtime-stat collection.
+                            progress_output.parent.mkdir(parents=True, exist_ok=True)
+                            temporary_progress = progress_output.with_suffix(".tmp")
+                            temporary_progress.write_text(json.dumps({
+                                "schema_version": 1, "object": "bloom.workload_progress",
+                                "state": "running", "requests_completed": request_count,
+                                "observed_seconds": stats_started - workload_started - stats_elapsed,
+                                "target_seconds": args.duration_seconds,
+                                "server_sha256": server_sha256,
+                                "model_sha256": identity["sha256"],
+                            }, indent=2) + "\n", encoding="utf-8")
+                            temporary_progress.replace(progress_output)
+                            last_progress = time.monotonic()
                         stats_elapsed += time.monotonic() - stats_started
                     if time.monotonic() - stats_elapsed >= deadline:
                         break
@@ -1050,6 +1070,8 @@ def main() -> int:
     parser.add_argument("--server-bin", type=pathlib.Path, required=True)
     parser.add_argument("--model", type=pathlib.Path, required=True)
     parser.add_argument("--output", type=pathlib.Path, required=True)
+    parser.add_argument("--progress-output", type=pathlib.Path,
+                        help="Atomic bounded progress snapshot, updated at most every 30 seconds")
     parser.add_argument("--expected-model-sha256")
     parser.add_argument("--expected-server-sha256")
     parser.add_argument("--backend", default="candle")

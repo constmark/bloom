@@ -11,7 +11,7 @@ use bloomai_engine::{SpeculativeMode, SupportLevel};
 use serde::Serialize;
 use tokio::sync::Semaphore;
 
-use super::cli::{Args, DoctorFormat, MAX_LOADED_MODELS};
+use super::cli::{Args, DoctorFormat, MAX_LOADED_MODELS, MAX_REQUEST_TIMEOUT_SECONDS};
 use super::model_index::validate_configuration as validate_model_index_configuration;
 use super::model_index_state::inspect_model_index_watermark_directory;
 use super::model_license::ModelLicensePolicy;
@@ -310,6 +310,11 @@ fn server_argument_errors_with_cachemesh_backend(
     }
     if args.context_size.checked_mul(args.max_concurrent).is_none() {
         errors.push("Context size multiplied by concurrency overflows this platform.".to_string());
+    }
+    if args.timeout > MAX_REQUEST_TIMEOUT_SECONDS {
+        errors.push(format!(
+            "Request timeout must be between 0 and {MAX_REQUEST_TIMEOUT_SECONDS} seconds (0 disables it)."
+        ));
     }
     if !(1..=MAX_SHUTDOWN_TIMEOUT_SECONDS).contains(&args.shutdown_timeout_seconds) {
         errors.push(format!(
@@ -1627,6 +1632,30 @@ mod tests {
         super::super::cli::apply_config(&mut explicit, &matches, &config);
         assert_eq!(explicit.max_loaded_models, 2);
         assert!(validate_server_arguments(&explicit).is_ok());
+    }
+
+    #[test]
+    fn request_timeout_rejects_overflowing_deadlines_in_startup_and_doctor() {
+        for timeout in [0, 1, MAX_REQUEST_TIMEOUT_SECONDS] {
+            let mut args = default_args();
+            args.timeout = timeout;
+            assert!(validate_server_arguments(&args).is_ok());
+        }
+        for timeout in [MAX_REQUEST_TIMEOUT_SECONDS + 1, u64::MAX] {
+            let mut args = default_args();
+            args.timeout = timeout;
+            assert!(
+                validate_server_arguments(&args)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Request timeout")
+            );
+            let temp = tempfile::tempdir().unwrap();
+            let models_root = temp.path().join("absent-models");
+            let report = inspect_server(&args, false, &models_root);
+            assert!(report.summary.failures > 0);
+            assert!(!models_root.exists());
+        }
     }
 
     #[test]

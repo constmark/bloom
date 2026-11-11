@@ -50,6 +50,18 @@ def validate_text(content: str) -> list[str]:
         if required not in docker_text:
             errors.append(f"builder lacks fail-closed UI toolchain setting: {required}")
 
+    for required in (
+        'cargo metadata --locked --format-version 1 --features serve-ui',
+        '--filter-platform "$native_target"',
+        '--filter-platform wasm32-unknown-unknown',
+        'python3 scripts/generate_sbom.py',
+        '--policy config/dependency-policy.json',
+        'COPY --from=builder /src/BLOOM-SBOM.cdx.json /usr/share/bloom/BLOOM-SBOM.cdx.json',
+        'COPY --from=builder /src/config/dependency-policy.json /usr/share/bloom/BLOOM-DEPENDENCY-POLICY.json',
+    ):
+        if required not in docker_text:
+            errors.append(f"container lacks policy-checked target SBOM: {required}")
+
     runtime_start = next(
         (
             index
@@ -85,9 +97,9 @@ def validate_ui_toolchain_text(content: str) -> list[str]:
         'BINARYEN_VERSION="127"',
         'BINARYEN_AMD64_SHA256="c8ebe5d00c978601086bcad33b2c80fcfe33d6a8b87b754ba4ea86a9a16cc316"',
         'BINARYEN_ARM64_SHA256="1589778bcedde5ba5ed6b7107f902c4ec6bc4c94147daa79157d778ca08300a2"',
-        'WASM_BINDGEN_VERSION="0.2.126"',
-        'WASM_BINDGEN_AMD64_SHA256="064948d58e2d6c0a745216477a639ba696216d6309aaa902939d1b865b1d869d"',
-        'WASM_BINDGEN_ARM64_SHA256="96864b3992ad45536deb59fc62edc5b845376b7d8b4ac670a6bdab4ab8d2c657"',
+        'WASM_BINDGEN_VERSION="0.2.129"',
+        'WASM_BINDGEN_AMD64_SHA256="82d12bb940e2d4e72e0d5605387fc1b8ca179044e012b620f0ce4e7440e8320e"',
+        'WASM_BINDGEN_ARM64_SHA256="1797c349a0f45d30946e8986b184135e12839ab576c9a04203e85febfc5dcb35"',
         'ESBUILD_VERSION="0.27.3"',
         'ESBUILD_AMD64_SHA256="066e20cdb882994160e18524a552b97e03648eb9aa0c7cdf5680a6493be65ab2"',
         'ESBUILD_ARM64_SHA256="04f0bfb132b8b0800c23b22caa9ad7a7adf41e2434c027fc8571318b9904712f"',

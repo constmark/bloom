@@ -48,7 +48,7 @@ def _string_set(value: object, label: str) -> set[str]:
 
 
 def validate_policy(value: object) -> dict[str, object]:
-    if not isinstance(value, dict) or set(value) != POLICY_KEYS:
+    if not isinstance(value, dict) or not POLICY_KEYS.issubset(value) or set(value) - POLICY_KEYS - {"reviewed_workspace_forks"}:
         raise SbomError("dependency policy has unknown or missing fields")
     if (
         isinstance(value["schema_version"], bool)
@@ -70,6 +70,24 @@ def validate_policy(value: object) -> dict[str, object]:
         normalized = _bounded_string(normalized, "license normalization result")
         if raw not in allowed_licenses or normalized not in allowed_licenses or raw == normalized:
             raise SbomError("license normalization must map reviewed distinct expressions")
+    forks = value.get("reviewed_workspace_forks", {})
+    if not isinstance(forks, dict) or len(forks) > 16:
+        raise SbomError("reviewed workspace forks must be a bounded object")
+    for name, fork in forks.items():
+        _bounded_string(name, "fork package")
+        if not isinstance(fork, dict) or set(fork) != {"version", "upstream"}:
+            raise SbomError("reviewed fork identity is incomplete")
+        _bounded_string(fork["version"], "fork version")
+        upstream = fork["upstream"]
+        fields = {"name", "version", "repository", "revision", "archive_url", "archive_sha256"}
+        if not isinstance(upstream, dict) or set(upstream) != fields:
+            raise SbomError("reviewed fork upstream provenance is incomplete")
+        for field, item in upstream.items():
+            _bounded_string(item, "upstream " + field)
+        if re.fullmatch(r"[0-9a-f]{40}", upstream["revision"]) is None or re.fullmatch(r"[0-9a-f]{64}", upstream["archive_sha256"]) is None:
+            raise SbomError("reviewed fork upstream hashes are invalid")
+        if not upstream["repository"].startswith("https://github.com/") or upstream["archive_url"] != f'https://static.crates.io/crates/{upstream["name"]}/{upstream["name"]}-{upstream["version"]}.crate':
+            raise SbomError("reviewed fork upstream source is invalid")
     return value
 
 
@@ -130,7 +148,7 @@ def merge_cargo_metadata(value: object) -> dict[str, object]:
             previous = packages.get(package_id)
             if previous is not None and any(
                 previous.get(field) != raw_package.get(field)
-                for field in ("name", "version", "license", "source")
+                for field in ("name", "version", "license", "source", "metadata")
             ):
                 raise SbomError(f"conflicting cargo package metadata: {package_id}")
             packages[package_id] = raw_package
@@ -259,7 +277,17 @@ def build_sbom(
         license_expression = license_normalizations.get(declared_license, declared_license)
         assert isinstance(license_expression, str)
         source = _source_for_package(package, workspace_members, allowed_sources)
-        if package_id in workspace_members:
+        fork = policy.get("reviewed_workspace_forks", {}).get(name)
+        package_metadata = package.get("metadata") or {}
+        if not isinstance(package_metadata, dict) or not isinstance(package_metadata.get("bloom", {}), dict):
+            raise SbomError("package metadata must contain a valid Bloom object")
+        upstream = package_metadata.get("bloom", {}).get("upstream")
+        if fork is not None:
+            if source != "workspace" or version != fork["version"] or upstream != fork["upstream"]:
+                raise SbomError("workspace fork does not match its reviewed upstream provenance")
+        elif upstream is not None:
+            raise SbomError("workspace fork has unreviewed upstream provenance")
+        if package_id in workspace_members and fork is None:
             workspace_versions.add(version)
         reference = _cargo_purl(name, version)
         if reference in refs_by_id.values():
@@ -276,7 +304,7 @@ def build_sbom(
                 "properties": [
                     {"name": "bloom:declared_license", "value": declared_license},
                     {"name": "bloom:source", "value": source},
-                ],
+                ] + ([{"name": "bloom:upstream", "value": json.dumps(upstream, sort_keys=True, separators=(",", ":"))}] if fork else []),
             }
         )
     if len(workspace_versions) != 1:
@@ -458,9 +486,10 @@ def validate_sbom_document(
         if reference != _cargo_purl(name, version):
             raise SbomError("SBOM component purl does not match its name and version")
         properties = component["properties"]
+        fork = policy.get("reviewed_workspace_forks", {}).get(name)
         if (
             not isinstance(properties, list)
-            or len(properties) != 2
+            or len(properties) != (3 if fork else 2)
             or any(
                 not isinstance(item, dict) or set(item) != {"name", "value"}
                 for item in properties
@@ -469,6 +498,9 @@ def validate_sbom_document(
             or properties[1].get("name") != "bloom:source"
         ):
             raise SbomError("SBOM component properties are incomplete")
+        if fork and (version != fork["version"] or properties[1]["value"] != "workspace"
+                     or properties[2] != {"name": "bloom:upstream", "value": json.dumps(fork["upstream"], sort_keys=True, separators=(",", ":"))}):
+            raise SbomError("SBOM fork omits or mismatches reviewed upstream provenance")
         declared_license = _bounded_string(
             properties[0]["value"], "SBOM component declared license"
         )

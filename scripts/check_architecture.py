@@ -15,7 +15,9 @@ ALLOWED_INTERNAL = {
     "bloomai-core": set(),
     "bloomai-backend": {"bloomai-core"},
     "bloomai-tilelang": set(),
-    "bloomai-engine": {"bloomai-core", "bloomai-backend", "bloomai-tilelang"},
+    # The reviewed Laya compatibility fork is a leaf inference library.
+    "bloomai-laya": set(),
+    "bloomai-engine": {"bloomai-core", "bloomai-backend", "bloomai-tilelang", "bloomai-laya"},
     # Native binaries resolve a physical device through the backend registry;
     # keep this dependency explicit so the layer map matches Cargo manifests.
     "bloomai-app": {"bloomai-core", "bloomai-backend", "bloomai-engine"},
@@ -64,7 +66,7 @@ def validate_packages(packages: list[dict]) -> list[str]:
                 errors.append(f"transport dependency below HTTP: {name} -> {target}")
             if name == "bloomai-server" and (target.startswith("candle-") or target in ENGINE_ONLY):
                 errors.append(f"HTTP must use engine contracts, not {target}")
-            if name in {"bloomai-core", "bloomai-backend", "bloomai-engine", "bloomai-ffi", "bloomai-tilelang"}:
+            if name in {"bloomai-core", "bloomai-backend", "bloomai-engine", "bloomai-ffi", "bloomai-tilelang", "bloomai-laya"}:
                 if dependency["kind"] != "dev" and target in CLI:
                     errors.append(f"process dependency below application layer: {name} -> {target}")
         if name == "bloomai-engine" and any("bin" in target["kind"] for target in package["targets"]):

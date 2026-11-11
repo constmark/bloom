@@ -14,7 +14,7 @@ documentation.workspace = true
 default = ["candle-engine"]
 candle-engine = ["candle-core", "candle-nn", "candle-transformers", "tokenizers"]
 cuda = ["candle-engine", "bloomai-backend/cuda", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
-metal = ["candle-engine", "bloomai-backend/metal", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal", "laya-decision/metal", "dep:metal", "dep:objc2-metal", "dep:candle-metal-kernels"]
+metal = ["candle-engine", "bloomai-backend/metal", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal", "laya/metal", "dep:metal", "dep:objc2-metal", "dep:candle-metal-kernels"]
 flash-attn = ["candle-engine", "candle-flash-attn"]
 # Opt-in tests that need real hardware or external toolchains (GPU/NPU/Metal,
 # the TileLang Python JIT, etc.). Excluded from default CI; enable with
@@ -30,20 +30,20 @@ thiserror.workspace = true
 bloomai-core = { workspace = true }
 bloomai-backend = { workspace = true }
 bloomai-tilelang = { workspace = true }
-candle-core = { version = "0.10", optional = true }
-candle-nn = { version = "0.10", optional = true }
-candle-transformers = { version = "0.10", optional = true }
+candle-core = { version = "=0.11.1", optional = true }
+candle-nn = { version = "=0.11.1", optional = true }
+candle-transformers = { version = "=0.11.1", optional = true }
 tokenizers = { version = "0.23", optional = true }
-candle-flash-attn = { version = "0.10", optional = true }
+candle-flash-attn = { version = "=0.11.1", optional = true }
 metal = { version = "0.33.0", optional = true }
 objc2-metal = { version = "0.3.2", optional = true }
-candle-metal-kernels = { version = "0.10.2", optional = true }
-laya-decision = { version = "0.2.4", default-features = true }
+candle-metal-kernels = { version = "=0.11.1", optional = true }
+laya = { package = "bloomai-laya", version = "=0.2.20-bloom.1", path = "../laya", default-features = true }
 tokio = { version = "1.52.3", features = ["full"] }
 image = { version = "0.24", default-features = false, features = ["png", "jpeg"] }
 libloading = { workspace = true }
 libc = "0.2"
-# Pinned to Candle 0.10.2 GEMM so its audited packing/TLS bounds remain valid.
+# Pinned to Candle 0.11.1 GEMM so its audited packing/TLS bounds remain valid.
 gemm-common = "=0.19.0"
 sha2 = "0.10"
 tempfile = "3"

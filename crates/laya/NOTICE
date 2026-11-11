@@ -1,0 +1,6 @@
+Bloom compatibility fork of laya-decision 0.2.20.
+Original source: https://github.com/GTC6244/Laya-Decision
+Revision: 5b750ebe543771443b76533d0a8a4d1067ba69b3
+Licensed under Apache-2.0; see LICENSE.
+Bloom changes: package identity, Candle 0.11.1 dependency migration, inherited workspace toolchain declaration, and provenance/documentation. Upstream Rust source is unchanged.
+This package is maintained by Bloom and is not an upstream Laya release.

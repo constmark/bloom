@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the embedded Bloom UI in a real Chromium browser."""
+"""Exercise the embedded Bloom UI contract in Chromium, Firefox, or WebKit."""
 
 from __future__ import annotations
 
@@ -43,6 +43,8 @@ def parse_args() -> argparse.Namespace:
         "--base-url",
         help="Test an already-running embedded UI instead of starting bloom_server.",
     )
+    parser.add_argument("--browser", choices=("chromium", "firefox", "webkit"), default="chromium")
+    parser.add_argument("--report", type=pathlib.Path, help="Write the passing browser evidence as JSON.")
     return parser.parse_args()
 
 
@@ -142,8 +144,8 @@ def build_embedded_server() -> pathlib.Path:
 
 def start_embedded_server(
     directory: pathlib.Path,
+    server: pathlib.Path,
 ) -> tuple[subprocess.Popen[bytes], pathlib.Path, str]:
-    server = build_embedded_server()
     models_dir = directory / "models"
     models_dir.mkdir()
     log_path = directory / "server.log"
@@ -183,6 +185,48 @@ def start_embedded_server(
     )
 
 
+def file_identity(path: pathlib.Path) -> dict:
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            size += len(chunk)
+            digest.update(chunk)
+    return {"sha256": digest.hexdigest(), "size_bytes": size}
+
+
+def artifact_snapshot(server: pathlib.Path | None, ui_dist: pathlib.Path) -> dict:
+    if server is None:
+        binary = {"status": "not_local", "reason": "target supplied through --base-url"}
+    else:
+        binary = {"status": "local_process", "path": str(server.resolve()), **file_identity(server)}
+    assets = {"status": "not_available", "path": str(ui_dist.resolve())}
+    if ui_dist.is_dir():
+        manifest = []
+        for path in sorted(ui_dist.rglob("*")):
+            if path.is_symlink():
+                raise AssertionError(f"UI asset snapshot contains a symlink: {path}")
+            if path.is_file():
+                manifest.append({"path": path.relative_to(ui_dist).as_posix(), **file_identity(path)})
+        canonical_manifest = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        assets = {
+            "status": "local_repository_snapshot",
+            "path": str(ui_dist.resolve()),
+            # This is separate evidence, not a claim that an external service
+            # or an earlier embedded release serves this repository directory.
+            "scope": "repository content only; served asset equivalence is not inferred",
+            "tree_sha256": hashlib.sha256(canonical_manifest).hexdigest(),
+            "files": manifest,
+        }
+    return {"server_binary": binary, "ui_dist": assets}
+
+
+def verify_artifact_snapshots(before: dict, after: dict) -> None:
+    for label in ("server_binary", "ui_dist"):
+        if before[label] != after[label]:
+            raise AssertionError(f"{label} changed during browser acceptance; evidence is invalid")
+
+
 def playwright_command() -> list[str]:
     override = os.environ.get("BLOOM_PLAYWRIGHT_CLI")
     if override:
@@ -218,9 +262,11 @@ def run_cli(
         timeout=timeout,
     )
     if completed.returncode != 0:
+        display_arguments = arguments[:arguments.index("run-code") + 1] if "run-code" in arguments else arguments
+        details = completed.stdout.split("### Error\n", 1)[-1]
         raise AssertionError(
             f"playwright-cli failed ({completed.returncode}): "
-            f"{' '.join(arguments)}\n{completed.stdout}"
+            f"{' '.join(display_arguments)}\n{details}"
         )
     return completed.stdout
 
@@ -234,7 +280,12 @@ def provision_axe_core(workdir: pathlib.Path) -> pathlib.Path:
             raise AssertionError(f"axe-core script does not exist: {path}")
         if path.stat().st_size > MAX_AXE_CORE_SCRIPT_BYTES:
             raise AssertionError(f"axe-core script exceeds size limit: {path}")
-        return path
+        # Keep screenshots and scanner inputs inside this run's artifact
+        # directory even when the verified scanner is provisioned offline.
+        local_path = workdir / f"axe-core-{AXE_CORE_VERSION}.min.js"
+        if path != local_path.resolve():
+            shutil.copyfile(path, local_path)
+        return local_path.resolve()
 
     request = urllib.request.Request(
         AXE_CORE_ARCHIVE_URL,
@@ -272,11 +323,12 @@ def provision_axe_core(workdir: pathlib.Path) -> pathlib.Path:
     return path.resolve()
 
 
-def browser_test_source(base_url: str, axe_core_path: pathlib.Path) -> str:
+def browser_test_source(base_url: str, axe_core_path: pathlib.Path, browser: str) -> str:
     source = r"""
 async (page) => {
   const baseUrl = __BASE_URL__;
   const axeCorePath = __AXE_CORE_PATH__;
+  const expectedBrowser = __BROWSER__;
   const assert = (condition, message) => {
     if (!condition) throw new Error(message);
   };
@@ -316,6 +368,14 @@ async (page) => {
     `expected axe-core __AXE_CORE_VERSION__, found ${axeVersion || 'none'}`);
   const accessibilityScans = [];
   const scanAccessibility = async (contextSelector, label) => {
+    // Contrast hit-testing during a drawer's entrance animation can see the
+    // backdrop through the moving surface. Scan the settled rendered UI.
+    await page.evaluate(async () => {
+      await Promise.all(document.getAnimations()
+        .filter((animation) => animation.playState === 'running' &&
+          Number.isFinite(animation.effect?.getTiming().iterations))
+        .map((animation) => animation.finished.catch(() => {})));
+    });
     const results = await page.evaluate(async ({ contextSelector }) => {
       const context = contextSelector ? document.querySelector(contextSelector) : document;
       if (!context) throw new Error(`accessibility context is missing: ${contextSelector}`);
@@ -337,7 +397,13 @@ async (page) => {
     }));
     assert(violations.length === 0,
       `${label} accessibility violations: ${JSON.stringify(violations)}`);
-    accessibilityScans.push({ label, passes: results.passes.length });
+    assert(results.incomplete.length === 0,
+      `${label} accessibility checks need manual review: ${JSON.stringify(results.incomplete.map(({ id, nodes }) => ({
+        id, nodes: nodes.map(({ target, failureSummary }) => ({ target, failure: failureSummary })),
+      })))}`);
+    accessibilityScans.push({ label, passes: results.passes.length,
+      manualReview: results.incomplete.map(({ id, impact, nodes }) => ({ id, impact,
+        nodes: nodes.map(({ target, failureSummary }) => ({ target, failure: failureSummary })) })) });
   };
 
   const productHeading = page.getByRole('heading', { name: 'Bloom', level: 1, exact: true });
@@ -352,6 +418,7 @@ async (page) => {
     'generation is enabled without a model');
   const favicon = await page.locator('link[rel~="icon"]').getAttribute('href');
   assert(favicon?.startsWith('data:image/svg+xml,'), 'favicon is missing or externally hosted');
+  await page.screenshot({ path: __SCREENSHOT_PATH__, fullPage: true });
   await scanAccessibility(null, 'application shell');
 
   const focusableSelector = 'button:not([disabled]):not([tabindex="-1"]),a[href]:not([tabindex="-1"]),input:not([disabled]):not([tabindex="-1"]),select:not([disabled]):not([tabindex="-1"]),textarea:not([disabled]):not([tabindex="-1"]),[tabindex]:not([tabindex="-1"])';
@@ -438,7 +505,7 @@ async (page) => {
   assert(await settingsButton.evaluate((button) => document.activeElement === button),
     'Settings did not restore focus to its opener');
 
-  const clipboardText = 'Bloom browser clipboard gate';
+  const clipboardText = `Bloom ${expectedBrowser} clipboard gate ${Date.now()}`;
   const archive = {
     version: 2,
     object: 'bloom.conversation_archive',
@@ -472,21 +539,39 @@ async (page) => {
 
   const assistantMessage = page.getByText(clipboardText, { exact: true });
   await assistantMessage.waitFor();
-  await page.context().grantPermissions(
-    ['clipboard-read', 'clipboard-write'],
-    { origin: baseUrl },
-  );
+  if (expectedBrowser === 'chromium') {
+    await page.context().grantPermissions(['clipboard-read', 'clipboard-write'], { origin: baseUrl });
+  } else if (expectedBrowser === 'webkit') {
+    await page.context().grantPermissions(['clipboard-read'], { origin: baseUrl });
+  }
   const copyButton = page.getByRole('button', {
     name: 'Copy assistant message',
     exact: true,
   });
   await copyButton.click();
-  await page.waitForFunction(
-    async (expected) => await navigator.clipboard.readText() === expected,
-    clipboardText,
-  );
-  assert(await copyButton.textContent() === 'Copied',
-    'message copy did not publish its success state');
+  await copyButton.filter({ hasText: 'Copied' }).waitFor();
+  if (expectedBrowser === 'firefox') {
+    // Firefox has no Playwright clipboard permission grant. A trusted paste
+    // verifies the actual browser clipboard without mocking its API.
+    await page.evaluate(() => {
+      const probe = document.createElement('textarea');
+      probe.id = 'bloom-clipboard-verification';
+      probe.setAttribute('aria-label', 'Clipboard verification');
+      document.body.appendChild(probe);
+    });
+    const clipboardProbe = page.locator('#bloom-clipboard-verification');
+    await clipboardProbe.focus();
+    const pasteShortcut = await page.evaluate(() =>
+      navigator.platform.toLowerCase().includes('mac') ? 'Meta+V' : 'Control+V');
+    await page.keyboard.press(pasteShortcut);
+    await page.waitForFunction((expected) =>
+      document.getElementById('bloom-clipboard-verification')?.value === expected,
+      clipboardText);
+    await clipboardProbe.evaluate((probe) => probe.remove());
+  } else {
+    await page.waitForFunction(async (expected) => await navigator.clipboard.readText() === expected,
+      clipboardText);
+  }
 
   const exportButton = page.locator('.conversation-backup-actions').getByRole('button', {
     name: 'Export',
@@ -530,7 +615,15 @@ async (page) => {
   page.off('console', onConsole);
   page.off('pageerror', onPageError);
   page.off('requestfailed', onRequestFailed);
+  const actualBrowser = page.context().browser().browserType().name();
+  assert(actualBrowser === expectedBrowser, `expected ${expectedBrowser}, ran ${actualBrowser}`);
   return {
+    object: 'bloom.browser_acceptance',
+    schema_version: 1,
+    status: 'passed',
+    browser: actualBrowser,
+    browser_version: page.context().browser().version(),
+    clipboard: expectedBrowser === 'firefox' ? 'trusted user-gesture copy and paste' : 'Clipboard API readback',
     title: await page.title(),
     dialogs: ['Models', 'Settings', 'Import conversations'],
     transfers: ['clipboard', 'conversation download'],
@@ -541,12 +634,36 @@ async (page) => {
 """
     return (
         source.replace("__BASE_URL__", json.dumps(base_url))
+        .replace("__BROWSER__", json.dumps(browser))
+        .replace("__SCREENSHOT_PATH__", json.dumps(str(axe_core_path.with_name("application-shell.png"))))
         .replace("__AXE_CORE_PATH__", json.dumps(str(axe_core_path)))
         .replace("__AXE_CORE_VERSION__", json.dumps(AXE_CORE_VERSION))
     )
 
 
-def run_browser_gate(base_url: str, workdir: pathlib.Path) -> None:
+def parse_browser_report(output: str, browser: str) -> dict:
+    # CLI diagnostics can be printed with a zero process status. Require
+    # the explicit successful result object instead of trusting exit alone.
+    marker = "### Result\n"
+    if marker not in output:
+        raise AssertionError(f"browser gate did not publish evidence:\n{output}")
+    try:
+        report, _ = json.JSONDecoder().raw_decode(output.split(marker, 1)[1].lstrip())
+    except (ValueError, TypeError) as error:
+        raise AssertionError(f"invalid browser gate evidence:\n{output}") from error
+    if (not isinstance(report, dict) or report.get("status") != "passed"
+            or report.get("browser") != browser
+            or report.get("object") != "bloom.browser_acceptance"
+            or type(report.get("schema_version")) is not int
+            or report.get("schema_version") != 1
+            or not isinstance(report.get("browser_version"), str)
+            or not report["browser_version"]
+            or "### Error\n" in output):
+        raise AssertionError(f"browser gate failed or ran the wrong engine:\n{output}")
+    return report
+
+
+def run_browser_gate(base_url: str, workdir: pathlib.Path, browser: str) -> dict:
     command = playwright_command()
     axe_core_path = provision_axe_core(workdir)
     version_output = run_cli(command, ["--version"], workdir)
@@ -556,20 +673,22 @@ def run_browser_gate(base_url: str, workdir: pathlib.Path) -> None:
         raise AssertionError(
             f"playwright-cli {PLAYWRIGHT_CLI_VERSION} is required, found {version}"
         )
-    session = f"bloom-ui-gate-{os.getpid()}"
+    session = f"bloom-ui-gate-{browser}-{os.getpid()}"
     try:
-        run_cli(command, ["--session", session, "open", "about:blank"], workdir)
-        run_cli(
+        browser_options = [] if browser == "chromium" else ["--browser", browser]
+        run_cli(command, ["--session", session, "open", "about:blank", *browser_options], workdir)
+        output = run_cli(
             command,
             [
                 "--session",
                 session,
                 "run-code",
-                browser_test_source(base_url, axe_core_path),
+                browser_test_source(base_url, axe_core_path, browser),
             ],
             workdir,
             timeout=90,
         )
+        return parse_browser_report(output, browser)
     finally:
         try:
             run_cli(command, ["--session", session, "close"], workdir)
@@ -579,8 +698,14 @@ def run_browser_gate(base_url: str, workdir: pathlib.Path) -> None:
 
 def main() -> int:
     args = parse_args()
+    if args.report:
+        args.report.parent.mkdir(parents=True, exist_ok=True)
+        args.report.write_text(json.dumps({"object": "bloom.browser_acceptance", "schema_version": 1,
+                                         "browser": args.browser, "status": "running"}) + "\n", encoding="utf-8")
     process: subprocess.Popen[bytes] | None = None
     log_path: pathlib.Path | None = None
+    local_server: pathlib.Path | None = None
+    identity: dict = {}
     output_root = ROOT / "output" / "playwright"
     output_root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(
@@ -589,16 +714,44 @@ def main() -> int:
         prefix="bloom-ui-browser-server-"
     ) as raw_server_dir:
         workdir = pathlib.Path(raw_workdir)
-        if args.base_url:
-            base_url = args.base_url.rstrip("/")
-            wait_for_health(base_url, None)
-        else:
-            process, log_path, base_url = start_embedded_server(
-                pathlib.Path(raw_server_dir)
-            )
         try:
-            run_browser_gate(base_url, workdir)
+            if not args.base_url:
+                local_server = build_embedded_server()
+            identity["before"] = artifact_snapshot(local_server, ROOT / "ui" / "dist")
+            if args.base_url:
+                base_url = args.base_url.rstrip("/")
+                wait_for_health(base_url, None)
+            else:
+                process, log_path, base_url = start_embedded_server(
+                    pathlib.Path(raw_server_dir), local_server
+                )
+            report = run_browser_gate(base_url, workdir, args.browser)
+            identity["after"] = artifact_snapshot(local_server, ROOT / "ui" / "dist")
+            verify_artifact_snapshots(identity["before"], identity["after"])
+            identity["unchanged"] = True
+            report["artifact_identity"] = identity
+            if args.report:
+                args.report.parent.mkdir(parents=True, exist_ok=True)
+                screenshot = workdir / "application-shell.png"
+                if screenshot.is_file():
+                    shutil.copyfile(screenshot, args.report.with_suffix(".png"))
+                args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         except BaseException as error:
+            if "before" in identity:
+                if "after" not in identity:
+                    try:
+                        identity["after"] = artifact_snapshot(local_server, ROOT / "ui" / "dist")
+                    except (OSError, AssertionError) as snapshot_error:
+                        identity["after_error"] = str(snapshot_error)
+                identity["unchanged"] = identity.get("after") == identity["before"]
+            if args.report:
+                screenshot = workdir / "application-shell.png"
+                if screenshot.is_file():
+                    shutil.copyfile(screenshot, args.report.with_suffix(".png"))
+                args.report.write_text(json.dumps({"object": "bloom.browser_acceptance", "schema_version": 1,
+                                                 "browser": args.browser, "status": "failed", "error": str(error),
+                                                 "artifact_identity": identity},
+                                                indent=2) + "\n", encoding="utf-8")
             if log_path is not None:
                 raise AssertionError(f"{error}\nserver log:\n{read_log(log_path)}") from error
             raise
@@ -606,7 +759,7 @@ def main() -> int:
             if process is not None:
                 stop_process(process)
     print(
-        "OK: embedded Bloom UI Chromium shell, security headers, semantics, "
+        f"OK: embedded Bloom UI {args.browser} shell, security headers, semantics, "
         f"axe-core {AXE_CORE_VERSION} WCAG scans, focus loops, Escape dismissal, "
         "focus restoration, reduced motion, clipboard, and conversation downloads"
     )

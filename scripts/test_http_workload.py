@@ -474,6 +474,9 @@ class DeploymentCellTests(unittest.TestCase):
             "waves": [{"concurrency": 1, "requests": 1, "elapsed_ms": 3_600_000},
                       {"concurrency": 2, "requests": 2, "elapsed_ms": 3_600_000}],
             "requests_completed": 3, "completion_tokens": 6,
+            "cold_start_ms": 50,
+            "latency_ms": {"count": 3, "p50": 10, "p95": 20, "p99": 25, "max": 30},
+            "first_content_ms": {"count": 3, "p50": 1, "p95": 2, "p99": 3, "max": 4},
             "disconnect": {"accepted": 2, "recovery_ms": 10,
                            "post_recovery_request": "pass"},
             "host_memory": {"warm_baseline_bytes": 100, "after_recovery_bytes": 110,
@@ -572,6 +575,71 @@ class DeploymentCellTests(unittest.TestCase):
             target[path[-1]] = value
             with self.subTest(path=path), self.assertRaises(ValueError):
                 cell.validate(self.report, min_duration_seconds=7200, failure_report=failure)
+
+    def test_latency_evidence_cannot_be_missing_or_incoherent(self) -> None:
+        cases = [(("latency_ms",), None), (("cold_start_ms",), None),
+                 (("latency_ms", "count"), True), (("latency_ms", "count"), 2),
+                 (("latency_ms", "p95"), float("nan")),
+                 (("latency_ms", "p99"), 1), (("first_content_ms", "max"), 31)]
+        for path, value in cases:
+            report = copy.deepcopy(self.report)
+            target = report
+            for key in path[:-1]:
+                target = target[key]
+            target[path[-1]] = value
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                self.validate(report)
+
+    def test_service_budgets_are_complete_and_enforced(self) -> None:
+        budgets = dict(cold_start_ms=50, latency_p95_ms=20, first_content_p95_ms=2,
+                       recovery_ms=10, peak_rss_bytes=120, rss_growth_bytes=10)
+        self.assertEqual(self.validate(budgets=budgets)["budgets"]["peak_rss_bytes"]["measured"], 120)
+        for name in budgets:
+            for value in (None, True, -1, float("inf"), budgets[name] - 1):
+                invalid = {**budgets, name: value}
+                with self.subTest(name=name, value=value), self.assertRaises(ValueError):
+                    self.validate(budgets=invalid)
+        with self.assertRaises(ValueError):
+            self.validate(budgets={})
+        with self.assertRaises(ValueError):
+            self.validate(min_requests=4)
+        with self.assertRaises(ValueError):
+            self.validate(min_requests=True)
+
+    def test_production_profile_cannot_downgrade_soak_or_request_minimum(self) -> None:
+        budgets = dict(cold_start_ms=50, latency_p95_ms=20, first_content_p95_ms=2,
+                       recovery_ms=10, peak_rss_bytes=120, rss_growth_bytes=10)
+        options = dict(production_profile=True, budgets=budgets,
+                       expected_model_sha256="a" * 64, expected_server_sha256="b" * 64,
+                       expected_backend="candle", expected_device="cpu")
+        with self.assertRaisesRegex(ValueError, "86400"):
+            self.validate(min_duration_seconds=1, **options)
+        self.report["settings"]["duration_seconds"] = 86400
+        self.report["workload_elapsed_ms"] = 86_400_001
+        for wave in self.report["waves"]:
+            wave["elapsed_ms"] = 43_200_000
+        with self.assertRaisesRegex(ValueError, "required minimum"):
+            self.validate(min_requests=1, **options)
+        self.report["waves"] *= 334
+        for wave in self.report["waves"]:
+            wave["elapsed_ms"] = 86_400_000 / 668
+        self.report["requests_completed"] = 1002
+        self.report["completion_tokens"] = 2004
+        self.report["settings"]["max_requests"] = 1002
+        for name in ("latency_ms", "first_content_ms"):
+            self.report[name]["count"] = 1002
+        result = self.validate(**options)
+        self.assertFalse(result["stable_claim"])
+        self.assertEqual(result["profile"], "production_workload")
+        for automatic in ("auto", "Auto", "AUTO"):
+            self.report["identity"]["device"] = automatic
+            with self.subTest(device=automatic), self.assertRaisesRegex(ValueError, "physical device"):
+                self.validate(**{**options, "expected_device": automatic})
+        self.report["identity"]["device"] = "cpu"
+        for field in ("budgets", "expected_model_sha256", "expected_server_sha256",
+                      "expected_backend", "expected_device"):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.validate(**{**options, field: None})
 
 
 if __name__ == "__main__":

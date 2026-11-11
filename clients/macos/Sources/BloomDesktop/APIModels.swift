@@ -215,15 +215,18 @@ struct ChatCompletionRequest: Encodable {
 }
 
 struct ChatCompletionChunk: Decodable {
+    let id: String?
     let model: String?
     let choices: [Choice]
     let usage: Usage?
 
     struct Choice: Decodable {
+        let index: Int?
         let delta: Delta
         let finishReason: String?
 
         enum CodingKeys: String, CodingKey {
+            case index
             case delta
             case finishReason = "finish_reason"
         }
@@ -243,6 +246,76 @@ struct ChatCompletionChunk: Decodable {
             case completionTokens = "completion_tokens"
             case totalTokens = "total_tokens"
         }
+    }
+}
+
+/// One bounded text choice, matching the request made by the native client.
+/// A transport EOF or a bare [DONE] must never turn incomplete output into success.
+struct ChatStreamValidator {
+    static let maximumResponseBytes = 64 * 1024 * 1024
+    static let maximumOutputBytes = 16 * 1024 * 1024
+    let expectedModel: String
+    private var responseBytes = 0
+    private var outputBytes = 0
+    private var requestID: String?
+    private var model: String?
+    private var finished = false
+    private var receivedUsage = false
+
+    init(expectedModel: String) {
+        self.expectedModel = expectedModel
+    }
+
+    mutating func observeByte() throws {
+        guard responseBytes < Self.maximumResponseBytes else {
+            throw BloomClientError.responseLimitExceeded
+        }
+        responseBytes += 1
+    }
+
+    mutating func observe(_ chunk: ChatCompletionChunk) throws {
+        if let id = chunk.id {
+            guard !id.isEmpty, id.utf8.count <= 128,
+                  id.utf8.allSatisfy({ (65 ... 90).contains($0) || (97 ... 122).contains($0)
+                      || (48 ... 57).contains($0) || $0 == 45 || $0 == 95 }),
+                  requestID == nil || requestID == id else { throw BloomClientError.malformedStream }
+            requestID = id
+        }
+        if let value = chunk.model {
+            guard !value.isEmpty, value.count <= 256,
+                  value.trimmingCharacters(in: .whitespacesAndNewlines) == value,
+                  !value.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }),
+                  expectedModel == "default" || value == expectedModel,
+                  model == nil || model == value else { throw BloomClientError.malformedStream }
+            model = value
+        }
+        if let usage = chunk.usage {
+            let (sum, overflow) = usage.promptTokens.addingReportingOverflow(usage.completionTokens)
+            guard !receivedUsage, usage.promptTokens >= 0, usage.completionTokens >= 0,
+                  !overflow, sum == usage.totalTokens else { throw BloomClientError.malformedStream }
+            receivedUsage = true
+        }
+        if chunk.choices.isEmpty {
+            guard finished, chunk.usage != nil else { throw BloomClientError.malformedStream }
+            return
+        }
+        guard !finished, chunk.choices.count == 1, let choice = chunk.choices.first,
+              choice.index == 0 else { throw BloomClientError.malformedStream }
+        let nextBytes = choice.delta.content?.utf8.count ?? 0
+        guard nextBytes <= Self.maximumOutputBytes - outputBytes else {
+            throw BloomClientError.responseLimitExceeded
+        }
+        outputBytes += nextBytes
+        if let reason = choice.finishReason {
+            guard ["stop", "length", "content_filter"].contains(reason) else {
+                throw BloomClientError.malformedStream
+            }
+            finished = true
+        }
+    }
+
+    func finish() throws {
+        guard finished, requestID != nil, model != nil else { throw BloomClientError.malformedStream }
     }
 }
 
@@ -319,6 +392,7 @@ struct SSEParser {
 
 enum BloomClientError: LocalizedError {
     case invalidServerURL
+    case invalidAPIKey
     case incompatibleServer
     case serverNotReady(String)
     case invalidHTTPResponse
@@ -327,11 +401,15 @@ enum BloomClientError: LocalizedError {
     case malformedStream
     case streamEndedWithoutDone
     case streamLimitExceeded
+    case responseLimitExceeded
+    case requestLimitExceeded
 
     var errorDescription: String? {
         switch self {
         case .invalidServerURL:
             return "Enter a valid HTTP or HTTPS Bloom server URL."
+        case .invalidAPIKey:
+            return "The API key must contain at most 4096 visible ASCII characters."
         case .incompatibleServer:
             return "The endpoint is not a compatible Bloom server."
         case let .serverNotReady(message):
@@ -348,6 +426,10 @@ enum BloomClientError: LocalizedError {
             return "The streaming response ended without a completion marker."
         case .streamLimitExceeded:
             return "The server returned a streaming event larger than the 1 MiB limit."
+        case .responseLimitExceeded:
+            return "The response exceeds the native client's stream or output limit."
+        case .requestLimitExceeded:
+            return "The conversation exceeds the native client's 1 MiB request limit. Start a new conversation."
         }
     }
 }

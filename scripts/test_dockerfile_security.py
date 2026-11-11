@@ -63,6 +63,16 @@ class DockerfileSecurityTests(unittest.TestCase):
             any("BINARYEN_AMD64_SHA256" in error for error in validate_ui_toolchain_text(mutated))
         )
 
+    def test_rejects_missing_target_filter_policy_or_bundled_sbom(self) -> None:
+        for fragment in (
+            '--filter-platform "$native_target"',
+            '--filter-platform wasm32-unknown-unknown',
+            '--policy config/dependency-policy.json',
+            'COPY --from=builder /src/BLOOM-SBOM.cdx.json /usr/share/bloom/BLOOM-SBOM.cdx.json',
+        ):
+            with self.subTest(fragment=fragment):
+                self.assert_rejected(DOCKERFILE.replace(fragment, "", 1), "target SBOM")
+
 
 if __name__ == "__main__":
     unittest.main()

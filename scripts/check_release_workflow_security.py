@@ -92,6 +92,29 @@ def validate_text(content: str) -> list[str]:
     ):
         errors.append("release workflow must default contents permission to read")
 
+    checks = nested_block(content, "checks", 2)
+    if checks is None or mapping_value(checks, "uses") != "./.github/workflows/ci.yml":
+        errors.append("release checks must reuse the same-revision CI workflow")
+    for job_name, dependency in (("build", "checks"), ("github-release", "build")):
+        job = nested_block(content, job_name, 2)
+        if job is None or mapping_value(job, "needs") != dependency:
+            errors.append(f"{job_name} must require successful {dependency}")
+        # Explicit conditions, or an allowed failure, can turn a dependency
+        # into mere sequencing instead of a mandatory successful gate.
+        if job is not None and re.search(r"^    (?:if|continue-on-error):", job, re.MULTILINE):
+            errors.append(f"{job_name} must not bypass dependency success")
+    if checks is not None and re.search(r"^    (?:if|continue-on-error):", checks, re.MULTILINE):
+        errors.append("release checks must not be skipped or allowed to fail")
+
+    build = nested_block(content, "build", 2) or ""
+    for required in (
+        "cargo install dioxus-cli --version 0.7.10 --locked --features no-downloads",
+        "python scripts/install_ui_toolchain.py",
+        'NO_DOWNLOADS: "1"',
+    ):
+        if required not in build:
+            errors.append(f"release UI build lacks fail-closed toolchain setting: {required}")
+
     job_marker = "\n  github-release:\n"
     _before_job, separator, release_job = ("\n" + jobs).partition(job_marker)
     if not separator:

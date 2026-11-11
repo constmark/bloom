@@ -5,6 +5,25 @@ Use this checklist before tagging a release or marking a model/backend path as
 
 ## Required Checks
 
+Tagged releases first call the complete CI workflow from the tagged revision.
+Archive builds require that check to succeed, and publication requires every
+archive build. This includes both native and UI lockfile vulnerability audits;
+a tag cannot bypass failing tests or an unresolved dependency advisory.
+
+Install the verified UI toolchain before packaging. The helper supports Linux
+x86-64/ARM64, macOS x86-64/ARM64, and Windows x86-64 (Git Bash). It verifies
+upstream SHA-256 values before executing tools and preserves the macOS
+Binaryen runtime library. Use a private prefix, then add its `bin` directory:
+
+```bash
+cargo install dioxus-cli --version 0.7.10 --locked --features no-downloads
+python3 scripts/install_ui_toolchain.py --install-dir "$PWD/target/ui-tools"
+export PATH="$PWD/target/ui-tools/bin:$PATH"
+```
+
+Packaging sets `NO_DOWNLOADS=1`: missing build helpers must be installed through
+the checksum-pinned installer rather than downloaded implicitly by Dioxus.
+
 ```bash
 python3 -m pip install -r requirements/compat-smoke.txt
 python3 -m pip install -r requirements/schema-validation.txt
@@ -35,6 +54,7 @@ python3 scripts/test_community_metadata.py
 python3 scripts/check_github_action_pins.py
 python3 scripts/check_release_workflow_security.py
 python3 scripts/test_release_workflow_security.py
+python3 scripts/test_install_ui_toolchain.py
 python3 scripts/check_dockerfile_security.py
 python3 scripts/test_dockerfile_security.py
 python3 scripts/test_create_release_archive.py
@@ -250,7 +270,7 @@ all protocol errors while leaving static UI paths outside the dynamic policy.
 
 ## Publishing to crates.io
 
-The workspace publishes seven crates under the `bloomai-*` namespace. Publish
+The workspace publishes eight crates under the `bloomai-*` namespace. Publish
 them in dependency order so each crate's path dependencies already exist on
 the registry. Publish the application crate after the engine and before the
 server; the FFI crate depends directly on the engine:
@@ -260,6 +280,7 @@ cargo login                          # one-time, needs a crates.io API token
 cargo publish -p bloomai-core
 cargo publish -p bloomai-backend
 cargo publish -p bloomai-tilelang
+cargo publish -p bloomai-laya         # 0.2.20-bloom.1 compatibility fork, before engine
 cargo publish -p bloomai-engine
 cargo publish -p bloomai-app
 cargo publish -p bloomai-ffi
@@ -269,10 +290,26 @@ cargo publish -p bloomai-server
 > **Namespace:** crates are published as `bloomai-*` because the bare
 > `bloom-core` name was already taken on crates.io by an unrelated project.
 > The original five library names were verified free on 2026-07-21; verify the
-> newer `bloomai-server` and `bloomai-app` names before their first publication.
+> newer `bloomai-server`, `bloomai-app`, and `bloomai-laya` names before their first publication.
 > The FFI dynamic
 > library keeps the file name `bloom_ffi` (`libbloom_ffi.{so,dylib,dll}`) so
 > the Python SDK and downstream loaders are unaffected by the crate rename.
+
+The compatibility crate uses its own version `0.2.20-bloom.1`, preserving
+upstream Laya's `0.2.20` identity in package metadata, `UPSTREAM.json`, and the
+CycloneDX `bloom:upstream` property. It contains the unchanged upstream Rust
+sources and Apache-2.0 license; its manifest selects the official Candle
+`0.11.1` release. This removes the old Candle/ZIP graph for both checkout and
+published-crate consumers. No registry cache edits, ZIP version aliases, or
+advisory suppressions are used. SBOM generation also checks the locked graph's
+official Candle 0.11.1/ZIP 9.5.1 versions and shared GEMM 0.19.0 identity, because
+the CPU memory admission bounds depend on that implementation. Updating them
+requires reviewing those bounds and the Metal encoder API again. Run
+`python3 scripts/check_laya_upstream.py`
+before packaging; both source-crate and application packaging enforce it.
+Track upstream Laya and remove the fork when a maintained release supports the
+security-maintained Candle dependency. Updating the fork requires reviewing the
+upstream archive checksum, commit, license, per-file manifest, and SBOM policy.
 
 Python SDK: `python/` has its own `pyproject.toml`; build the native library
 first (`cargo build --release -p bloomai-ffi`), then `pip install ./python`.

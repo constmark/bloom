@@ -88,6 +88,35 @@ def ui_metadata() -> dict[str, object]:
 
 
 class SbomContractTests(unittest.TestCase):
+    def test_reviewed_workspace_fork_preserves_upstream_identity(self) -> None:
+        reviewed_policy = json.loads((pathlib.Path(__file__).resolve().parents[1] / "config/dependency-policy.json").read_text())
+        fork = reviewed_policy["reviewed_workspace_forks"]["bloomai-laya"]
+        data = metadata()
+        identity = "path+file:///workspace/crates/laya#bloomai-laya@" + fork["version"]
+        data["workspace_members"].append(identity)
+        data["packages"].append({"id": identity, "name": "bloomai-laya", "version": fork["version"],
+                                 "license": "Apache-2.0", "source": None,
+                                 "metadata": {"bloom": {"upstream": fork["upstream"]}}})
+        data["resolve"]["nodes"].append({"id": identity, "deps": []})
+        data["resolve"]["nodes"][0]["deps"].append({"pkg": identity})
+        sbom = build_sbom(data, reviewed_policy, "aarch64-apple-darwin", False)
+        component = next(item for item in sbom["components"] if item["name"] == "bloomai-laya")
+        self.assertEqual(json.loads(component["properties"][2]["value"]), fork["upstream"])
+        self.assertEqual(sbom["metadata"]["component"]["version"], "0.1.0")
+        for broken in ({}, {"bloom": {"upstream": {**fork["upstream"], "archive_sha256": "0" * 64}}}):
+            changed = copy.deepcopy(data)
+            changed["packages"][-1]["metadata"] = broken
+            with self.assertRaisesRegex(SbomError, "upstream provenance"):
+                build_sbom(changed, reviewed_policy, "aarch64-apple-darwin", False)
+        changed = copy.deepcopy(data)
+        changed["packages"][-1]["version"] = "0.2.21-bloom.1"
+        with self.assertRaisesRegex(SbomError, "upstream provenance"):
+            build_sbom(changed, reviewed_policy, "aarch64-apple-darwin", False)
+        validate_sbom_document(sbom, reviewed_policy, "0.1.0", "aarch64-apple-darwin", False)
+        component["properties"].pop()
+        with self.assertRaises(SbomError):
+            validate_sbom_document(sbom, reviewed_policy, "0.1.0", "aarch64-apple-darwin", False)
+
     def test_repository_policy_preserves_option_ext_license(self) -> None:
         policy_path = pathlib.Path(__file__).resolve().parents[1] / "config/dependency-policy.json"
         repository_policy = json.loads(policy_path.read_text(encoding="utf-8"))

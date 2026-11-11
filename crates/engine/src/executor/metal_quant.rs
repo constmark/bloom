@@ -113,26 +113,29 @@ impl MetalQuantizer {
                 candle_core::Storage::Metal(out_ms),
             ) = (&*qw_storage, &*scales_storage, &*qz_storage, &*out_storage)
             {
-                let encoder = metal_device.command_encoder()?;
+                // Hold Candle's encoder lock through the complete dispatch and
+                // register input/output buffers for its automatic GPU barriers.
+                let commands = metal_device.command_encoder()?;
+                let encoder = commands.as_ref();
                 encoder.set_label("dequantize_awq");
                 encoder.set_compute_pipeline_state(&self.pipeline_awq);
 
-                encoder.set_buffer(
+                encoder.set_input_buffer(
                     0,
                     Some(qw_ms.buffer()),
                     qw_layout.start_offset() * qweight.dtype().size_in_bytes(),
                 );
-                encoder.set_buffer(
+                encoder.set_input_buffer(
                     1,
                     Some(scales_ms.buffer()),
                     scales_layout.start_offset() * scales.dtype().size_in_bytes(),
                 );
-                encoder.set_buffer(
+                encoder.set_input_buffer(
                     2,
                     Some(qz_ms.buffer()),
                     qz_layout.start_offset() * qzeros.dtype().size_in_bytes(),
                 );
-                encoder.set_buffer(
+                encoder.set_output_buffer(
                     3,
                     Some(out_ms.buffer()),
                     out_layout.start_offset() * out.dtype().size_in_bytes(),
@@ -230,31 +233,32 @@ impl MetalQuantizer {
                 &*g_storage,
                 &*out_storage,
             ) {
-                let encoder = metal_device.command_encoder()?;
+                let commands = metal_device.command_encoder()?;
+                let encoder = commands.as_ref();
                 encoder.set_label("dequantize_gptq");
                 encoder.set_compute_pipeline_state(&self.pipeline_gptq);
 
-                encoder.set_buffer(
+                encoder.set_input_buffer(
                     0,
                     Some(qw_ms.buffer()),
                     qw_layout.start_offset() * qweight.dtype().size_in_bytes(),
                 );
-                encoder.set_buffer(
+                encoder.set_input_buffer(
                     1,
                     Some(scales_ms.buffer()),
                     scales_layout.start_offset() * scales.dtype().size_in_bytes(),
                 );
-                encoder.set_buffer(
+                encoder.set_input_buffer(
                     2,
                     Some(qz_ms.buffer()),
                     qz_layout.start_offset() * qzeros.dtype().size_in_bytes(),
                 );
-                encoder.set_buffer(
+                encoder.set_input_buffer(
                     3,
                     Some(g_ms.buffer()),
                     g_layout.start_offset() * g_idx.dtype().size_in_bytes(),
                 );
-                encoder.set_buffer(
+                encoder.set_output_buffer(
                     4,
                     Some(out_ms.buffer()),
                     out_layout.start_offset() * out.dtype().size_in_bytes(),

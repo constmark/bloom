@@ -3,8 +3,8 @@
 FROM rust:1.97.1-bookworm@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97 AS builder
 WORKDIR /src
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl libssl-dev pkg-config \
+RUN apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update \
+    && apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y --no-install-recommends ca-certificates curl libssl-dev pkg-config python3 \
     && rm -rf /var/lib/apt/lists/*
 ARG TARGETARCH
 COPY scripts/install_ui_toolchain_linux.sh /usr/local/src/install_ui_toolchain_linux.sh
@@ -19,6 +19,15 @@ ENV RUSTUP_TOOLCHAIN=bloom-container \
 
 COPY . .
 RUN --mount=type=cache,id=bloom-cargo-registry,target=/usr/local/cargo/registry \
+    native_target="$(rustc -vV | sed -n 's/^host: //p')" \
+    && cargo metadata --locked --format-version 1 --features serve-ui \
+        --filter-platform "$native_target" > /tmp/bloom-native-metadata.json \
+    && cargo metadata --manifest-path ui/Cargo.toml --locked --format-version 1 \
+        --filter-platform wasm32-unknown-unknown > /tmp/bloom-ui-metadata.json \
+    && python3 scripts/generate_sbom.py --metadata /tmp/bloom-native-metadata.json \
+        --metadata /tmp/bloom-ui-metadata.json --policy config/dependency-policy.json \
+        --target "$native_target" --embedded-ui true --output /src/BLOOM-SBOM.cdx.json
+RUN --mount=type=cache,id=bloom-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=bloom-ui-target-${TARGETARCH},target=/src/ui/target \
     ./scripts/build_ui.sh
 RUN --mount=type=cache,id=bloom-cargo-registry,target=/usr/local/cargo/registry \
@@ -30,8 +39,8 @@ RUN mkdir -p /tmp/bloom-doctor \
     && rm -rf /tmp/bloom-doctor /tmp/bloom-doctor.txt
 
 FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241 AS runtime
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+RUN apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update \
+    && apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 bloom \
     && useradd --uid 10001 --gid bloom --create-home --no-log-init \
@@ -43,6 +52,8 @@ COPY --from=builder /src/target/release/bloom_server /usr/local/bin/bloom_server
 COPY --from=builder /src/target/release/bloom_infer /usr/local/bin/bloom_infer
 COPY --from=builder /src/target/release/bloom_bench /usr/local/bin/bloom_bench
 COPY --from=builder /src/target/release/inspect_gguf /usr/local/bin/inspect_gguf
+COPY --from=builder /src/BLOOM-SBOM.cdx.json /usr/share/bloom/BLOOM-SBOM.cdx.json
+COPY --from=builder /src/config/dependency-policy.json /usr/share/bloom/BLOOM-DEPENDENCY-POLICY.json
 
 ENV HOME=/home/bloom \
     BLOOM_CONFIG_HOME=/var/lib/bloom \

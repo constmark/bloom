@@ -592,9 +592,8 @@ button:focus-visible, a:focus-visible, textarea:focus-visible, input:focus-visib
   padding: clamp(26px, 5vw, 48px);
   border: 1px solid rgba(47, 111, 237, 0.16);
   border-radius: 24px;
-  background:
-    radial-gradient(circle at 92% 0%, rgba(106, 160, 255, 0.18), transparent 36%),
-    linear-gradient(145deg, #ffffff 0%, #f8fbff 100%);
+  /* A uniform text surface keeps every home-state contrast measurable. */
+  background: var(--panel);
   box-shadow: 0 18px 45px rgba(47, 111, 237, 0.09), var(--shadow);
   text-align: center;
   color: var(--text-dim);

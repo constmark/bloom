@@ -30,6 +30,9 @@ See the [edge-engine goal](docs/edge-engine-goal.md),
 > **experimental**. Other backends may require external runtimes or may only
 > provide capability-detection skeletons. See the
 > [support matrix](docs/support-matrix.md) before choosing a production path.
+> The [2026-11-11 launch review](docs/launch-readiness-2026-11-11.md) records
+> the implemented hardening and remaining release blockers, including the
+> target-host stability evidence and hosted release acceptance.
 
 ## Highlights
 
@@ -957,6 +960,7 @@ Public JSON schemas and examples live under `examples/`. Validate them with:
 | `crates/server` | HTTP application layer, model lifecycle, protocol adapters, and optional UI embedding |
 | `crates/tilelang` | TileLang kernel compilation and loading |
 | `crates/ffi` | Pre-1.0 C ABI for native consumers |
+| `crates/laya` | Explicitly named Laya compatibility fork with original source provenance and updated Candle dependencies |
 | `python` | Python SDK bindings over the C ABI |
 | `clients/macos` | Native SwiftUI macOS client |
 | `ui` | Optional Dioxus web interface |

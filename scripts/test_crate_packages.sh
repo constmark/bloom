@@ -23,6 +23,13 @@ mkdir "$PACKAGE_VERIFY_DIR"
 trap 'rm -rf "$PACKAGE_VERIFY_DIR"' EXIT
 
 cd "$WORKSPACE_ROOT"
+python3 scripts/check_laya_upstream.py
+# The desktop tests must carry their fixture inside the published app crate.
+# Keep it byte-identical to the public protocol example in this checkout.
+if ! cmp -s examples/readiness.json crates/app/tests/fixtures/readiness.json; then
+    echo "App crate readiness fixture differs from examples/readiness.json" >&2
+    exit 1
+fi
 
 WORKSPACE_PACKAGES=()
 while IFS= read -r package; do

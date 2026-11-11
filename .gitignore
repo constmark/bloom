@@ -96,6 +96,7 @@ test_*.rs
 !scripts/test_server_http_boundary.py
 !scripts/test_server_shutdown.py
 !scripts/test_http_workload.py
+!scripts/test_deployment_soak.py
 !scripts/test_tensorrt_infer.py
 !scripts/test_onnx_embedding.py
 !scripts/test_markdown_links.py
@@ -104,9 +105,16 @@ test_*.rs
 !scripts/test_community_metadata.py
 !scripts/test_release_workflow_security.py
 !scripts/test_generate_sbom.py
+!scripts/test_laya_upstream.py
+!scripts/test_runtime_dependencies.py
 !scripts/test_validate_release_artifact.py
 !scripts/test_ui_tool_version.py
+!scripts/test_install_ui_toolchain.py
+!scripts/test_deployment_storage_drill.py
+!scripts/test_container_release.py
+!scripts/test_container_runtime.py
 !scripts/test_ui_browser.py
+!scripts/test_ui_browser_contract.py
 !scripts/test_compare_llamacpp.py
 !python/tests/test_*.py
 mock_wan.py

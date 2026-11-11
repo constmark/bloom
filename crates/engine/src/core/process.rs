@@ -47,7 +47,7 @@ impl ChildGuard {
         })
     }
 
-    fn spawn_bounded(command: &mut Command) -> Result<Self> {
+    pub(crate) fn spawn_bounded(command: &mut Command) -> Result<Self> {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
@@ -66,7 +66,7 @@ impl ChildGuard {
         }
     }
 
-    fn kill(&mut self) -> std::io::Result<()> {
+    pub(crate) fn kill(&mut self) -> std::io::Result<()> {
         #[cfg(unix)]
         if let Some(group) = self.process_group {
             // SAFETY: spawn_bounded created a separate process group whose

@@ -44,5 +44,18 @@
     "Apache-2.0/MIT": "Apache-2.0 OR MIT",
     "MIT/Apache-2.0": "MIT OR Apache-2.0",
     "Unlicense/MIT": "Unlicense OR MIT"
+  },
+  "reviewed_workspace_forks": {
+    "bloomai-laya": {
+      "version": "0.2.20-bloom.1",
+      "upstream": {
+        "name": "laya-decision",
+        "version": "0.2.20",
+        "repository": "https://github.com/GTC6244/Laya-Decision",
+        "revision": "5b750ebe543771443b76533d0a8a4d1067ba69b3",
+        "archive_url": "https://static.crates.io/crates/laya-decision/laya-decision-0.2.20.crate",
+        "archive_sha256": "8b28bacdaf21f50e83245afde0457c4e7fa74993a1720e34471beb9db7776792"
+      }
+    }
   }
 }

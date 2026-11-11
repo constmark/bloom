@@ -1,0 +1,70 @@
+[
+  {
+    "input": "Hi team,\n\nI was charged twice this month. Please refund.\n\nThanks,\nJane\n\nOn Mon, Jan 1, 2024 at 10:00 AM John <john@x.com> wrote:\n> Original message here\n> more quoted text",
+    "output": "Hi team,\n\nI was charged twice this month. Please refund."
+  },
+  {
+    "input": "Please cancel my order.\n\nBest regards,\nMaria Silva\nAcme Corp\n555-1234",
+    "output": "Please cancel my order."
+  },
+  {
+    "input": "Preciso de ajuda com o meu pedido.\n\nAtenciosamente,\nJoao",
+    "output": "Preciso de ajuda com o meu pedido."
+  },
+  {
+    "input": "I need help.\n\nSent from my iPhone",
+    "output": "I need help."
+  },
+  {
+    "input": "This is confidential information intended solely for the addressee. If you received this email in error, please delete it.",
+    "output": "This is confidential information intended solely for the addressee."
+  },
+  {
+    "input": "Is this confidential? I need to know before sending.",
+    "output": "Is this confidential? I need to know before sending."
+  },
+  {
+    "input": "Refund please.\n\nThanks for the quick reply.",
+    "output": "Refund please.\n\nThanks for the quick reply."
+  },
+  {
+    "input": "Ola, quero cancelar.\n\nEm 10/09/2024, Fulano <fulano@x.com> escreveu:\n> mensagem antiga",
+    "output": "Ola, quero cancelar."
+  },
+  {
+    "input": "Report the bug.\n\n-----Original Message-----\nFrom: someone\nSent: yesterday",
+    "output": "Report the bug."
+  },
+  {
+    "input": "Body line one.\nBody line two.\n\n--\nSignature Block\nCompany Name",
+    "output": "Body line one.\nBody line two."
+  },
+  {
+    "input": "From: my side the whole integration works, but I was charged twice and need a refund please.",
+    "output": "From: my side the whole integration works, but I was charged twice and need a refund please."
+  },
+  {
+    "input": "I need a refund for the duplicate charge.\n\nFrom: Maria Souza\nSent: Monday\nOld quoted reply text here",
+    "output": "I need a refund for the duplicate charge."
+  },
+  {
+    "input": "Bonjour,\n\nJe voudrais un remboursement pour la double facturation.\n\nCordialement,\nMarie Dupont\n\nLe lun. 1 janv. 2024 à 10:00, Jean <jean@x.com> a écrit :\n> message cité ici",
+    "output": "Bonjour,\n\nJe voudrais un remboursement pour la double facturation."
+  },
+  {
+    "input": "J'ai besoin d'aide avec ma commande.\n\nEnvoyé depuis mon iPhone",
+    "output": "J'ai besoin d'aide avec ma commande."
+  },
+  {
+    "input": "Ce message est confidentiel et destiné uniquement au destinataire. Si vous avez reçu ce message par erreur, veuillez le supprimer.",
+    "output": ""
+  },
+  {
+    "input": "Je veux un remboursement.\n\nDe : Marie Dupont\nEnvoyé : lundi\nancien message cité",
+    "output": "Je veux un remboursement."
+  },
+  {
+    "input": "Merci de bien vouloir traiter ma demande de remboursement rapidement.",
+    "output": "Merci de bien vouloir traiter ma demande de remboursement rapidement."
+  }
+]

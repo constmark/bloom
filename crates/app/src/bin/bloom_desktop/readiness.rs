@@ -162,7 +162,7 @@ mod tests {
     use super::*;
 
     fn example() -> Value {
-        serde_json::from_str(include_str!("../../../../../examples/readiness.json")).unwrap()
+        serde_json::from_str(include_str!("../../../tests/fixtures/readiness.json")).unwrap()
     }
     fn response(code: u16, value: &Value) -> Vec<u8> {
         let body = serde_json::to_string(value).unwrap();

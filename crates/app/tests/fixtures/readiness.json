@@ -1,0 +1,20 @@
+{
+  "schema_version": 3,
+  "object": "bloom.readiness",
+  "protocol_version": 3,
+  "minimum_ui_protocol_version": 3,
+  "maximum_ui_protocol_version": 3,
+  "server_version": "0.1.0",
+  "status": "not_ready",
+  "progress": 0,
+  "model": "not loaded",
+  "loading": false,
+  "load_error": null,
+  "input_modalities": [],
+  "model_tasks": [],
+  "context_window": null,
+  "in_flight_requests": 0,
+  "available_permits": 4,
+  "memory_pressure_high": false,
+  "ram_utilization": 0.25
+}

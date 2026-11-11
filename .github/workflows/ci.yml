@@ -3,6 +3,7 @@ name: CI
 on:
   pull_request:
   push:
+  workflow_call:
 
 permissions:
   contents: read
@@ -57,16 +58,26 @@ jobs:
         run: |
           python3 scripts/check_release_workflow_security.py
           python3 scripts/test_release_workflow_security.py
+          python3 scripts/check_container_workflow.py
+          python3 scripts/test_container_release.py
       - name: Check Dockerfile security baseline
         run: |
           python3 scripts/check_dockerfile_security.py
           python3 scripts/test_dockerfile_security.py
       - name: Test deterministic release archives
         run: python3 scripts/test_create_release_archive.py
+      - name: Check vendored Laya upstream provenance
+        run: |
+          python3 scripts/check_laya_upstream.py
+          python3 scripts/test_laya_upstream.py
+          python3 scripts/test_runtime_dependencies.py
       - name: Check Rust toolchain consistency
         run: python3 scripts/check_toolchain_consistency.py
       - name: Test Dioxus CLI version gate
-        run: python3 scripts/test_ui_tool_version.py
+        run: |
+          python3 scripts/test_ui_tool_version.py
+          python3 scripts/test_ui_browser_contract.py
+          python3 scripts/test_install_ui_toolchain.py
       - name: Check dependency policy and SBOM contract
         run: |
           host_target=$(rustc -vV | awk '/^host:/ {print $2}')
@@ -95,12 +106,14 @@ jobs:
       - name: Install embedded UI build tools
         run: |
           rustup target add wasm32-unknown-unknown
-          cargo install dioxus-cli --version 0.7.10 --locked
+          cargo install dioxus-cli --version 0.7.10 --locked --features no-downloads
           export BLOOM_UI_TOOL_INSTALL_DIR="$RUNNER_TEMP/bloom-ui-tools"
           export PATH="$BLOOM_UI_TOOL_INSTALL_DIR:$PATH"
           ./scripts/install_ui_toolchain_linux.sh
           echo "$BLOOM_UI_TOOL_INSTALL_DIR" >> "$GITHUB_PATH"
       - name: Build embedded UI assets
+        env:
+          NO_DOWNLOADS: "1"
         run: ./scripts/build_ui.sh
       - name: Check embedded UI feature
         # The release artifact is built with the embedded UI feature. Keep a
@@ -125,12 +138,15 @@ jobs:
         timeout-minutes: 20
         run: cargo test --workspace --locked
       - name: Test Python SDK boundary
+        env:
+          BLOOM_TEST_NATIVE_FFI: "1"
+          BLOOM_FFI_LIB: ${{ github.workspace }}/target/debug/libbloom_ffi.so
         run: |
           cargo build -p bloomai-ffi --locked
           python3 scripts/check_ffi_abi_compatibility.py \
             --library target/debug/libbloom_ffi.so
           python3 scripts/test_ffi_abi_compatibility.py
-          BLOOM_TEST_NATIVE_FFI=1 python3 -m unittest discover -s python/tests -v
+          python3 -m unittest discover -s python/tests -v
       - name: Test Python SDK distribution
         run: |
           python -m pip install --disable-pip-version-check -r requirements/python-package.txt
@@ -138,7 +154,12 @@ jobs:
       - name: Test benchmark evidence gate
         run: python3 scripts/test_bench_budget_check.py
       - name: Test HTTP workload evidence collector
-        run: python3 scripts/test_http_workload.py
+        run: |
+          python3 scripts/test_http_workload.py
+          python3 scripts/test_deployment_failure_injection.py
+          python3 scripts/test_validate_deployment_cell.py
+          python3 scripts/test_deployment_soak.py
+          python3 scripts/test_deployment_storage_drill.py
       - name: Test TileLang Windows exports
         run: python3 scripts/test_tilelang_windows_exports.py
       - name: Check C and C++ header compatibility
@@ -244,15 +265,34 @@ jobs:
         # Bound image-build stalls while leaving room for a cold dependency build.
         timeout-minutes: 20
         run: docker build -t bloom:ci .
-      - name: Test embedded UI in Chromium
-        # Bound browser startup and UI checks so a stalled container does not hang CI.
-        timeout-minutes: 20
+      - name: Test embedded UI in Chromium, Firefox, and WebKit
+        # Reuse the built container while exercising the identical contract in
+        # every engine. A failure remains blocking and all engines are attempted.
+        timeout-minutes: 30
         run: |
-          npx --yes --package @playwright/cli@0.1.18 playwright-cli install-browser chromium
           docker run --detach --name bloom-ui-browser-ci --network host \
             bloom:ci --host 127.0.0.1 --port 31373
           trap 'docker rm --force bloom-ui-browser-ci >/dev/null' EXIT
-          python3 scripts/test_ui_browser.py --base-url http://127.0.0.1:31373
+          mkdir -p "$RUNNER_TEMP/bloom-browser-results"
+          browser_status=0
+          for browser_engine in chromium firefox webkit; do
+            if ! npx --yes --package @playwright/cli@0.1.18 playwright-cli install-browser "$browser_engine" --with-deps; then
+              browser_status=1
+              continue
+            fi
+            python3 scripts/test_ui_browser.py --base-url http://127.0.0.1:31373 \
+              --browser "$browser_engine" \
+              --report "$RUNNER_TEMP/bloom-browser-results/$browser_engine.json" || browser_status=1
+          done
+          exit "$browser_status"
+      - name: Upload browser acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: bloom-browser-acceptance
+          path: ${{ runner.temp }}/bloom-browser-results/
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Check hardened Docker runtime defaults
         run: |
           docker run --rm --entrypoint sh bloom:ci -c '
@@ -280,6 +320,11 @@ jobs:
         with:
           toolchain: "1.97.1"
           components: rustfmt, clippy
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements/python-package.txt
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Test macOS client contracts
         run: ./scripts/test_macos_client.sh
@@ -294,6 +339,18 @@ jobs:
         # Bound macOS workspace test stalls just like the Linux and Windows jobs.
         timeout-minutes: 20
         run: cargo test --workspace --features metal --locked
+      - name: Test Python SDK distribution with native ABI
+        # The wheel is pure Python; validate its clean installation against a
+        # separately built platform library, including real ctypes callbacks.
+        timeout-minutes: 10
+        env:
+          BLOOM_TEST_NATIVE_FFI: "1"
+          BLOOM_FFI_LIB: ${{ github.workspace }}/target/debug/libbloom_ffi.dylib
+        run: |
+          cargo build -p bloomai-ffi --locked
+          python -m pip install --disable-pip-version-check -r requirements/python-package.txt
+          python -m unittest discover -s python/tests -v
+          python scripts/test_python_package.py
 
   windows:
     name: Rust (Windows)
@@ -307,6 +364,8 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements/python-package.txt
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Check
         run: cargo check --workspace --all-targets --locked
@@ -329,6 +388,18 @@ jobs:
             echo "::error title=Windows cargo test failure::$summary"
           fi
           exit "$test_status"
+      - name: Test Python SDK distribution with native ABI
+        # Keep command failures blocking under bash, matching the Unix gates.
+        timeout-minutes: 10
+        shell: bash
+        env:
+          BLOOM_TEST_NATIVE_FFI: "1"
+          BLOOM_FFI_LIB: ${{ github.workspace }}/target/debug/bloom_ffi.dll
+        run: |
+          cargo build -p bloomai-ffi --locked
+          python -m pip install --disable-pip-version-check -r requirements/python-package.txt
+          python -m unittest discover -s python/tests -v
+          python scripts/test_python_package.py
       - name: Package server-only zip smoke
         shell: bash
         run: |
@@ -394,4 +465,6 @@ jobs:
       - name: Audit locked dependencies
         # Vulnerabilities fail the job; informational warnings such as an
         # unmaintained transitive crate remain visible without blocking CI.
-        run: cargo audit
+        run: |
+          cargo audit
+          cargo audit --file ui/Cargo.lock

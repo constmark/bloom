@@ -84,7 +84,7 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-for command_name in curl python3 sha256sum timeout; do
+for command_name in curl python3 sha256sum; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
         echo "FAIL: required command is unavailable: ${command_name}" >&2
         exit 1
@@ -247,7 +247,7 @@ if expected_weight_bytes:
 PY
 
 echo "Running deterministic trained-model semantic check..." >&2
-timeout 180 "$INFER_BIN" \
+python3 "${WORKSPACE_DIR}/scripts/run_with_timeout.py" 180 "$INFER_BIN" \
     --model "$MODEL_PATH" \
     --device cpu \
     --context-size 512 \
@@ -272,7 +272,7 @@ if text.strip() != expected:
 PY
 
 echo "Running trained-model CPU benchmark..." >&2
-timeout 240 "$BENCH_BIN" \
+python3 "${WORKSPACE_DIR}/scripts/run_with_timeout.py" 240 "$BENCH_BIN" \
     --model "$MODEL_PATH" \
     --prompt "$CHAT_PROMPT" \
     --device cpu \

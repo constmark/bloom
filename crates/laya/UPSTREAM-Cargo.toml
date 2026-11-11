@@ -1,0 +1,49 @@
+[package]
+name = "laya-decision"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure-Rust port of the Laya non-autoregressive System-1 decision engine (Laya-Decision)"
+readme = "README.md"
+keywords = ["nlp", "classification", "inference", "candle", "transformer"]
+categories = ["science", "text-processing"]
+
+# `laya` is taken on crates.io, so the package is `laya-decision` but the import name stays `laya`.
+[lib]
+name = "laya"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+indexmap.workspace = true
+regex.workspace = true
+thiserror.workspace = true
+unicode-general-category.workspace = true
+
+# inference backend — feature-gated so the pure-logic modules build without it
+candle-core = { workspace = true, optional = true }
+candle-nn = { workspace = true, optional = true }
+candle-transformers = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+hf-hub = { workspace = true, optional = true }
+
+[features]
+default = ["model"]
+# Native inference (candle encoder + head), HF tokenizer, and Hub download.
+model = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub"]
+# Metal GPU backend (Apple Silicon). Enables `LoadOptions.device = "metal"`.
+metal = ["model", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+
+[[example]]
+name = "predict"
+required-features = ["model"]
+
+[[example]]
+name = "tok_debug"
+required-features = ["model"]
+
+[[example]]
+name = "shortlist"
+required-features = ["model"]

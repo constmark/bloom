@@ -1,0 +1,1270 @@
+[
+  {
+    "question_set": "triage",
+    "state": {
+      "message": "I was charged twice this month and I'm furious. Refund me now."
+    },
+    "questions": {
+      "intent": {
+        "type": "choice",
+        "instructions": "What does the customer want in `message`?",
+        "criteria": {
+          "refund": "money returned or a duplicate charge reversed",
+          "technical_help": "a bug, outage or integration problem",
+          "billing_question": "a question about an invoice, plan or payment method",
+          "information": "general information, pricing or how-to",
+          "cancellation": "wants to cancel or downgrade",
+          "other": "none of the other options fits"
+        }
+      },
+      "is_urgent": {
+        "type": "noul",
+        "instructions": "Does `message` communicate time pressure or a deadline?"
+      },
+      "frustration": {
+        "type": "score",
+        "instructions": "How frustrated does the customer sound in `message`?",
+        "criteria": [
+          "calm and neutral",
+          "concerned but civil",
+          "clearly annoyed",
+          "very angry or using strong language"
+        ]
+      },
+      "refund_requested": {
+        "type": "noul",
+        "instructions": "Does the customer ask for money back?"
+      },
+      "churn_risk": {
+        "type": "noul",
+        "instructions": "Does `message` suggest the customer may leave for a competitor or cancel?"
+      }
+    },
+    "result": {
+      "model": "laya-rl-agent",
+      "answers": {
+        "intent": {
+          "type": "choice",
+          "choice": "refund",
+          "probabilities": {
+            "refund": 0.9457,
+            "technical_help": 0.0043,
+            "billing_question": 0.0304,
+            "information": 0.0036,
+            "cancellation": 0.0046,
+            "other": 0.0114
+          },
+          "confidence": 0.8445,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "is_urgent": {
+          "type": "noul",
+          "noul": 0.6193,
+          "confidence": 0.6193,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "frustration": {
+          "type": "score",
+          "score": 2.4157,
+          "legend": {
+            "0": "calm and neutral",
+            "1": "concerned but civil",
+            "2": "clearly annoyed",
+            "3": "very angry or using strong language"
+          },
+          "probabilities": {
+            "0": 0.0152,
+            "1": 0.0622,
+            "2": 0.4143,
+            "3": 0.5083
+          },
+          "confidence": 0.318,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "refund_requested": {
+          "type": "noul",
+          "noul": 0.7534,
+          "confidence": 0.7534,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "churn_risk": {
+          "type": "noul",
+          "noul": 0.2189,
+          "confidence": 0.7811,
+          "action": {
+            "act_probability": 1.0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 349,
+        "output_tokens": 0
+      }
+    }
+  },
+  {
+    "question_set": "triage",
+    "state": {
+      "message": "Just wanted to say thanks, everything works great!"
+    },
+    "questions": {
+      "intent": {
+        "type": "choice",
+        "instructions": "What does the customer want in `message`?",
+        "criteria": {
+          "refund": "money returned or a duplicate charge reversed",
+          "technical_help": "a bug, outage or integration problem",
+          "billing_question": "a question about an invoice, plan or payment method",
+          "information": "general information, pricing or how-to",
+          "cancellation": "wants to cancel or downgrade",
+          "other": "none of the other options fits"
+        }
+      },
+      "is_urgent": {
+        "type": "noul",
+        "instructions": "Does `message` communicate time pressure or a deadline?"
+      },
+      "frustration": {
+        "type": "score",
+        "instructions": "How frustrated does the customer sound in `message`?",
+        "criteria": [
+          "calm and neutral",
+          "concerned but civil",
+          "clearly annoyed",
+          "very angry or using strong language"
+        ]
+      },
+      "refund_requested": {
+        "type": "noul",
+        "instructions": "Does the customer ask for money back?"
+      },
+      "churn_risk": {
+        "type": "noul",
+        "instructions": "Does `message` suggest the customer may leave for a competitor or cancel?"
+      }
+    },
+    "result": {
+      "model": "laya-rl-agent",
+      "answers": {
+        "intent": {
+          "type": "choice",
+          "choice": "other",
+          "probabilities": {
+            "refund": 0.0186,
+            "technical_help": 0.1477,
+            "billing_question": 0.0241,
+            "information": 0.0956,
+            "cancellation": 0.0289,
+            "other": 0.6851
+          },
+          "confidence": 0.4239,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "is_urgent": {
+          "type": "noul",
+          "noul": 0.0942,
+          "confidence": 0.9058,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "frustration": {
+          "type": "score",
+          "score": 0.4077,
+          "legend": {
+            "0": "calm and neutral",
+            "1": "concerned but civil",
+            "2": "clearly annoyed",
+            "3": "very angry or using strong language"
+          },
+          "probabilities": {
+            "0": 0.7136,
+            "1": 0.1986,
+            "2": 0.0543,
+            "3": 0.0335
+          },
+          "confidence": 0.3985,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "refund_requested": {
+          "type": "noul",
+          "noul": 0.0005,
+          "confidence": 0.9995,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "churn_risk": {
+          "type": "noul",
+          "noul": 0.0022,
+          "confidence": 0.9978,
+          "action": {
+            "act_probability": 1.0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 319,
+        "output_tokens": 0
+      }
+    }
+  },
+  {
+    "question_set": "triage",
+    "state": "Can you help me reset my password?",
+    "questions": {
+      "intent": {
+        "type": "choice",
+        "instructions": "What does the customer want in `message`?",
+        "criteria": {
+          "refund": "money returned or a duplicate charge reversed",
+          "technical_help": "a bug, outage or integration problem",
+          "billing_question": "a question about an invoice, plan or payment method",
+          "information": "general information, pricing or how-to",
+          "cancellation": "wants to cancel or downgrade",
+          "other": "none of the other options fits"
+        }
+      },
+      "is_urgent": {
+        "type": "noul",
+        "instructions": "Does `message` communicate time pressure or a deadline?"
+      },
+      "frustration": {
+        "type": "score",
+        "instructions": "How frustrated does the customer sound in `message`?",
+        "criteria": [
+          "calm and neutral",
+          "concerned but civil",
+          "clearly annoyed",
+          "very angry or using strong language"
+        ]
+      },
+      "refund_requested": {
+        "type": "noul",
+        "instructions": "Does the customer ask for money back?"
+      },
+      "churn_risk": {
+        "type": "noul",
+        "instructions": "Does `message` suggest the customer may leave for a competitor or cancel?"
+      }
+    },
+    "result": {
+      "model": "laya-rl-agent",
+      "answers": {
+        "intent": {
+          "type": "choice",
+          "choice": "other",
+          "probabilities": {
+            "refund": 0.0871,
+            "technical_help": 0.0831,
+            "billing_question": 0.1396,
+            "information": 0.1026,
+            "cancellation": 0.0559,
+            "other": 0.5317
+          },
+          "confidence": 0.2048,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "is_urgent": {
+          "type": "noul",
+          "noul": 0.154,
+          "confidence": 0.846,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "frustration": {
+          "type": "score",
+          "score": 1.2479,
+          "legend": {
+            "0": "calm and neutral",
+            "1": "concerned but civil",
+            "2": "clearly annoyed",
+            "3": "very angry or using strong language"
+          },
+          "probabilities": {
+            "0": 0.229,
+            "1": 0.3836,
+            "2": 0.298,
+            "3": 0.0894
+          },
+          "confidence": 0.0754,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "refund_requested": {
+          "type": "noul",
+          "noul": 0.0798,
+          "confidence": 0.9202,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "churn_risk": {
+          "type": "noul",
+          "noul": 0.198,
+          "confidence": 0.802,
+          "action": {
+            "act_probability": 1.0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 284,
+        "output_tokens": 0
+      }
+    }
+  },
+  {
+    "question_set": "triage",
+    "state": [
+      "Hi, I have a problem",
+      "What is it?",
+      "My invoice is wrong and I need it fixed today"
+    ],
+    "questions": {
+      "intent": {
+        "type": "choice",
+        "instructions": "What does the customer want in `message`?",
+        "criteria": {
+          "refund": "money returned or a duplicate charge reversed",
+          "technical_help": "a bug, outage or integration problem",
+          "billing_question": "a question about an invoice, plan or payment method",
+          "information": "general information, pricing or how-to",
+          "cancellation": "wants to cancel or downgrade",
+          "other": "none of the other options fits"
+        }
+      },
+      "is_urgent": {
+        "type": "noul",
+        "instructions": "Does `message` communicate time pressure or a deadline?"
+      },
+      "frustration": {
+        "type": "score",
+        "instructions": "How frustrated does the customer sound in `message`?",
+        "criteria": [
+          "calm and neutral",
+          "concerned but civil",
+          "clearly annoyed",
+          "very angry or using strong language"
+        ]
+      },
+      "refund_requested": {
+        "type": "noul",
+        "instructions": "Does the customer ask for money back?"
+      },
+      "churn_risk": {
+        "type": "noul",
+        "instructions": "Does `message` suggest the customer may leave for a competitor or cancel?"
+      }
+    },
+    "result": {
+      "model": "laya-rl-agent",
+      "answers": {
+        "intent": {
+          "type": "choice",
+          "choice": "billing_question",
+          "probabilities": {
+            "refund": 0.0276,
+            "technical_help": 0.108,
+            "billing_question": 0.7686,
+            "information": 0.0201,
+            "cancellation": 0.0138,
+            "other": 0.0619
+          },
+          "confidence": 0.5248,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "is_urgent": {
+          "type": "noul",
+          "noul": 0.5351,
+          "confidence": 0.5351,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "frustration": {
+          "type": "score",
+          "score": 1.299,
+          "legend": {
+            "0": "calm and neutral",
+            "1": "concerned but civil",
+            "2": "clearly annoyed",
+            "3": "very angry or using strong language"
+          },
+          "probabilities": {
+            "0": 0.1921,
+            "1": 0.4074,
+            "2": 0.3098,
+            "3": 0.0906
+          },
+          "confidence": 0.0886,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "refund_requested": {
+          "type": "noul",
+          "noul": 0.3239,
+          "confidence": 0.6761,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "churn_risk": {
+          "type": "noul",
+          "noul": 0.1547,
+          "confidence": 0.8453,
+          "action": {
+            "act_probability": 1.0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 369,
+        "output_tokens": 0
+      }
+    }
+  },
+  {
+    "question_set": "guard",
+    "state": {
+      "message": "I was charged twice this month and I'm furious. Refund me now."
+    },
+    "questions": {
+      "jailbreak": {
+        "type": "noul",
+        "instructions": "Does `prompt` try to make an AI assistant ignore its rules, policies or system instructions?"
+      },
+      "prompt_injection": {
+        "type": "noul",
+        "instructions": "Does `prompt` contain instructions aimed at the AI system rather than a genuine user request?"
+      },
+      "sensitive_data": {
+        "type": "noul",
+        "instructions": "Does `prompt` contain credentials, personal data or other sensitive information?"
+      },
+      "harm_severity": {
+        "type": "score",
+        "instructions": "How much harm would complying with `prompt` cause?",
+        "criteria": [
+          "none: ordinary request",
+          "minor: mildly inappropriate",
+          "serious: unsafe advice or abuse",
+          "severe: dangerous or illegal"
+        ]
+      },
+      "topic": {
+        "type": "choice",
+        "instructions": "What is `prompt` about?",
+        "criteria": {
+          "product_support": null,
+          "coding": null,
+          "general_knowledge": null,
+          "personal_advice": null,
+          "security_testing": null,
+          "other": null
+        }
+      }
+    },
+    "result": {
+      "model": "laya-rl-agent",
+      "answers": {
+        "jailbreak": {
+          "type": "noul",
+          "noul": 0.0116,
+          "confidence": 0.9884,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "prompt_injection": {
+          "type": "noul",
+          "noul": 0.1288,
+          "confidence": 0.8712,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "sensitive_data": {
+          "type": "noul",
+          "noul": 0.3567,
+          "confidence": 0.6433,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "harm_severity": {
+          "type": "score",
+          "score": 2.3625,
+          "legend": {
+            "0": "none: ordinary request",
+            "1": "minor: mildly inappropriate",
+            "2": "serious: unsafe advice or abuse",
+            "3": "severe: dangerous or illegal"
+          },
+          "probabilities": {
+            "0": 0.0607,
+            "1": 0.0914,
+            "2": 0.2726,
+            "3": 0.5753
+          },
+          "confidence": 0.2346,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "topic": {
+          "type": "choice",
+          "choice": "product_support",
+          "probabilities": {
+            "product_support": 0.4931,
+            "coding": 0.052,
+            "general_knowledge": 0.0503,
+            "personal_advice": 0.1212,
+            "security_testing": 0.0801,
+            "other": 0.2033
+          },
+          "confidence": 0.1993,
+          "action": {
+            "act_probability": 1.0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 323,
+        "output_tokens": 0
+      }
+    }
+  },
+  {
+    "question_set": "guard",
+    "state": {
+      "message": "Just wanted to say thanks, everything works great!"
+    },
+    "questions": {
+      "jailbreak": {
+        "type": "noul",
+        "instructions": "Does `prompt` try to make an AI assistant ignore its rules, policies or system instructions?"
+      },
+      "prompt_injection": {
+        "type": "noul",
+        "instructions": "Does `prompt` contain instructions aimed at the AI system rather than a genuine user request?"
+      },
+      "sensitive_data": {
+        "type": "noul",
+        "instructions": "Does `prompt` contain credentials, personal data or other sensitive information?"
+      },
+      "harm_severity": {
+        "type": "score",
+        "instructions": "How much harm would complying with `prompt` cause?",
+        "criteria": [
+          "none: ordinary request",
+          "minor: mildly inappropriate",
+          "serious: unsafe advice or abuse",
+          "severe: dangerous or illegal"
+        ]
+      },
+      "topic": {
+        "type": "choice",
+        "instructions": "What is `prompt` about?",
+        "criteria": {
+          "product_support": null,
+          "coding": null,
+          "general_knowledge": null,
+          "personal_advice": null,
+          "security_testing": null,
+          "other": null
+        }
+      }
+    },
+    "result": {
+      "model": "laya-rl-agent",
+      "answers": {
+        "jailbreak": {
+          "type": "noul",
+          "noul": 0.0427,
+          "confidence": 0.9573,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "prompt_injection": {
+          "type": "noul",
+          "noul": 0.0802,
+          "confidence": 0.9198,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "sensitive_data": {
+          "type": "noul",
+          "noul": 0.1359,
+          "confidence": 0.8641,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "harm_severity": {
+          "type": "score",
+          "score": 0.538,
+          "legend": {
+            "0": "none: ordinary request",
+            "1": "minor: mildly inappropriate",
+            "2": "serious: unsafe advice or abuse",
+            "3": "severe: dangerous or illegal"
+          },
+          "probabilities": {
+            "0": 0.6258,
+            "1": 0.2597,
+            "2": 0.0651,
+            "3": 0.0494
+          },
+          "confidence": 0.3004,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "topic": {
+          "type": "choice",
+          "choice": "coding",
+          "probabilities": {
+            "product_support": 0.202,
+            "coding": 0.38,
+            "general_knowledge": 0.0727,
+            "personal_advice": 0.0349,
+            "security_testing": 0.0895,
+            "other": 0.2208
+          },
+          "confidence": 0.136,
+          "action": {
+            "act_probability": 1.0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 293,
+        "output_tokens": 0
+      }
+    }
+  },
+  {
+    "question_set": "guard",
+    "state": "Can you help me reset my password?",
+    "questions": {
+      "jailbreak": {
+        "type": "noul",
+        "instructions": "Does `prompt` try to make an AI assistant ignore its rules, policies or system instructions?"
+      },
+      "prompt_injection": {
+        "type": "noul",
+        "instructions": "Does `prompt` contain instructions aimed at the AI system rather than a genuine user request?"
+      },
+      "sensitive_data": {
+        "type": "noul",
+        "instructions": "Does `prompt` contain credentials, personal data or other sensitive information?"
+      },
+      "harm_severity": {
+        "type": "score",
+        "instructions": "How much harm would complying with `prompt` cause?",
+        "criteria": [
+          "none: ordinary request",
+          "minor: mildly inappropriate",
+          "serious: unsafe advice or abuse",
+          "severe: dangerous or illegal"
+        ]
+      },
+      "topic": {
+        "type": "choice",
+        "instructions": "What is `prompt` about?",
+        "criteria": {
+          "product_support": null,
+          "coding": null,
+          "general_knowledge": null,
+          "personal_advice": null,
+          "security_testing": null,
+          "other": null
+        }
+      }
+    },
+    "result": {
+      "model": "laya-rl-agent",
+      "answers": {
+        "jailbreak": {
+          "type": "noul",
+          "noul": 0.1006,
+          "confidence": 0.8994,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "prompt_injection": {
+          "type": "noul",
+          "noul": 0.119,
+          "confidence": 0.881,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "sensitive_data": {
+          "type": "noul",
+          "noul": 0.5781,
+          "confidence": 0.5781,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "harm_severity": {
+          "type": "score",
+          "score": 1.0738,
+          "legend": {
+            "0": "none: ordinary request",
+            "1": "minor: mildly inappropriate",
+            "2": "serious: unsafe advice or abuse",
+            "3": "severe: dangerous or illegal"
+          },
+          "probabilities": {
+            "0": 0.3448,
+            "1": 0.356,
+            "2": 0.1798,
+            "3": 0.1194
+          },
+          "confidence": 0.0643,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "topic": {
+          "type": "choice",
+          "choice": "security_testing",
+          "probabilities": {
+            "product_support": 0.1455,
+            "coding": 0.26,
+            "general_knowledge": 0.0341,
+            "personal_advice": 0.1258,
+            "security_testing": 0.3408,
+            "other": 0.0939
+          },
+          "confidence": 0.1095,
+          "action": {
+            "act_probability": 1.0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 258,
+        "output_tokens": 0
+      }
+    }
+  },
+  {
+    "question_set": "guard",
+    "state": [
+      "Hi, I have a problem",
+      "What is it?",
+      "My invoice is wrong and I need it fixed today"
+    ],
+    "questions": {
+      "jailbreak": {
+        "type": "noul",
+        "instructions": "Does `prompt` try to make an AI assistant ignore its rules, policies or system instructions?"
+      },
+      "prompt_injection": {
+        "type": "noul",
+        "instructions": "Does `prompt` contain instructions aimed at the AI system rather than a genuine user request?"
+      },
+      "sensitive_data": {
+        "type": "noul",
+        "instructions": "Does `prompt` contain credentials, personal data or other sensitive information?"
+      },
+      "harm_severity": {
+        "type": "score",
+        "instructions": "How much harm would complying with `prompt` cause?",
+        "criteria": [
+          "none: ordinary request",
+          "minor: mildly inappropriate",
+          "serious: unsafe advice or abuse",
+          "severe: dangerous or illegal"
+        ]
+      },
+      "topic": {
+        "type": "choice",
+        "instructions": "What is `prompt` about?",
+        "criteria": {
+          "product_support": null,
+          "coding": null,
+          "general_knowledge": null,
+          "personal_advice": null,
+          "security_testing": null,
+          "other": null
+        }
+      }
+    },
+    "result": {
+      "model": "laya-rl-agent",
+      "answers": {
+        "jailbreak": {
+          "type": "noul",
+          "noul": 0.0431,
+          "confidence": 0.9569,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "prompt_injection": {
+          "type": "noul",
+          "noul": 0.1776,
+          "confidence": 0.8224,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "sensitive_data": {
+          "type": "noul",
+          "noul": 0.3131,
+          "confidence": 0.6869,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "harm_severity": {
+          "type": "score",
+          "score": 0.9363,
+          "legend": {
+            "0": "none: ordinary request",
+            "1": "minor: mildly inappropriate",
+            "2": "serious: unsafe advice or abuse",
+            "3": "severe: dangerous or illegal"
+          },
+          "probabilities": {
+            "0": 0.4116,
+            "1": 0.3509,
+            "2": 0.1271,
+            "3": 0.1104
+          },
+          "confidence": 0.1068,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "topic": {
+          "type": "choice",
+          "choice": "product_support",
+          "probabilities": {
+            "product_support": 0.4033,
+            "coding": 0.1028,
+            "general_knowledge": 0.0964,
+            "personal_advice": 0.1418,
+            "security_testing": 0.0371,
+            "other": 0.2186
+          },
+          "confidence": 0.1309,
+          "action": {
+            "act_probability": 1.0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 343,
+        "output_tokens": 0
+      }
+    }
+  },
+  {
+    "question_set": "moderation",
+    "state": {
+      "message": "I was charged twice this month and I'm furious. Refund me now."
+    },
+    "questions": {
+      "toxic": {
+        "type": "noul",
+        "instructions": "Is `post` toxic: rude, disrespectful or likely to make someone leave the discussion?"
+      },
+      "harassment": {
+        "type": "noul",
+        "instructions": "Does `post` target or harass a specific person?"
+      },
+      "threat": {
+        "type": "noul",
+        "instructions": "Does `post` threaten violence, harm or intimidation?"
+      },
+      "spam": {
+        "type": "noul",
+        "instructions": "Is `post` spam or advertising?"
+      },
+      "severity": {
+        "type": "score",
+        "instructions": "How severe is any rule-breaking in `post`?",
+        "criteria": [
+          "no rule-breaking: ordinary on-topic post",
+          "mild: rude tone or off-topic, no target",
+          "clear violation: insults, harassment or spam aimed at someone",
+          "severe: threats, hate speech or calls for violence"
+        ]
+      }
+    },
+    "result": {
+      "model": "laya-rl-agent",
+      "answers": {
+        "toxic": {
+          "type": "noul",
+          "noul": 0.2862,
+          "confidence": 0.7138,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "harassment": {
+          "type": "noul",
+          "noul": 0.2028,
+          "confidence": 0.7972,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "threat": {
+          "type": "noul",
+          "noul": 0.3732,
+          "confidence": 0.6268,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "spam": {
+          "type": "noul",
+          "noul": 0.1371,
+          "confidence": 0.8629,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "severity": {
+          "type": "score",
+          "score": 1.6163,
+          "legend": {
+            "0": "no rule-breaking: ordinary on-topic post",
+            "1": "mild: rude tone or off-topic, no target",
+            "2": "clear violation: insults, harassment or spam aimed at someone",
+            "3": "severe: threats, hate speech or calls for violence"
+          },
+          "probabilities": {
+            "0": 0.2042,
+            "1": 0.1572,
+            "2": 0.4566,
+            "3": 0.182
+          },
+          "confidence": 0.0743,
+          "action": {
+            "act_probability": 1.0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 336,
+        "output_tokens": 0
+      }
+    }
+  },
+  {
+    "question_set": "moderation",
+    "state": {
+      "message": "Just wanted to say thanks, everything works great!"
+    },
+    "questions": {
+      "toxic": {
+        "type": "noul",
+        "instructions": "Is `post` toxic: rude, disrespectful or likely to make someone leave the discussion?"
+      },
+      "harassment": {
+        "type": "noul",
+        "instructions": "Does `post` target or harass a specific person?"
+      },
+      "threat": {
+        "type": "noul",
+        "instructions": "Does `post` threaten violence, harm or intimidation?"
+      },
+      "spam": {
+        "type": "noul",
+        "instructions": "Is `post` spam or advertising?"
+      },
+      "severity": {
+        "type": "score",
+        "instructions": "How severe is any rule-breaking in `post`?",
+        "criteria": [
+          "no rule-breaking: ordinary on-topic post",
+          "mild: rude tone or off-topic, no target",
+          "clear violation: insults, harassment or spam aimed at someone",
+          "severe: threats, hate speech or calls for violence"
+        ]
+      }
+    },
+    "result": {
+      "model": "laya-rl-agent",
+      "answers": {
+        "toxic": {
+          "type": "noul",
+          "noul": 0.0479,
+          "confidence": 0.9521,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "harassment": {
+          "type": "noul",
+          "noul": 0.0049,
+          "confidence": 0.9951,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "threat": {
+          "type": "noul",
+          "noul": 0.0005,
+          "confidence": 0.9995,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "spam": {
+          "type": "noul",
+          "noul": 0.1173,
+          "confidence": 0.8827,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "severity": {
+          "type": "score",
+          "score": 0.3857,
+          "legend": {
+            "0": "no rule-breaking: ordinary on-topic post",
+            "1": "mild: rude tone or off-topic, no target",
+            "2": "clear violation: insults, harassment or spam aimed at someone",
+            "3": "severe: threats, hate speech or calls for violence"
+          },
+          "probabilities": {
+            "0": 0.7051,
+            "1": 0.2272,
+            "2": 0.0446,
+            "3": 0.0231
+          },
+          "confidence": 0.4166,
+          "action": {
+            "act_probability": 1.0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 306,
+        "output_tokens": 0
+      }
+    }
+  },
+  {
+    "question_set": "moderation",
+    "state": "Can you help me reset my password?",
+    "questions": {
+      "toxic": {
+        "type": "noul",
+        "instructions": "Is `post` toxic: rude, disrespectful or likely to make someone leave the discussion?"
+      },
+      "harassment": {
+        "type": "noul",
+        "instructions": "Does `post` target or harass a specific person?"
+      },
+      "threat": {
+        "type": "noul",
+        "instructions": "Does `post` threaten violence, harm or intimidation?"
+      },
+      "spam": {
+        "type": "noul",
+        "instructions": "Is `post` spam or advertising?"
+      },
+      "severity": {
+        "type": "score",
+        "instructions": "How severe is any rule-breaking in `post`?",
+        "criteria": [
+          "no rule-breaking: ordinary on-topic post",
+          "mild: rude tone or off-topic, no target",
+          "clear violation: insults, harassment or spam aimed at someone",
+          "severe: threats, hate speech or calls for violence"
+        ]
+      }
+    },
+    "result": {
+      "model": "laya-rl-agent",
+      "answers": {
+        "toxic": {
+          "type": "noul",
+          "noul": 0.1218,
+          "confidence": 0.8782,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "harassment": {
+          "type": "noul",
+          "noul": 0.054,
+          "confidence": 0.946,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "threat": {
+          "type": "noul",
+          "noul": 0.1043,
+          "confidence": 0.8957,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "spam": {
+          "type": "noul",
+          "noul": 0.2251,
+          "confidence": 0.7749,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "severity": {
+          "type": "score",
+          "score": 1.0061,
+          "legend": {
+            "0": "no rule-breaking: ordinary on-topic post",
+            "1": "mild: rude tone or off-topic, no target",
+            "2": "clear violation: insults, harassment or spam aimed at someone",
+            "3": "severe: threats, hate speech or calls for violence"
+          },
+          "probabilities": {
+            "0": 0.3845,
+            "1": 0.3063,
+            "2": 0.2279,
+            "3": 0.0813
+          },
+          "confidence": 0.0831,
+          "action": {
+            "act_probability": 1.0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 271,
+        "output_tokens": 0
+      }
+    }
+  },
+  {
+    "question_set": "moderation",
+    "state": [
+      "Hi, I have a problem",
+      "What is it?",
+      "My invoice is wrong and I need it fixed today"
+    ],
+    "questions": {
+      "toxic": {
+        "type": "noul",
+        "instructions": "Is `post` toxic: rude, disrespectful or likely to make someone leave the discussion?"
+      },
+      "harassment": {
+        "type": "noul",
+        "instructions": "Does `post` target or harass a specific person?"
+      },
+      "threat": {
+        "type": "noul",
+        "instructions": "Does `post` threaten violence, harm or intimidation?"
+      },
+      "spam": {
+        "type": "noul",
+        "instructions": "Is `post` spam or advertising?"
+      },
+      "severity": {
+        "type": "score",
+        "instructions": "How severe is any rule-breaking in `post`?",
+        "criteria": [
+          "no rule-breaking: ordinary on-topic post",
+          "mild: rude tone or off-topic, no target",
+          "clear violation: insults, harassment or spam aimed at someone",
+          "severe: threats, hate speech or calls for violence"
+        ]
+      }
+    },
+    "result": {
+      "model": "laya-rl-agent",
+      "answers": {
+        "toxic": {
+          "type": "noul",
+          "noul": 0.1835,
+          "confidence": 0.8165,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "harassment": {
+          "type": "noul",
+          "noul": 0.1376,
+          "confidence": 0.8624,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "threat": {
+          "type": "noul",
+          "noul": 0.1548,
+          "confidence": 0.8452,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "spam": {
+          "type": "noul",
+          "noul": 0.1448,
+          "confidence": 0.8552,
+          "action": {
+            "act_probability": 1.0
+          }
+        },
+        "severity": {
+          "type": "score",
+          "score": 0.8889,
+          "legend": {
+            "0": "no rule-breaking: ordinary on-topic post",
+            "1": "mild: rude tone or off-topic, no target",
+            "2": "clear violation: insults, harassment or spam aimed at someone",
+            "3": "severe: threats, hate speech or calls for violence"
+          },
+          "probabilities": {
+            "0": 0.4592,
+            "1": 0.2713,
+            "2": 0.191,
+            "3": 0.0786
+          },
+          "confidence": 0.1147,
+          "action": {
+            "act_probability": 1.0
+          }
+        }
+      },
+      "usage": {
+        "input_tokens": 356,
+        "output_tokens": 0
+      }
+    }
+  }
+]

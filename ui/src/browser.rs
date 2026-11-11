@@ -223,6 +223,45 @@ fn resample_mono_pcm(samples: &[f32], source_rate: u32, target_rate: u32) -> Vec
         .collect()
 }
 
+/// Establish the clicked button as the focus owner before Dioxus click
+/// handlers mount a modal. WebKit does not focus pointer-activated buttons,
+/// and changing focus during mousedown is undone by its default action.
+pub struct ButtonActivationFocus {
+    document: web_sys::Document,
+    callback: Closure<dyn FnMut(web_sys::MouseEvent)>,
+}
+
+impl Drop for ButtonActivationFocus {
+    fn drop(&mut self) {
+        let _ = self.document.remove_event_listener_with_callback_and_bool(
+            "click",
+            self.callback.as_ref().unchecked_ref(),
+            true,
+        );
+    }
+}
+
+pub fn capture_button_activation() -> Option<Rc<ButtonActivationFocus>> {
+    let document = web_sys::window()?.document()?;
+    let callback = Closure::wrap(Box::new(move |event: web_sys::MouseEvent| {
+        if event.button() != 0 {
+            return;
+        }
+        let button = event
+            .target()
+            .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+            .and_then(|element| element.closest("button:not([disabled])").ok().flatten())
+            .and_then(|element| element.dyn_into::<web_sys::HtmlElement>().ok());
+        if let Some(button) = button {
+            let _ = button.focus();
+        }
+    }) as Box<dyn FnMut(web_sys::MouseEvent)>);
+    document
+        .add_event_listener_with_callback_and_bool("click", callback.as_ref().unchecked_ref(), true)
+        .ok()?;
+    Some(Rc::new(ButtonActivationFocus { document, callback }))
+}
+
 pub fn capture_active_element() -> Option<web_sys::HtmlElement> {
     web_sys::window()?
         .document()?

@@ -347,12 +347,20 @@ history. Text-only requests also avoid constructing a duplicate multimodal
 prompt.
 
 Stream transport is bounded independently of generation settings. The client
-requires `text/event-stream`, accepts at most 64 MiB of decoded response bytes,
+requires `text/event-stream`, accepts at most 64 MiB of response bytes,
 1 MiB per event, 4 KiB per streamed error message, and 16 MiB of accumulated
 generated text. Limits are enforced before callbacks update the conversation.
 Both text and multimodal streams require `[DONE]`; a multimodal `End` chunk does
 not substitute for transport completion, and an early EOF records the bounded
 partial response as failed.
+Text chat also requires exactly one choice at index zero, a supported finish
+reason before `[DONE]`, and at most one usage record. Extra choices, invalid
+delta fields, repeated usage, and content after the finish reason fail explicitly.
+The incremental parser accepts LF, CRLF, and CR line endings, preserves data
+field whitespace, and rejects invalid UTF-8 and unfinished events, including
+an unclosed `[DONE]`. Streaming requests allow 120 seconds for headers, 30
+seconds between body chunks, and 300 seconds for the body overall. Dropping a
+streaming task aborts its fetch and cancels its body reader.
 
 Non-streaming API reads are bounded independently. General browser control
 responses have a 16 MiB maximum success budget. Source inspection is limited to
@@ -365,8 +373,8 @@ shows no more than 4 KiB of normalized error detail. Typed success responses
 must use `application/json` or `application/*+json`. Ordinary control requests
 allow 120 seconds for response headers; body reads allow 30 seconds between
 chunks and 300 seconds overall. Dropping an in-progress UI task aborts its fetch
-or cancels its reader. Generation and model-import uploads retain explicit Stop
-controls instead of inheriting these ordinary control-request assumptions.
+or cancels its reader. Generation and model-import uploads also retain explicit
+Stop controls.
 
 Bloom readiness also reports the active model's context window. The composer
 shows the latest server-reported turn usage against that window and warns when
@@ -512,27 +520,40 @@ just ui-check
 just ui-test
 just ui-clippy
 
-# One-time Chromium installation for the pinned browser-test driver.
-npx --yes --package @playwright/cli@0.1.18 playwright-cli install-browser chromium
+# Install the engines for the pinned browser-test driver (add --with-deps on Linux).
+for browser in chromium firefox webkit; do
+  npx --yes --package @playwright/cli@0.1.18 playwright-cli install-browser "$browser"
+done
 just ui-build
-just ui-browser-test
+for browser in chromium firefox webkit; do
+  python3 scripts/test_ui_browser.py --browser "$browser" \
+    --report "output/playwright/$browser-acceptance.json"
+done
 ```
 
 Pure conversation-state, archive-merge, submission-preflight, history-window,
 streaming-protocol, and modal keyboard-boundary tests run on the host. The UI
 type check targets `wasm32-unknown-unknown`, matching production builds. The
-pinned Chromium gate loads the real embedded WASM shell, validates its security
+same gate runs in Chromium, Firefox, and WebKit, loads the real embedded WASM shell, validates its security
 headers and empty state, and exercises Models/Settings focus entry, forward and
 reverse containment, Escape dismissal, opener restoration, accessible names,
 reduced motion, an imported message's real clipboard write, and a versioned
 conversation download whose filename and decoded contents are checked. CI runs
-that gate against the release-shaped container. Pinned axe-core 4.13.0 also
+each engine against the release-shaped container and uploads a versioned JSON
+report with the actual engine/version and executed checks. Any missing browser,
+failed capability, scanner failure, or malformed result fails the gate; a
+previous successful report is invalidated before another run starts. Pinned axe-core 4.13.0 also
 scans the application shell and the Models, Settings, and conversation-import
 dialogs against WCAG 2.0, 2.1, and 2.2 A/AA rules. The test downloads the
 bounded npm archive with a pinned SHA-512 digest and verifies the browser-side
 scanner version; offline environments can set `BLOOM_AXE_CORE_PATH` to a
-pre-provisioned `axe.min.js` from that exact release. Other browser engines and
-target assistive technology remain release checks.
+pre-provisioned `axe.min.js` from that exact release. Scanner findings requiring
+manual review also fail the gate and are retained in its failure report. Chromium and WebKit verify copied
+text through real Clipboard API readback with their supported permissions;
+Firefox verifies it through a trusted paste gesture because its Playwright
+permission API cannot grant clipboard access. No clipboard methods are mocked.
+These automated checks do not establish screen-reader or target assistive
+technology compatibility; those remain manual release checks.
 
 ### Embedded in bloom_server
 

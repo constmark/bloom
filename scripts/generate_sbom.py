@@ -9,6 +9,8 @@ import pathlib
 import sys
 
 from sbom_contract import SbomError, build_sbom
+from check_laya_upstream import verify as verify_laya_upstream
+from check_runtime_dependencies import verify as verify_runtime_dependencies
 
 
 def read_json(path: pathlib.Path, label: str) -> object:
@@ -33,8 +35,13 @@ def main() -> int:
     parser.add_argument("--output", required=True, type=pathlib.Path)
     args = parser.parse_args()
     try:
+        verify_laya_upstream(pathlib.Path(__file__).resolve().parents[1])
+        documents = [read_json(path, "cargo metadata") for path in args.metadata]
+        # The first metadata document is the native release graph; optional UI
+        # metadata comes from its separate workspace. Both are obtained locked.
+        verify_runtime_dependencies(documents[0])
         sbom = build_sbom(
-            [read_json(path, "cargo metadata") for path in args.metadata],
+            documents,
             read_json(args.policy, "dependency policy"),
             args.target,
             args.embedded_ui == "true",
@@ -42,7 +49,7 @@ def main() -> int:
         args.output.write_text(
             json.dumps(sbom, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
-    except (OSError, SbomError) as error:
+    except (OSError, SbomError, ValueError, KeyError, TypeError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
     print(f"OK: wrote policy-checked CycloneDX SBOM to {args.output}")

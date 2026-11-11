@@ -38,6 +38,42 @@ def _positive_int(value: Any, name: str) -> int:
     return value
 
 
+def _distribution(value: Any, name: str, count: int) -> dict[str, Any]:
+    if not isinstance(value, dict) or type(value.get("count")) is not int or value["count"] != count:
+        raise ValueError(f"{name} count does not match completed requests")
+    previous = 0.0
+    for field in ("p50", "p95", "p99", "max"):
+        current = _positive(value.get(field), f"{name}.{field}")
+        if current < previous:
+            raise ValueError(f"{name} percentiles are not ordered")
+        previous = current
+    return value
+
+
+def _check_budgets(report: dict[str, Any], budgets: Any) -> dict[str, Any]:
+    """Require every service budget; omitted measurements never count as zero."""
+    measurements = {
+        "cold_start_ms": report.get("cold_start_ms"),
+        "latency_p95_ms": report["latency_ms"]["p95"],
+        "first_content_p95_ms": report["first_content_ms"]["p95"],
+        "recovery_ms": report["disconnect"]["recovery_ms"],
+        "peak_rss_bytes": report["host_memory"]["observed_peak_bytes"],
+        "rss_growth_bytes": max(0, report["host_memory"]["drift_bytes"]),
+    }
+    if not isinstance(budgets, dict) or set(budgets) != set(measurements):
+        raise ValueError("budgets must declare exactly: " + ", ".join(measurements))
+    checked = {}
+    for name, measured in measurements.items():
+        limit = (0.0 if name == "rss_growth_bytes" and type(budgets[name]) in (int, float)
+                 and budgets[name] == 0 else _positive(budgets[name], f"budget {name}"))
+        if name != "rss_growth_bytes":
+            _positive(measured, name)
+        if measured > limit:
+            raise ValueError(f"{name} exceeds deployment budget: {measured} > {limit:g}")
+        checked[name] = {"measured": measured, "limit": limit}
+    return checked
+
+
 def validate(
     report: Any,
     *,
@@ -48,6 +84,9 @@ def validate(
     expected_device: str | None = None,
     min_concurrency_levels: int = 2,
     failure_report: Any | None = None,
+    min_requests: int = 1,
+    budgets: Any | None = None,
+    production_profile: bool = False,
 ) -> dict[str, Any]:
     """Validate a workload report and return a bounded validation result."""
     if not isinstance(report, dict):
@@ -80,6 +119,16 @@ def validate(
         raise ValueError("device does not match deployment cell")
 
     min_duration_seconds = _positive(min_duration_seconds, "min_duration_seconds")
+    min_requests = _positive_int(min_requests, "min_requests")
+    if production_profile:
+        min_duration_seconds = max(86400, min_duration_seconds)
+        min_requests = max(1000, min_requests)
+        if budgets is None:
+            raise ValueError("production profile requires explicit service budgets")
+        if not all((expected_model_sha256, expected_server_sha256, expected_backend, expected_device)):
+            raise ValueError("production profile requires expected model, server, backend and device identity")
+        if expected_device.lower() == "auto":
+            raise ValueError("production profile requires an explicit physical device selection")
     duration = _positive(settings.get("duration_seconds"), "duration_seconds")
     if duration < min_duration_seconds:
         raise ValueError(
@@ -136,11 +185,20 @@ def validate(
         or requests_completed > max_requests
     ):
         raise ValueError("requests_completed does not match completed concurrency waves")
+    if requests_completed < min_requests:
+        raise ValueError("requests_completed is below the required minimum")
+    # Latency and first-content distributions are public workload evidence,
+    # even when no operator-specific upper budget has been selected yet.
+    latency = _distribution(report.get("latency_ms"), "latency_ms", requests_completed)
+    first_content = _distribution(report.get("first_content_ms"), "first_content_ms", requests_completed)
+    if any(first_content[key] > latency[key] for key in ("p50", "p95", "p99", "max")):
+        raise ValueError("first-content time exceeds complete request latency")
+    _positive(report.get("cold_start_ms"), "cold_start_ms")
     completion_tokens = report.get("completion_tokens")
     if (
         not isinstance(completion_tokens, int)
         or isinstance(completion_tokens, bool)
-        or completion_tokens <= 0
+        or completion_tokens < requests_completed
     ):
         raise ValueError("completion_tokens is missing or invalid")
 
@@ -216,11 +274,15 @@ def validate(
     if _sha256_text(deployment.get("model_sha256"), "failure-injection model sha256") != model_sha:
         raise ValueError("failure-injection model identity does not match workload")
     failure_status = "pass"
+    checked_budgets = _check_budgets(report, budgets) if budgets is not None else None
     return {
         "schema_version": 1,
         "object": "bloom.deployment_cell_validation",
         "result": "evidence_complete",
         "stable_claim": False,
+        "profile": "production_workload" if production_profile else "workload",
+        "requests_completed": requests_completed,
+        "budgets": checked_budgets,
         "duration_seconds": duration,
         "observed_duration_seconds": elapsed_ms / 1000,
         "concurrency_levels": sorted(levels),
@@ -251,9 +313,15 @@ def main() -> int:
     parser.add_argument("--device")
     parser.add_argument("--min-concurrency-levels", type=int, default=2)
     parser.add_argument("--failure-report", type=pathlib.Path)
+    parser.add_argument("--min-requests", type=int, default=1)
+    parser.add_argument("--budgets", type=pathlib.Path,
+                        help="JSON object declaring all six service budget limits")
+    parser.add_argument("--production-profile", action="store_true",
+                        help="Require 24 hours, 1000 requests, pinned identity and explicit budgets")
     args = parser.parse_args()
     try:
         report = json.loads(args.report.read_text(encoding="utf-8"))
+        budgets = json.loads(args.budgets.read_text(encoding="utf-8")) if args.budgets else None
         failure_report = (
             json.loads(args.failure_report.read_text(encoding="utf-8"))
             if args.failure_report is not None
@@ -268,6 +336,9 @@ def main() -> int:
             expected_device=args.device,
             min_concurrency_levels=args.min_concurrency_levels,
             failure_report=failure_report,
+            min_requests=args.min_requests,
+            budgets=budgets,
+            production_profile=args.production_profile,
         )
     except (OSError, json.JSONDecodeError, ValueError) as error:
         print(f"deployment-cell evidence: FAIL: {error}", file=sys.stderr)

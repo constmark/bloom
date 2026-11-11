@@ -1,7 +1,10 @@
 # Bloom Python SDK
 
-A pre-1.0 Python wrapper for Bloom's native local inference engine. Python 3.8
+A pre-1.0 Python wrapper for Bloom's native local inference engine. Python 3.9
 or newer is required. Importing the package does not load a model or library.
+The minimum includes source installation: the SPDX-aware setuptools build
+backend requires Python 3.9 or newer. Earlier releases incorrectly advertised
+Python 3.8 source-build support.
 
 ## Install
 

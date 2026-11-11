@@ -2,6 +2,7 @@
 use super::*;
 
 pub(crate) const MAX_LOADED_MODELS: usize = 16;
+pub(crate) const MAX_REQUEST_TIMEOUT_SECONDS: u64 = 86_400;
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DoctorFormat {
@@ -105,7 +106,7 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = 4096)]
     pub max_num_tokens: usize,
 
-    /// Request timeout in seconds (0 = no timeout).
+    /// Request timeout in seconds (0 = no timeout; at most 86400).
     #[arg(long, default_value_t = 300)]
     pub timeout: u64,
 

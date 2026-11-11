@@ -1,6 +1,14 @@
 **/target
+**/.build
+**/__pycache__
+**/*.pyc
 .git
 .venv*
+.pytest_cache
+.DS_Store
+output
+release-artifacts
+ui/dist
 .bloom-downloads
 .bloom-imports
 .bloom-metadata

@@ -41,6 +41,7 @@ else
     echo "Error: Python 3 is required for release packaging and validation." >&2
     exit 1
 fi
+"$PYTHON_BIN" "${WORKSPACE_DIR}/scripts/check_laya_upstream.py"
 if ! "$PYTHON_BIN" -c 'import sys; raise SystemExit(sys.version_info < (3, 10))'; then
     echo "Error: Python 3.10 or newer is required for release packaging." >&2
     exit 1
@@ -106,7 +107,7 @@ if [ "$PACKAGE_UI" = true ]; then
         exit 1
     fi
     echo "Building embedded Bloom UI..."
-    "${WORKSPACE_DIR}/scripts/build_ui.sh"
+    NO_DOWNLOADS=1 "${WORKSPACE_DIR}/scripts/build_ui.sh"
 fi
 
 # Build arguments

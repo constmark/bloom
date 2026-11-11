@@ -56,7 +56,7 @@ sha2 = "0.10"
 base64 = "0.22"
 ed25519-dalek = { version = "2.2", default-features = false, features = ["std"] }
 tower-http.workspace = true
-rust-embed = { version = "8", optional = true }
+rust-embed = { version = "8", optional = true, features = ["deterministic-timestamps"] }
 mime_guess = { version = "2", optional = true }
 
 [target.'cfg(windows)'.dependencies]

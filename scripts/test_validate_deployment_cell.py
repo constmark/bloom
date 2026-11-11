@@ -31,6 +31,9 @@ def report() -> dict:
         ],
         "requests_completed": 30,
         "completion_tokens": 90,
+        "cold_start_ms": 50,
+        "latency_ms": {"count": 30, "p50": 10, "p95": 20, "p99": 25, "max": 30},
+        "first_content_ms": {"count": 30, "p50": 1, "p95": 2, "p99": 3, "max": 4},
         "disconnect": {"accepted": 2, "recovery_ms": 12.0, "post_recovery_request": "pass"},
         "host_memory": {
             "warm_baseline_bytes": 100,

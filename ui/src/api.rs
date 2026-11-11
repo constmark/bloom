@@ -45,6 +45,7 @@ const HTTP_RETRY_AFTER_HEADER: &str = "retry-after";
 const MAX_HTTP_RETRY_AFTER_SECONDS: u32 = 300;
 const MAX_READINESS_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_AUTH_PROBE_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_RESIDENT_MODELS: usize = 16;
 const MAX_EMBEDDING_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_EMBEDDING_VALUES: usize = 1_048_576;
 const MAX_RERANK_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
@@ -102,10 +103,8 @@ const MAX_MODEL_PACKAGE_FILES: usize = 256;
 const MAX_STREAM_MODEL_ID_CHARS: usize = 256;
 const MAX_STREAM_REQUEST_ID_CHARS: usize = 128;
 const MAX_SSE_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
-const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_STREAM_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STREAM_ERROR_MESSAGE_BYTES: usize = 4 * 1024;
-const MAX_SSE_SEPARATOR_BYTES: usize = 4;
 const MAX_RESPONSE_JSON_SCHEMA_DEPTH: usize = 16;
 const MAX_RESPONSE_JSON_SCHEMA_NODES: usize = 1_024;
 const MAX_RESPONSE_JSON_SCHEMA_PROPERTIES: usize = 256;
@@ -2583,11 +2582,12 @@ fn decode_api_access_probe(text: &str) -> Result<(), String> {
     let data = value
         .get("data")
         .and_then(serde_json::Value::as_array)
-        .filter(|data| data.len() <= 1);
+        .filter(|data| data.len() <= MAX_RESIDENT_MODELS);
     if value.get("object").and_then(serde_json::Value::as_str) != Some("list") || data.is_none() {
         return Err("API access probe did not return Bloom's bounded Models list".to_string());
     }
-    if let Some(model) = data.and_then(|data| data.first()) {
+    let mut identities = HashSet::new();
+    for model in data.into_iter().flatten() {
         let id = model.get("id").and_then(serde_json::Value::as_str);
         if id.is_none_or(|id| {
             id.is_empty()
@@ -2600,6 +2600,7 @@ fn decode_api_access_probe(text: &str) -> Result<(), String> {
                 .and_then(serde_json::Value::as_u64)
                 .is_some_and(|created| created > 0)
             || model.get("owned_by").and_then(serde_json::Value::as_str) != Some("bloom")
+            || !identities.insert(id.unwrap_or_default())
         {
             return Err("API access probe returned an invalid Model resource".to_string());
         }
@@ -4580,11 +4581,8 @@ where
     opts.set_body(&wasm_bindgen::JsValue::from_str(&body_text));
     opts.set_signal(Some(&cancellation.controller.signal()));
 
-    let response = match http_request(&url, &opts).await {
-        Ok(response) => response,
-        Err(_) if cancellation.is_cancelled() => return Err(ChatStreamError::Cancelled),
-        Err(error) => return Err(ChatStreamError::Request(error)),
-    };
+    let _network_guard = NetworkCancellationGuard::new(cancellation.controller.clone());
+    let response = streaming_http_request(&url, &opts, cancellation).await?;
     if !response.ok() {
         return Err(ChatStreamError::Request(
             read_response_error(&response).await,
@@ -4669,11 +4667,8 @@ where
     opts.set_headers(&headers);
     opts.set_body(form.as_ref());
     opts.set_signal(Some(&cancellation.controller.signal()));
-    let response = match http_request(&url, &opts).await {
-        Ok(response) => response,
-        Err(_) if cancellation.is_cancelled() => return Err(ChatStreamError::Cancelled),
-        Err(error) => return Err(ChatStreamError::Request(error)),
-    };
+    let _network_guard = NetworkCancellationGuard::new(cancellation.controller.clone());
+    let response = streaming_http_request(&url, &opts, cancellation).await?;
     if !response.ok() {
         return Err(ChatStreamError::Request(
             read_response_error(&response).await,
@@ -4896,11 +4891,8 @@ where
     opts.set_body(&wasm_bindgen::JsValue::from_str(&body_text));
     opts.set_signal(Some(&cancellation.controller.signal()));
 
-    let response = match http_request(&url, &opts).await {
-        Ok(response) => response,
-        Err(_) if cancellation.is_cancelled() => return Err(ChatStreamError::Cancelled),
-        Err(error) => return Err(ChatStreamError::Request(error)),
-    };
+    let _network_guard = NetworkCancellationGuard::new(cancellation.controller.clone());
+    let response = streaming_http_request(&url, &opts, cancellation).await?;
     if !response.ok() {
         return Err(ChatStreamError::Request(
             read_response_error(&response).await,
@@ -4910,10 +4902,12 @@ where
     let mut accumulated = String::new();
     let mut observed_model = None;
     let mut observed_request_id = None;
+    let mut stream_state = TextStreamState::default();
     consume_sse(&response, cancellation, |frame| {
         process_sse_frame(
             frame,
             model,
+            &mut stream_state,
             &mut observed_model,
             &mut observed_request_id,
             &mut accumulated,
@@ -4924,6 +4918,25 @@ where
     ensure_stream_model_observed(&observed_model)?;
     ensure_stream_request_id_observed(&observed_request_id)?;
     Ok(accumulated)
+}
+
+async fn streaming_http_request(
+    url: &str,
+    opts: &web_sys::RequestInit,
+    cancellation: &ChatCancellation,
+) -> Result<web_sys::Response, ChatStreamError> {
+    let fetch = http_request(url, opts).fuse();
+    let timeout = TimeoutFuture::new(MAX_HTTP_REQUEST_WAIT_MS).fuse();
+    futures_util::pin_mut!(fetch, timeout);
+    futures_util::select_biased! {
+        response = fetch => match response {
+            Ok(response) => Ok(response),
+            Err(_) if cancellation.is_cancelled() => Err(ChatStreamError::Cancelled),
+            Err(error) => Err(ChatStreamError::Request(error)),
+        },
+        _ = timeout => Err(ChatStreamError::Request(
+            "Streaming request timed out before response headers were received".into())),
+    }
 }
 
 async fn consume_sse<F>(
@@ -4938,27 +4951,36 @@ where
     let raw_body = response
         .body()
         .ok_or_else(|| ChatStreamError::Request("response has no body".into()))?;
-    let reader = raw_body
-        .get_reader()
-        .dyn_into::<web_sys::ReadableStreamDefaultReader>()
-        .map_err(|_| ChatStreamError::Request("failed to read response stream".into()))?;
-    let mut buffer = String::new();
+    let reader = NetworkCancellationGuard::new(
+        raw_body
+            .get_reader()
+            .dyn_into::<web_sys::ReadableStreamDefaultReader>()
+            .map_err(|_| ChatStreamError::Request("failed to read response stream".into()))?,
+    );
+    let mut decoder = crate::sse::BrowserSseDecoder::default();
     let mut response_bytes = 0_usize;
-    let decoder = web_sys::TextDecoder::new()
-        .map_err(|error| ChatStreamError::Request(format!("{error:?}")))?;
-    let decode_options = web_sys::TextDecodeOptions::new();
-    decode_options.set_stream(true);
+    let total_timeout = TimeoutFuture::new(MAX_HTTP_RESPONSE_TOTAL_WAIT_MS).fuse();
+    futures_util::pin_mut!(total_timeout);
 
     loop {
-        let chunk = match JsFuture::from(reader.read()).await {
-            Ok(chunk) => chunk,
-            Err(_) if cancellation.is_cancelled() => return Err(ChatStreamError::Cancelled),
-            Err(error) => return Err(ChatStreamError::Request(format!("{error:?}"))),
+        let read = JsFuture::from(reader.inner().read()).fuse();
+        let idle_timeout = TimeoutFuture::new(MAX_HTTP_RESPONSE_IDLE_WAIT_MS).fuse();
+        futures_util::pin_mut!(read, idle_timeout);
+        let chunk = futures_util::select_biased! {
+            chunk = read => match chunk {
+                Ok(chunk) => chunk,
+                Err(_) if cancellation.is_cancelled() => return Err(ChatStreamError::Cancelled),
+                Err(error) => return Err(ChatStreamError::Request(format!("{error:?}"))),
+            },
+            _ = total_timeout => return Err(ChatStreamError::Request(
+                "Streaming response exceeded the 300-second deadline".into())),
+            _ = idle_timeout => return Err(ChatStreamError::Request(
+                "Streaming response was idle for 30 seconds".into())),
         };
         let done = js_sys::Reflect::get(&chunk, &"done".into())
             .ok()
             .and_then(|value| value.as_bool())
-            .unwrap_or(true);
+            .ok_or_else(|| ChatStreamError::Request("invalid stream completion flag".into()))?;
         if done {
             break;
         }
@@ -4968,62 +4990,32 @@ where
             continue;
         }
         let bytes = js_sys::Uint8Array::new(&value);
-        if let Err(error) = observe_stream_response_bytes(
+        observe_stream_response_bytes(
             &mut response_bytes,
             bytes.length() as usize,
             MAX_SSE_RESPONSE_BYTES,
-        ) {
-            let _ = reader.cancel();
-            return Err(error);
-        }
-        let text = decoder
-            .decode_with_js_u8_array_and_options(&bytes, &decode_options)
-            .map_err(|error| ChatStreamError::Request(format!("{error:?}")))?;
-        buffer.push_str(&text);
-
-        loop {
-            let frame = match take_sse_frame(&mut buffer) {
-                Ok(Some(frame)) => frame,
-                Ok(None) => break,
-                Err(error) => {
-                    let _ = reader.cancel();
-                    return Err(error);
-                }
-            };
-            match on_frame(&frame) {
-                Ok(true) => {
-                    let _ = reader.cancel();
-                    return Ok(());
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    let _ = reader.cancel();
-                    return Err(error);
-                }
+        )?;
+        for data in decoder
+            .push(&bytes.to_vec())
+            .map_err(ChatStreamError::Request)?
+        {
+            // Reconstruct only the data fields expected by the protocol handlers.
+            // The parser has already validated UTF-8 and a complete event boundary.
+            let frame = data
+                .split('\n')
+                .map(|line| format!("data: {line}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if on_frame(&frame)? {
+                return Ok(());
             }
         }
     }
-
-    let decoder_tail = decoder
-        .decode()
-        .map_err(|error| ChatStreamError::Request(format!("{error:?}")))?;
-    buffer.push_str(&decoder_tail);
-    if let Err(error) = validate_sse_frame_size(buffer.len(), MAX_SSE_FRAME_BYTES) {
-        let _ = reader.cancel();
-        return Err(error);
-    }
-    if !buffer.trim().is_empty() {
-        match on_frame(&buffer) {
-            Ok(true) => return Ok(()),
-            Ok(false) => {}
-            Err(error) => return Err(error),
-        }
-    }
     if cancellation.is_cancelled() {
-        stream_eof_result(true)
-    } else {
-        stream_eof_result(false)
+        return stream_eof_result(true);
     }
+    decoder.finish().map_err(ChatStreamError::Request)?;
+    stream_eof_result(false)
 }
 
 fn stream_eof_result(cancelled: bool) -> Result<(), ChatStreamError> {
@@ -5098,9 +5090,77 @@ fn observe_stream_response_bytes(
     Ok(())
 }
 
+#[derive(Default)]
+struct TextStreamState {
+    finished: bool,
+    received_usage: bool,
+}
+
+impl TextStreamState {
+    fn observe(&mut self, chunk: &serde_json::Value) -> Result<(), ChatStreamError> {
+        let invalid = || ChatStreamError::Request("invalid stream choice or terminal state".into());
+        let usage = chunk.get("usage").is_some_and(|value| !value.is_null());
+        if usage && self.received_usage {
+            return Err(invalid());
+        }
+        let choices = chunk
+            .get("choices")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(invalid)?;
+        if choices.is_empty() {
+            if !self.finished || !usage {
+                return Err(invalid());
+            }
+        } else {
+            if self.finished || choices.len() != 1 {
+                return Err(invalid());
+            }
+            let choice = &choices[0];
+            if choice.get("index").and_then(serde_json::Value::as_u64) != Some(0) {
+                return Err(invalid());
+            }
+            let delta = choice
+                .get("delta")
+                .and_then(serde_json::Value::as_object)
+                .ok_or_else(invalid)?;
+            if delta
+                .get("content")
+                .is_some_and(|value| !value.is_null() && !value.is_string())
+                || delta
+                    .get("role")
+                    .is_some_and(|value| !value.is_null() && value.as_str() != Some("assistant"))
+                || ["tool_calls", "function_call"]
+                    .iter()
+                    .any(|field| delta.get(*field).is_some_and(|value| !value.is_null()))
+            {
+                return Err(invalid());
+            }
+            if let Some(reason) = choice.get("finish_reason").filter(|value| !value.is_null()) {
+                if !matches!(reason.as_str(), Some("stop" | "length" | "content_filter")) {
+                    return Err(invalid());
+                }
+                self.finished = true;
+            }
+        }
+        self.received_usage |= usage;
+        Ok(())
+    }
+
+    fn finish(&self) -> Result<(), ChatStreamError> {
+        if self.finished {
+            Ok(())
+        } else {
+            Err(ChatStreamError::Request(
+                "stream ended without a choice finish reason".into(),
+            ))
+        }
+    }
+}
+
 fn process_sse_frame<F>(
     frame: &str,
     expected_model: &str,
+    stream_state: &mut TextStreamState,
     observed_model: &mut Option<String>,
     observed_request_id: &mut Option<String>,
     accumulated: &mut String,
@@ -5113,6 +5173,7 @@ where
         return Ok(false);
     };
     if data == "[DONE]" {
+        stream_state.finish()?;
         return Ok(true);
     }
     let chunk: serde_json::Value = serde_json::from_str(&data)
@@ -5129,7 +5190,7 @@ where
     ensure_stream_model_observed(observed_model)?;
     observe_stream_request_id(&chunk, observed_request_id, on_update)?;
     ensure_stream_request_id_observed(observed_request_id)?;
-    if let Some(usage) = chunk.get("usage").filter(|usage| !usage.is_null()) {
+    let usage = if let Some(usage) = chunk.get("usage").filter(|usage| !usage.is_null()) {
         let usage = serde_json::from_value::<ChatUsage>(usage.clone()).map_err(|error| {
             ChatStreamError::Request(format!("invalid stream usage metadata: {error}"))
         })?;
@@ -5138,6 +5199,12 @@ where
                 "invalid stream usage metadata: total token count does not match".to_string(),
             ));
         }
+        Some(usage)
+    } else {
+        None
+    };
+    stream_state.observe(&chunk)?;
+    if let Some(usage) = usage {
         on_update(StreamUpdate::Usage(usage));
     }
     if let Some(delta) = chunk
@@ -5413,43 +5480,13 @@ where
     }
 }
 
-fn take_sse_frame(buffer: &mut String) -> Result<Option<String>, ChatStreamError> {
-    let lf = buffer.find("\n\n").map(|position| (position, 2));
-    let crlf = buffer.find("\r\n\r\n").map(|position| (position, 4));
-    let (position, separator_len) = match (lf, crlf) {
-        (Some(left), Some(right)) => left.min(right),
-        (Some(found), None) | (None, Some(found)) => found,
-        (None, None) => {
-            let pending_limit = MAX_SSE_FRAME_BYTES.saturating_add(MAX_SSE_SEPARATOR_BYTES - 1);
-            if buffer.len() > pending_limit {
-                return Err(ChatStreamError::Request(format!(
-                    "stream event exceeds the {MAX_SSE_FRAME_BYTES}-byte frame limit"
-                )));
-            }
-            return Ok(None);
-        }
-    };
-    validate_sse_frame_size(position, MAX_SSE_FRAME_BYTES)?;
-    let frame = buffer[..position].to_string();
-    buffer.drain(..position + separator_len);
-    Ok(Some(frame))
-}
-
-fn validate_sse_frame_size(frame_bytes: usize, max_bytes: usize) -> Result<(), ChatStreamError> {
-    if frame_bytes > max_bytes {
-        Err(ChatStreamError::Request(format!(
-            "stream event exceeds the {max_bytes}-byte frame limit"
-        )))
-    } else {
-        Ok(())
-    }
-}
-
 fn sse_data(frame: &str) -> Option<String> {
     let data = frame
         .lines()
-        .filter_map(|line| line.trim_end_matches('\r').strip_prefix("data:"))
-        .map(str::trim_start)
+        .filter_map(|line| {
+            let (field, value) = line.split_once(':').unwrap_or((line, ""));
+            (field == "data").then(|| value.strip_prefix(' ').unwrap_or(value))
+        })
         .collect::<Vec<_>>();
     (!data.is_empty()).then(|| data.join("\n"))
 }
@@ -5478,7 +5515,12 @@ impl CancelNetworkWork for web_sys::AbortController {
 
 impl CancelNetworkWork for web_sys::ReadableStreamDefaultReader {
     fn cancel_network_work(&self) {
-        let _ = self.cancel();
+        let cancellation = self.cancel();
+        // Cancelling an already aborted/errored stream rejects this promise.
+        // Observe it so cleanup cannot create an unhandled browser rejection.
+        wasm_bindgen_futures::spawn_local(async move {
+            let _ = JsFuture::from(cancellation).await;
+        });
     }
 }
 
@@ -5888,7 +5930,7 @@ fn cancel_readable_stream(body: &web_sys::ReadableStream) {
         .get_reader()
         .dyn_into::<web_sys::ReadableStreamDefaultReader>()
     {
-        let _ = reader.cancel();
+        reader.cancel_network_work();
     }
 }
 
@@ -6101,6 +6143,34 @@ mod tests {
             r#"{"object":"list","data":[{"id":"tiny.gguf","object":"model","created":1700000000,"owned_by":"bloom"}]}"#,
         )
         .unwrap();
+
+        let models = (0..MAX_RESIDENT_MODELS).map(|index| serde_json::json!({
+            "id": format!("model-{index}"), "object": "model", "created": 1, "owned_by": "bloom",
+        })).collect::<Vec<_>>();
+        for count in [2, MAX_RESIDENT_MODELS] {
+            decode_api_access_probe(
+                &serde_json::json!({"object":"list","data":&models[..count]}).to_string(),
+            )
+            .unwrap();
+        }
+        let mut oversized = models.clone();
+        oversized.push(
+            serde_json::json!({"id":"extra","object":"model","created":1,"owned_by":"bloom"}),
+        );
+        assert!(
+            decode_api_access_probe(
+                &serde_json::json!({"object":"list","data":oversized}).to_string()
+            )
+            .is_err()
+        );
+        for invalid in [serde_json::json!({}), models[0].clone()] {
+            assert!(
+                decode_api_access_probe(
+                    &serde_json::json!({"object":"list","data":[models[0],invalid]}).to_string()
+                )
+                .is_err()
+            );
+        }
 
         for invalid in [
             r#"{}"#,
@@ -6371,21 +6441,6 @@ mod tests {
     }
 
     #[test]
-    fn decoder_handles_lf_and_crlf_frames() {
-        let mut buffer = "data: one\n\ndata: two\r\n\r\npartial".to_string();
-
-        assert_eq!(
-            take_sse_frame(&mut buffer).unwrap().as_deref(),
-            Some("data: one")
-        );
-        assert_eq!(
-            take_sse_frame(&mut buffer).unwrap().as_deref(),
-            Some("data: two")
-        );
-        assert_eq!(buffer, "partial");
-    }
-
-    #[test]
     fn stream_admission_requires_sse_mime_and_bounded_length() {
         assert!(validate_sse_content_type(Some("text/event-stream")).is_ok());
         assert!(validate_sse_content_type(Some("Text/Event-Stream; charset=utf-8")).is_ok());
@@ -6478,18 +6533,6 @@ mod tests {
         assert_eq!(observed, 7);
         assert!(observe_stream_response_bytes(&mut observed, 4, 10).is_err());
         assert_eq!(observed, 7);
-
-        let mut exact = format!("{}\n\n", "x".repeat(MAX_SSE_FRAME_BYTES));
-        assert_eq!(
-            take_sse_frame(&mut exact).unwrap().unwrap().len(),
-            MAX_SSE_FRAME_BYTES
-        );
-
-        let mut delimited = format!("{}\n\n", "x".repeat(MAX_SSE_FRAME_BYTES + 1));
-        assert!(take_sse_frame(&mut delimited).is_err());
-
-        let mut unterminated = "x".repeat(MAX_SSE_FRAME_BYTES + MAX_SSE_SEPARATOR_BYTES);
-        assert!(take_sse_frame(&mut unterminated).is_err());
     }
 
     #[test]
@@ -6521,14 +6564,41 @@ mod tests {
     }
 
     #[test]
+    fn text_stream_rejects_missing_terminal_extra_choices_and_late_content() {
+        let initial = serde_json::json!({"choices":[{"index":0,"delta":{"content":"hello"}}]});
+        let terminal =
+            serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]});
+        let usage = serde_json::json!({"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}});
+        let mut state = TextStreamState::default();
+        state.observe(&initial).unwrap();
+        assert!(state.finish().is_err());
+        state.observe(&terminal).unwrap();
+        state.observe(&usage).unwrap();
+        state.finish().unwrap();
+        assert!(state.observe(&initial).is_err());
+        assert!(state.observe(&usage).is_err());
+        for invalid in [
+            serde_json::json!({"choices": []}),
+            serde_json::json!({"choices": [{"index":1,"delta":{}}]}),
+            serde_json::json!({"choices": [{"index":0,"delta":{}},{"index":1,"delta":{}}]}),
+            serde_json::json!({"choices": [{"index":0,"delta":{"content":3}}]}),
+            serde_json::json!({"choices": [{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
+            usage,
+        ] {
+            assert!(TextStreamState::default().observe(&invalid).is_err());
+        }
+    }
+
+    #[test]
     fn stream_frame_emits_request_id_and_delta() {
         let mut updates = Vec::new();
         let mut accumulated = String::new();
         let mut observed_model = None;
         let mut observed_request_id = None;
         let finished = process_sse_frame(
-            r#"data: {"id":"chatcmpl-1","model":"tiny.gguf","choices":[{"delta":{"content":"Hello"}}]}"#,
+            r#"data: {"id":"chatcmpl-1","model":"tiny.gguf","choices":[{"index":0,"delta":{"content":"Hello"}}]}"#,
             "tiny.gguf",
+            &mut TextStreamState::default(),
             &mut observed_model,
             &mut observed_request_id,
             &mut accumulated,
@@ -6553,6 +6623,7 @@ mod tests {
         let error = process_sse_frame(
             r#"data: {"error":{"message":"model failed"}}"#,
             "tiny.gguf",
+            &mut TextStreamState::default(),
             &mut None,
             &mut None,
             &mut String::new(),
@@ -6571,6 +6642,7 @@ mod tests {
         let finished = process_sse_frame(
             r#"data: {"id":"chatcmpl-1","model":"tiny.gguf","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":4,"total_tokens":16}}"#,
             "tiny.gguf",
+            &mut TextStreamState { finished: true, received_usage: false },
             &mut observed_model,
             &mut observed_request_id,
             &mut String::new(),
@@ -6598,6 +6670,7 @@ mod tests {
         let error = process_sse_frame(
             r#"data: {"id":"chatcmpl-1","model":"tiny.gguf","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":4,"total_tokens":15}}"#,
             "tiny.gguf",
+            &mut TextStreamState::default(),
             &mut None,
             &mut None,
             &mut String::new(),
@@ -6616,8 +6689,9 @@ mod tests {
     #[test]
     fn stream_rejects_content_before_model_identity() {
         let error = process_sse_frame(
-            r#"data: {"id":"chatcmpl-1","choices":[{"delta":{"content":"Unbound"}}]}"#,
+            r#"data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"content":"Unbound"}}]}"#,
             "tiny.gguf",
+            &mut TextStreamState::default(),
             &mut None,
             &mut None,
             &mut String::new(),
@@ -6761,6 +6835,7 @@ mod tests {
             process_sse_frame(
                 &frame,
                 "tiny.gguf",
+                &mut TextStreamState::default(),
                 &mut None,
                 &mut None,
                 &mut String::new(),
@@ -6886,8 +6961,9 @@ mod tests {
     #[test]
     fn stream_rejects_content_before_request_id() {
         let error = process_sse_frame(
-            r#"data: {"model":"tiny.gguf","choices":[{"delta":{"content":"Unbound"}}]}"#,
+            r#"data: {"model":"tiny.gguf","choices":[{"index":0,"delta":{"content":"Unbound"}}]}"#,
             "tiny.gguf",
+            &mut TextStreamState::default(),
             &mut None,
             &mut None,
             &mut String::new(),

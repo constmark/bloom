@@ -10,6 +10,36 @@ called out in release notes.
 
 ### Reliability and distribution
 
+- Upgrade to official Candle 0.11.1 and zip 9.5.1, closing the native ZIP
+  advisories without ignores. Preserve Laya through an explicitly named,
+  Apache-licensed compatibility package with checked upstream source hashes
+  and SBOM provenance; migrate and exercise the real Metal adapter.
+- Add durable, hash-bound 24-hour deployment workloads with phase deadlines,
+  cancellation and orphan cleanup, plus isolated physical disk-full and
+  distinct-binary rollback drills. Wait for asynchronous model readiness.
+- Run the packaged browser gate on Chromium, Firefox and WebKit; resolve
+  scanner contrast findings and restore dialog focus after Safari-style clicks.
+  Bind local browser evidence to the tested server/assets and remove embedded
+  filesystem timestamps from release binaries. Extend clean SDK
+  installation/native ABI gates to all three CI platforms.
+- Add tested-container publication gates with final-layer scanning, inventory,
+  digest-bound provenance and a hardened loopback-only deployment reference.
+  Official image publication remains contingent on the complete release gates.
+- Gate release archives on the complete same-revision CI, including native and
+  UI dependency audits; checksum and version-check native UI build helpers and
+  disable implicit Dioxus downloads.
+- Bound audio/image preprocessing allocations and normalized values; use
+  atomically created private temporary WAV files. Bound persistent ASR inference
+  with `BLOOM_ASR_TIMEOUT_SECS` (default 300, range 1–3600) and clean up hung
+  workers. Reject server request timeouts above 86400 seconds at startup/doctor.
+- Authenticate the macOS connection probe and validate stream identity, choices,
+  terminals and usage. Bound native/Web streaming reads and reject malformed or
+  incomplete SSE. Correct the Python SDK minimum version to Python 3.9.
+- Isolate deployment drills from saved configuration and inherited Bloom
+  environment variables, verify post-run identities, and add explicit service
+  budgets plus a 24-hour/1,000-request production workload profile. A passing
+  workload remains evidence rather than an automatic stable-support claim.
+
 - Add exact `/v1/tokenize` and `/v1/detokenize` operations without fabricated
   fallback IDs, with bounded model-owned tokenizer execution and vocabulary
   validation. Add the optional `LoadedModel::detokenize` method (defaulting to

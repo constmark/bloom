@@ -9,8 +9,13 @@ permissions:
   contents: read
 
 jobs:
+  checks:
+    name: Required release checks
+    uses: ./.github/workflows/ci.yml
+
   build:
     name: Build ${{ matrix.os }}
+    needs: checks
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -46,6 +51,7 @@ jobs:
         run: |
           python scripts/check_release_workflow_security.py
           python scripts/test_release_workflow_security.py
+          python scripts/test_install_ui_toolchain.py
       - name: Test deterministic release archives
         run: python scripts/test_create_release_archive.py
       - name: Check Rust toolchain consistency
@@ -64,54 +70,18 @@ jobs:
             brew install openssl@3 pkg-config
           fi
       - name: Install Dioxus CLI
-        run: cargo install dioxus-cli --version 0.7.10 --locked
-      - name: Cache pinned trained Qwen2 model
-        if: runner.os == 'Linux'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: /tmp/bloom-trained-qwen2-runtime
-          key: trained-qwen2-q4-aca679832ded61145239ce7f5c5ebddb1c57ada786c9c23733899c3888e0596f
-      - name: Test pinned trained Qwen2 CPU runtime
-        if: runner.os == 'Linux'
-        run: ./scripts/test_trained_qwen2_runtime.sh
-      - name: Cache pinned trained Qwen3 model
-        if: runner.os == 'Linux'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: /tmp/bloom-trained-qwen3-runtime
-          key: trained-qwen3-q8-9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031
-      - name: Test pinned trained Qwen3 CPU runtime
-        if: runner.os == 'Linux'
-        run: ./scripts/test_trained_qwen3_runtime.sh
-      - name: Cache pinned trained SmolLM2 Llama model
-        if: runner.os == 'Linux'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: /tmp/bloom-trained-llama-runtime
-          key: trained-llama-q8-48ab3034d0dd401fbc721eb1df3217902fee7dab9078992d66431f09b7750201
-      - name: Test pinned trained SmolLM2 Llama CPU runtime
-        if: runner.os == 'Linux'
-        run: ./scripts/test_trained_llama_runtime.sh
-      - name: Cache pinned trained SmolLM2 Safetensors model
-        if: runner.os == 'Linux'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: /tmp/bloom-trained-safetensors-runtime
-          key: trained-safetensors-bf16-e6bffe7435d7ddc10fd3b9a9efd429dafbacb1cb17015fb5562664e7532bf86e
-      - name: Test pinned trained SmolLM2 Safetensors CPU runtime
-        if: runner.os == 'Linux'
-        run: ./scripts/test_trained_safetensors_runtime.sh
-      - name: Cache pinned trained MiniLM embedding model
-        if: runner.os == 'Linux'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: /tmp/bloom-trained-embedding-runtime
-          key: trained-embedding-minilm-f32-53aa51172d142c89d9012cce15ae4d6cc0ca6895895114379cacb4fab128d9db
-      - name: Test pinned trained MiniLM CPU embedding runtime
-        if: runner.os == 'Linux'
-        run: ./scripts/test_trained_embedding_runtime.sh
+        run: cargo install dioxus-cli --version 0.7.10 --locked --features no-downloads
+      - name: Install verified UI build tools
+        shell: bash
+        run: |
+          export BLOOM_UI_TOOL_INSTALL_DIR="$RUNNER_TEMP/bloom-ui-tools"
+          export PATH="$BLOOM_UI_TOOL_INSTALL_DIR/bin:$PATH"
+          python scripts/install_ui_toolchain.py
+          echo "$BLOOM_UI_TOOL_INSTALL_DIR/bin" >> "$GITHUB_PATH"
       - name: Build and self-check application archive
         shell: bash
+        env:
+          NO_DOWNLOADS: "1"
         run: |
           ./scripts/package_release.sh
           host_target=$(rustc -vV | awk '/^host:/ {print $2}' | tr -d '\r')

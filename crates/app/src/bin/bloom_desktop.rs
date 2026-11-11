@@ -732,7 +732,7 @@ mod tests {
         let worker = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept probe request");
             read_probe_request(&mut stream);
-            let body = include_str!("../../../../examples/readiness.json");
+            let body = include_str!("../../tests/fixtures/readiness.json");
             let response = format!(
                 "HTTP/1.0 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
                 body.len()

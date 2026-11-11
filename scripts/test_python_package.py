@@ -89,6 +89,8 @@ def main():
             metadata = email.message_from_bytes(archive.read(metadata_name))
             if metadata["Name"] != "bloom-sdk" or not metadata.get_payload().strip():
                 raise AssertionError("missing SDK metadata or package README")
+            if metadata["Requires-Python"] != ">=3.9":
+                raise AssertionError("SDK must declare Python >=3.9, matching its source-build backend")
             license_name = next(name for name in names if name.endswith("/LICENSE"))
             if archive.read(license_name) != (ROOT / "LICENSE").read_bytes():
                 raise AssertionError("wheel license does not match")

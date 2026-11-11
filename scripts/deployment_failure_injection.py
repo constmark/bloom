@@ -24,6 +24,8 @@ import tempfile
 import time
 from typing import Any
 
+from readiness_contract import ReadinessContractError, validate_readiness_document
+
 
 STARTUP = re.compile(r"server running on http://127\.0\.0\.1:(\d+)")
 MAX_BODY = 256 * 1024
@@ -98,6 +100,8 @@ def _start(
         if model is not None:
             command.extend(["--model", str(model)])
         command.extend([
+            "--config", str(models_dir.parent / "isolated-config.json"),
+            "--strict-memory-budget",
             "--models-dir", str(models_dir),
             "--host", "127.0.0.1",
             "--port", "0",
@@ -109,7 +113,11 @@ def _start(
             command,
             stdout=log,
             stderr=subprocess.STDOUT,
-            env={**os.environ, "RUST_LOG": "bloom_server=info", **(environment or {})},
+            # A developer's saved config, credentials or escape hatches must
+            # never change the cell being measured (or touch their catalog).
+            env={**{key: value for key, value in os.environ.items()
+                    if not key.startswith("BLOOM_")},
+                 "RUST_LOG": "bloom_server=info", **(environment or {})},
         )
     finally:
         log.close()
@@ -142,7 +150,15 @@ def _wait_ready(
         if port:
             try:
                 status, payload = _request(port, "/ready", 1.0)
-                if status in {200, 503}:
+                # A listener is ready before asynchronous model loading ends.
+                # Initial 503/loading snapshots are not failed deployment
+                # evidence; wait for a fully ready or terminal-error snapshot.
+                terminal_error = (
+                    status == 503 and isinstance(payload, dict)
+                    and isinstance(payload.get("load_error"), str)
+                    and bool(payload["load_error"].strip())
+                )
+                if _ready(status, payload) or terminal_error:
                     return status, payload, (time.monotonic() - started) * 1000
             except (OSError, http.client.HTTPException):
                 pass
@@ -166,7 +182,11 @@ def _stop(process: subprocess.Popen[bytes], *, hard: bool = False) -> int:
 
 
 def _ready(status: int, payload: dict[str, Any] | None) -> bool:
-    return status == 200 and isinstance(payload, dict) and payload.get("status") == "ready"
+    try:
+        document = validate_readiness_document(payload)
+    except ReadinessContractError:
+        return False
+    return status == 200 and document["status"] == "ready"
 
 
 def _invalid_model_failed(
@@ -370,6 +390,8 @@ def _process_interruption(
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    if args.server_bin.is_symlink() or (args.model and args.model.is_symlink()):
+        raise ValueError("server and model paths must not be symlinks")
     binary = args.server_bin.resolve(strict=True)
     model = args.model.resolve(strict=True) if args.model else None
     if binary.is_symlink() or not binary.is_file():
@@ -393,6 +415,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             )
         if args.scenario in {"storage-quota", "all"}:
             results["storage_quota"] = _storage_quota(binary, root, args.backend, args.device)
+    if _sha256_file(binary) != server_sha256 or _model_identity(model) != model_sha256:
+        raise RuntimeError("server binary or model changed during failure injection")
     return {
         "schema_version": 1,
         "object": "bloom.deployment_failure_injection",

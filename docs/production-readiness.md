@@ -12,8 +12,8 @@ criteria that cut across those capabilities.
 - Model acquisition verifies hashes, records provenance, bounds storage, and
   supports crash-safe signed upgrades plus persistent index rollback and
   permanent exact-version revocation protection.
-- Release archives are deterministic at the archive layer, self-checked, and
-  published with build-provenance attestations.
+- Release archives are deterministic at the archive layer and self-checked;
+  the publication workflow requires build-provenance attestations.
 - Pinned trained CPU gates cover maintained Qwen2, Qwen3, SmolLM2, and MiniLM
   profiles through the native runtime and compatibility APIs.
 - Non-loopback listeners fail closed without authentication. The Dockerfile
@@ -25,6 +25,24 @@ criteria that cut across those capabilities.
   legacy single-key behavior remains available only outside that baseline.
 
 ## Blocking gaps
+
+### Dependency audit closure — 2026-11-11
+
+The native vulnerability gate now passes without advisory ignores. Official
+Candle 0.11.1 and zip 9.5.1 replace the vulnerable ZIP graph. Laya remains
+available through the explicitly named `bloomai-laya` compatibility package,
+which preserves the verified upstream 0.2.20 code and Apache license while
+migrating its Candle dependency. Original archive hashes, source commit, file
+hashes and reviewed changes are recorded in `crates/laya/UPSTREAM.json` and
+checked by `scripts/check_laya_upstream.py`. SBOMs expose this fork's provenance;
+crate packaging resolves its actual registry dependency rather than relying on
+a checkout-only Cargo patch. The fork must track future upstream/security
+updates until an equivalent supported upstream dependency is available.
+
+The release workflow depends on complete same-revision reusable CI, including
+native and UI audits. Two upstream unmaintained-dependency notices remain
+visible; they are not vulnerability ignores or a zero-risk claim. See the
+[launch review](launch-readiness-2026-11-11.md) for measured closure evidence.
 
 ### P0: establish a supported deployment cell
 
@@ -46,8 +64,12 @@ promote other model families, accelerators, or external-runtime adapters.
 The pinned Qwen2 Q4_0 Candle CPU profile is the first candidate. Its short
 CI workload records identity, concurrent streaming latency, disconnect
 recovery, and host RSS using the [HTTP workload procedure](http-workload.md).
-Multi-hour target-host evidence and the failure-injection drills above are
-still required before `stable` classification.
+The final 24-hour local CPU run uses the exact packaged server and remains
+pending final validation. Local physical HFS+ disk-full and
+distinct-binary trained rollback drills have also passed. Exact target-host
+evidence, reference comparisons and the service-manager checks above are still
+required before `stable` classification; see the
+[continuation record](launch-readiness-2026-11-11.md#continuation-validation-record).
 
 The workload evidence gate now requires a passing report from
 `scripts/deployment_failure_injection.py` covering invalid-model admission,
@@ -59,9 +81,10 @@ target-host upgrade/rollback run remains required for deployment promotion.
 
 ### P0: complete the chosen deployment artifact
 
-Release archives have provenance, while the Dockerfile is CI-built and receives
-short-lived runtime, strict-default, doctor, and embedded-browser checks but no
-official container publication contract exists. If containers are a supported
+Release archives have a provenance publication gate, while the Dockerfile is CI-built and receives
+short-lived runtime, strict-default, doctor, and embedded-browser checks but the
+official multi-architecture publication workflow is now implemented but has not
+yet produced verified public registry artifacts. If containers are a supported
 deployment, publish a multi-architecture image by digest, attach an SBOM and
 signed provenance, scan the final runtime layer, document a read-only root
 filesystem/security context, and exercise liveness/readiness plus signal drain
@@ -69,13 +92,15 @@ under the target orchestrator. The Docker build now installs fixed
 Linux/amd64 and Linux/arm64 `wasm-bindgen`, `esbuild`, and `wasm-opt` binaries,
 verifies their SHA-256 digests, selects the compiler already present in the
 digest-pinned builder without refreshing its online channel, and runs a
-download-disabled `dx`; extend that same fail-closed toolchain contract to the
-non-container macOS and Windows archive builders.
+download-disabled `dx`. Native archive builders now also use checksum-pinned
+platform helpers and download-disabled Dioxus; cross-platform hosted execution
+remains part of the release gate.
 
 ## High-priority gaps
 
-- Add cross-browser and target assistive-technology validation. The current
-  release-container gate covers the real WASM application shell, security
+- Complete target assistive-technology validation. The same gate now runs on
+  Chromium, Firefox and WebKit, with real per-engine reports; the local runs
+  passed with zero axe violations and unresolved scanner items. It covers the real WASM application shell, security
   headers, empty-model admission, document/landmark/control semantics,
   Models/Settings/import-dialog focus behavior, bidirectional Tab containment,
   Escape dismissal, opener-focus restoration, reduced motion, real clipboard
@@ -99,9 +124,11 @@ non-container macOS and Windows archive builders.
   drill, including forced refresh latency, operator alerting, state backup, and
   replacement-digest recovery evidence. The protocol and local fail-closed
   enforcement are implemented; fleet incident operations are not yet proven.
-- Extend the native archive's dependency policy and target-filtered CycloneDX
-  SBOM gate to any future official container image, including final-layer
-  package inventory and signed image provenance.
+- Execute the implemented container dependency-policy, target-filtered
+  CycloneDX SBOM, final-layer inventory/scanning and signed-provenance workflow
+  successfully on the final candidate. The local new-image build was blocked
+  by Debian package-index HTTP 500/502; an older image's runtime checks do not
+  satisfy this gate.
 - Split the largest server, CLI, scheduler, executor, and browser modules so
   security and lifecycle boundaries remain reviewable as features grow. Loaded
   runtime ownership now has a focused bounded pool, exact draining leases, and

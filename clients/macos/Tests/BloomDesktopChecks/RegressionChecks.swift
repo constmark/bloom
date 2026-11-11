@@ -72,6 +72,7 @@ func runRegressionChecks() async throws {
     try await lifecycle.testConnectionEditsRequireNewReadinessAndIgnoreStaleResult()
     try await lifecycle.testCancelledConnectionCanBeRetried()
     try await lifecycle.testGenerationUsesConnectedClientSnapshot()
+    try checkStreamValidation()
     try await checkHTTPTransport()
 }
 
@@ -310,33 +311,65 @@ private struct ChatViewModelChecks {
 // Exercise the real URLSession byte reader without a network service. The
 // oversized fixture deliberately never reaches EOF; the client must reject it
 // while reading instead of waiting to check the size after body completion.
+private final class TransportCancellationLog {
+    private let lock = NSLock()
+    private var paths = Set<String>()
+    func record(_ path: String) { lock.lock(); defer { lock.unlock() }; paths.insert(path) }
+    func contains(_ path: String) -> Bool { lock.lock(); defer { lock.unlock() }; return paths.contains(path) }
+}
+private let transportCancellations = TransportCancellationLog()
+
+@MainActor
+private func expectTransportCancelled(_ path: String) async throws {
+    for _ in 0..<100 {
+        if transportCancellations.contains(path) { return }
+        try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    fatalError("Transport was not cancelled after client stopped reading: \(path)")
+}
+
 private final class FixtureProtocol: URLProtocol {
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
         let scenario = request.url!.pathComponents[1]
-        let contentType = scenario == "wrong-type" ? "application/json" :
-            (request.url!.lastPathComponent == "ready" ? "application/json" : "text/event-stream; charset=utf-8")
+        let isModels = request.url!.lastPathComponent == "models"
+        let isReady = request.url!.lastPathComponent == "ready"
+        let status = isModels && scenario == "unauthorized" ? 401 : 200
+        let contentType = scenario == "wrong-type" || isReady || isModels
+            ? "application/json" : "text/event-stream; charset=utf-8"
         let response = HTTPURLResponse(
-            url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
+            url: request.url!, statusCode: status, httpVersion: "HTTP/1.1",
             headerFields: ["Content-Type": contentType]
         )!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         let body: Data
-        switch scenario {
+        if isModels {
+            if scenario == "unauthorized" {
+                body = Data(#"{"error":{"message":"Invalid API key"}}"#.utf8)
+            } else if scenario == "bad-models" {
+                body = Data(#"{"object":"list","data":[{}]}"#.utf8)
+            } else {
+                body = Data(#"{"object":"list","data":[]}"#.utf8)
+            }
+        } else { switch scenario {
         case "oversized": body = Data(repeating: 0x20, count: 64 * 1024 + 1)
-        case "ready": body = Data(readinessFixture.utf8)
-        case "multiline":
-            body = Data("data: {\r\ndata: \"choices\":[{\"delta\":{\"content\":\"中文\"}}]}\r\n\r\ndata: [DONE]\r\n\r\n".utf8)
+        case "ready", "unauthorized", "bad-models": body = Data(readinessFixture.utf8)
+        case "multiline", "open-stream":
+            body = Data(("data: {\r\ndata: \"id\":\"chat-1\",\"model\":\"tiny\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"中文\"}}]}\r\n\r\n"
+                + "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+                + "data: [DONE]\r\n\r\n").utf8)
+        case "malformed-open-stream": body = Data("data: invalid JSON\n\n".utf8)
         case "truncated": body = Data("data: [DONE]\n".utf8)
         default: body = Data("data: [DONE]\n\n".utf8)
         }
+        }
         client?.urlProtocol(self, didLoad: body)
-        if scenario != "oversized" { client?.urlProtocolDidFinishLoading(self) }
+        if !["oversized", "open-stream", "malformed-open-stream"].contains(scenario) { client?.urlProtocolDidFinishLoading(self) }
     }
 
-    override func stopLoading() {}
+    override func stopLoading() { transportCancellations.record(request.url!.path) }
 }
 
 @MainActor
@@ -355,7 +388,38 @@ private func checkHTTPTransport() async throws {
     try await client("multiline").streamChat(model: "tiny", messages: []) {
         contents.append($0.choices.first?.delta.content ?? "")
     }
-    expectEqual(contents, ["中文"])
+    expectEqual(contents, ["中文", ""])
+    try await client("open-stream").streamChat(model: "tiny", messages: []) { _ in }
+    try await expectTransportCancelled("/open-stream/v1/chat/completions")
+    do {
+        try await client("malformed-open-stream").streamChat(model: "tiny", messages: []) { _ in }
+        fatalError("Malformed event must fail before EOF")
+    } catch BloomClientError.malformedStream {}
+    try await expectTransportCancelled("/malformed-open-stream/v1/chat/completions")
+
+    do {
+        _ = try await client("unauthorized").readiness()
+        fatalError("Public readiness must not bypass credential validation")
+    } catch BloomClientError.http(401, _) {}
+    do {
+        _ = try await client("bad-models").readiness()
+        fatalError("Malformed protected API response must fail the connection")
+    } catch BloomClientError.incompatibleServer {}
+    do {
+        try await client("bare-done").streamChat(model: "tiny", messages: []) { _ in }
+        fatalError("Bare DONE must not succeed")
+    } catch BloomClientError.malformedStream {}
+    do {
+        try await client("ready").streamChat(model: "tiny", messages: [
+            APIChatMessage(role: "user", content: String(repeating: "x", count: 1024 * 1024)),
+        ]) { _ in }
+        fatalError("Oversized request must fail before network I/O")
+    } catch BloomClientError.requestLimitExceeded {}
+    for key in ["key\nInjected: value", "中文", String(repeating: "x", count: 4097)] {
+        expectThrows(try BloomAPIClient(serverURL: "http://localhost", apiKey: key)) {
+            guard case BloomClientError.invalidAPIKey = $0 else { fatalError("Unexpected key error") }
+        }
+    }
 
     do {
         try await client("wrong-type").streamChat(model: "tiny", messages: []) { _ in
@@ -383,4 +447,47 @@ private func checkHTTPTransport() async throws {
     defer { boundedRead.cancel() }
     try await rejected.wait()
     await boundedRead.value
+    try await expectTransportCancelled("/oversized/ready")
+}
+
+private func checkStreamValidation() throws {
+    func chunk(_ text: String) throws -> ChatCompletionChunk {
+        try JSONDecoder().decode(ChatCompletionChunk.self, from: Data(text.utf8))
+    }
+    let initial = try chunk(#"{"id":"chat-1","model":"tiny","choices":[{"index":0,"delta":{"content":"hello"}}]}"#)
+    let terminal = try chunk(#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#)
+    let usage = try chunk(#"{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}"#)
+    var valid = ChatStreamValidator(expectedModel: "tiny")
+    try valid.observe(initial)
+    try valid.observe(terminal)
+    try valid.observe(usage)
+    try valid.finish()
+
+    for text in [
+        #"{"model":"different","choices":[{"index":0,"delta":{}}]}"#,
+        #"{"id":"changed","choices":[{"index":0,"delta":{}}]}"#,
+        #"{"choices":[{"index":1,"delta":{}}]}"#,
+        #"{"choices":[{"index":0,"delta":{}},{"index":1,"delta":{}}]}"#,
+        #"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        #"{"choices":[{"index":0,"delta":{}}],"usage":{"prompt_tokens":-1,"completion_tokens":2,"total_tokens":1}}"#,
+        #"{"choices":[{"index":0,"delta":{}}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":4}}"#,
+    ] {
+        var validator = ChatStreamValidator(expectedModel: "tiny")
+        try validator.observe(initial)
+        expectThrows(try validator.observe(chunk(text))) {
+            guard case BloomClientError.malformedStream = $0 else { fatalError("Unexpected stream error") }
+        }
+    }
+    var unfinished = ChatStreamValidator(expectedModel: "tiny")
+    try unfinished.observe(initial)
+    expectThrows(try unfinished.finish()) { _ in }
+    expectThrows(try valid.observe(initial)) { _ in }
+    expectThrows(try valid.observe(usage)) { _ in }
+    var tooLarge = ChatStreamValidator(expectedModel: "tiny")
+    let large = try chunk(#"{"choices":[{"index":0,"delta":{"content":""#
+        + String(repeating: "x", count: 1024 * 1024) + #""}}]}"#)
+    for _ in 0..<16 { try tooLarge.observe(large) }
+    expectThrows(try tooLarge.observe(large)) {
+        guard case BloomClientError.responseLimitExceeded = $0 else { fatalError("Unexpected limit error") }
+    }
 }
