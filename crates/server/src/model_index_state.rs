@@ -699,7 +699,9 @@ mod tests {
     async fn accepts_legacy_v1_watermarks_and_advances_them_to_v2_history() {
         let temp = tempfile::tempdir().unwrap();
         let state = temp.path().join("state");
-        fs::create_dir(&state).unwrap();
+        // A trusted legacy directory must be private independently of the
+        // test process's umask (e.g. 0002 would make create_dir use 0775).
+        create_private_directory(&state).unwrap();
         let source_id = "ab".repeat(32);
         let legacy = WatermarkRecord {
             schema_version: 1,
