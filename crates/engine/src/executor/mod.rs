@@ -18,6 +18,7 @@ pub mod longcat_image_edit;
 pub mod longcat_native;
 #[cfg(feature = "candle-engine")]
 pub mod metal_quant;
+pub mod minimax_h3;
 pub mod mlx;
 pub mod npu_tts;
 pub mod onnx;

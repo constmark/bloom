@@ -195,6 +195,22 @@ pub(crate) fn run_bounded_output(
     stderr_limit: usize,
     timeout: Duration,
 ) -> Result<BoundedProcessOutput> {
+    run_bounded_output_cancellable(command, request, stdout_limit, stderr_limit, timeout, None)
+}
+
+/// The same bounded process contract, with cooperative cancellation. Cancellation
+/// kills the worker's process group and joins its pipe threads before returning.
+pub(crate) fn run_bounded_output_cancellable(
+    command: &mut Command,
+    request: &[u8],
+    stdout_limit: usize,
+    stderr_limit: usize,
+    timeout: Duration,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<BoundedProcessOutput> {
+    let is_cancelled =
+        || cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire));
+    ensure!(!is_cancelled(), "inference process cancelled");
     let mut child = ChildGuard::spawn_bounded(command)?;
     let stdout = child
         .stdout
@@ -225,6 +241,12 @@ pub(crate) fn run_bounded_output(
 
     let mut exit_status = None;
     let status = loop {
+        if is_cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            discard_process_threads(stdout_reader, stderr_reader, stdin_writer);
+            bail!("inference process cancelled");
+        }
         let polled = match exit_status {
             Some(status) => Ok(Some(status)),
             None => child.try_wait(),
@@ -362,6 +384,72 @@ mod tests {
         let (bytes, exceeded) = read_bounded("abc".as_bytes(), 3).unwrap();
         assert_eq!(bytes, b"abc");
         assert!(!exceeded);
+    }
+
+    #[test]
+    fn cancelled_process_never_spawns() {
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        let error = run_bounded_output_cancellable(
+            &mut Command::new("a-program-that-does-not-exist"),
+            &[],
+            16,
+            16,
+            Duration::from_secs(30),
+            Some(&cancelled),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_reaps_worker_and_closes_descendant_pipes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let directory = tempfile::tempdir().unwrap();
+        let pid_path = directory.path().join("pid");
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "echo $$ > \"$1\"; sleep 30 & wait", "test"])
+            .arg(&pid_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let cancelled = AtomicBool::new(false);
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !pid_path.exists() && started.elapsed() < Duration::from_secs(5) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                cancelled.store(true, Ordering::Release);
+            });
+            let error = run_bounded_output_cancellable(
+                &mut command,
+                &[],
+                16,
+                16,
+                Duration::from_secs(30),
+                Some(&cancelled),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("cancelled"));
+        });
+        assert!(started.elapsed() < Duration::from_secs(6));
+        let pid: libc::pid_t = std::fs::read_to_string(pid_path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // SAFETY: this PID belongs to the just-finished test worker. It must
+        // have been reaped before cancellation returns to the caller.
+        assert_eq!(
+            unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
     }
 
     #[cfg(unix)]

@@ -839,6 +839,7 @@ paths. The current source of truth is the
 | Candle on CPU | Experimental | Default development and CI path |
 | Candle on Metal | Experimental | Build with `--features metal` |
 | Candle on CUDA | Experimental | Build with `--features cuda` |
+| MiniMax H3 audio/video | Experimental external runtime | Dedicated [`bloom_h3` CLI](docs/minimax-h3.md), CUDA sd.cpp, four model components and FFmpeg |
 | OpenVINO and ASR bridges | External runtime | Require additional runtimes or Python packages |
 | Laya decision models | Experimental native runtime | Use a Laya checkpoint directory and JSON `{state, questions}` input; returns typed answers rather than generated text |
 | ONNX Runtime | External runtime | Bundled Python bridge; install `onnxruntime` or `onnxruntime-gpu` |
