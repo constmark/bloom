@@ -165,6 +165,10 @@ impl LoadedModel for LayaModel {
     }
 
     fn infer(&self, input: ModelInput, params: &GenerationParams) -> Result<ModelOutput> {
+        anyhow::ensure!(
+            params.logprobs.is_none(),
+            "this backend does not support token logprobs"
+        );
         let mut text = String::new();
         self.infer_stream(input, params, &mut |chunk| {
             if let OutputChunk::TextDelta(delta) = chunk {
@@ -173,6 +177,7 @@ impl LoadedModel for LayaModel {
             Ok(())
         })?;
         Ok(ModelOutput {
+            logprobs: None,
             text: Some(text),
             logits: None,
             image: None,
@@ -187,6 +192,10 @@ impl LoadedModel for LayaModel {
         _params: &GenerationParams,
         sink: &mut dyn crate::model::OutputSink,
     ) -> Result<()> {
+        anyhow::ensure!(
+            _params.logprobs.is_none(),
+            "this backend does not support token logprobs"
+        );
         let prompt = match input {
             ModelInput::Text { prompt } => prompt,
             _ => {

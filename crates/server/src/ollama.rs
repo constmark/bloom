@@ -2330,6 +2330,7 @@ fn prepare_ollama_image_request(
     let max_tokens = resolve_chat_max_tokens(request.max_tokens, request.max_completion_tokens)?;
     let (presence_penalty, frequency_penalty) = request_penalties(&request.extensions)?;
     let params = InferenceParams {
+        logprobs: None,
         max_tokens,
         temperature: request.temperature.unwrap_or(0.7),
         top_p: request.top_p.unwrap_or(0.9),

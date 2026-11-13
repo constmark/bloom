@@ -118,6 +118,62 @@ mod tests {
         }
     }
 
+    struct ModelEosExecutor {
+        eos: Vec<u32>,
+        token: u32,
+        extras: Vec<u32>,
+    }
+
+    impl EngineExecutor for ModelEosExecutor {
+        fn execute(&self, batch: ExecutionBatch) -> Result<BatchResult> {
+            Ok(BatchResult {
+                next_tokens: vec![self.token; batch.request_ids.len()],
+                speculative_tokens: Some(vec![self.extras.clone(); batch.request_ids.len()]),
+            })
+        }
+        fn max_batch_size(&self, _: ExecutionPhase) -> usize {
+            1
+        }
+        fn is_eos_token(&self, token: u32) -> bool {
+            self.eos.contains(&token)
+        }
+    }
+
+    #[test]
+    fn scheduler_honors_model_eos_and_bounds_speculative_tails() {
+        assert!(MockExecutor.is_eos_token(2));
+        for (eos, token, extras, maximum, expected, finished) in [
+            (vec![99], 2, vec![], 3, vec![2], false),
+            (vec![99], 99, vec![7], 3, vec![99], true),
+            (vec![], 2, vec![], 3, vec![2], false),
+            (vec![], 99, vec![], 3, vec![99], false),
+            (vec![99], 7, vec![99, 8], 3, vec![7, 99], true),
+            (vec![99], 7, vec![8, 9], 1, vec![7], true),
+        ] {
+            let scheduler = InferenceScheduler::new(
+                Arc::new(ModelEosExecutor { eos, token, extras }),
+                Arc::new(MockKvPool::new(10)),
+            );
+            let mut request = request_for_cleanup("model-eos");
+            request.params.max_tokens = maximum;
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            scheduler
+                .token_senders
+                .lock()
+                .unwrap()
+                .insert(request.id.clone(), tx);
+            scheduler.submit(request).unwrap();
+            scheduler.step().unwrap();
+            let mut tokens = Vec::new();
+            while let Ok(token) = rx.try_recv() {
+                tokens.push(token.unwrap());
+            }
+            assert_eq!(tokens, expected);
+            assert_eq!(scheduler.queue_stats() == (0, 0, 0), finished);
+            scheduler.cancel_request("model-eos");
+        }
+    }
+
     #[test]
     fn token_budget_capacity_check_is_overflow_safe() {
         assert!(token_budget_allows(usize::MAX, 0, usize::MAX));
@@ -629,6 +685,24 @@ mod tests {
     }
 
     #[test]
+    fn logprobs_are_rejected_before_scheduler_allocation() {
+        let pool = Arc::new(MockKvPool::new(10));
+        let scheduler = InferenceScheduler::new(Arc::new(MockExecutor), pool.clone());
+        let mut request = request_for_cleanup("unsupported-logprobs");
+        request.params.logprobs = Some(0);
+        assert!(
+            scheduler
+                .submit(request)
+                .unwrap_err()
+                .to_string()
+                .contains("logprobs")
+        );
+        assert_eq!(pool.free_slots.lock().unwrap().len(), 10);
+        assert!(scheduler.live_request_ids.lock().unwrap().is_empty());
+        assert_eq!(scheduler.queue_stats(), (0, 0, 0));
+    }
+
+    #[test]
     fn invalid_kv_admission_threshold_never_allocates() {
         for threshold in [f64::NAN, f64::INFINITY, -0.1, 1.1] {
             let pool = Arc::new(MockKvPool::new(10));
@@ -642,6 +716,27 @@ mod tests {
                     .unwrap_err()
                     .to_string()
                     .contains("admission threshold")
+            );
+            assert_eq!(pool.free_slots.lock().unwrap().len(), 10);
+            assert_eq!(scheduler.queue_stats(), (0, 0, 0));
+            assert!(scheduler.live_request_ids.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn invalid_kv_retention_ratio_never_allocates() {
+        for retention in [f64::NAN, f64::INFINITY, -0.1, 1.1] {
+            let pool = Arc::new(MockKvPool::new(10));
+            let mut config = CoreTokenSchedulingConfig::default();
+            config.kv_eviction.retention_ratio = retention;
+            let scheduler =
+                InferenceScheduler::with_config(Arc::new(MockExecutor), pool.clone(), config);
+            assert!(
+                scheduler
+                    .submit(request_for_cleanup("invalid-retention"))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("retention ratio")
             );
             assert_eq!(pool.free_slots.lock().unwrap().len(), 10);
             assert_eq!(scheduler.queue_stats(), (0, 0, 0));
@@ -982,6 +1077,15 @@ mod tests {
 
     #[test]
     fn cancellation_waits_for_executor_before_freeing_kv_and_guard() {
+        assert_cancellation_waits_for_executor(false);
+    }
+
+    #[test]
+    fn synchronous_cancellation_waits_for_executor_before_freeing_kv_and_guard() {
+        assert_cancellation_waits_for_executor(true);
+    }
+
+    fn assert_cancellation_waits_for_executor(synchronous: bool) {
         let dropped = Arc::new(AtomicBool::new(false));
         let probe = Arc::new(DropProbe {
             dropped: Arc::clone(&dropped),
@@ -1033,7 +1137,11 @@ mod tests {
         let scheduler_for_cancel = Arc::clone(&scheduler);
         let cancel = std::thread::spawn(move || {
             cancel_started_tx.send(()).unwrap();
-            let cancelled = scheduler_for_cancel.cancel_request("guarded");
+            let cancelled = if synchronous {
+                scheduler_for_cancel.cancel_request_and_wait("guarded")
+            } else {
+                scheduler_for_cancel.cancel_request("guarded")
+            };
             cancel_done_tx.send(cancelled).unwrap();
         });
         cancel_started_rx
@@ -1071,6 +1179,133 @@ mod tests {
         );
         assert!(weak_probe.upgrade().is_none());
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn synchronous_cancellation_waits_for_unrelated_submission_and_clears_deferred_cleanup() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let probe = Arc::new(DropProbe {
+            dropped: dropped.clone(),
+        });
+        let weak_probe = Arc::downgrade(&probe);
+        let guard: ExecutionGuard = probe.clone();
+        drop(probe);
+        let pool = Arc::new(BloomKvCachePool::new(4, 16));
+        let scheduler = Arc::new(InferenceScheduler::new(
+            Arc::new(MockExecutor),
+            pool.clone(),
+        ));
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        scheduler
+            .token_senders
+            .lock()
+            .unwrap()
+            .insert("target".into(), sender);
+        scheduler
+            .submit_with_execution_guard(request_for_cleanup("target"), guard)
+            .unwrap();
+
+        let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = mpsc::sync_channel(0);
+        let resume_rx = Mutex::new(resume_rx);
+        pool.set_on_allocate(move |id, _, _, _| {
+            if id == "unrelated" {
+                entered_tx.send(()).unwrap();
+                resume_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            }
+        });
+        let submitter = scheduler.clone();
+        let submission =
+            std::thread::spawn(move || submitter.submit(request_for_cleanup("unrelated")));
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(scheduler.submission_in_progress.load(Ordering::Acquire));
+        // Reproduce the existing nonblocking path's deferred cancellation,
+        // then require the new API to finish that exact cleanup before return.
+        assert!(scheduler.cancel_request("target"));
+        assert!(
+            scheduler
+                .cancelled_while_busy
+                .lock()
+                .unwrap()
+                .contains("target")
+        );
+        let (started_tx, started_rx) = mpsc::sync_channel(0);
+        let (done_tx, done_rx) = mpsc::sync_channel(0);
+        let canceller = scheduler.clone();
+        let cancellation = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            done_tx
+                .send(canceller.cancel_request_and_wait("target"))
+                .unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+        assert!(weak_probe.upgrade().is_some());
+        assert!(!dropped.load(Ordering::SeqCst));
+        assert!(
+            pool.state
+                .lock()
+                .unwrap()
+                .active_requests
+                .contains_key("target")
+        );
+
+        resume_tx.send(()).unwrap();
+        submission.join().unwrap().unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+        cancellation.join().unwrap();
+        assert!(weak_probe.upgrade().is_none());
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(
+            !scheduler
+                .live_request_ids
+                .lock()
+                .unwrap()
+                .contains("target")
+        );
+        assert!(
+            scheduler
+                .live_request_ids
+                .lock()
+                .unwrap()
+                .contains("unrelated")
+        );
+        assert!(
+            !scheduler
+                .token_senders
+                .lock()
+                .unwrap()
+                .contains_key("target")
+        );
+        assert!(
+            !scheduler
+                .cancelled_while_busy
+                .lock()
+                .unwrap()
+                .contains("target")
+        );
+        {
+            // Terminal release keeps reusable prefix blocks as an inactive
+            // cache entry, while neither live handle index may resolve it.
+            let state = pool.state.lock().unwrap();
+            assert!(!state.active_requests["target"].active);
+            assert!(!state.request_id_to_handle.contains_key("target"));
+            assert!(state.handle_to_request_id.values().all(|id| id != "target"));
+            assert!(state.active_requests["unrelated"].active);
+        }
+        assert_eq!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        );
+        assert_eq!(scheduler.queue_stats(), (1, 0, 0));
+        assert!(scheduler.cancel_request_and_wait("unrelated"));
     }
 
     struct FailingExecutor {

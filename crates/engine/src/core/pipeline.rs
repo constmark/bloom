@@ -419,9 +419,18 @@ impl InferencePipeline {
     pub fn run(&self, input: ModelInput, params: &GenerationParams) -> Result<ModelOutput> {
         let _span = tracing::info_span!("pipeline.run").entered();
         params.validate().map_err(BloomError::InvalidInput)?;
+        if params.logprobs.is_some() && !self.model.supports_logprobs() {
+            return Err(BloomError::InvalidInput(
+                "this model does not support token logprobs".into(),
+            )
+            .into());
+        }
         input.validate().map_err(BloomError::InvalidInput)?;
         let output = self.model.infer(input, params)?;
         output.validate().map_err(BloomError::InvalidInput)?;
+        if params.logprobs.is_some() && output.logprobs.is_none() {
+            return Err(BloomError::Engine("model omitted requested token logprobs".into()).into());
+        }
         Ok(output)
     }
 
@@ -433,6 +442,12 @@ impl InferencePipeline {
     ) -> Result<()> {
         let _span = tracing::info_span!("pipeline.run_stream").entered();
         params.validate().map_err(BloomError::InvalidInput)?;
+        if params.logprobs.is_some() && !self.model.supports_logprobs() {
+            return Err(BloomError::InvalidInput(
+                "this model does not support token logprobs".into(),
+            )
+            .into());
+        }
         input.validate().map_err(BloomError::InvalidInput)?;
         let mut validating_sink = ValidatingOutputSink {
             inner: sink,
@@ -479,6 +494,7 @@ impl InferencePipeline {
         let _span = tracing::info_span!("pipeline.run_request").entered();
         request.validate().map_err(BloomError::InvalidInput)?;
         let params = GenerationParams {
+            logprobs: request.params.logprobs,
             max_tokens: request.params.max_tokens,
             temperature: request.params.temperature,
             top_p: request.params.top_p,
@@ -490,6 +506,12 @@ impl InferencePipeline {
             response_format: request.params.response_format.clone(),
         };
         params.validate().map_err(BloomError::InvalidInput)?;
+        if params.logprobs.is_some() && !self.model.supports_logprobs() {
+            return Err(BloomError::InvalidInput(
+                "this model does not support token logprobs".into(),
+            )
+            .into());
+        }
         let mut validating_sink = ValidatingOutputSink {
             inner: sink,
             ended: false,
@@ -656,6 +678,27 @@ mod tests {
     };
 
     #[test]
+    fn unsupported_model_rejects_logprobs_before_inference() {
+        let params = GenerationParams {
+            logprobs: Some(0),
+            ..Default::default()
+        };
+        let model = crate::EchoTextModel::default();
+        let input = ModelInput::Text {
+            prompt: "hello".into(),
+        };
+        assert!(!model.supports_logprobs());
+        assert!(model.infer(input.clone(), &params).is_err());
+        assert!(
+            model
+                .infer_stream(input, &params, &mut |_| panic!(
+                    "unsupported operation must not emit output"
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn validating_stream_requires_terminal_event() {
         let mut received = Vec::new();
         let mut sink = ValidatingOutputSink {
@@ -769,6 +812,7 @@ mod tests {
 
         fn infer(&self, _input: ModelInput, _params: &GenerationParams) -> Result<ModelOutput> {
             Ok(ModelOutput {
+                logprobs: None,
                 text: Some("ok".to_string()),
                 logits: None,
                 image: None,

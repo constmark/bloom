@@ -662,6 +662,26 @@ pub(crate) fn chat_output_message_for_choice(
     }
 }
 
+/// Construct a validated streaming delta with candidate-scoped call IDs and
+/// per-message tool indices. The public stream ID remains shared by choices.
+pub(crate) fn chat_output_delta_for_choice(
+    request_id: &str,
+    choice_index: usize,
+    output: &ParsedChatOutput,
+) -> serde_json::Value {
+    match output {
+        ParsedChatOutput::Message(content) => json!({"content": content}),
+        ParsedChatOutput::ToolCalls(calls) => {
+            let identity = if choice_index == 0 {
+                request_id.to_string()
+            } else {
+                format!("choice{choice_index}_{request_id}")
+            };
+            json!({"tool_calls": tool_calls_json(&identity, calls, true)})
+        }
+    }
+}
+
 pub(crate) fn chat_output_finish_reason(
     output: &ParsedChatOutput,
     completion_tokens: usize,
@@ -703,12 +723,7 @@ pub(crate) fn chat_tool_output_payload(
     max_tokens: usize,
 ) -> serde_json::Value {
     let finish_reason = chat_output_finish_reason(output, completion_tokens, max_tokens);
-    let delta = match output {
-        ParsedChatOutput::Message(content) => json!({"content": content}),
-        ParsedChatOutput::ToolCalls(calls) => {
-            json!({"tool_calls": tool_calls_json(&request_id, calls, true)})
-        }
-    };
+    let delta = chat_output_delta_for_choice(&request_id, 0, output);
     json!({
         "id": request_id,
         "object": "chat.completion.chunk",

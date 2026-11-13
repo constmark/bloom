@@ -257,9 +257,14 @@ impl LoadedModel for LongCatImageEditModel {
     }
 
     fn infer(&self, input: ModelInput, params: &GenerationParams) -> Result<ModelOutput> {
+        anyhow::ensure!(
+            params.logprobs.is_none(),
+            "this backend does not support token logprobs"
+        );
         let (prompt, image) = resolve_edit_input(input)?;
         match self.run_native(&prompt, &image, params) {
             Ok(bytes) => Ok(ModelOutput {
+                logprobs: None,
                 text: None,
                 logits: None,
                 image: Some(bytes),
@@ -279,6 +284,10 @@ impl LoadedModel for LongCatImageEditModel {
         params: &GenerationParams,
         sink: &mut dyn OutputSink,
     ) -> Result<()> {
+        anyhow::ensure!(
+            params.logprobs.is_none(),
+            "this backend does not support token logprobs"
+        );
         sink.on_chunk(OutputChunk::DiffusionProgress {
             step: 0,
             total_steps: params.max_tokens as u32,

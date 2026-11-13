@@ -48,6 +48,7 @@ pub const BLOOM_STATUS_INFERENCE_ERROR: i32 = -5;
 pub const BLOOM_STATUS_OUTPUT_ERROR: i32 = -6;
 pub const BLOOM_STATUS_PANIC: i32 = -7;
 pub const BLOOM_STATUS_CANCELLED: i32 = -8;
+pub const BLOOM_STATUS_UNSUPPORTED: i32 = -9;
 
 const MAX_FFI_IDENTIFIER_BYTES: usize = 4 * 1024;
 // Windows extended-length paths may contain up to 32,767 UTF-16 code units.
@@ -75,6 +76,8 @@ struct FfiGenerationParams {
     logit_bias: Option<std::collections::BTreeMap<u32, f64>>,
     seed: Option<u64>,
     response_format: Option<FfiResponseFormat>,
+    #[serde(default)]
+    logprobs: Option<usize>,
 }
 
 #[derive(serde::Deserialize)]
@@ -99,6 +102,7 @@ fn parse_generation_params(json: &str) -> Result<GenerationParams, serde_json::E
         frequency_penalty: params.frequency_penalty,
         logit_bias: params.logit_bias,
         seed: params.seed,
+        logprobs: params.logprobs,
         response_format: params.response_format.map(|format| match format {
             FfiResponseFormat::Text => bloomai_core::ResponseFormat::Text,
             FfiResponseFormat::JsonObject => bloomai_core::ResponseFormat::JsonObject,
@@ -994,6 +998,151 @@ unsafe fn bloom_pipeline_run_v2_impl(
     BLOOM_STATUS_OK
 }
 
+/// Encode UTF-8 text with the loaded model's exact tokenizer.
+///
+/// This optional ABI revision 2 extension returns a JSON array of token IDs.
+/// Empty input is allowed. Models without an exact tokenizer return
+/// [`BLOOM_STATUS_UNSUPPORTED`]; approximate token counts are never used.
+///
+/// # Safety
+/// `pipeline` must remain live throughout the call. `text` must reference
+/// `len` readable bytes. `output` must point to writable, initially empty
+/// storage. A non-NULL error buffer must have `error_buffer_len` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bloom_pipeline_tokenize_v2(
+    pipeline: *mut BloomPipeline,
+    text: BloomSlice,
+    output: *mut BloomOwnedBuffer,
+    error_buffer: *mut c_char,
+    error_buffer_len: usize,
+) -> i32 {
+    unsafe {
+        tokenization_v2(
+            pipeline,
+            text,
+            output,
+            error_buffer,
+            error_buffer_len,
+            false,
+        )
+    }
+}
+
+/// Decode a JSON array of u32 token IDs with the exact model tokenizer.
+///
+/// Returns a JSON string in `output`; release it with [`bloom_buffer_free`].
+/// Empty arrays are allowed. Special tokens follow the model adapter's policy.
+///
+/// # Safety
+/// The pointer and ownership requirements of [`bloom_pipeline_tokenize_v2`]
+/// apply. `tokens_json` must reference `len` readable bytes for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bloom_pipeline_detokenize_v2(
+    pipeline: *mut BloomPipeline,
+    tokens_json: BloomSlice,
+    output: *mut BloomOwnedBuffer,
+    error_buffer: *mut c_char,
+    error_buffer_len: usize,
+) -> i32 {
+    unsafe {
+        tokenization_v2(
+            pipeline,
+            tokens_json,
+            output,
+            error_buffer,
+            error_buffer_len,
+            true,
+        )
+    }
+}
+
+unsafe fn tokenization_v2(
+    pipeline: *mut BloomPipeline,
+    input: BloomSlice,
+    output: *mut BloomOwnedBuffer,
+    error_buffer: *mut c_char,
+    error_buffer_len: usize,
+    decode: bool,
+) -> i32 {
+    // Clear every writable output even when another argument is invalid.
+    if !output.is_null() {
+        unsafe { *output = BloomOwnedBuffer::default() };
+    }
+    let result = catch_unwind(AssertUnwindSafe(|| -> Result<Vec<u8>, (i32, String)> {
+        if pipeline.is_null() || output.is_null() {
+            return Err((
+                BLOOM_STATUS_INVALID_ARGUMENT,
+                "NULL tokenization argument".into(),
+            ));
+        }
+        let limit = if decode {
+            MAX_FFI_JSON_BYTES
+        } else {
+            bloomai_engine::core::io::MAX_TEXT_BYTES
+        };
+        let input = unsafe { slice_as_utf8(input, "tokenization input", limit) }?;
+        let pipeline = unsafe { &*pipeline };
+        let unsupported = || {
+            (
+                BLOOM_STATUS_UNSUPPORTED,
+                "The model does not expose an exact tokenizer".into(),
+            )
+        };
+        let runtime_error =
+            |error: anyhow::Error| (BLOOM_STATUS_INFERENCE_ERROR, error.to_string());
+        let serialized = if decode {
+            let tokens: Vec<u32> = serde_json::from_str(input)
+                .map_err(|error| (BLOOM_STATUS_INVALID_INPUT_JSON, error.to_string()))?;
+            if tokens.len() > bloomai_engine::core::io::MAX_TOKEN_COUNT {
+                return Err((BLOOM_STATUS_INVALID_ARGUMENT, "Too many token IDs".into()));
+            }
+            let text = pipeline
+                .inner
+                .detokenize_exact(&tokens)
+                .ok_or_else(unsupported)?
+                .map_err(runtime_error)?;
+            serde_json::to_vec(&text)
+        } else {
+            let tokens = pipeline
+                .inner
+                .tokenize_exact(input)
+                .ok_or_else(unsupported)?
+                .map_err(runtime_error)?;
+            if tokens.len() > bloomai_engine::core::io::MAX_TOKEN_COUNT {
+                return Err((
+                    BLOOM_STATUS_OUTPUT_ERROR,
+                    "Tokenizer returned too many token IDs".into(),
+                ));
+            }
+            serde_json::to_vec(&tokens)
+        };
+        let bytes = serialized.map_err(|error| (BLOOM_STATUS_OUTPUT_ERROR, error.to_string()))?;
+        if bytes.len() > MAX_FFI_JSON_BYTES {
+            return Err((
+                BLOOM_STATUS_OUTPUT_ERROR,
+                "Tokenization output exceeds the 16 MiB limit".into(),
+            ));
+        }
+        Ok(bytes)
+    }));
+    let result = result.unwrap_or_else(|_| {
+        Err((
+            BLOOM_STATUS_PANIC,
+            "Bloom caught an internal panic during tokenization".into(),
+        ))
+    });
+    match result {
+        Ok(bytes) => {
+            unsafe { *output = owned_buffer(bytes) };
+            BLOOM_STATUS_OK
+        }
+        Err((status, message)) => {
+            unsafe { write_error(&message, error_buffer, error_buffer_len) };
+            status
+        }
+    }
+}
+
 /// Run streaming inference.
 /// Returns 0 on success, negative error code on failure.
 ///
@@ -1381,6 +1530,148 @@ mod tests {
         BloomSlice, FfiOutputSink, bloom_pipeline_load, bloom_pipeline_load_v2, catch_ffi_panic,
     };
 
+    struct TokenizerTestEngine;
+
+    impl super::Engine for TokenizerTestEngine {
+        fn name(&self) -> &'static str {
+            "tokenizer-test"
+        }
+        fn supported_modalities(&self) -> Vec<bloomai_core::Modality> {
+            super::MockEngine.supported_modalities()
+        }
+        fn supported_devices(&self) -> Vec<DeviceKind> {
+            super::MockEngine.supported_devices()
+        }
+        fn capability(&self) -> super::EngineCapability {
+            super::MockEngine.capability()
+        }
+        fn load(
+            &self,
+            _: &std::path::Path,
+            _: DeviceKind,
+        ) -> anyhow::Result<Box<dyn super::LoadedModel>> {
+            Ok(Box::new(
+                TokenizerTestModel(super::EchoTextModel::default()),
+            ))
+        }
+    }
+
+    struct TokenizerTestModel(super::EchoTextModel);
+
+    impl super::LoadedModel for TokenizerTestModel {
+        fn metadata(&self) -> &bloomai_engine::ModelMetadata {
+            self.0.metadata()
+        }
+        fn infer(
+            &self,
+            input: super::ModelInput,
+            params: &super::GenerationParams,
+        ) -> anyhow::Result<bloomai_engine::core::io::ModelOutput> {
+            self.0.infer(input, params)
+        }
+        fn tokenize(&self, text: &str) -> Option<anyhow::Result<Vec<u32>>> {
+            if text == "panic" {
+                panic!("test tokenizer panic");
+            }
+            if text == "error" {
+                return Some(Err(anyhow::anyhow!("test tokenizer error")));
+            }
+            Some(Ok(text.chars().map(u32::from).collect()))
+        }
+        fn detokenize(&self, tokens: &[u32]) -> Option<anyhow::Result<String>> {
+            Some(
+                tokens
+                    .iter()
+                    .map(|token| {
+                        char::from_u32(*token).ok_or_else(|| anyhow::anyhow!("invalid test token"))
+                    })
+                    .collect(),
+            )
+        }
+    }
+
+    #[test]
+    fn tokenization_extensions_preserve_results_and_guard_backend_errors() {
+        let inner = super::InferencePipeline::load_standalone(
+            &TokenizerTestEngine,
+            DeviceKind::Cpu,
+            std::path::Path::new("."),
+        )
+        .unwrap();
+        let mut pipeline = super::BloomPipeline { inner };
+        let mut error = [0 as c_char; 256];
+        let slice = |bytes: &[u8]| BloomSlice {
+            data: bytes.as_ptr(),
+            len: bytes.len(),
+        };
+        let mut output = super::BloomOwnedBuffer::default();
+        unsafe {
+            for text in ["", "中文 🌸\0"] {
+                assert_eq!(
+                    super::bloom_pipeline_tokenize_v2(
+                        &mut pipeline,
+                        slice(text.as_bytes()),
+                        &mut output,
+                        error.as_mut_ptr(),
+                        error.len(),
+                    ),
+                    super::BLOOM_STATUS_OK
+                );
+                let tokens = std::slice::from_raw_parts(output.data, output.len).to_vec();
+                assert_eq!(
+                    serde_json::from_slice::<Vec<u32>>(&tokens).unwrap(),
+                    text.chars().map(u32::from).collect::<Vec<_>>()
+                );
+                super::bloom_buffer_free(&mut output);
+                assert_eq!(
+                    super::bloom_pipeline_detokenize_v2(
+                        &mut pipeline,
+                        slice(&tokens),
+                        &mut output,
+                        error.as_mut_ptr(),
+                        error.len(),
+                    ),
+                    super::BLOOM_STATUS_OK
+                );
+                assert_eq!(
+                    serde_json::from_slice::<String>(std::slice::from_raw_parts(
+                        output.data,
+                        output.len
+                    ))
+                    .unwrap(),
+                    text
+                );
+                super::bloom_buffer_free(&mut output);
+            }
+            for (input, status) in [
+                (b"error".as_slice(), super::BLOOM_STATUS_INFERENCE_ERROR),
+                (b"panic", super::BLOOM_STATUS_PANIC),
+            ] {
+                assert_eq!(
+                    super::bloom_pipeline_tokenize_v2(
+                        &mut pipeline,
+                        slice(input),
+                        &mut output,
+                        error.as_mut_ptr(),
+                        error.len(),
+                    ),
+                    status
+                );
+                assert!(output.data.is_null());
+            }
+            assert_eq!(
+                super::bloom_pipeline_detokenize_v2(
+                    &mut pipeline,
+                    slice(b"[4294967295]"),
+                    &mut output,
+                    error.as_mut_ptr(),
+                    error.len(),
+                ),
+                super::BLOOM_STATUS_INFERENCE_ERROR
+            );
+        }
+    }
+
     #[test]
     fn ffi_generation_contract_preserves_every_shared_control() {
         let params = bloomai_core::GenerationParams {
@@ -1389,6 +1680,7 @@ mod tests {
             frequency_penalty: 0.75,
             logit_bias: Some(std::collections::BTreeMap::from([(17, -100.0)])),
             seed: Some(42),
+            logprobs: Some(20),
             response_format: Some(bloomai_core::ResponseFormat::JsonSchema(
                 serde_json::json!({"type": "object"}),
             )),
@@ -1398,6 +1690,54 @@ mod tests {
         assert_eq!(super::parse_generation_params(&json).unwrap(), params);
     }
 
+    #[test]
+    fn ffi_logprobs_defaults_and_bounds_match_the_engine() {
+        let base = serde_json::json!({"max_tokens": 4096, "temperature": 0.7, "top_p": 0.9});
+        assert_eq!(
+            super::parse_generation_params(&base.to_string())
+                .unwrap()
+                .logprobs,
+            None
+        );
+        for count in [
+            serde_json::Value::Null,
+            serde_json::json!(0),
+            serde_json::json!(20),
+        ] {
+            let mut params = base.clone();
+            params["logprobs"] = count.clone();
+            let parsed = super::parse_generation_params(&params.to_string()).unwrap();
+            assert_eq!(parsed.logprobs, count.as_u64().map(|value| value as usize));
+            parsed.validate().unwrap();
+        }
+        for count in [
+            serde_json::json!(true),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("1"),
+        ] {
+            let mut params = base.clone();
+            params["logprobs"] = count;
+            assert!(super::parse_generation_params(&params.to_string()).is_err());
+        }
+        let mut params = base;
+        params["logprobs"] = serde_json::json!(21);
+        assert!(
+            super::parse_generation_params(&params.to_string())
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+        params["logprobs"] = serde_json::json!(0);
+        params["max_tokens"] = serde_json::json!(4097);
+        assert!(
+            super::parse_generation_params(&params.to_string())
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+    }
+
     unsafe extern "C" fn capture_callback(
         user_data: *mut std::ffi::c_void,
         chunk_json: *const c_char,
@@ -1405,6 +1745,59 @@ mod tests {
         unsafe {
             *user_data.cast::<Option<String>>() =
                 Some(CStr::from_ptr(chunk_json).to_string_lossy().into_owned());
+        }
+    }
+
+    unsafe extern "C" fn capture_callback_v2(
+        user_data: *mut std::ffi::c_void,
+        chunk_json: *const u8,
+        len: usize,
+    ) {
+        unsafe {
+            *user_data.cast::<Option<String>>() = Some(
+                String::from_utf8(std::slice::from_raw_parts(chunk_json, len).to_vec()).unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn both_stream_abis_preserve_logprob_metadata_and_token_bytes() {
+        let record = bloomai_engine::TokenLogprobs {
+            token: bloomai_engine::TokenLogprob {
+                token_id: 17,
+                token: "�".into(),
+                bytes: vec![0xe4],
+                logprob: -0.25,
+            },
+            top_logprobs: vec![bloomai_engine::TokenLogprob {
+                token_id: 18,
+                token: "x".into(),
+                bytes: vec![b'x'],
+                logprob: -1.5,
+            }],
+        };
+        record.validate().unwrap();
+        let expected = serde_json::json!({"TokenLogprobs": record});
+        let mut legacy: Option<String> = None;
+        FfiOutputSink {
+            callback: capture_callback,
+            user_data: (&mut legacy as *mut Option<String>).cast(),
+        }
+        .on_chunk(OutputChunk::TokenLogprobs(record.clone()))
+        .unwrap();
+        let mut revision_two: Option<String> = None;
+        super::FfiOutputSinkV2 {
+            callback: capture_callback_v2,
+            user_data: (&mut revision_two as *mut Option<String>).cast(),
+            cancellation: None,
+        }
+        .on_chunk(OutputChunk::TokenLogprobs(record))
+        .unwrap();
+        for encoded in [legacy, revision_two] {
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&encoded.unwrap()).unwrap(),
+                expected
+            );
         }
     }
 

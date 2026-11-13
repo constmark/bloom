@@ -429,6 +429,10 @@ impl LoadedModel for TensorRtModel {
         &self.metadata
     }
     fn infer(&self, input: ModelInput, params: &GenerationParams) -> Result<ModelOutput> {
+        anyhow::ensure!(
+            params.logprobs.is_none(),
+            "this backend does not support token logprobs"
+        );
         input.validate().map_err(anyhow::Error::msg)?;
         params.validate().map_err(anyhow::Error::msg)?;
         // Numeric engines have no sampler; accepting active controls would be misleading.
@@ -450,6 +454,7 @@ impl LoadedModel for TensorRtModel {
         let raw = self.call_bridge(prompt.as_bytes(), false)?;
         let decoded: TensorRtResult = serde_json::from_slice(&raw)?;
         let output = ModelOutput {
+            logprobs: None,
             text: decoded.text,
             logits: Some(decoded.logits),
             image: decoded.image,
@@ -479,6 +484,10 @@ impl LoadedModel for TensorRtModel {
         params: &GenerationParams,
         sink: &mut dyn crate::model::OutputSink,
     ) -> Result<()> {
+        anyhow::ensure!(
+            params.logprobs.is_none(),
+            "this backend does not support token logprobs"
+        );
         let output = self.infer(input, params)?;
         sink.on_chunk(crate::OutputChunk::Embedding(
             output

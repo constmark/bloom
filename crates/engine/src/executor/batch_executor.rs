@@ -530,6 +530,13 @@ impl CandleBatchExecutor {
                         let mut num_speculative = 0;
                         if structured_output
                             || matches!(speculative_mode_ref, SpeculativeMode::None)
+                            // This executor verifies drafts with raw argmax;
+                            // defer all stochastic or adjusted distributions
+                            // to the normal per-request sampler.
+                            || req_params.is_none_or(|params| {
+                                params.temperature > 1e-7
+                                    || !super::speculative::supports_sampling(speculative_mode_ref, params)
+                            })
                         {
                             // None
                         } else {
@@ -1092,6 +1099,10 @@ impl CandleBatchExecutor {
 }
 
 impl EngineExecutor for CandleBatchExecutor {
+    fn is_eos_token(&self, token: u32) -> bool {
+        self.eos_token_ids.contains(&token)
+    }
+
     fn supports_dense_batch(&self) -> bool {
         self.dense_batch
     }
@@ -1109,6 +1120,10 @@ impl EngineExecutor for CandleBatchExecutor {
     }
 
     fn execute(&self, batch: ExecutionBatch) -> Result<BatchResult> {
+        anyhow::ensure!(
+            batch.params.iter().all(|params| params.logprobs.is_none()),
+            "logprobs is unsupported by continuous batching"
+        );
         self.bind_device_context()?;
         match batch.phase {
             ExecutionPhase::Prefill => {
@@ -1316,23 +1331,23 @@ fn sample_logits(
         return weighted.first().map(|(idx, _)| *idx as u32).unwrap_or(0);
     }
 
-    // Weighted random sampling with optional seed. The LCG keeps seeded batch
-    // requests deterministic without sharing mutable RNG state between them.
+    // Position-derived seeded draws survive batching, preemption and request
+    // ID reuse without mutable executor-global state. Reusing the initial draw
+    // on every decode would correlate all generated tokens in a request.
     let mut rng_state = seed.unwrap_or_else(|| {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64
     });
-    rng_state = rng_state
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    let threshold = (rng_state >> 33) as f32 / (u32::MAX as f32);
+    rng_state =
+        rng_state.wrapping_add((generated_tokens.len() as u64).wrapping_mul(0x9E3779B97F4A7C15));
+    let threshold = super::speculative::lcg_next_f32(&mut rng_state);
 
     let mut cumulative = 0.0f32;
     for (token, weight) in &weighted {
         cumulative += *weight / total;
-        if threshold <= cumulative {
+        if threshold < cumulative {
             return *token as u32;
         }
     }
@@ -1346,6 +1361,44 @@ mod tests {
     use crate::scheduler::paged_cache::{LongContextPolicy, PagedCacheConfig};
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn batch_eos_uses_model_ids_and_empty_lists_never_invent_eos() {
+        for eos in [vec![], vec![23, 99]] {
+            let executor =
+                CandleBatchExecutor::new(Box::new(|_, _, _| unreachable!()), Device::Cpu, 1, 32)
+                    .with_grammar_support(Vec::new(), eos.clone());
+            for token in [2, 23, 99] {
+                assert_eq!(executor.is_eos_token(token), eos.contains(&token));
+            }
+        }
+    }
+
+    #[test]
+    fn seeded_batch_sampling_covers_the_vocabulary_and_varies_by_position() {
+        let params = GenerationParams {
+            temperature: 1.0,
+            top_p: 1.0,
+            seed: Some(42),
+            ..Default::default()
+        };
+        let mut counts = [0usize; 4];
+        let history = vec![0; 1024];
+        for position in 0..history.len() {
+            let token = sample_logits(&[0.0; 4], Some(&params), &history[..position]);
+            assert_eq!(
+                token,
+                sample_logits(&[0.0; 4], Some(&params), &history[..position])
+            );
+            counts[token as usize] += 1;
+        }
+        for count in counts {
+            assert!(
+                (200..310).contains(&count),
+                "uniform logits should sample every token: {counts:?}"
+            );
+        }
+    }
 
     #[test]
     fn batch_sampler_applies_top_k_penalties_and_logit_bias() {

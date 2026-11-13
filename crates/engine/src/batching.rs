@@ -100,6 +100,10 @@ impl EngineExecutor for PipelineBatchExecutor {
         self.executor.supports_dense_batch()
     }
 
+    fn is_eos_token(&self, token: u32) -> bool {
+        self.executor.is_eos_token(token)
+    }
+
     fn clear_request_state(&self, handle: usize) {
         self.executor.clear_request_state(handle);
     }
@@ -277,6 +281,9 @@ mod tests {
                 speculative_tokens: None,
             })
         }
+        fn is_eos_token(&self, token: u32) -> bool {
+            matches!(token, 23 | 24)
+        }
         fn max_batch_size(&self, _: crate::scheduler::ExecutionPhase) -> usize {
             3
         }
@@ -351,6 +358,24 @@ mod tests {
         assert_eq!(result.next_tokens, vec![42]);
         drop(executor);
         assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn pipeline_wrapper_preserves_executor_eos_policy() {
+        let executor = build_batch_executor(
+            portable_pipeline(Some(DeviceKind::Cpu)),
+            Arc::new(BloomKvCachePool::new(16, 8)),
+            None,
+            config(),
+        )
+        .unwrap();
+        assert!(executor.is_eos_token(23));
+        assert!(executor.is_eos_token(24));
+        assert!(
+            !executor.is_eos_token(2),
+            "wrapper must not inherit the default EOS token"
+        );
+        assert!(!executor.is_eos_token(42));
     }
 
     #[test]

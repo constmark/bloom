@@ -42,9 +42,11 @@ final parity claim.
 
 - Complete the first candidate deployment cell: pinned Qwen2 0.5B Instruct
   Q4_0 GGUF on Candle CPU through OpenAI streaming. A short concurrent HTTP
-  workload now runs in CI and a 30-second local release run has been recorded;
-  repeated multi-hour target-host runs, failure injection, measured budgets,
-  and upgrade/rollback evidence are still required before stable support.
+  workload runs in CI. The previous packaged build completed a verified
+  24-hour/132,378-request workload with budgets and failure injection; see the
+  [completion review](capability-completion-2026-11-13.md). Current-build sustained
+  validation, reference comparison and target deployment/rollback evidence are
+  still required before stable support.
 - Broaden pinned, license-reviewed trained-model evidence beyond the maintained
   official Qwen2 0.5B Instruct Q4_0, Qwen3 0.6B Q8_0, SmolLM2 360M
   Instruct Q8_0 GGUF and BF16 Safetensors, and MiniLM sentence-embedding CPU
@@ -75,8 +77,10 @@ final parity claim.
 - Expand trained embedding and cross-encoder evidence beyond the current CPU
   gates; native cross-encoder reranking is implemented, while the established
   quality cell remains normalized bi-encoder cosine similarity.
-- Extend the bounded C ABI/Python SDK and isolated sdist/wheel gate to platform
-  binary wheels, cross-version ABI tests, and a declared compatibility window.
+- Execute the implemented native SDK wheel matrix on Linux/macOS/Windows and
+  Python 3.9/3.12/3.14, validate release-mode artifacts on clean hosts and extend
+  the ABI/portability window from that evidence. Bundled host-native wheel
+  construction and local macOS isolation checks are implemented.
 
 ## Later
 

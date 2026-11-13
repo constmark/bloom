@@ -745,6 +745,21 @@ impl Engine for CandleEngine {
                 model_type
             ));
         }
+        // RTN is decoded by our native loader into ordinary floating weights.
+        // Assess the executable representation instead of classifying packed
+        // INT4 as an unknown AWQ/GPTQ kernel format.
+        if matches!(
+            manifest
+                .parameters
+                .get("_bloom_rtn_bits")
+                .and_then(serde_json::Value::as_u64),
+            Some(4 | 8)
+        ) {
+            let mut materialized = manifest.clone();
+            materialized.quantization = None;
+            materialized.primary_dtype = bloomai_core::DType::F32;
+            return default_engine_supports(&self.capability(), &materialized, device_cap);
+        }
         let base = default_engine_supports(&self.capability(), manifest, device_cap);
         if !base.is_supported() {
             return base;
@@ -1843,6 +1858,9 @@ impl Drop for PrefixStateGuard<'_> {
     }
 }
 
+#[path = "candle/logprobs.rs"]
+mod logprobs;
+
 impl CandleTextModel {
     fn sample_with_penalties(
         logits_processor: &mut candle_transformers::generation::LogitsProcessor,
@@ -1850,6 +1868,15 @@ impl CandleTextModel {
         params: &GenerationParams,
         history: &[u32],
     ) -> Result<u32> {
+        let adjusted = Self::adjusted_logits(logits, params, history)?;
+        Ok(logits_processor.sample(&adjusted)?)
+    }
+
+    fn adjusted_logits(
+        logits: &Tensor,
+        params: &GenerationParams,
+        history: &[u32],
+    ) -> Result<Tensor> {
         if params.presence_penalty == 0.0
             && params.frequency_penalty == 0.0
             && params
@@ -1857,62 +1884,35 @@ impl CandleTextModel {
                 .as_ref()
                 .is_none_or(std::collections::BTreeMap::is_empty)
         {
-            return Ok(logits_processor.sample(logits)?);
+            return Ok(logits.clone());
         }
-
+        // Adjust raw logits before temperature and nucleus/top-k sampling.
+        // Applying exp(bias) to post-softmax probabilities changes the meaning
+        // of bias at every temperature other than 1 and cannot recover logits
+        // that already underflowed. Do not clip valid +/-100 bias values.
+        let mut adjusted = logits.to_dtype(DType::F32)?.to_vec1::<f32>()?;
         let mut counts = HashMap::<u32, usize>::new();
-        for &token in history {
-            *counts.entry(token).or_default() += 1;
+        if params.presence_penalty != 0.0 || params.frequency_penalty != 0.0 {
+            for &token in history {
+                *counts.entry(token).or_default() += 1;
+            }
         }
-        if params.temperature <= 1e-7 {
-            let mut adjusted = logits.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-            for (token, count) in counts {
+        for (token, count) in counts {
+            if let Some(value) = adjusted.get_mut(token as usize) {
+                *value -=
+                    (params.presence_penalty + params.frequency_penalty * count as f64) as f32;
+            }
+        }
+        if let Some(logit_bias) = &params.logit_bias {
+            for (&token, &bias) in logit_bias {
                 if let Some(value) = adjusted.get_mut(token as usize) {
-                    *value -=
-                        (params.presence_penalty + params.frequency_penalty * count as f64) as f32;
+                    *value += bias as f32;
                 }
             }
-            if let Some(logit_bias) = &params.logit_bias {
-                for (&token, &bias) in logit_bias {
-                    if let Some(value) = adjusted.get_mut(token as usize) {
-                        *value += bias as f32;
-                    }
-                }
-            }
-            let len = adjusted.len();
-            let adjusted = Tensor::from_vec(adjusted, len, logits.device())?;
-            return Ok(logits_processor.sample(&adjusted)?);
         }
-        Ok(logits_processor.sample_f(logits, |probabilities| {
-            let mut total = 0.0_f32;
-            for (token, probability) in probabilities.iter_mut().enumerate() {
-                let count = counts.get(&(token as u32)).copied().unwrap_or(0);
-                if count > 0 {
-                    // Multiplying post-softmax probabilities by exp(-penalty)
-                    // is equivalent to subtracting the penalty from logits and
-                    // keeps the backend sampler's top-k/top-p ordering intact.
-                    let adjustment = -(params.presence_penalty
-                        + params.frequency_penalty * count as f64)
-                        .clamp(-20.0, 20.0);
-                    *probability *= adjustment.exp() as f32;
-                }
-                if let Some(bias) = params
-                    .logit_bias
-                    .as_ref()
-                    .and_then(|biases| biases.get(&(token as u32)))
-                {
-                    *probability *= bias.clamp(-20.0, 20.0).exp() as f32;
-                }
-                if probability.is_finite() && *probability > 0.0 {
-                    total += *probability;
-                }
-            }
-            if total > 0.0 && total.is_finite() {
-                for probability in probabilities {
-                    *probability /= total;
-                }
-            }
-        })?)
+        let len = adjusted.len();
+        let adjusted = Tensor::from_vec(adjusted, len, logits.device())?;
+        Ok(adjusted)
     }
 
     fn is_cross_encoder_model(&self) -> bool {
@@ -2334,9 +2334,14 @@ impl CandleTextModel {
             crate::core::memory::prefetch_file_madvise(f);
         }
 
-        let vb = unsafe {
-            candle_nn::VarBuilder::from_mmaped_safetensors(&safetensors_files, dtype, vb_device)
-                .map_err(|e| anyhow!("failed to load safetensors: {}", e))?
+        let vb = if super::rtn::is_rtn(&self.config) {
+            let tensors = super::rtn::load(&safetensors_files, &self.config, dtype, vb_device)?;
+            candle_nn::VarBuilder::from_tensors(tensors, dtype, vb_device)
+        } else {
+            unsafe {
+                candle_nn::VarBuilder::from_mmaped_safetensors(&safetensors_files, dtype, vb_device)
+                    .map_err(|e| anyhow!("failed to load safetensors: {}", e))?
+            }
         };
 
         let model = if is_streaming {
@@ -2788,6 +2793,13 @@ impl LoadedModel for CandleTextModel {
         &self.metadata
     }
 
+    fn supports_logprobs(&self) -> bool {
+        self.device.is_cpu()
+            && !self.is_embedding_model()
+            && !self.is_cross_encoder_model()
+            && logprobs::supports(&self.tokenizer)
+    }
+
     fn supports_native_embedding_batch(&self) -> bool {
         self.model_type == ModelType::Bert && !self.is_cross_encoder_model()
     }
@@ -2847,9 +2859,12 @@ impl LoadedModel for CandleTextModel {
 
     fn infer(&self, input: ModelInput, params: &GenerationParams) -> Result<ModelOutput> {
         let mut text_parts = Vec::new();
+        let mut logprob_records = Vec::new();
         self.infer_stream(input, params, &mut |chunk: crate::io::OutputChunk| {
-            if let crate::io::OutputChunk::TextDelta(delta) = chunk {
-                text_parts.push(delta);
+            match chunk {
+                crate::io::OutputChunk::TextDelta(delta) => text_parts.push(delta),
+                crate::io::OutputChunk::TokenLogprobs(record) => logprob_records.push(record),
+                _ => {}
             }
             Ok(())
         })?;
@@ -2860,6 +2875,7 @@ impl LoadedModel for CandleTextModel {
         };
         Ok(ModelOutput {
             text,
+            logprobs: params.logprobs.map(|_| logprob_records),
             logits: None,
             image: None,
             audio: None,
@@ -2891,6 +2907,16 @@ impl LoadedModel for CandleTextModel {
         request: crate::io::InferenceRequest,
         sink: &mut dyn crate::model::OutputSink,
     ) -> Result<()> {
+        request.validate().map_err(anyhow::Error::msg)?;
+        if request.params.logprobs.is_some() {
+            anyhow::ensure!(
+                request.blocks.iter().all(|block| matches!(
+                    block,
+                    crate::io::DataBlock::Text(_) | crate::io::DataBlock::Tokens(_)
+                )),
+                "logprobs requires text or token input only"
+            );
+        }
         let mut tokens_opt = None;
         for block in &request.blocks {
             if let crate::io::DataBlock::Tokens(ids) = block {
@@ -2920,6 +2946,7 @@ impl LoadedModel for CandleTextModel {
         };
 
         let gen_params = GenerationParams {
+            logprobs: request.params.logprobs,
             max_tokens: request.params.max_tokens,
             temperature: request.params.temperature,
             top_p: request.params.top_p,
@@ -2964,6 +2991,27 @@ impl CandleTextModel {
         sink: &mut dyn crate::model::OutputSink,
         speculative_mode: SpeculativeMode,
     ) -> Result<()> {
+        params.validate().map_err(anyhow::Error::msg)?;
+        let mut logprob_emitter = if params.logprobs.is_some() {
+            anyhow::ensure!(
+                self.supports_logprobs(),
+                "logprobs is unsupported for this model, device or tokenizer"
+            );
+            anyhow::ensure!(
+                matches!(speculative_mode, SpeculativeMode::None),
+                "logprobs is unsupported with speculative decoding"
+            );
+            anyhow::ensure!(
+                params
+                    .response_format
+                    .as_ref()
+                    .is_none_or(|format| matches!(format, bloomai_core::ResponseFormat::Text)),
+                "logprobs is unsupported with structured output"
+            );
+            Some(logprobs::Emitter::new(&self.tokenizer)?)
+        } else {
+            None
+        };
         let start_time = std::time::Instant::now();
         let mut total_draft_tokens = 0usize;
         let mut total_accepted_tokens = 0usize;
@@ -3097,9 +3145,11 @@ impl CandleTextModel {
 
         *current_prefix_guard = token_ids.clone();
 
+        let mut speculation_rng = params.seed.unwrap_or(42).wrapping_add(0x9E3779B97F4A7C15);
         let mut all_tokens = token_ids.clone();
         let mut prev_text = String::new();
         let mut next_token = 0;
+        let mut first_logprob_logits = None;
         if matches!(speculative_mode, SpeculativeMode::Mtp { .. }) {
             return Err(anyhow!(
                 "speculative=mtp is unavailable in the Candle backend; \
@@ -3120,7 +3170,8 @@ impl CandleTextModel {
                     model_path.clone(),
                     num_speculative,
                     self.device_kind,
-                );
+                )
+                .with_seed(params.seed.unwrap_or(42));
                 Some(Box::new(strategy))
             }
             _ => None,
@@ -3167,6 +3218,9 @@ impl CandleTextModel {
                 } else {
                     logits
                 };
+                if params.logprobs.is_some() {
+                    first_logprob_logits = Some(filtered.clone());
+                }
                 next_token = Self::sample_with_penalties(
                     &mut logits_processor,
                     &filtered,
@@ -3195,6 +3249,9 @@ impl CandleTextModel {
             } else {
                 logits
             };
+            if params.logprobs.is_some() {
+                first_logprob_logits = Some(filtered.clone());
+            }
             next_token =
                 Self::sample_with_penalties(&mut logits_processor, &filtered, params, &all_tokens)?;
             start_pos += token_ids.len();
@@ -3206,20 +3263,33 @@ impl CandleTextModel {
             output_tokens: 1,
         })?;
         if !self.eos_token_ids.contains(&next_token) {
+            if let Some(emitter) = &mut logprob_emitter {
+                emitter.emit(
+                    first_logprob_logits
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("missing prefill logits"))?,
+                    next_token,
+                    params,
+                    &all_tokens,
+                    sink,
+                )?;
+            }
             all_tokens.push(next_token);
             current_prefix_guard.push(next_token);
             if let Some(strategy) = &speculative_strategy {
                 strategy.update_context(&[next_token]);
             }
 
-            self.decode_and_emit_delta(&all_tokens, token_ids.len(), &mut prev_text, sink)?;
+            if logprob_emitter.is_none() {
+                self.decode_and_emit_delta(&all_tokens, token_ids.len(), &mut prev_text, sink)?;
+            }
 
             let mut generated = 1usize;
             let _span_decode =
                 tracing::info_span!("decode", max_tokens = params.max_tokens).entered();
             while generated < params.max_tokens {
                 if let Some(strategy) = &speculative_strategy
-                    && params.response_format.is_none()
+                    && super::speculative::supports_sampling(&speculative_mode, params)
                 {
                     let remaining = params.max_tokens - generated;
                     let draft_budget = match speculative_mode {
@@ -3281,13 +3351,11 @@ impl CandleTextModel {
                             // Derive an independent PRNG seed from the
                             // request seed so rejection sampling
                             // doesn't share state with `logits_processor`.
-                            let mut rng_state =
-                                params.seed.unwrap_or(42).wrapping_add(0x9E3779B97F4A7C15);
                             verify_with_rejection_sampling(
                                 &verifier_vecs,
                                 &proposed_with_logits,
                                 params.temperature,
-                                &mut rng_state,
+                                &mut speculation_rng,
                             )
                         } else {
                             let mut verifier_greedy = Vec::with_capacity(proposed.len());
@@ -3459,6 +3527,9 @@ impl CandleTextModel {
                     break;
                 }
 
+                if let Some(emitter) = &mut logprob_emitter {
+                    emitter.emit(&filtered, next_tok, params, &all_tokens, sink)?;
+                }
                 all_tokens.push(next_tok);
                 current_prefix_guard.push(next_tok);
                 if let Some(strategy) = &speculative_strategy {
@@ -3466,10 +3537,15 @@ impl CandleTextModel {
                 }
                 generated += 1;
 
-                self.decode_and_emit_delta(&all_tokens, token_ids.len(), &mut prev_text, sink)?;
+                if logprob_emitter.is_none() {
+                    self.decode_and_emit_delta(&all_tokens, token_ids.len(), &mut prev_text, sink)?;
+                }
             }
         }
 
+        if let Some(emitter) = &logprob_emitter {
+            emitter.finish()?;
+        }
         let compute_ms = start_time.elapsed().as_millis() as u64;
         let spec_mode = speculative_mode;
         let spec_acceptance_rate = if total_draft_tokens > 0 {

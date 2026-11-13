@@ -957,6 +957,7 @@ mod tests {
             assert_eq!(model as usize, 0x12345678);
             let _input_str = unsafe { std::ffi::CStr::from_ptr(input_json).to_str().unwrap() };
             let output = ModelOutput {
+                logprobs: None,
                 text: Some("hello from FFI".to_string()),
                 logits: None,
                 image: None,

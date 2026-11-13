@@ -25,7 +25,8 @@ typedef enum BloomStatus {
     BLOOM_STATUS_INFERENCE_ERROR = -5,
     BLOOM_STATUS_OUTPUT_ERROR = -6,
     BLOOM_STATUS_PANIC = -7,
-    BLOOM_STATUS_CANCELLED = -8
+    BLOOM_STATUS_CANCELLED = -8,
+    BLOOM_STATUS_UNSUPPORTED = -9
 } BloomStatus;
 
 /** Borrowed bytes. The caller retains ownership for the complete call. */
@@ -91,6 +92,25 @@ int32_t bloom_pipeline_run_v2(
     BloomOwnedBuffer* output,
     char* error_buffer,
     size_t error_buffer_len
+);
+
+/**
+ * Optional ABI v2 extensions: exact model tokenization, never approximation.
+ * Discover these symbols before calling when loading older v2 libraries.
+ * tokenize accepts UTF-8 text (at most 8 MiB), returning a JSON u32 array.
+ * detokenize accepts a JSON u32 array (at most 16 MiB / 4M tokens), returning
+ * a JSON string. Empty text/arrays are allowed; special tokens follow the
+ * model adapter. Unsupported models return BLOOM_STATUS_UNSUPPORTED.
+ * Initialize output to {NULL, 0}; release successful output with
+ * bloom_buffer_free. Every failure clears output. Results are at most 16 MiB.
+ */
+int32_t bloom_pipeline_tokenize_v2(
+    BloomPipeline* pipeline, BloomSlice text, BloomOwnedBuffer* output,
+    char* error_buffer, size_t error_buffer_len
+);
+int32_t bloom_pipeline_detokenize_v2(
+    BloomPipeline* pipeline, BloomSlice tokens_json, BloomOwnedBuffer* output,
+    char* error_buffer, size_t error_buffer_len
 );
 
 /** Allocate a thread-safe cooperative cancellation token. */

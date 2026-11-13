@@ -22,6 +22,7 @@ REQUIRED_JOB_PERMISSIONS = {
 REQUIRED_SUBJECTS = {
     "artifacts/*.tar.gz",
     "artifacts/*.zip",
+    "artifacts/*.whl",
     "artifacts/*.sha256",
 }
 
@@ -142,6 +143,11 @@ def validate_text(content: str) -> list[str]:
     publish = unique_action(
         release_job, PUBLISH_ACTION, "release publication", errors
     )
+    if download is not None:
+        download_step = action_step(release_job, download)
+        download_with = nested_block(download_step, "with", 8) if download_step else None
+        if download_with is None or mapping_value(download_with, "pattern") != "release-bloom-*":
+            errors.append("release download must select only release-bloom-* artifacts; CI wheels may share filenames")
     if download is not None and attest is not None and publish is not None:
         if not download.start() < attest.start() < publish.start():
             errors.append("release order must be download, attest, then publish")

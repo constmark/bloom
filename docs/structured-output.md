@@ -45,7 +45,12 @@ Bloom adds a JSON-only instruction to the formatted prompt. Non-streaming output
 that is not a JSON object returns `invalid_response_format`. For streaming
 requests, text is emitted as it is generated and a terminal SSE error is emitted
 instead of a normal stop chunk if the complete output is invalid. Clients must
-therefore retain or discard partial text according to their own policy.
+therefore retain or discard partial text according to their own policy. Direct
+Chat/Completion multi-candidate streams (`n` up to 8), including Completion
+prompt arrays, instead buffer each candidate until it passes format validation.
+If a later candidate fails, earlier valid candidates remain delivered; the stream
+ends with an error and `[DONE]` without aggregate success usage. Function-tool
+candidates always buffer their private control JSON until tool validation passes.
 
 ## JSON Schema mode
 

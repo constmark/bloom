@@ -39,7 +39,7 @@ const MAX_REPORTED_EXTENSION_FIELD_CHARS: usize = 64;
 pub(crate) fn validate_chat_request_compatibility(
     request: &ChatRequest,
 ) -> std::result::Result<(), String> {
-    reject_token_logprobs("chat completion request", &request.extensions)?;
+    request_logprobs(&request.extensions, true)?;
     reject_non_neutral_extensions(
         "chat completion request",
         &request.extensions,
@@ -201,7 +201,7 @@ impl StopSequenceFilter {
 pub(crate) fn validate_completion_request_compatibility(
     request: &CompletionRequest,
 ) -> std::result::Result<(), String> {
-    reject_token_logprobs("completion request", &request.extensions)?;
+    request_logprobs(&request.extensions, false)?;
     reject_non_neutral_extensions(
         "completion request",
         &request.extensions,
@@ -220,11 +220,8 @@ pub(crate) fn validate_responses_request_compatibility(
     )
 }
 
-/// Token-level log probabilities require a backend stream contract that
-/// exposes the sampled distribution and token text for every emitted token.
-/// Bloom's current `LoadedModel` contract intentionally exposes text/output
-/// chunks only, so fail closed with a typed diagnostic instead of silently
-/// dropping a requested field.
+/// Responses has not yet mapped token metadata through its event adapter.
+/// Keep it fail-closed until that independent protocol supports logprobs.
 fn reject_token_logprobs(
     scope: &str,
     extensions: &std::collections::BTreeMap<String, serde_json::Value>,
@@ -239,7 +236,7 @@ fn reject_token_logprobs(
             .is_some_and(|value| value > 0);
     if requested {
         return Err(format!(
-            "{scope} requested token log probabilities, but the active engine contract does not expose token-level logits; use logprobs=false and top_logprobs=0 or a backend with token-logprob support."
+            "{scope} requested token log probabilities, but the Responses adapter does not yet expose token metadata; use top_logprobs=0."
         ));
     }
     Ok(())
@@ -289,13 +286,14 @@ fn neutral_request_extension(field: &str, value: &serde_json::Value) -> bool {
             value.as_array().is_some_and(|entries| entries.is_empty())
         }
         "tool_choice" | "function_call" => value.as_str() == Some("none"),
-        "parallel_tool_calls" | "logprobs" | "store" | "echo" => value.as_bool() == Some(false),
+        "parallel_tool_calls" | "store" | "echo" => value.as_bool() == Some(false),
+        "logprobs" => value.as_bool().is_some(),
         "frequency_penalty" | "presence_penalty" => value
             .as_f64()
             .is_some_and(|penalty| penalty.is_finite() && (-2.0..=2.0).contains(&penalty)),
         "logit_bias" => valid_logit_bias(value),
         "metadata" => value.as_object().is_some_and(|entries| entries.is_empty()),
-        "top_logprobs" => value.as_u64() == Some(0),
+        "top_logprobs" => value.as_u64().is_some_and(|n| n <= 20),
         "user" => value.as_str().is_some_and(|user| {
             !user.is_empty() && user.chars().count() <= 256 && !user.chars().any(char::is_control)
         }),
@@ -308,7 +306,62 @@ fn neutral_request_extension(field: &str, value: &serde_json::Value) -> bool {
 /// Keep it scoped to that endpoint so Chat Completions cannot accidentally
 /// accept and silently ignore the same field.
 fn neutral_completion_extension(field: &str, value: &serde_json::Value) -> bool {
-    neutral_request_extension(field, value) || (field == "echo" && value.as_bool().is_some())
+    match field {
+        "logprobs" => {
+            value.is_null()
+                || value.as_bool() == Some(false)
+                || value.as_u64().is_some_and(|n| n <= 5)
+        }
+        "top_logprobs" => value.is_null() || value.as_u64() == Some(0),
+        _ => {
+            neutral_request_extension(field, value)
+                || (field == "echo" && value.as_bool().is_some())
+        }
+    }
+}
+
+/// Chat uses a boolean plus top_logprobs; legacy Completions uses an integer.
+/// Keep false/zero neutral extensions accepted for older Bloom clients.
+pub(crate) fn request_logprobs(
+    extensions: &std::collections::BTreeMap<String, serde_json::Value>,
+    chat: bool,
+) -> std::result::Result<Option<usize>, String> {
+    let requested = extensions.get("logprobs").filter(|v| !v.is_null());
+    let top = extensions.get("top_logprobs").filter(|v| !v.is_null());
+    if chat {
+        let enabled = match requested {
+            None => false,
+            Some(value) => value
+                .as_bool()
+                .ok_or("logprobs must be a boolean for Chat Completions.")?,
+        };
+        let count = match top {
+            None => 0,
+            Some(value) => value
+                .as_u64()
+                .filter(|n| *n <= 20)
+                .ok_or("top_logprobs must be an integer between 0 and 20.")?,
+        };
+        if !enabled && count > 0 {
+            return Err("top_logprobs requires logprobs=true.".into());
+        }
+        Ok(enabled.then_some(count as usize))
+    } else {
+        if top.is_some_and(|v| v.as_u64() != Some(0)) {
+            return Err("Completions uses logprobs=0..5, not top_logprobs.".into());
+        }
+        match requested {
+            None => Ok(None),
+            Some(value) if value.as_bool() == Some(false) => Ok(None),
+            Some(value) => value
+                .as_u64()
+                .filter(|n| *n <= 5)
+                .map(|n| Some(n as usize))
+                .ok_or_else(|| {
+                    "logprobs must be an integer between 0 and 5 for Completions.".into()
+                }),
+        }
+    }
 }
 
 pub(crate) fn request_echo(
@@ -3157,6 +3210,7 @@ pub(crate) fn collect_embedding(
     let embedding = Arc::new(std::sync::Mutex::new(None::<Vec<f32>>));
     let embedding_sink = Arc::clone(&embedding);
     let params = GenerationParams {
+        logprobs: None,
         max_tokens: 1,
         temperature: 0.0,
         top_p: 1.0,

@@ -175,6 +175,26 @@ cargo run --release --features cuda --bin bloom_infer -- \
 Run `cargo run --release --bin bloom_infer -- --help` for the complete CLI
 reference.
 
+The CLI also exposes `--presence-penalty`, `--frequency-penalty`, `--logit-bias`
+(a JSON token-ID map), and `--response-format` (the native typed JSON format).
+These controls are available in `infer` configuration, JSON prompt requests,
+and interactive `/set` commands. JSON request values override CLI/configuration;
+explicit CLI values override configuration. For example:
+
+```bash
+bloom_infer --model /path/to/model.gguf --prompt "Return a status object" \
+  --presence-penalty 0.5 --logit-bias '{"17":-5}' \
+  --response-format '{"type":"json_object"}' --stream
+```
+
+Ordinary JSON objects without `prompt`/`messages` remain literal prompts;
+recognized generation requests reject invalid or unknown fields. Offline
+`bloom_quantize` produces [packed RTN tensor exports](docs/quantization-export.md);
+`--model-package` also creates native-loadable dense Qwen2/Qwen3/Llama packages.
+Weights expand to floating point at load time, so storage savings do not imply
+lower runtime memory or faster kernels.
+
+
 ### Docker
 
 The container image runs as the fixed unprivileged UID/GID `10001`, stores
@@ -624,10 +644,10 @@ sampling controls, tokenizes the fully formatted prompt, and requires the prompt
 plus `max_tokens` reservation to fit that window. An oversized request returns
 HTTP 400 with `context_length_exceeded`; Bloom does not silently discard earlier
 messages. The legacy completions endpoint accepts one string or a bounded array of up
-to eight strings for direct non-streaming requests. Batched prompts are generated
-independently with prompt-major flattened choices and aggregate usage; stream and
-continuous-batching requests with prompt arrays are rejected before runtime
-admission.
+to eight strings for direct buffered or streaming requests, including structured
+output. Batched prompts are generated independently with prompt-major flattened
+choices and aggregate usage. With continuous batching enabled, candidates enter
+the scheduler sequentially under the same HTTP request lease.
 
 Text endpoints accept bounded `json_object` and fail-closed `json_schema`
 response formats through Chat/Completions `response_format` and Responses
@@ -642,13 +662,17 @@ Chat and legacy completion requests also capture fields outside Bloom's
 supported OpenAI subset. Exact no-op defaults such as `n: 1`, empty `tools`,
 `tool_choice: "none"`, and zero penalties remain compatible; any
 unknown or unsupported semantics fail with HTTP 400 before runtime admission
-instead of being silently ignored. Direct non-streaming text requests support
-bounded independent choices through `n: 1..8`; streaming/continuous-batching
-multiple choices, log probabilities, custom tools, and deprecated function-call
+instead of being silently ignored. Direct buffered and streamed text, structured
+output and Chat function-tool requests support bounded independent choices through
+`n: 1..8` through direct or continuously batched execution; multimodal multiple
+choices, custom tools, and deprecated function-call
 fields on legacy Completions are not yet implemented. See the
 [OpenAI compatibility guide](docs/openai-compatibility.md) for the precise field
 matrix and error behavior. The llama.cpp-compatible `top_k` extension is
 implemented for text generation and Ollama `options.top_k` (1–32,768).
+Direct CPU Candle text requests also support bounded token log probabilities
+through Chat/Completions and the Rust/Python APIs. See the
+[logprobs contract](docs/token-logprobs.md) for decoder, mode and byte semantics.
 
 Bloom also provides an experimental, bounded Ollama-native surface at
 `/api/version`, `/api/tags`, `/api/ps`, `/api/show`, `/api/pull`,
@@ -853,7 +877,9 @@ Bloom includes a native SwiftUI client for macOS 13 and newer. It connects
 directly to a local or remote `bloom_server`, validates the readiness v3
 contract, and streams OpenAI-compatible chat completions without loading a Web
 UI or embedding a browser runtime. API keys remain in memory and the server URL
-is saved as a local preference.
+is saved as a local preference. Conversations, drafts and partial responses
+are persisted locally with bounded storage and recovery; the sidebar supports
+new, select and delete operations. See the [native client guide](clients/macos/README.md).
 
 Start a Metal backend, then build and open the desktop client. The server can
 select the available device automatically, while `--device gpu` remains useful

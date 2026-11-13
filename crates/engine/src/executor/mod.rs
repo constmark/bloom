@@ -25,6 +25,8 @@ pub mod openvino;
 pub mod qwen3_vl;
 #[cfg(feature = "candle-engine")]
 pub mod qwen_streaming;
+#[cfg(feature = "candle-engine")]
+pub mod rtn;
 pub mod speculative;
 pub mod tensorrt;
 pub mod vulkan;

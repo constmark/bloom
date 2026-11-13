@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Validate packaged Bloom native libraries against the public C ABI contract.
 
-The Python wheel is intentionally pure Python and loads ``bloomai-ffi`` at
-runtime.  This gate therefore checks every native library supplied to it
+The Python wrapper loads ``bloomai-ffi`` at runtime, from a bundled native
+wheel or an explicitly configured library.  This gate therefore checks every native library supplied to it
 independently, including a previously released ABI-1 library when one is
 available.  It validates the exported symbol set and exercises the safe error
 and cancellation paths without requiring a model or accelerator.

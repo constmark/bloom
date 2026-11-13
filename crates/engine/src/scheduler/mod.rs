@@ -1230,6 +1230,12 @@ pub trait EngineExecutor: Send + Sync {
     fn execute(&self, batch: ExecutionBatch) -> Result<BatchResult>;
     fn max_batch_size(&self, phase: ExecutionPhase) -> usize;
 
+    /// Whether a sampled token terminates this model. Legacy executors retain
+    /// token 2; model-aware executors must override this using their vocabulary.
+    fn is_eos_token(&self, token: u32) -> bool {
+        token == 2
+    }
+
     /// True only when compatible requests can run in one model tensor
     /// forward. This promises same-length, same-position dense batching,
     /// not ragged batching; unsupported shapes may execute independently.
@@ -1846,6 +1852,22 @@ impl InferenceScheduler {
         }
     }
 
+    /// Cancel and wait until this request no longer owns scheduler resources.
+    ///
+    /// This blocking variant is for external worker threads. Never call it
+    /// from executor or KV backend callbacks: they already own the execution
+    /// gate. Allocation callbacks retain the deferred `cancel_request` path.
+    /// Unlike that path, an unrelated in-progress submission cannot defer
+    /// cleanup past the return of this method.
+    pub fn cancel_request_and_wait(&self, request_id: &str) -> bool {
+        let _execution = self
+            .execution_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let was_deferred = self.take_busy_cancellation(request_id);
+        self.cancel_request_inner(request_id) || was_deferred
+    }
+
     fn take_busy_cancellation(&self, request_id: &str) -> bool {
         self.cancelled_while_busy
             .lock()
@@ -2069,6 +2091,12 @@ impl InferenceScheduler {
     }
 
     fn submit_inner(&self, mut request: ScheduledRequest) -> Result<()> {
+        if request.params.logprobs.is_some() {
+            return Err(BloomError::InvalidInput(
+                "logprobs is unsupported by continuous batching".into(),
+            )
+            .into());
+        }
         if request.prompt_tokens.is_empty() {
             return Err(BloomError::InvalidInput(
                 "request prompt must contain at least one token".to_string(),
@@ -2093,6 +2121,13 @@ impl InferenceScheduler {
             if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
                 return Err(BloomError::SchedulingFailed(
                     "KV cache admission threshold must be finite and in [0, 1]".to_string(),
+                )
+                .into());
+            }
+            let retention = self.config.kv_eviction.retention_ratio;
+            if !retention.is_finite() || !(0.0..=1.0).contains(&retention) {
+                return Err(BloomError::SchedulingFailed(
+                    "KV cache retention ratio must be finite and in [0, 1]".to_string(),
                 )
                 .into());
             }
@@ -2154,11 +2189,12 @@ impl InferenceScheduler {
                         }
                     }
 
-                    // Try to evict inactive sessions to make room
+                    // Plan complete-session cancellation under the retention floor.
+                    // An incomplete plan must not sacrifice existing requests.
                     let victims = eviction_mgr.select_eviction_victims(&sessions, num_tokens);
                     if victims.is_empty() {
                         return Err(BloomError::SchedulingFailed(format!(
-                            "Admission rejected: {} and no inactive sessions can be evicted",
+                            "Admission rejected: {} and insufficient KV cache can be evicted within the retention policy",
                             reason
                         ))
                         .into());
@@ -2970,39 +3006,32 @@ impl InferenceScheduler {
 
             if let Some(mut req) = active.remove(id) {
                 self.clear_prefill_reuse(id);
-                req.generated_tokens.push(next_token);
                 req.last_accessed = Instant::now();
-
-                // Send generated token to the corresponding client stream
-                if let Ok(senders) = self.token_senders.lock()
-                    && let Some(sender) = senders.get(id)
-                {
-                    let _ = sender.send(Ok(next_token));
-                }
-
-                // Process extra speculative tokens if any
-                if let Some(ref spec_tokens_list) = result.speculative_tokens
-                    && let Some(spec_tokens) = spec_tokens_list.get(i)
-                {
-                    for &tok in spec_tokens {
-                        req.generated_tokens.push(tok);
-                        if let Ok(senders) = self.token_senders.lock()
-                            && let Some(sender) = senders.get(id)
-                        {
-                            let _ = sender.send(Ok(tok));
-                        }
-                    }
-                }
-
-                let last_token = result
+                let extra_tokens = result
                     .speculative_tokens
                     .as_ref()
-                    .and_then(|list| list.get(i))
-                    .and_then(|toks| toks.last().copied())
-                    .unwrap_or(next_token);
-
+                    .and_then(|tokens| tokens.get(i))
+                    .into_iter()
+                    .flatten()
+                    .copied();
+                let mut reached_eos = false;
+                for token in std::iter::once(next_token).chain(extra_tokens) {
+                    if req.generated_tokens.len() >= req.params.max_tokens {
+                        break;
+                    }
+                    req.generated_tokens.push(token);
+                    if let Ok(senders) = self.token_senders.lock()
+                        && let Some(sender) = senders.get(id)
+                    {
+                        let _ = sender.send(Ok(token));
+                    }
+                    reached_eos = self.executor.is_eos_token(token);
+                    if reached_eos {
+                        break;
+                    }
+                }
                 let is_finished =
-                    last_token == 2 || req.generated_tokens.len() >= req.params.max_tokens;
+                    reached_eos || req.generated_tokens.len() >= req.params.max_tokens;
 
                 if is_finished {
                     req.state = RequestState::Finished;

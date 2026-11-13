@@ -21,8 +21,10 @@ request.
 - [Conversation archives](conversation-archive.md)
 - [Encoder result exports](encoder-result-export.md)
 - [OpenAI API compatibility](openai-compatibility.md)
+- [Token log probabilities](token-logprobs.md)
 - [Ollama API compatibility](ollama-compatibility.md)
 - [Structured output](structured-output.md)
+- [Packed RTN model conversion and loading](quantization-export.md)
 - [C ABI and Python SDK](ffi-python.md)
 - [Readiness and UI/server compatibility](readiness-contract.md)
 - [Model load preflight](model-preflight.md)
@@ -37,6 +39,11 @@ request.
 - [September 2026 project assessment](project-assessment-2026-09.md)
 - [October 2026 cross-platform assessment](project-assessment-2026-10.md)
 - [November 2026 capability audit](project-assessment-2026-11.md)
+- [Cross-layer completion review (2026-11-13)](capability-completion-2026-11-13.md)
+- [Capability continuation: native packages, IFB, desktop history and wheels](capability-continuation-2026-11-13.md)
+- [Capability continuation: logprobs, native tools and Metal](capability-logprobs-metal-2026-11-13.md)
+- [Metal runtime validation](metal-runtime-validation-2026-11-13.md)
+- [Native logprob runtime validation](logprobs-runtime-validation-2026-11-13.md)
 
 ## Understand and extend Bloom
 

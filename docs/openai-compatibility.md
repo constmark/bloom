@@ -81,7 +81,7 @@ local catalog removal API.
   `json_schema` subset
 - up to 32 function tools, `tool_choice` values `none`, `auto`, `required`,
   or a named function, and `parallel_tool_calls`
-- buffered direct text, structured-output, and function-tool requests support
+- buffered and streamed direct text, structured-output, and function-tool requests support
   `n` from 1 through 8, with independent candidate validation and aggregate usage
 
 The response uses OpenAI-compatible completion objects or SSE chunks. Streaming
@@ -390,9 +390,10 @@ registration, and exactly-once accounting guarantees as `/v1/embeddings`.
 streaming flag, and response formats. `prompt` may be one string or an array of
 up to eight strings. Direct text requests, buffered or streaming, generate each prompt
 independently, flatten choices in prompt-major order, and aggregate prompt and
-completion usage. Continuous-batching requests with prompt arrays and
-streaming prompt arrays with structured output are rejected before runtime
-admission. Direct text streams include per-choice echo and terminal events.
+completion usage. Structured-output streams also accept prompt arrays; each
+candidate is validated before publication. Continuous-batching execution also supports these bounded prompt arrays and
+multiple choices; candidates within one request enter the scheduler sequentially
+under a shared request admission lease. Direct text streams include per-choice echo and terminal events.
 
 ## Stop sequences
 
@@ -426,12 +427,13 @@ template:
 | `best_of` | `1` |
 | `functions` | `[]` |
 | `function_call` | `"none"` |
-| `logprobs`, `store` | `false` |
+| `store` | `false` |
+| `logprobs` | Chat boolean; legacy integer 0–5. Active requests require the supported direct CPU text path; see [token log probabilities](token-logprobs.md). |
 | `echo` on legacy Completions | `false` or `true`; true prefixes each returned choice with its prompt and emits a prompt prefix chunk when streaming |
 | `frequency_penalty`, `presence_penalty` | Finite values from -2 through 2; applied to seen-token probabilities during native generation. |
 | `logit_bias` | `{}` or a bounded numeric token-bias map described below |
 | `metadata` | `{}` |
-| `top_logprobs` | `0` |
+| `top_logprobs` | Chat integer 0–20 with `logprobs: true`; zero remains neutral when disabled. |
 | `user` | A non-empty, control-free string of at most 256 characters |
 
 The `user` value is accepted only as compatibility metadata. Bloom does not use
@@ -459,8 +461,8 @@ Any unsupported non-neutral value for these fields is rejected with HTTP 400 and
 `invalid_request_error` before runtime availability, concurrency admission,
 tokenization, or inference. Examples include a non-empty deprecated `functions`
 array on legacy Completions, a custom or built-in tool, an out-of-range `n`, an
-`n` greater than one combined with continuous batching or multimodal input,
-streaming multiple structured/tool choices, requested log probabilities, and
+`n` greater than one combined with multimodal input,
+unsupported logprob combinations, and
 an unsupported active field. Unknown non-null fields follow the same fail-closed rule. Error text
 reports at most eight bounded safe field names and never echoes arbitrary large
 or control-bearing names.
@@ -474,25 +476,37 @@ to the sampled token history and accept finite values from -2 through 2.
 `logit_bias` accepts up to 1,024 numeric token IDs from 0 through 1,000,000
 with finite values from -100 through 100.
 
-Continuous-batching and multimodal multiple choices, streaming tool or
-structured-output multiple choices,
-token log probabilities, custom tools, and deprecated function fields on legacy
-Completions remain explicitly unsupported. Direct text requests may return up
-to eight choices with `n`, buffered or streaming. Buffered Chat structured output
+Multimodal multiple choices,
+custom tools, and deprecated function fields on legacy Completions remain
+explicitly unsupported. Direct text requests may return up
+to eight choices with `n`, buffered or streaming. Chat structured output
 and function tools, including the deprecated Chat function aliases, use the same
-bounded choices. Buffered legacy Completions supports structured output with
-both single prompts and prompt arrays. Every generated candidate is validated
-before publishing the response; a single invalid candidate returns HTTP 422
-without a partial `choices` array. Tool-call IDs are unique across all candidates
+bounded choices. Legacy Completions supports structured output with
+both single prompts and prompt arrays in either mode. Buffered requests validate
+every candidate before publishing the response; a single invalid candidate returns
+HTTP 422 without a partial `choices` array. Multi-candidate structured/tool streams
+buffer and validate each candidate before publishing it. An invalid candidate
+produces an SSE error and `[DONE]`, with no invalid content, later candidates or
+success usage chunk; earlier valid candidates may already have been delivered. Tool-call IDs are unique across all candidates
 and calls in one response, so a selected candidate can be continued using its
 original call/result identities. Prompt tokens count each input once;
 completion usage sums the generated content or tool-control tokens across all
 candidates. Each choice executes
-independently under one admission permit. Streams preserve candidate indices,
+independently under one admission permit. With continuous batching enabled,
+candidates use separate internal scheduler identities and enter sequentially;
+other HTTP requests can batch with the active candidate. Public cancellation
+stops the entire candidate group, and scheduler cleanup retains its runtime
+ownership. Streams preserve candidate indices,
 per-choice start/finish events, stop filtering, and a single `[DONE]`; Chat
 `stream_options.include_usage` adds aggregate usage after all choices. Legacy
 Completions also stream arrays of up to eight prompts, with prompt-major
-flattened indices and per-choice `echo`. A bounded channel applies backpressure;
+flattened indices and per-choice `echo`. Echo contains only the original user
+prompt, never the private structured-output instructions. The candidate worker
+limits serialized JSON event bytes to 16 MiB across the entire request, including
+echo and tool arguments; exceeding it stops the stream with an error rather than
+queueing unbounded candidate payloads. Scheduled text is decoded cumulatively
+so UTF-8 sequences spanning tokens remain intact. A scheduler channel closing
+before EOS or the token budget is an error, not a successful stop. A bounded channel applies backpressure;
 cancellation and disconnect stop the entire request and retain its runtime
 lease until the worker exits. Explicit seeds increment by flattened index,
 using the same deterministic policy as buffered choices. Message content arrays accept text
@@ -580,3 +594,10 @@ Maintainers can run the immutable trained MiniLM profile directly:
 That profile additionally requires native 384-dimensional output, a positive
 semantic and rerank margin, the published 256-token task limit, and fail-closed
 generation across the OpenAI and Ollama adapters.
+
+## Token log probabilities
+
+Direct CPU Candle Chat and legacy Completions support buffered/SSE logprobs,
+multiple choices and legacy prompt arrays. Exact bytes, EOS usage, Unicode
+offsets and explicit unsupported combinations are documented in the
+[token logprob contract](token-logprobs.md). Responses logprobs remain unsupported.

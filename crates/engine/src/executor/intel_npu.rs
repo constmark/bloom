@@ -514,6 +514,10 @@ impl LoadedModel for IntelNpuModel {
     }
 
     fn infer(&self, input: ModelInput, params: &GenerationParams) -> Result<ModelOutput> {
+        anyhow::ensure!(
+            params.logprobs.is_none(),
+            "this backend does not support token logprobs"
+        );
         let mut text_parts = Vec::new();
         self.infer_stream(input, params, &mut |chunk: crate::io::OutputChunk| {
             if let crate::io::OutputChunk::TextDelta(delta) = chunk {
@@ -529,6 +533,7 @@ impl LoadedModel for IntelNpuModel {
         };
 
         Ok(ModelOutput {
+            logprobs: None,
             text,
             logits: None,
             image: None,
@@ -543,6 +548,10 @@ impl LoadedModel for IntelNpuModel {
         params: &GenerationParams,
         sink: &mut dyn crate::model::OutputSink,
     ) -> Result<()> {
+        anyhow::ensure!(
+            params.logprobs.is_none(),
+            "this backend does not support token logprobs"
+        );
         let prompt = match input {
             ModelInput::Text { prompt } => prompt,
             _ => return Err(anyhow!("Intel NPU model only supports text input")),

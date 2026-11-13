@@ -388,6 +388,10 @@ impl LoadedModel for WanVideoModel {
     }
 
     fn infer(&self, input: ModelInput, params: &GenerationParams) -> Result<ModelOutput> {
+        anyhow::ensure!(
+            params.logprobs.is_none(),
+            "this backend does not support token logprobs"
+        );
         match input {
             ModelInput::VideoGeneration {
                 prompt,
@@ -413,6 +417,7 @@ impl LoadedModel for WanVideoModel {
                     None,
                 )?;
                 Ok(ModelOutput {
+                    logprobs: None,
                     text: None,
                     logits: None,
                     image: None,
@@ -456,6 +461,7 @@ impl LoadedModel for WanVideoModel {
                     None,
                 )?;
                 Ok(ModelOutput {
+                    logprobs: None,
                     text: None,
                     logits: None,
                     image: None,
@@ -476,6 +482,10 @@ impl LoadedModel for WanVideoModel {
         params: &GenerationParams,
         sink: &mut dyn OutputSink,
     ) -> Result<()> {
+        anyhow::ensure!(
+            params.logprobs.is_none(),
+            "this backend does not support token logprobs"
+        );
         let (prompt, neg_prompt, width, height, num_frames, fps, guidance_scale, num_steps, seed) =
             match input {
                 ModelInput::VideoGeneration {

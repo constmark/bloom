@@ -65,11 +65,19 @@ class StreamBufferTests(unittest.TestCase):
 
     def test_receive_rejects_invalid_timeout(self):
         buffer = _stream.StreamBuffer()
-        for timeout in (True, -1, float("nan"), float("inf"), "1"):
+        for timeout in (True, -1, float("nan"), float("inf"), "1", 10 ** 400):
             with self.subTest(timeout=timeout):
                 with self.assertRaises(ValueError):
                     buffer.receive(timeout=timeout)
         buffer.stop()
+
+    def test_large_finite_timeout_does_not_overflow_platform_wait(self):
+        buffer = _stream.StreamBuffer()
+        with mock.patch.object(buffer._condition, "wait") as wait:
+            wait.side_effect = lambda timeout: buffer.finish()
+            self.assertIsNone(buffer.receive(timeout=1e300))
+            self.assertEqual(wait.call_count, 1)
+            self.assertEqual(wait.call_args[0][0], threading.TIMEOUT_MAX)
 
 
 if __name__ == "__main__":

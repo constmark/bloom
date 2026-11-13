@@ -329,7 +329,9 @@ fn estimate_memory_with_weight_dtype(
         matches!(target_device, Some(DeviceKind::Gpu | DeviceKind::Npu)).then_some(num_layers)
     });
 
-    let mmap_residency_applied = manifest.runtime_hints.supports_mmap && !manifest.files.is_empty();
+    let mmap_residency_applied = manifest.runtime_hints.supports_mmap
+        && !manifest.parameters.contains_key("_bloom_rtn_bits")
+        && !manifest.files.is_empty();
     let resident_weight_bytes = if mmap_residency_applied {
         // Startup budget cares about resident pages, not the whole mmapped file.
         weight_bytes.saturating_mul(30) / 100
@@ -464,6 +466,24 @@ fn scale_safetensors_weight_bytes(
         .any(|file| file.format == ModelFormat::Safetensors);
     if !has_safetensors {
         return stored_weight_bytes;
+    }
+
+    if let Some(bits) = manifest
+        .parameters
+        .get("_bloom_rtn_bits")
+        .and_then(serde_json::Value::as_u64)
+    {
+        // RTN is compressed storage, not a packed compute kernel. Charge the
+        // CPU F32 expansion plus the source bytes during conversion. Counting
+        // headers/scales at the same factor deliberately bounds the peak even
+        // with odd-width INT4 padding and device/dtype transfer buffers.
+        let factor = match (bits, runtime_dtype) {
+            (4, DType::F32) => 10,
+            (8, DType::F32) => 6,
+            (4, _) => 18,
+            _ => 10,
+        };
+        return stored_weight_bytes.saturating_mul(factor);
     }
 
     if let Some(element_count) = manifest
@@ -694,6 +714,19 @@ pub fn infer_quantization(config: &serde_json::Value) -> Option<QuantizationInfo
                     },
                     4,
                 )
+            } else {
+                (QuantScheme::INT8, 8)
+            }
+        }
+        "bloom_rtn"
+            if quant_config
+                .get("version")
+                .and_then(serde_json::Value::as_u64)
+                == Some(1)
+                && matches!(bits, Some(4 | 8)) =>
+        {
+            if bits == Some(4) {
+                (QuantScheme::INT4, 4)
             } else {
                 (QuantScheme::INT8, 8)
             }
@@ -1284,6 +1317,7 @@ fn validate_manifest(
         .parameters
         .remove(VALIDATED_SAFETENSORS_ELEMENT_COUNT);
     let mut safetensors_element_count = 0_u64;
+    manifest.parameters.remove("_bloom_rtn_bits");
     let mut has_safetensors = false;
 
     // Verify that required files exist and normalize every declared file to
@@ -1359,6 +1393,32 @@ fn validate_manifest(
             VALIDATED_SAFETENSORS_ELEMENT_COUNT.to_string(),
             serde_json::json!(safetensors_element_count),
         );
+    }
+
+    if has_safetensors && model_path.join("config.json").is_file() {
+        let bytes = fs::read(model_path.join("config.json")).map_err(|error| {
+            BloomError::ModelLoad(format!("failed to read RTN config: {error}"))
+        })?;
+        let config: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|error| BloomError::ModelLoad(format!("invalid RTN config: {error}")))?;
+        if config["quantization_config"]["quant_method"] == "bloom_rtn" {
+            let quantization = infer_quantization(&config).ok_or_else(|| {
+                BloomError::ModelLoad("unsupported Bloom RTN version or bits".into())
+            })?;
+            if !matches!(
+                config["model_type"].as_str(),
+                Some("qwen2" | "qwen3" | "llama")
+            ) {
+                return Err(BloomError::ModelLoad(
+                    "Bloom RTN requires dense Qwen2, Qwen3 or Llama".into(),
+                ));
+            }
+            manifest.parameters.insert(
+                "_bloom_rtn_bits".into(),
+                serde_json::json!(quantization.bits),
+            );
+            manifest.runtime_hints.supports_mmap = false;
+        }
     }
 
     if has_safetensors && let Some(declared_quantization) = manifest.quantization.as_ref() {

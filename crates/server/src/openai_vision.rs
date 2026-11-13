@@ -127,6 +127,7 @@ pub(crate) fn prepare_openai_vision_request(
     Ok(Some(InferenceRequest {
         blocks,
         params: InferenceParams {
+            logprobs: None,
             max_tokens,
             temperature,
             top_p,

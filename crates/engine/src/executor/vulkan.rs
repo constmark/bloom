@@ -39,6 +39,10 @@ impl LoadedModel for VulkanPluginModel {
     }
 
     fn infer(&self, _input: ModelInput, _params: &GenerationParams) -> Result<ModelOutput> {
+        anyhow::ensure!(
+            _params.logprobs.is_none(),
+            "this backend does not support token logprobs"
+        );
         Err(anyhow!(
             "Inference not fully implemented in Vulkan plugin skeleton"
         ))

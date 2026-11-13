@@ -344,6 +344,7 @@ impl CoreMlModel {
             "CoreML output dimensions or finite-value contract failed"
         );
         let output = ModelOutput {
+            logprobs: None,
             text: None,
             logits: Some(response.values),
             image: None,
@@ -376,6 +377,10 @@ impl LoadedModel for CoreMlModel {
     }
 
     fn infer(&self, input: ModelInput, params: &GenerationParams) -> Result<ModelOutput> {
+        anyhow::ensure!(
+            params.logprobs.is_none(),
+            "this backend does not support token logprobs"
+        );
         validate_generation_params(params)?;
         let ModelInput::Text { prompt } = input else {
             bail!("CoreML tensor inference accepts a JSON number array or one DataBlock::Tensor");
@@ -397,6 +402,10 @@ impl LoadedModel for CoreMlModel {
         params: &GenerationParams,
         sink: &mut dyn OutputSink,
     ) -> Result<()> {
+        anyhow::ensure!(
+            params.logprobs.is_none(),
+            "this backend does not support token logprobs"
+        );
         let output = self.infer(input, params)?;
         sink.on_chunk(OutputChunk::Embedding(
             output
@@ -407,8 +416,13 @@ impl LoadedModel for CoreMlModel {
     }
 
     fn infer_request(&self, request: InferenceRequest, sink: &mut dyn OutputSink) -> Result<()> {
+        anyhow::ensure!(
+            request.params.logprobs.is_none(),
+            "this backend does not support token logprobs"
+        );
         request.validate().map_err(anyhow::Error::msg)?;
         let params = GenerationParams {
+            logprobs: request.params.logprobs,
             max_tokens: request.params.max_tokens,
             temperature: request.params.temperature,
             top_p: request.params.top_p,

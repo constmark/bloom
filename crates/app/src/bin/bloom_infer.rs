@@ -7,13 +7,14 @@
 //! an independent inference engine (similar to llama.cpp's `main` or
 //! vLLM's `entrypoints`).
 
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{Result, anyhow};
-use bloomai_core::{BenchmarkResult, DType, DeviceKind, GenerationParams};
+use bloomai_core::{BenchmarkResult, DType, DeviceKind, GenerationParams, ResponseFormat};
 use clap::builder::BoolishValueParser;
 use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
@@ -52,6 +53,7 @@ pub struct ChatCompletionMessage {
 
 /// JSON prompt parsing.
 #[derive(serde::Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 struct PromptJson {
     prompt: Option<String>,
     messages: Option<Vec<ChatCompletionMessage>>,
@@ -60,6 +62,10 @@ struct PromptJson {
     top_p: Option<f64>,
     top_k: Option<usize>,
     seed: Option<u64>,
+    presence_penalty: Option<f64>,
+    frequency_penalty: Option<f64>,
+    logit_bias: Option<BTreeMap<u32, f64>>,
+    response_format: Option<ResponseFormat>,
 }
 
 /// Resolved input from prompt parsing.
@@ -70,6 +76,10 @@ struct ResolvedInput {
     top_p: f64,
     top_k: Option<usize>,
     seed: Option<u64>,
+    presence_penalty: f64,
+    frequency_penalty: f64,
+    logit_bias: Option<BTreeMap<u32, f64>>,
+    response_format: Option<ResponseFormat>,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +143,22 @@ struct Args {
     /// Optional top-k sampling cap applied before top-p.
     #[arg(long)]
     top_k: Option<usize>,
+
+    /// Presence penalty in -2..=2, applied before temperature.
+    #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+    presence_penalty: f64,
+
+    /// Frequency penalty in -2..=2, applied before temperature.
+    #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+    frequency_penalty: f64,
+
+    /// JSON map of token IDs to logit biases in -100..=100.
+    #[arg(long, value_parser = parse_logit_bias)]
+    logit_bias: Option<BTreeMap<u32, f64>>,
+
+    /// Typed JSON response format: text, json_object, or json_schema.
+    #[arg(long, value_parser = parse_response_format)]
+    response_format: Option<ResponseFormat>,
 
     /// Random seed for reproducible generation.
     #[arg(long)]
@@ -345,6 +371,10 @@ fn apply_config(args: &mut Args, matches: &ArgMatches, config: &bloomai_app::Inf
     apply_config_value!(args, matches, config, temperature);
     apply_config_value!(args, matches, config, top_p);
     apply_config_option!(args, matches, config, top_k);
+    apply_config_value!(args, matches, config, presence_penalty);
+    apply_config_value!(args, matches, config, frequency_penalty);
+    apply_config_option!(args, matches, config, logit_bias);
+    apply_config_option!(args, matches, config, response_format);
     apply_config_option!(args, matches, config, seed);
     apply_config_value!(args, matches, config, stream);
     apply_config_value!(args, matches, config, device);
@@ -669,6 +699,10 @@ fn resolve_and_parse_input(
             top_p: args.top_p,
             top_k: args.top_k,
             seed: args.seed,
+            presence_penalty: args.presence_penalty,
+            frequency_penalty: args.frequency_penalty,
+            logit_bias: args.logit_bias.clone(),
+            response_format: args.response_format.clone(),
         });
     }
 
@@ -688,9 +722,23 @@ fn resolve_and_parse_input(
                 top_p: args.top_p,
                 top_k: args.top_k,
                 seed: args.seed,
+                presence_penalty: args.presence_penalty,
+                frequency_penalty: args.frequency_penalty,
+                logit_bias: args.logit_bias.clone(),
+                response_format: args.response_format.clone(),
             });
         }
-        if let Ok(json_obj) = serde_json::from_str::<PromptJson>(trimmed) {
+        if serde_json::from_str::<serde_json::Value>(trimmed)
+            .ok()
+            .is_some_and(|v| v.get("prompt").is_some() || v.get("messages").is_some())
+        {
+            let json_obj: PromptJson = serde_json::from_str(trimmed)
+                .map_err(|error| anyhow!("invalid generation request JSON: {error}"))?;
+            if json_obj.prompt.is_some() && json_obj.messages.is_some() {
+                return Err(anyhow!(
+                    "generation request must specify either prompt or messages, not both"
+                ));
+            }
             let prompt = if let Some(messages) = json_obj.messages {
                 chat_prompt_for_model(&messages, template)
             } else {
@@ -703,6 +751,12 @@ fn resolve_and_parse_input(
                 top_p: json_obj.top_p.unwrap_or(args.top_p),
                 top_k: json_obj.top_k.or(args.top_k),
                 seed: json_obj.seed.or(args.seed),
+                presence_penalty: json_obj.presence_penalty.unwrap_or(args.presence_penalty),
+                frequency_penalty: json_obj.frequency_penalty.unwrap_or(args.frequency_penalty),
+                logit_bias: json_obj.logit_bias.or_else(|| args.logit_bias.clone()),
+                response_format: json_obj
+                    .response_format
+                    .or_else(|| args.response_format.clone()),
             });
         }
     } else if trimmed.starts_with('[')
@@ -716,6 +770,10 @@ fn resolve_and_parse_input(
             top_p: args.top_p,
             top_k: args.top_k,
             seed: args.seed,
+            presence_penalty: args.presence_penalty,
+            frequency_penalty: args.frequency_penalty,
+            logit_bias: args.logit_bias.clone(),
+            response_format: args.response_format.clone(),
         });
     }
 
@@ -727,6 +785,10 @@ fn resolve_and_parse_input(
         top_p: args.top_p,
         top_k: args.top_k,
         seed: args.seed,
+        presence_penalty: args.presence_penalty,
+        frequency_penalty: args.frequency_penalty,
+        logit_bias: args.logit_bias.clone(),
+        response_format: args.response_format.clone(),
     })
 }
 
@@ -852,6 +914,20 @@ fn main() -> Result<()> {
     }
     let config = bloomai_app::load_config(&config_path)?;
     apply_config(&mut args, &matches, &config.infer);
+    GenerationParams {
+        logprobs: None,
+        max_tokens: args.max_tokens,
+        temperature: args.temperature,
+        top_p: args.top_p,
+        top_k: args.top_k,
+        presence_penalty: args.presence_penalty,
+        frequency_penalty: args.frequency_penalty,
+        logit_bias: args.logit_bias.clone(),
+        response_format: args.response_format.clone(),
+        seed: args.seed,
+    }
+    .validate()
+    .map_err(anyhow::Error::msg)?;
     if args.json
         && (args.bench || args.bench_json || args.interactive || args.inspect || args.list_engines)
     {
@@ -1013,15 +1089,16 @@ fn main() -> Result<()> {
 
     if args.interactive {
         let params = GenerationParams {
+            logprobs: None,
             max_tokens: args.max_tokens,
             temperature: args.temperature,
             top_p: args.top_p,
             top_k: args.top_k,
-            presence_penalty: 0.0,
-            frequency_penalty: 0.0,
-            logit_bias: None,
+            presence_penalty: args.presence_penalty,
+            frequency_penalty: args.frequency_penalty,
+            logit_bias: args.logit_bias.clone(),
             seed: args.seed,
-            response_format: None,
+            response_format: args.response_format.clone(),
         };
         return run_interactive(&args, &pipeline, params, chat_template);
     }
@@ -1031,15 +1108,16 @@ fn main() -> Result<()> {
 
     // Build generation parameters
     let params = GenerationParams {
+        logprobs: None,
         max_tokens: resolved_input.max_tokens,
         temperature: resolved_input.temperature,
         top_p: resolved_input.top_p,
         top_k: resolved_input.top_k,
-        presence_penalty: 0.0,
-        frequency_penalty: 0.0,
-        logit_bias: None,
+        presence_penalty: resolved_input.presence_penalty,
+        frequency_penalty: resolved_input.frequency_penalty,
+        logit_bias: resolved_input.logit_bias,
         seed: resolved_input.seed,
-        response_format: None,
+        response_format: resolved_input.response_format,
     };
 
     // Build input — use VideoGeneration for Wan backends
@@ -1664,6 +1742,10 @@ fn print_interactive_help() {
     println!("  /set temperature <n>          Set sampling temperature");
     println!("  /set top_p <n>                Set nucleus sampling threshold");
     println!("  /set top_k <n|none>           Set or clear top-k sampling cap");
+    println!("  /set presence_penalty <n>     Set presence penalty (-2..2)");
+    println!("  /set frequency_penalty <n>    Set frequency penalty (-2..2)");
+    println!("  /set logit_bias <json|none>    Set token biases");
+    println!("  /set response_format <json|none> Set constrained output");
     println!("  /set seed <n|none>            Set or clear random seed");
     println!("  /set system <text|none>       Set or clear system prompt");
     println!("  /set stream <on|off>          Toggle streaming output");
@@ -1696,7 +1778,46 @@ fn set_interactive_option(
     stream: &mut bool,
     system_prompt: &mut Option<String>,
 ) -> Result<()> {
+    let mut candidate = params.clone();
     match key {
+        "max_tokens" | "max-tokens" | "num_predict" | "num-predict" => {
+            candidate.max_tokens = value.parse()?
+        }
+        "temperature" | "temp" => candidate.temperature = value.parse()?,
+        "top_p" | "top-p" => candidate.top_p = value.parse()?,
+        "top_k" | "top-k" => {
+            candidate.top_k =
+                if value.eq_ignore_ascii_case("none") || value.eq_ignore_ascii_case("off") {
+                    None
+                } else {
+                    Some(value.parse()?)
+                }
+        }
+        "presence_penalty" | "presence-penalty" => candidate.presence_penalty = value.parse()?,
+        "frequency_penalty" | "frequency-penalty" => candidate.frequency_penalty = value.parse()?,
+        "logit_bias" | "logit-bias" => {
+            candidate.logit_bias = if value.eq_ignore_ascii_case("none") {
+                None
+            } else {
+                Some(parse_logit_bias(value).map_err(anyhow::Error::msg)?)
+            }
+        }
+        "response_format" | "response-format" => {
+            candidate.response_format = if value.eq_ignore_ascii_case("none") {
+                None
+            } else {
+                Some(parse_response_format(value).map_err(anyhow::Error::msg)?)
+            }
+        }
+        _ => {}
+    }
+    candidate.validate().map_err(anyhow::Error::msg)?;
+    match key {
+        "presence_penalty" | "presence-penalty" | "frequency_penalty" | "frequency-penalty"
+        | "logit_bias" | "logit-bias" | "response_format" | "response-format" => {
+            *params = candidate;
+            println!("{key} = {value}");
+        }
         "max_tokens" | "max-tokens" | "num_predict" | "num-predict" => {
             params.max_tokens = value.parse()?;
             println!("max_tokens = {}", params.max_tokens);
@@ -1762,6 +1883,30 @@ fn set_interactive_option(
     Ok(())
 }
 
+fn parse_logit_bias(value: &str) -> std::result::Result<BTreeMap<u32, f64>, String> {
+    let bias: BTreeMap<u32, f64> =
+        serde_json::from_str(value).map_err(|error| format!("invalid logit_bias JSON: {error}"))?;
+    GenerationParams {
+        logprobs: None,
+        logit_bias: Some(bias.clone()),
+        ..Default::default()
+    }
+    .validate()?;
+    Ok(bias)
+}
+
+fn parse_response_format(value: &str) -> std::result::Result<ResponseFormat, String> {
+    let format: ResponseFormat = serde_json::from_str(value)
+        .map_err(|error| format!("invalid response_format JSON: {error}"))?;
+    GenerationParams {
+        logprobs: None,
+        response_format: Some(format.clone()),
+        ..Default::default()
+    }
+    .validate()?;
+    Ok(format)
+}
+
 fn parse_optional_seed(value: &str) -> Result<Option<u64>> {
     match value.to_lowercase().as_str() {
         "" | "none" | "null" | "off" => Ok(None),
@@ -1803,15 +1948,16 @@ fn run_bench(args: &Args, engine: &dyn Engine, model_path: &std::path::Path) -> 
     }
 
     let params = GenerationParams {
+        logprobs: None,
         max_tokens: args.max_tokens,
-        temperature: 0.7,
-        top_p: 0.9,
+        temperature: args.temperature,
+        top_p: args.top_p,
         top_k: args.top_k,
-        presence_penalty: 0.0,
-        frequency_penalty: 0.0,
-        logit_bias: None,
-        seed: Some(42),
-        response_format: None,
+        presence_penalty: args.presence_penalty,
+        frequency_penalty: args.frequency_penalty,
+        logit_bias: args.logit_bias.clone(),
+        seed: args.seed.or(Some(42)),
+        response_format: args.response_format.clone(),
     };
 
     let prompt = if args.prompt.is_empty() {
@@ -2046,6 +2192,106 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sampling_controls_flow_through_flags_config_and_json() {
+        let matches = Args::command()
+            .try_get_matches_from([
+                "bloom_infer",
+                "--presence-penalty",
+                "-1",
+                "--frequency-penalty",
+                "0.4",
+                "--logit-bias",
+                r#"{"7":100}"#,
+                "--response-format",
+                r#"{"type":"json_object"}"#,
+                "--prompt",
+                r#"{"prompt":"hello","frequency_penalty":0.9,"logit_bias":{"8":-50}}"#,
+            ])
+            .unwrap();
+        let mut args = Args::from_arg_matches(&matches).unwrap();
+        let config = bloomai_app::InferConfig {
+            presence_penalty: Some(1.0),
+            frequency_penalty: Some(1.0),
+            logit_bias: Some(BTreeMap::from([(9, 5.0)])),
+            response_format: Some(ResponseFormat::Text),
+            ..Default::default()
+        };
+        apply_config(&mut args, &matches, &config);
+        let resolved = resolve_and_parse_input(&args, CliChatTemplate::Legacy, false).unwrap();
+        assert_eq!(resolved.presence_penalty, -1.0);
+        assert_eq!(resolved.frequency_penalty, 0.9);
+        assert_eq!(resolved.logit_bias, Some(BTreeMap::from([(8, -50.0)])));
+        assert_eq!(resolved.response_format, Some(ResponseFormat::JsonObject));
+        let defaults = Args::command()
+            .try_get_matches_from(["bloom_infer", "--prompt", "hello"])
+            .unwrap();
+        let mut args = Args::from_arg_matches(&defaults).unwrap();
+        apply_config(&mut args, &defaults, &config);
+        assert_eq!(args.presence_penalty, 1.0);
+        assert_eq!(args.logit_bias, config.logit_bias);
+        assert_eq!(args.response_format, Some(ResponseFormat::Text));
+    }
+
+    #[test]
+    fn json_prompts_are_not_silently_erased_and_request_errors_are_explicit() {
+        let literal = r#"{"some":"data"}"#;
+        let args = Args::parse_from(["bloom_infer", "--prompt", literal]);
+        let resolved = resolve_and_parse_input(&args, CliChatTemplate::Legacy, false).unwrap();
+        assert_eq!(resolved.prompt, literal);
+        for invalid in [
+            r#"{"prompt":"hello","temperatur":0.1}"#,
+            r#"{"prompt":"hello","temperature":"hot"}"#,
+            r#"{"prompt":"hello","messages":[]}"#,
+        ] {
+            let args = Args::parse_from(["bloom_infer", "--prompt", invalid]);
+            assert!(resolve_and_parse_input(&args, CliChatTemplate::Legacy, false).is_err());
+        }
+    }
+
+    #[test]
+    fn interactive_invalid_updates_leave_valid_settings_unchanged() {
+        let mut params = GenerationParams::default();
+        let expected = params.clone();
+        let mut stream = false;
+        let mut system = None;
+        for (key, value) in [
+            ("temperature", "NaN"),
+            ("top_p", "0"),
+            ("max_tokens", "0"),
+            ("presence_penalty", "3"),
+            ("frequency_penalty", "inf"),
+            ("logit_bias", r#"{"7":101}"#),
+            (
+                "response_format",
+                r#"{"type":"json_schema","json_schema":[]}"#,
+            ),
+        ] {
+            assert!(
+                set_interactive_option(key, value, &mut params, &mut stream, &mut system).is_err()
+            );
+            assert_eq!(params, expected);
+        }
+        set_interactive_option(
+            "presence_penalty",
+            "-0.5",
+            &mut params,
+            &mut stream,
+            &mut system,
+        )
+        .unwrap();
+        assert_eq!(params.presence_penalty, -0.5);
+        set_interactive_option(
+            "response_format",
+            r#"{"type":"json_object"}"#,
+            &mut params,
+            &mut stream,
+            &mut system,
+        )
+        .unwrap();
+        assert_eq!(params.response_format, Some(ResponseFormat::JsonObject));
+    }
 
     #[test]
     fn chat_prompt_single_user_uses_content() {
@@ -2288,6 +2534,7 @@ mod tests {
     #[test]
     fn numeric_and_json_output_preserve_every_value_without_changing_text_mode() {
         let output = bloomai_engine::ModelOutput {
+            logprobs: None,
             logits: Some(vec![1.25, -2.5, 0.0]),
             text: None,
             audio: None,
@@ -2318,6 +2565,7 @@ mod tests {
             "\"End\""
         );
         let text = bloomai_engine::ModelOutput {
+            logprobs: None,
             text: Some("unchanged".into()),
             ..output
         };

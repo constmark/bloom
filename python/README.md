@@ -15,9 +15,37 @@ export BLOOM_FFI_LIB=/absolute/path/to/libbloom_ffi.so
 ```
 
 Use `libbloom_ffi.dylib` on macOS or `bloom_ffi.dll` on Windows. The source
-distribution and Python wheel contain the wrapper only; build or supply the
-native library separately. `BLOOM_FFI_LIB` selects it explicitly. Source
+distribution and `py3-none-any` wheel contain the wrapper only; build or supply
+the native library separately. `BLOOM_FFI_LIB` selects it explicitly. Source
 checkouts also search the workspace's `target/release` and `target/debug`.
+
+A platform-specific native wheel contains the library and needs no Rust compiler
+or `BLOOM_FFI_LIB` at installation time:
+
+```sh
+python -m pip install /path/to/bloom_sdk-0.1.0-py3-none-macosx_26_0_arm64.whl
+```
+
+Choose the wheel matching the host OS/architecture. The bundled library takes
+precedence over workspace/system discovery; an explicit `BLOOM_FFI_LIB` still
+overrides it. A broken bundled library fails explicitly instead of silently
+loading a different ABI. Wheels have a hash-checked library inventory, complete
+RECORD and ABI revision 2. Linux artifacts have a host `linux_*` tag, not a
+manylinux portability claim; external native dependencies must be available.
+
+Maintainers build and verify a native wheel with the pinned dependencies:
+
+```sh
+python -m pip install -r requirements/python-package.txt
+cargo build --release -p bloomai-ffi --locked
+python scripts/build_python_native_wheel.py --native-library target/release/libbloom_ffi.dylib
+python scripts/test_python_native_wheel.py release-artifacts/python/*.whl
+```
+
+Use the appropriate native filename on Linux/Windows. CI builds on all three
+OS families and installs the same artifact under Python 3.9, 3.12 and 3.14.
+Hosted execution remains a required acceptance gate; local macOS checks do not
+prove Linux/Windows compatibility.
 
 ## Generate
 
@@ -75,6 +103,16 @@ and malformed schema-wrapper metadata are rejected before native inference.
 `max_tokens` must be positive and `temperature` must be between 0 and 2.
 Existing positional arguments retain their order.
 
+Use keyword-only `logprobs=0` to request selected-token log probabilities, or
+`logprobs=1` through `20` to include top alternatives. Such requests require
+`max_tokens <= 4096` and a native backend that supports token log probabilities.
+Unsupported models, devices, and decoding combinations fail explicitly.
+`generate` retains the output's `logprobs` array; `generate_stream` yields each
+`{"TokenLogprobs": ...}` event unchanged. Each record has `token` and
+`top_logprobs` containing token IDs, display text, exact byte arrays, and log
+probabilities. Join selected token byte arrays before decoding split UTF-8.
+The default `logprobs=None` omits the field for older-library compatibility.
+
 Streaming buffers at most 64 serialized chunks and 16 MiB of queued bytes.
 Data chunks are dictionaries; the native terminal event is the string `"End"`.
 Slow consumers apply backpressure to native callbacks. Individual chunks over
@@ -85,6 +123,31 @@ waits for active native calls before freeing the handle.
 Pass `timeout` to `generate_stream` to bound the wait for each next chunk. A
 `TimeoutError` stops the stream and releases its worker; omit it (the default)
 to wait indefinitely for native output.
+
+## Exact tokenization
+
+Use the loaded model's tokenizer without running generation:
+
+```python
+tokens = pipeline.tokenize("你好, Bloom 🌸")
+text = pipeline.detokenize(tokens)
+```
+
+`tokenize` accepts UTF-8 text up to 8 MiB; `detokenize` accepts a list or tuple
+of unsigned 32-bit token IDs, bounded to 4M tokens and 16 MiB of JSON. Empty
+inputs are allowed. Special-token insertion and removal follow the selected
+model adapter, so decoded text need not include every special token. Results
+are exact model tokenization; models without a tokenizer raise
+`BloomInferenceError` instead of returning estimated token IDs.
+
+These methods require the optional `bloom_pipeline_tokenize_v2` and
+`bloom_pipeline_detokenize_v2` symbols in a newly built native library. Older
+ABI v1/v2 libraries continue to support generation and fail explicitly if
+tokenization is requested. Native output buffers are released on success and
+failure, and calls are serialized with generation and pipeline close.
+
+Generation input and parameter JSON are each limited to 16 MiB before either
+ABI is called. Engine and device identifiers have a 4 KiB UTF-8 limit.
 
 The wrapper negotiates ABI revision 2 and supports revision 1 fallback.
 Revision 2 cancellation is cooperative at output boundaries. Revision 1 has

@@ -262,6 +262,10 @@ impl LoadedModel for MlxRuntimeModel {
         input: ModelInput,
         params: &bloomai_core::GenerationParams,
     ) -> Result<ModelOutput> {
+        anyhow::ensure!(
+            params.logprobs.is_none(),
+            "this backend does not support token logprobs"
+        );
         let request = serde_json::to_vec(&serde_json::json!({
             "input": input,
             "params": params,
@@ -310,6 +314,10 @@ impl LoadedModel for MlxRuntimeModel {
         params: &bloomai_core::GenerationParams,
         sink: &mut dyn OutputSink,
     ) -> Result<()> {
+        anyhow::ensure!(
+            params.logprobs.is_none(),
+            "this backend does not support token logprobs"
+        );
         let request = serde_json::to_vec(&serde_json::json!({
             "input": input,
             "params": params,

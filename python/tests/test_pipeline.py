@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -15,6 +16,37 @@ REPOSITORY_ROOT = PYTHON_ROOT.parent
 sys.path.insert(0, str(PYTHON_ROOT))
 
 import bloom_sdk.pipeline as pipeline_module
+
+
+class BundledLibraryTests(unittest.TestCase):
+    def test_bundled_runtime_precedes_workspace_and_system(self):
+        with tempfile.TemporaryDirectory() as directory:
+            package = Path(directory) / "bloom_sdk"
+            package.mkdir()
+            name = {"win32": "bloom_ffi.dll", "darwin": "libbloom_ffi.dylib"}.get(sys.platform, "libbloom_ffi.so")
+            native = package / name
+            native.write_bytes(b"test fixture")
+            with mock.patch.object(pipeline_module, "__file__", str(package / "pipeline.py")), mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(ctypes, "CDLL") as load:
+                expected = object()
+                load.return_value = expected
+                self.assertIs(pipeline_module._find_lib(), expected)
+                load.assert_called_once_with(str(native.resolve()))
+
+    def test_broken_bundle_cannot_silently_fall_back(self):
+        with tempfile.TemporaryDirectory() as directory:
+            package = Path(directory) / "bloom_sdk"
+            package.mkdir()
+            name = {"win32": "bloom_ffi.dll", "darwin": "libbloom_ffi.dylib"}.get(sys.platform, "libbloom_ffi.so")
+            (package / name).write_bytes(b"test fixture")
+            with mock.patch.object(pipeline_module, "__file__", str(package / "pipeline.py")), mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(ctypes, "CDLL", side_effect=OSError("bad dependency")) as load:
+                with self.assertRaisesRegex(RuntimeError, "bundled Bloom"):
+                    pipeline_module._find_lib()
+                self.assertEqual(load.call_count, 1)
+
+    def test_explicit_native_override_retains_precedence(self):
+        with mock.patch.dict(os.environ, {"BLOOM_FFI_LIB": "/chosen/library"}), mock.patch.object(ctypes, "CDLL") as load:
+            pipeline_module._find_lib()
+            load.assert_called_once_with("/chosen/library")
 
 
 class FakeFunction:
@@ -48,6 +80,8 @@ class FakeLibrary:
         self.bloom_pipeline_free = FakeFunction(self._free_pipeline)
         self.bloom_pipeline_run = FakeFunction(self._run)
         self.bloom_pipeline_run_v2 = FakeFunction(self._run_v2)
+        self.bloom_pipeline_tokenize_v2 = FakeFunction(self._tokenize_v2)
+        self.bloom_pipeline_detokenize_v2 = FakeFunction(self._detokenize_v2)
         self.bloom_pipeline_run_stream = FakeFunction(self._run_stream)
         self.bloom_pipeline_run_stream_v2 = FakeFunction(self._run_stream_v2)
         self.bloom_string_free = FakeFunction(self._free_string)
@@ -98,6 +132,16 @@ class FakeLibrary:
         if self.block_stream:
             self.stream_release.wait(timeout=5)
         return 0
+
+    def _tokenize_v2(self, pipeline, text, output, error, error_len):
+        text = ctypes.string_at(text.data, text.len).decode("utf-8")
+        self.output_buffer = ctypes.create_string_buffer(json.dumps([ord(c) for c in text]).encode())
+        return self._run_v2(pipeline, None, None, output, error, error_len)
+
+    def _detokenize_v2(self, pipeline, tokens, output, error, error_len):
+        tokens = json.loads(ctypes.string_at(tokens.data, tokens.len))
+        self.output_buffer = ctypes.create_string_buffer(json.dumps("".join(chr(t) for t in tokens)).encode())
+        return self._run_v2(pipeline, None, None, output, error, error_len)
 
     def _run_stream_v2(
         self,
@@ -157,6 +201,81 @@ class BloomPipelineTests(unittest.TestCase):
         self.fake_lib.stream_release.set()
         pipeline_module._lib = self.previous_lib
 
+    def test_exact_tokenization_round_trips_unicode_and_empty_input(self):
+        with pipeline_module.BloomPipeline(".", engine="mock") as pipeline:
+            for text in ("", "hello", "中文 🌸\0"):
+                tokens = pipeline.tokenize(text)
+                self.assertEqual(tokens, [ord(c) for c in text])
+                self.assertEqual(pipeline.detokenize(tokens), text)
+        self.assertEqual(self.fake_lib.freed_buffers, 6)
+
+    def test_tokenization_validates_inputs_before_native_calls(self):
+        with pipeline_module.BloomPipeline(".", engine="mock") as pipeline:
+            for text in (1, None, b"hello"):
+                with self.assertRaises(TypeError):
+                    pipeline.tokenize(text)
+            with self.assertRaises(ValueError):
+                pipeline.tokenize("\ud800")
+            for tokens in ([True], [-1], [1.5], [1 << 32], ["1"]):
+                with self.assertRaises(ValueError):
+                    pipeline.detokenize(tokens)
+            for tokens in (None, "123", iter([1])):
+                with self.assertRaises(TypeError):
+                    pipeline.detokenize(tokens)
+            with mock.patch.object(pipeline_module, "MAX_TEXT_BYTES", 3):
+                with self.assertRaisesRegex(ValueError, "UTF-8 limit"):
+                    pipeline.tokenize("🌸")
+            with mock.patch.object(pipeline_module, "MAX_TOKEN_COUNT", 1):
+                with self.assertRaisesRegex(ValueError, "token limit"):
+                    pipeline.detokenize([1, 2])
+            with mock.patch.object(pipeline_module, "MAX_JSON_BYTES", 3):
+                with self.assertRaisesRegex(ValueError, "JSON limit"):
+                    pipeline.detokenize([100])
+        self.assertEqual(self.fake_lib.freed_buffers, 0)
+
+    def test_tokenization_is_optional_for_old_libraries_and_checks_closed_state(self):
+        del self.fake_lib.bloom_pipeline_tokenize_v2
+        del self.fake_lib.bloom_pipeline_detokenize_v2
+        pipeline_module._configure_lib(self.fake_lib)
+        with pipeline_module.BloomPipeline(".", engine="mock") as pipeline:
+            self.assertEqual(pipeline.generate("hello"), {"text": "ok"})
+            for call in (lambda: pipeline.tokenize("hello"), lambda: pipeline.detokenize([1])):
+                with self.assertRaisesRegex(pipeline_module.BloomInferenceError, "does not support exact tokenization"):
+                    call()
+            pipeline.close()
+            with self.assertRaisesRegex(pipeline_module.BloomError, "closed"):
+                pipeline.tokenize("hello")
+
+    def test_tokenization_errors_free_native_buffers_and_reject_invalid_results(self):
+        def error(*args):
+            self.fake_lib._run_v2(args[0], None, None, *args[2:])
+            return -9
+        self.fake_lib.bloom_pipeline_tokenize_v2.implementation = error
+        with pipeline_module.BloomPipeline(".", engine="mock") as pipeline:
+            with self.assertRaisesRegex(pipeline_module.BloomInferenceError, "code -9"):
+                pipeline.tokenize("hello")
+            self.fake_lib.bloom_pipeline_tokenize_v2.implementation = (
+                lambda *args: self.fake_lib._run_v2(args[0], None, None, *args[2:])
+            )
+            for output in (b"not-json", b"[true]", b"[4294967296]", b"{}", b"\xff"):
+                self.fake_lib.output_buffer = ctypes.create_string_buffer(output)
+                with self.assertRaises(pipeline_module.BloomInferenceError):
+                    pipeline.tokenize("hello")
+        self.assertEqual(self.fake_lib.freed_buffers, 6)
+
+    def test_sdk_json_and_identifier_limits_apply_before_native_execution(self):
+        with mock.patch.object(pipeline_module, "MAX_IDENTIFIER_BYTES", 3):
+            for name in ("engine", "device"):
+                with self.assertRaisesRegex(ValueError, "UTF-8 limit"):
+                    pipeline_module.BloomPipeline(".", **{name: "🌸"})
+        with pipeline_module.BloomPipeline(".", engine="mock") as pipeline:
+            with mock.patch.object(pipeline_module, "MAX_JSON_BYTES", 100):
+                with self.assertRaisesRegex(ValueError, "generation parameters.*JSON limit"):
+                    pipeline.generate("a")
+                with self.assertRaisesRegex(ValueError, "input.*JSON limit"):
+                    next(pipeline.generate_stream("🌸" * 30))
+        self.assertFalse(self.fake_lib.stream_started.is_set())
+
     def test_package_import_does_not_require_a_native_library(self):
         environment = os.environ.copy()
         environment["PYTHONPATH"] = str(PYTHON_ROOT)
@@ -202,6 +321,7 @@ class BloomPipelineTests(unittest.TestCase):
         invalid_arguments = [
             {"max_tokens": -1},
             {"max_tokens": 0},
+            {"max_tokens": True},
             {"max_tokens": 1 << (8 * ctypes.sizeof(ctypes.c_size_t))},
             {"temperature": float("nan")},
             {"temperature": True},
@@ -231,6 +351,13 @@ class BloomPipelineTests(unittest.TestCase):
             {"logit_bias": {"1": 1, 1: 2}},
             {"logit_bias": {"1" * 5000: 1}},
             {"logit_bias": dict.fromkeys(range(1025), 0)},
+            {"logprobs": True},
+            {"logprobs": False},
+            {"logprobs": -1},
+            {"logprobs": 21},
+            {"logprobs": 1.5},
+            {"logprobs": "1"},
+            {"logprobs": 0, "max_tokens": 4097},
         ]
         for arguments in invalid_arguments:
             with self.subTest(arguments=arguments):
@@ -278,6 +405,57 @@ class BloomPipelineTests(unittest.TestCase):
                 for params in captured:
                     for name, value in expected.items():
                         self.assertEqual(params[name], value)
+
+    def test_logprobs_reach_both_abis_and_preserve_buffered_and_stream_results(self):
+        records = [
+            {"token": {"token_id": 10, "token": "�", "bytes": [228], "logprob": -0.1}, "top_logprobs": []},
+            {"token": {"token_id": 11, "token": "��", "bytes": [189, 160], "logprob": -0.2}, "top_logprobs": []},
+        ]
+        output = {"text": "你", "logprobs": records}
+        events = [{"TokenLogprobs": row} for row in records] + [{"TextDelta": "你"}, "End"]
+        self.fake_lib.output_buffer = ctypes.create_string_buffer(json.dumps(output).encode())
+        for v2 in (False, True):
+            self.fake_lib._bloom_uses_v2 = v2
+            captured = []
+            suffix = "_v2" if v2 else ""
+            native_run = getattr(self.fake_lib, "bloom_pipeline_run" + suffix)
+            original_run = native_run.implementation
+
+            def capture_params(params):
+                if v2:
+                    params = ctypes.string_at(params.data, params.len)
+                captured.append(json.loads(params))
+
+            def run(*args):
+                capture_params(args[2])
+                return original_run(*args)
+
+            def stream(_p, _i, params, callback, *_rest):
+                capture_params(params)
+                for event in events:
+                    encoded = json.dumps(event).encode()
+                    if v2:
+                        chunk = ctypes.create_string_buffer(encoded)
+                        callback(None, ctypes.cast(chunk, ctypes.POINTER(ctypes.c_uint8)), len(encoded))
+                    else:
+                        callback(None, encoded)
+                return 0
+
+            native_run.implementation = run
+            getattr(self.fake_lib, "bloom_pipeline_run_stream" + suffix).implementation = stream
+            with pipeline_module.BloomPipeline(".", engine="mock") as pipeline:
+                for count in (None, 0, 20):
+                    with self.subTest(v2=v2, logprobs=count):
+                        # Requests without metadata retain the earlier token
+                        # budget contract, including values above 4096.
+                        arguments = {"logprobs": count, "max_tokens": 4097 if count is None else 4096}
+                        self.assertEqual(pipeline.generate("hello", **arguments), output)
+                        self.assertEqual(list(pipeline.generate_stream("hello", **arguments)), events)
+                        for params in captured[-2:]:
+                            if count is None:
+                                self.assertNotIn("logprobs", params)
+                            else:
+                                self.assertEqual(params["logprobs"], count)
 
     def test_response_format_rejects_ignored_semantics(self):
         invalid_formats = [
@@ -626,6 +804,12 @@ class NativeFfiIntegrationTests(unittest.TestCase):
         self.assertEqual(output["text"], "echo: hello")
         self.assertEqual(chunks[0], {"TextDelta": "echo: hello"})
         self.assertEqual(chunks[-1], "End")
+
+    def test_native_model_without_tokenizer_fails_explicitly(self):
+        with pipeline_module.BloomPipeline(".", engine="mock") as pipeline:
+            for call in (lambda: pipeline.tokenize("hello"), lambda: pipeline.detokenize([1])):
+                with self.assertRaisesRegex(pipeline_module.BloomInferenceError, "code -9.*exact tokenizer"):
+                    call()
 
 
 if __name__ == "__main__":

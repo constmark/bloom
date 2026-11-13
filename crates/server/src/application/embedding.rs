@@ -110,6 +110,7 @@ pub(crate) fn collect_embedding(
 ) -> Result<Vec<f32>> {
     let mut embedding = None;
     let params = bloomai_core::GenerationParams {
+        logprobs: None,
         max_tokens: 1,
         temperature: 0.0,
         top_p: 1.0,

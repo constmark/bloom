@@ -2,11 +2,24 @@ import Foundation
 
 protocol BloomAPITransport {
     @MainActor func readiness() async throws -> BloomReadiness
+    @MainActor func modelCatalog() async throws -> DesktopCatalog
+    @MainActor func loadCatalogModel(_ id: String) async throws
+    @MainActor func unloadCatalogModel() async throws
+    @MainActor func embeddings(model: String, inputs: [String], dimensions: Int?) async throws -> DesktopEmbeddingResult
     @MainActor func streamChat(
         model: String,
         messages: [APIChatMessage],
         onChunk: (ChatCompletionChunk) -> Void
     ) async throws
+}
+
+extension BloomAPITransport {
+    @MainActor func modelCatalog() async throws -> DesktopCatalog { throw BloomClientError.incompatibleServer }
+    @MainActor func loadCatalogModel(_ id: String) async throws { throw BloomClientError.incompatibleServer }
+    @MainActor func unloadCatalogModel() async throws { throw BloomClientError.incompatibleServer }
+    @MainActor func embeddings(model: String, inputs: [String], dimensions: Int?) async throws -> DesktopEmbeddingResult {
+        throw BloomClientError.incompatibleServer
+    }
 }
 
 struct BloomAPIClient: BloomAPITransport {
@@ -199,6 +212,79 @@ struct BloomAPIClient: BloomAPITransport {
 
     private func endpoint(_ path: String) -> URL {
         serverURL.appendingPathComponent(path)
+    }
+
+    @MainActor
+    func modelCatalog() async throws -> DesktopCatalog {
+        let bytes = try await jsonRequest("v1/model-management/models", limit: 16 * 1024 * 1024)
+        let value = try JSONDecoder().decode(DesktopCatalog.self, from: bytes)
+        try value.validate()
+        return value
+    }
+
+    @MainActor
+    func loadCatalogModel(_ id: String) async throws {
+        guard DesktopCatalog.validID(id) else { throw BloomClientError.serverNotReady("Invalid catalog model selector.") }
+        let body = try JSONSerialization.data(withJSONObject: ["id": id])
+        let bytes = try await jsonRequest("v1/model-management/switch", body: body, limit: 64 * 1024)
+        struct Reply: Decodable { let object: String; let model: String; let accepted: Bool; let unchanged: Bool? }
+        let reply = try JSONDecoder().decode(Reply.self, from: bytes)
+        guard reply.object == "bloom.model_load", reply.model == id,
+              reply.accepted || reply.unchanged == true else { throw BloomClientError.incompatibleServer }
+    }
+
+    @MainActor
+    func unloadCatalogModel() async throws {
+        let bytes = try await jsonRequest("v1/model-management/unload", body: Data("{}".utf8), limit: 64 * 1024)
+        struct Reply: Decodable { let object: String; let unloaded: Bool }
+        let reply = try JSONDecoder().decode(Reply.self, from: bytes)
+        guard reply.object == "bloom.model_unload", reply.unloaded else { throw BloomClientError.incompatibleServer }
+    }
+
+    @MainActor
+    func embeddings(model: String, inputs: [String], dimensions: Int?) async throws -> DesktopEmbeddingResult {
+        guard !model.isEmpty, model.utf8.count <= 1024, (1...256).contains(inputs.count),
+              inputs.allSatisfy({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && $0.unicodeScalars.count <= 262_144 }),
+              inputs.reduce(0, { $0 + $1.utf8.count }) <= 768 * 1024,
+              dimensions == nil || (1...16_384).contains(dimensions!) else {
+            throw BloomClientError.serverNotReady("Invalid embedding input or dimensions.")
+        }
+        var payload: [String: Any] = ["model": model, "input": inputs, "encoding_format": "float"]
+        if let dimensions { payload["dimensions"] = dimensions }
+        let body = try JSONSerialization.data(withJSONObject: payload)
+        let bytes = try await jsonRequest("v1/embeddings", body: body, limit: 32 * 1024 * 1024)
+        let result = try JSONDecoder().decode(DesktopEmbeddingResult.self, from: bytes)
+        try result.validate(model: model, count: inputs.count, dimensions: dimensions)
+        return result
+    }
+
+    @MainActor
+    private func jsonRequest(_ path: String, body: Data? = nil, limit: Int) async throws -> Data {
+        if let body, body.count > 6 * 1024 * 1024 { throw BloomClientError.requestLimitExceeded }
+        var request = URLRequest(url: endpoint(path))
+        request.httpMethod = body == nil ? "GET" : "POST"
+        request.httpBody = body
+        request.timeoutInterval = body == nil ? 15 : 300
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if body != nil { request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
+        applyHeaders(to: &request)
+        try Task.checkCancellation()
+        let (bytes, response) = try await session.bytes(for: request, delegate: Self.redirectPolicy)
+        defer { bytes.task.cancel() }
+        guard let http = response as? HTTPURLResponse else { throw BloomClientError.invalidHTTPResponse }
+        let success = http.statusCode == 200 || http.statusCode == 202
+        let responseLimit = success ? limit : 64 * 1024
+        guard http.expectedContentLength <= Int64(responseLimit) else { throw BloomClientError.responseLimitExceeded }
+        if success, http.mimeType?.lowercased() != "application/json" { throw BloomClientError.invalidHTTPResponse }
+        var data = Data()
+        for try await byte in bytes {
+            try Task.checkCancellation()
+            guard data.count < responseLimit else { throw BloomClientError.responseLimitExceeded }
+            data.append(byte)
+        }
+        guard success else { throw BloomClientError.http(http.statusCode, Self.errorMessage(from: data)) }
+        return data
     }
 
     private func applyHeaders(to request: inout URLRequest) {

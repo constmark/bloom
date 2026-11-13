@@ -196,6 +196,8 @@ pub struct InferenceParams {
     pub seed: Option<u64>,
     #[serde(default)]
     pub response_format: Option<bloomai_core::ResponseFormat>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<usize>,
 }
 
 impl Default for InferenceParams {
@@ -210,6 +212,7 @@ impl Default for InferenceParams {
             logit_bias: None,
             seed: None,
             response_format: None,
+            logprobs: None,
         }
     }
 }
@@ -226,6 +229,7 @@ impl InferenceParams {
             logit_bias: self.logit_bias.clone(),
             seed: self.seed,
             response_format: self.response_format.clone(),
+            logprobs: self.logprobs,
         }
         .validate()
     }
@@ -250,9 +254,71 @@ impl InferenceRequest {
     }
 }
 
+/// One exact token and its log probability in the adjusted model distribution.
+/// `bytes` can contain a partial UTF-8 codepoint; `token` is its lossy display.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TokenLogprob {
+    pub token_id: u32,
+    pub token: String,
+    pub bytes: Vec<u8>,
+    pub logprob: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TokenLogprobs {
+    pub token: TokenLogprob,
+    pub top_logprobs: Vec<TokenLogprob>,
+}
+
+impl TokenLogprobs {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.top_logprobs.len() > 20 {
+            return Err("top_logprobs exceeds 20 alternatives".into());
+        }
+        for token in std::iter::once(&self.token).chain(&self.top_logprobs) {
+            if token.bytes.len() > 1024 || token.token.len() > 4096 {
+                return Err("logprob token exceeds the byte limit".into());
+            }
+            if !token.logprob.is_finite() || token.logprob > 0.0 {
+                return Err("token logprob must be finite and nonpositive".into());
+            }
+            if token.token != String::from_utf8_lossy(&token.bytes) {
+                return Err("token logprob display does not match its bytes".into());
+            }
+        }
+        let mut ids = std::collections::HashSet::new();
+        let mut previous = f64::INFINITY;
+        for token in &self.top_logprobs {
+            if !ids.insert(token.token_id) || token.logprob > previous {
+                return Err("top_logprobs must be unique and sorted by probability".into());
+            }
+            if token.token_id == self.token.token_id && token != &self.token {
+                return Err("selected token disagrees with its top_logprobs entry".into());
+            }
+            previous = token.logprob;
+        }
+        Ok(())
+    }
+
+    pub fn byte_size(&self) -> usize {
+        std::iter::once(&self.token)
+            .chain(&self.top_logprobs)
+            .map(|token| {
+                token
+                    .bytes
+                    .len()
+                    .saturating_add(token.token.len())
+                    .saturating_add(64)
+            })
+            .fold(0usize, usize::saturating_add)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OutputChunk {
     TextDelta(String),
+    /// Metadata precedes the text produced by this non-EOS token.
+    TokenLogprobs(TokenLogprobs),
     Tokens(Vec<u32>),
     /// Cumulative exact input and accepted output IDs (including EOS). Emitted
     /// before text so stop/disconnect sinks retain the sampled token count.
@@ -328,6 +394,7 @@ impl OutputChunk {
     /// one request into an unbounded allocation or leaking NaN values.
     pub fn validate(&self) -> Result<(), String> {
         match self {
+            Self::TokenLogprobs(value) => value.validate(),
             Self::TextDelta(text) => {
                 if text.len() > MAX_TEXT_BYTES {
                     Err("text output chunk exceeds the byte limit".to_string())
@@ -642,6 +709,8 @@ pub struct VideoOutput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelOutput {
     pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<Vec<TokenLogprobs>>,
     pub logits: Option<Vec<f32>>,
     /// Image output from image generation or editing models.
     pub image: Option<Vec<u8>>,
@@ -653,6 +722,27 @@ pub struct ModelOutput {
 
 impl ModelOutput {
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(records) = &self.logprobs {
+            if records.len() > 4096
+                || records
+                    .iter()
+                    .map(TokenLogprobs::byte_size)
+                    .fold(0usize, usize::saturating_add)
+                    > MAX_TEXT_BYTES
+            {
+                return Err("logprob output exceeds the aggregate limit".into());
+            }
+            for record in records {
+                record.validate()?;
+            }
+            let bytes: Vec<u8> = records
+                .iter()
+                .flat_map(|record| record.token.bytes.iter().copied())
+                .collect();
+            if bytes != self.text.as_deref().unwrap_or_default().as_bytes() {
+                return Err("logprob token bytes do not reconstruct output text".into());
+            }
+        }
         if let Some(text) = &self.text {
             bounded_text(text, "text output")?;
         }
@@ -691,6 +781,7 @@ impl ModelOutput {
 impl From<Vec<OutputChunk>> for ModelOutput {
     fn from(chunks: Vec<OutputChunk>) -> Self {
         let mut text = String::new();
+        let mut logprobs = Vec::new();
         let mut logits = Vec::new();
         let mut image = None;
         let mut audio_samples = Vec::new();
@@ -700,6 +791,7 @@ impl From<Vec<OutputChunk>> for ModelOutput {
         for chunk in chunks {
             match chunk {
                 OutputChunk::TextDelta(delta) => text.push_str(&delta),
+                OutputChunk::TokenLogprobs(value) => logprobs.push(value),
                 OutputChunk::Image(bytes) => image = Some(bytes),
                 OutputChunk::Embedding(values) => logits.extend(values),
                 OutputChunk::AudioDelta(samples) => audio_samples.extend(samples),
@@ -734,6 +826,11 @@ impl From<Vec<OutputChunk>> for ModelOutput {
         });
         Self {
             text: if text.is_empty() { None } else { Some(text) },
+            logprobs: if logprobs.is_empty() {
+                None
+            } else {
+                Some(logprobs)
+            },
             logits: if logits.is_empty() {
                 None
             } else {
@@ -753,6 +850,38 @@ impl From<Vec<OutputChunk>> for ModelOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logprob_records_validate_probabilities_bytes_and_bounded_candidates() {
+        let token = TokenLogprob {
+            token_id: 1,
+            token: "x".into(),
+            bytes: b"x".to_vec(),
+            logprob: -0.5,
+        };
+        let record = TokenLogprobs {
+            token: token.clone(),
+            top_logprobs: vec![token.clone()],
+        };
+        assert!(record.validate().is_ok());
+        for value in [f64::NAN, f64::INFINITY, 0.1] {
+            let mut invalid = record.clone();
+            invalid.token.logprob = value;
+            assert!(invalid.validate().is_err());
+        }
+        let mut invalid = record.clone();
+        invalid.token.bytes = b"y".to_vec();
+        assert!(invalid.validate().is_err());
+        let mut invalid = record.clone();
+        invalid.top_logprobs = vec![token.clone(); 21];
+        assert!(invalid.validate().is_err());
+        let mut invalid = record.clone();
+        invalid.top_logprobs[0].logprob = -0.4;
+        assert!(invalid.validate().is_err());
+        let mut invalid = record.clone();
+        invalid.top_logprobs.push(token);
+        assert!(invalid.validate().is_err());
+    }
 
     #[test]
     fn test_model_input_text_serde() {
@@ -842,6 +971,7 @@ mod tests {
     #[test]
     fn test_model_output_serde() {
         let output = ModelOutput {
+            logprobs: None,
             text: Some("result".to_string()),
             logits: Some(vec![0.9, 0.1]),
             image: None,
@@ -941,6 +1071,7 @@ mod tests {
         assert!(progress.validate().unwrap_err().contains("range"));
 
         let output = ModelOutput {
+            logprobs: None,
             text: None,
             logits: None,
             image: None,

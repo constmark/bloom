@@ -2179,20 +2179,33 @@ async fn collect_scheduled_text(
     request_id: &str,
     generated_count: &AtomicU64,
     stop_sequences: Vec<String>,
+    max_tokens: usize,
 ) -> std::result::Result<GeneratedText, String> {
     let has_stop_sequences = !stop_sequences.is_empty();
     let mut filter = StopSequenceFilter::new(stop_sequences);
     let mut generated_tokens = Vec::new();
+    let mut saw_eos = false;
+    let mut emitted = String::new();
     let mut text = String::new();
     while let Some(result) = receiver.recv().await {
         let token = result?;
+        if pipeline.model().eos_token_ids().contains(&token) {
+            saw_eos = true;
+            break;
+        }
         generated_tokens.push(token);
         generated_count.fetch_add(1, Ordering::Relaxed);
         if has_stop_sequences {
-            let delta = pipeline.detokenize(&[token]).map_err(|error| {
-                scheduler.cancel_request(request_id);
-                format!("Detokenization failed: {error}")
-            })?;
+            let delta = pipeline
+                .detokenize(&generated_tokens)
+                .and_then(|decoded| {
+                    crate::openai_choices::stable_decoded_delta(&decoded, &mut emitted, false)
+                })
+                .map_err(|error| {
+                    scheduler.cancel_request(request_id);
+                    format!("Detokenization failed: {error}")
+                })?
+                .unwrap_or_default();
             let update = filter.push(&delta);
             text.push_str(&update.text);
             if update.stopped {
@@ -2204,7 +2217,29 @@ async fn collect_scheduled_text(
             }
         }
     }
+    if !saw_eos && generated_tokens.len() < max_tokens {
+        return Err("scheduler ended the candidate without EOS or its token budget".into());
+    }
     if has_stop_sequences {
+        let tail = pipeline
+            .detokenize(&generated_tokens)
+            .and_then(|decoded| {
+                crate::openai_choices::stable_decoded_delta(&decoded, &mut emitted, true)
+            })
+            .map_err(|error| {
+                scheduler.cancel_request(request_id);
+                format!("Detokenization failed: {error}")
+            })?
+            .unwrap_or_default();
+        let update = filter.push(&tail);
+        text.push_str(&update.text);
+        if update.stopped {
+            scheduler.cancel_request(request_id);
+            return Ok(GeneratedText {
+                text,
+                stopped: true,
+            });
+        }
         text.push_str(&filter.finish());
     } else {
         text = pipeline.detokenize(&generated_tokens).map_err(|error| {
@@ -2356,6 +2391,16 @@ async fn handle_chat_completions_inner(
             message,
         );
     }
+    let logprobs = match request_logprobs(&payload.extensions, true) {
+        Ok(value) => value,
+        Err(message) => {
+            return error_response(
+                axum::http::StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                message,
+            );
+        }
+    };
     let choice_count = match request_choice_count(&payload.extensions) {
         Ok(count) => count,
         Err(message) => {
@@ -2366,13 +2411,7 @@ async fn handle_chat_completions_inner(
             );
         }
     };
-    if choice_count > 1 && state.app.enable_ifb {
-        return error_response(
-            axum::http::StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "n greater than 1 is currently supported only for direct text Chat Completions without continuous batching.",
-        );
-    }
+
     let vision_request = match prepare_openai_vision_request(&payload) {
         Ok(request) => request,
         Err(message) => {
@@ -2384,6 +2423,13 @@ async fn handle_chat_completions_inner(
         }
     };
     if let Some(vision_request) = vision_request {
+        if logprobs.is_some() {
+            return error_response(
+                axum::http::StatusCode::BAD_REQUEST,
+                "unsupported_logprobs",
+                "Token log probabilities currently require direct text input.",
+            );
+        }
         if choice_count > 1 {
             return error_response(
                 axum::http::StatusCode::BAD_REQUEST,
@@ -2454,14 +2500,16 @@ async fn handle_chat_completions_inner(
             "response_format cannot be combined with active function tools in Bloom. Tool arguments are validated against each function's parameters schema.",
         );
     }
-    if payload.stream
-        && choice_count > 1
-        && (tool_config.is_some() || !matches!(response_format, ResponseFormatMode::Text))
+    if logprobs.is_some()
+        && (state.app.enable_ifb
+            || tool_config.is_some()
+            || !matches!(response_format, ResponseFormatMode::Text)
+            || !stop_sequences.is_empty())
     {
         return error_response(
             axum::http::StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "streaming n greater than 1 currently supports direct text Chat Completions without tools or structured output; use a non-streaming request for structured or function-tool choices.",
+            "unsupported_logprobs",
+            "Token log probabilities require direct plain text generation without IFB, active tools, response_format or custom stop sequences.",
         );
     }
     let core_response_format = match (&tool_config, &response_format) {
@@ -2485,6 +2533,13 @@ async fn handle_chat_completions_inner(
         };
     let temperature = payload.temperature.unwrap_or(0.7);
     let top_p = payload.top_p.unwrap_or(0.9);
+    if logprobs.is_some() && max_tokens > 4096 {
+        return error_response(
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Token log probabilities support at most 4096 generated tokens per choice.",
+        );
+    }
     if let Err(message) = validate_generation_controls(max_tokens, temperature, top_p) {
         return error_response(
             axum::http::StatusCode::BAD_REQUEST,
@@ -2552,6 +2607,13 @@ async fn handle_chat_completions_inner(
         return non_generation_model_response(&model_id);
     }
     let pipeline = Arc::clone(&runtime.pipeline);
+    if logprobs.is_some() && !pipeline.model().supports_logprobs() {
+        return error_response(
+            axum::http::StatusCode::BAD_REQUEST,
+            "unsupported_logprobs",
+            "The loaded model/device/tokenizer cannot provide exact token log probabilities.",
+        );
+    }
     let model_family = runtime.model_family.clone();
     let model_architecture = runtime.model_architecture.clone();
     let model_chat_template = runtime.model_chat_template.clone();
@@ -2582,6 +2644,7 @@ async fn handle_chat_completions_inner(
         presence_penalty,
         frequency_penalty,
         logit_bias,
+        logprobs,
         seed: payload.seed,
         response_format: match core_response_format {
             bloomai_core::ResponseFormat::Text => None,
@@ -2698,6 +2761,61 @@ async fn handle_chat_completions_inner(
                 "Continuous batching is enabled, but the scheduler is unavailable.",
             );
         };
+        if choice_count > 1 {
+            let generated_count = Arc::new(AtomicU64::new(0));
+            let lifecycle = InferenceLifecycle::new(
+                cancel_guard,
+                InferenceLifecycleResources {
+                    metrics: Arc::clone(&state.app.metrics),
+                    request_start,
+                    generated_tokens: Arc::clone(&generated_count),
+                    prompt_tokens: prompt_tokens as u64,
+                    permit,
+                    runtime_lease: runtime_lease.clone(),
+                },
+                StreamExecution::Blocking,
+            );
+            let request = crate::openai_choices::TextChoiceStream {
+                request_id,
+                model_id,
+                inputs: vec![input],
+                echo_prompts: None,
+                choice_count,
+                params,
+                stop_sequences,
+                response_format,
+                tool_config,
+                chat: true,
+                include_usage,
+                prompt_tokens: prompt_tokens as u64,
+                scheduled: Some(crate::openai_choices::ScheduledChoices {
+                    scheduler,
+                    execution_guard: runtime_lease.execution_guard(),
+                }),
+            };
+            return if payload.stream {
+                crate::openai_choices::stream_text_choices(
+                    Arc::clone(&state),
+                    pipeline,
+                    request,
+                    lifecycle,
+                    generated_count,
+                    cancel_token,
+                    request_start,
+                )
+            } else {
+                crate::openai_choices::buffered_text_choices(
+                    Arc::clone(&state),
+                    pipeline,
+                    request,
+                    lifecycle,
+                    generated_count,
+                    cancel_token,
+                    request_start,
+                )
+                .await
+            };
+        }
         let (tx, mut rx) = mpsc::unbounded_channel::<Result<u32, String>>();
         scheduler
             .token_senders
@@ -2776,6 +2894,7 @@ async fn handle_chat_completions_inner(
                 &request_id,
                 &generated_count,
                 stop_sequences.clone(),
+                max_tokens,
             )
             .await
             {
@@ -2868,6 +2987,11 @@ async fn handle_chat_completions_inner(
 
         let pipeline_for_stream = Arc::clone(&pipeline);
         let expose_text_deltas = tool_config.is_none();
+        let scheduled_terminal_seen = Arc::new(AtomicBool::new(false));
+        let scheduled_terminal_for_stream = Arc::clone(&scheduled_terminal_seen);
+        let mut decoded_tokens = Vec::new();
+        let mut decoded_emitted = String::new();
+        let decode_max_tokens = params.max_tokens;
         let sse_stream = UnboundedReceiverStream::new(rx)
             .map(move |item| {
                 if stream_failed_for_stream.load(Ordering::Acquire) {
@@ -2875,16 +2999,33 @@ async fn handle_chat_completions_inner(
                 }
                 let chunk = match item {
                     Ok(tok) => {
-                        record_stream_tokens(
-                            &state_clone,
-                            request_start,
-                            &first_token_for_stream,
-                            &last_token_for_stream,
-                            &generated_count_for_stream,
-                            1,
-                        );
-                        let text = match pipeline_for_stream.detokenize(&[tok]) {
-                            Ok(text) => text,
+                        let is_eos = pipeline_for_stream.model().eos_token_ids().contains(&tok);
+                        if !is_eos {
+                            decoded_tokens.push(tok);
+                            record_stream_tokens(
+                                &state_clone,
+                                request_start,
+                                &first_token_for_stream,
+                                &last_token_for_stream,
+                                &generated_count_for_stream,
+                                1,
+                            );
+                        }
+                        let terminal = is_eos || decoded_tokens.len() >= decode_max_tokens;
+                        if terminal {
+                            scheduled_terminal_for_stream.store(true, Ordering::Release);
+                        }
+                        let text = match pipeline_for_stream.detokenize(&decoded_tokens).and_then(
+                            |decoded| {
+                                crate::openai_choices::stable_decoded_delta(
+                                    &decoded,
+                                    &mut decoded_emitted,
+                                    terminal,
+                                )
+                            },
+                        ) {
+                            Ok(Some(text)) => text,
+                            Ok(None) => return None,
                             Err(error) => {
                                 stream_failed_for_stream.store(true, Ordering::Release);
                                 scheduler_for_stop.cancel_request(&request_id_for_stop);
@@ -2978,11 +3119,23 @@ async fn handle_chat_completions_inner(
         let stop_filter_for_flush = Arc::clone(&stop_filter);
         let accumulated_text_for_flush = Arc::clone(&accumulated_text);
         let stream_failed_for_flush = Arc::clone(&stream_failed);
+        let stop_hit_for_flush = Arc::clone(&stop_sequence_hit);
         let flush_request_id = request_id.clone();
         let flush_model_id = model_id.clone();
         let flush_stream = futures::stream::once(async move {
             if stream_failed_for_flush.load(Ordering::Acquire) {
                 return None;
+            }
+            if !scheduled_terminal_seen.load(Ordering::Acquire)
+                && !stop_hit_for_flush.load(Ordering::Acquire)
+            {
+                stream_failed_for_flush.store(true, Ordering::Release);
+                return Some(Ok::<Event, std::convert::Infallible>(json_event(
+                    stream_error_payload(
+                        "internal_error",
+                        "scheduler ended the candidate without EOS or its token budget",
+                    ),
+                )));
             }
             let tail = stop_filter_for_flush
                 .lock()
@@ -3094,7 +3247,7 @@ async fn handle_chat_completions_inner(
             .into_response();
     }
 
-    if payload.stream && choice_count > 1 {
+    if logprobs.is_some() || (payload.stream && choice_count > 1) {
         let generated_count = Arc::new(AtomicU64::new(0));
         let lifecycle = InferenceLifecycle::new(
             cancel_guard,
@@ -3108,26 +3261,43 @@ async fn handle_chat_completions_inner(
             },
             StreamExecution::Blocking,
         );
-        return crate::openai_choices::stream_text_choices(
-            Arc::clone(&state),
-            pipeline,
-            crate::openai_choices::TextChoiceStream {
-                request_id,
-                model_id,
-                inputs: vec![input],
-                echo_prompts: None,
-                choice_count,
-                params,
-                stop_sequences,
-                chat: true,
-                include_usage,
-                prompt_tokens: prompt_tokens as u64,
-            },
-            lifecycle,
-            generated_count,
-            cancel_token,
-            request_start,
-        );
+        let choices_request = crate::openai_choices::TextChoiceStream {
+            request_id,
+            model_id,
+            inputs: vec![input],
+            echo_prompts: None,
+            choice_count,
+            params,
+            stop_sequences,
+            response_format,
+            tool_config,
+            chat: true,
+            include_usage,
+            prompt_tokens: prompt_tokens as u64,
+            scheduled: None,
+        };
+        return if payload.stream {
+            crate::openai_choices::stream_text_choices(
+                Arc::clone(&state),
+                pipeline,
+                choices_request,
+                lifecycle,
+                generated_count,
+                cancel_token,
+                request_start,
+            )
+        } else {
+            crate::openai_choices::buffered_text_choices(
+                Arc::clone(&state),
+                pipeline,
+                choices_request,
+                lifecycle,
+                generated_count,
+                cancel_token,
+                request_start,
+            )
+            .await
+        };
     }
 
     if !payload.stream {
@@ -4162,6 +4332,16 @@ pub(crate) async fn handle_completions(
             message,
         );
     }
+    let logprobs = match request_logprobs(&payload.extensions, false) {
+        Ok(value) => value,
+        Err(message) => {
+            return error_response(
+                axum::http::StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                message,
+            );
+        }
+    };
     let choice_count = match request_choice_count(&payload.extensions) {
         Ok(count) => count,
         Err(message) => {
@@ -4173,13 +4353,7 @@ pub(crate) async fn handle_completions(
         }
     };
     let echo = request_echo(&payload.extensions);
-    if choice_count > 1 && state.app.enable_ifb {
-        return error_response(
-            axum::http::StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "n greater than 1 is currently supported only for direct text Completions without continuous batching.",
-        );
-    }
+
     let stop_sequences = match normalize_stop_sequences(payload.stop.as_ref()) {
         Ok(sequences) => sequences,
         Err(message) => {
@@ -4193,6 +4367,13 @@ pub(crate) async fn handle_completions(
     let max_tokens = payload.max_tokens.unwrap_or(128);
     let temperature = payload.temperature.unwrap_or(0.7);
     let top_p = payload.top_p.unwrap_or(0.9);
+    if logprobs.is_some() && max_tokens > 4096 {
+        return error_response(
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Token log probabilities support at most 4096 generated tokens per choice.",
+        );
+    }
     if let Err(message) = validate_generation_controls(max_tokens, temperature, top_p) {
         return error_response(
             axum::http::StatusCode::BAD_REQUEST,
@@ -4240,13 +4421,6 @@ pub(crate) async fn handle_completions(
             );
         }
     };
-    if payload.stream && choice_count > 1 && !matches!(response_format, ResponseFormatMode::Text) {
-        return error_response(
-            axum::http::StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "streaming n greater than 1 currently supports direct text Completions without structured output; use a non-streaming request for structured choices.",
-        );
-    }
     let prompts = match completion_prompts(&payload.prompt) {
         Ok(prompts) => prompts,
         Err(message) => {
@@ -4257,18 +4431,17 @@ pub(crate) async fn handle_completions(
             );
         }
     };
-    if payload.stream && prompts.len() > 1 && !matches!(response_format, ResponseFormatMode::Text) {
+
+    if logprobs.is_some()
+        && (state.app.enable_ifb
+            || echo
+            || !matches!(response_format, ResponseFormatMode::Text)
+            || !stop_sequences.is_empty())
+    {
         return error_response(
             axum::http::StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "streaming batched prompts currently support text output only.",
-        );
-    }
-    if prompts.len() > 1 && state.app.enable_ifb {
-        return error_response(
-            axum::http::StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "batched prompts are currently supported only for direct text Completions without continuous batching.",
+            "unsupported_logprobs",
+            "Token log probabilities require direct plain text generation without IFB, echo, response_format or custom stop sequences.",
         );
     }
     if !state.app.ready.load(Ordering::Acquire) {
@@ -4286,6 +4459,13 @@ pub(crate) async fn handle_completions(
         return non_generation_model_response(&model_id);
     }
     let pipeline = Arc::clone(&runtime.pipeline);
+    if logprobs.is_some() && !pipeline.model().supports_logprobs() {
+        return error_response(
+            axum::http::StatusCode::BAD_REQUEST,
+            "unsupported_logprobs",
+            "The loaded model/device/tokenizer cannot provide exact token log probabilities.",
+        );
+    }
     let scheduler_opt = runtime.scheduler.clone();
 
     let permit = match Arc::clone(&state.app.semaphore).try_acquire_owned() {
@@ -4318,6 +4498,7 @@ pub(crate) async fn handle_completions(
         presence_penalty,
         frequency_penalty,
         logit_bias,
+        logprobs,
         seed: payload.seed,
         response_format: match core_response_format {
             bloomai_core::ResponseFormat::Text => None,
@@ -4325,6 +4506,8 @@ pub(crate) async fn handle_completions(
         },
     };
 
+    // Echo returns only the submitted prompt, never our private schema instructions.
+    let original_prompts = prompts.clone();
     let prompts = prompts
         .into_iter()
         .map(|prompt| apply_response_format_instruction(prompt, &response_format))
@@ -4431,6 +4614,61 @@ pub(crate) async fn handle_completions(
                 "Continuous batching is enabled, but the scheduler is unavailable.",
             );
         };
+        if choice_count > 1 || inputs.len() > 1 {
+            let generated_count = Arc::new(AtomicU64::new(0));
+            let lifecycle = InferenceLifecycle::new(
+                cancel_guard,
+                InferenceLifecycleResources {
+                    metrics: Arc::clone(&state.app.metrics),
+                    request_start,
+                    generated_tokens: Arc::clone(&generated_count),
+                    prompt_tokens: prompt_tokens as u64,
+                    permit,
+                    runtime_lease: runtime_lease.clone(),
+                },
+                StreamExecution::Blocking,
+            );
+            let request = crate::openai_choices::TextChoiceStream {
+                request_id,
+                model_id,
+                inputs,
+                echo_prompts: echo.then_some(original_prompts),
+                choice_count,
+                params,
+                stop_sequences,
+                response_format,
+                tool_config: None,
+                chat: false,
+                include_usage: false,
+                prompt_tokens: prompt_tokens as u64,
+                scheduled: Some(crate::openai_choices::ScheduledChoices {
+                    scheduler,
+                    execution_guard: runtime_lease.execution_guard(),
+                }),
+            };
+            return if payload.stream {
+                crate::openai_choices::stream_text_choices(
+                    Arc::clone(&state),
+                    pipeline,
+                    request,
+                    lifecycle,
+                    generated_count,
+                    cancel_token,
+                    request_start,
+                )
+            } else {
+                crate::openai_choices::buffered_text_choices(
+                    Arc::clone(&state),
+                    pipeline,
+                    request,
+                    lifecycle,
+                    generated_count,
+                    cancel_token,
+                    request_start,
+                )
+                .await
+            };
+        }
         let (tx, mut rx) = mpsc::unbounded_channel::<Result<u32, String>>();
         scheduler
             .token_senders
@@ -4508,6 +4746,7 @@ pub(crate) async fn handle_completions(
                 &request_id,
                 &generated_count,
                 stop_sequences.clone(),
+                max_tokens,
             )
             .await
             {
@@ -4554,7 +4793,7 @@ pub(crate) async fn handle_completions(
                 "choices": [{
                     "index": 0,
                     "text": if echo {
-                        format!("{prompt}{generated_text}")
+                        format!("{}{generated_text}", original_prompts[0])
                     } else {
                         generated_text
                     },
@@ -4594,6 +4833,11 @@ pub(crate) async fn handle_completions(
         let request_id_for_stop = request_id.clone();
 
         let pipeline_for_stream = Arc::clone(&pipeline);
+        let scheduled_terminal_seen = Arc::new(AtomicBool::new(false));
+        let scheduled_terminal_for_stream = Arc::clone(&scheduled_terminal_seen);
+        let mut decoded_tokens = Vec::new();
+        let mut decoded_emitted = String::new();
+        let decode_max_tokens = params.max_tokens;
         let sse_stream = UnboundedReceiverStream::new(rx)
             .map(move |item| {
                 if stream_failed_for_stream.load(Ordering::Acquire) {
@@ -4601,16 +4845,33 @@ pub(crate) async fn handle_completions(
                 }
                 let chunk = match item {
                     Ok(tok) => {
-                        record_stream_tokens(
-                            &state_clone,
-                            request_start,
-                            &first_token_for_stream,
-                            &last_token_for_stream,
-                            &generated_count_for_stream,
-                            1,
-                        );
-                        let text = match pipeline_for_stream.detokenize(&[tok]) {
-                            Ok(text) => text,
+                        let is_eos = pipeline_for_stream.model().eos_token_ids().contains(&tok);
+                        if !is_eos {
+                            decoded_tokens.push(tok);
+                            record_stream_tokens(
+                                &state_clone,
+                                request_start,
+                                &first_token_for_stream,
+                                &last_token_for_stream,
+                                &generated_count_for_stream,
+                                1,
+                            );
+                        }
+                        let terminal = is_eos || decoded_tokens.len() >= decode_max_tokens;
+                        if terminal {
+                            scheduled_terminal_for_stream.store(true, Ordering::Release);
+                        }
+                        let text = match pipeline_for_stream.detokenize(&decoded_tokens).and_then(
+                            |decoded| {
+                                crate::openai_choices::stable_decoded_delta(
+                                    &decoded,
+                                    &mut decoded_emitted,
+                                    terminal,
+                                )
+                            },
+                        ) {
+                            Ok(Some(text)) => text,
+                            Ok(None) => return None,
                             Err(error) => {
                                 stream_failed_for_stream.store(true, Ordering::Release);
                                 scheduler_for_stop.cancel_request(&request_id_for_stop);
@@ -4678,11 +4939,23 @@ pub(crate) async fn handle_completions(
         let stop_filter_for_flush = Arc::clone(&stop_filter);
         let accumulated_text_for_flush = Arc::clone(&accumulated_text);
         let stream_failed_for_flush = Arc::clone(&stream_failed);
+        let stop_hit_for_flush = Arc::clone(&stop_sequence_hit);
         let flush_request_id = request_id.clone();
         let flush_model_id = model_id.clone();
         let flush_stream = futures::stream::once(async move {
             if stream_failed_for_flush.load(Ordering::Acquire) {
                 return None;
+            }
+            if !scheduled_terminal_seen.load(Ordering::Acquire)
+                && !stop_hit_for_flush.load(Ordering::Acquire)
+            {
+                stream_failed_for_flush.store(true, Ordering::Release);
+                return Some(Ok::<Event, std::convert::Infallible>(json_event(
+                    stream_error_payload(
+                        "internal_error",
+                        "scheduler ended the candidate without EOS or its token budget",
+                    ),
+                )));
             }
             let tail = stop_filter_for_flush
                 .lock()
@@ -4726,7 +4999,7 @@ pub(crate) async fn handle_completions(
         let echo_prefix_events = if echo {
             let prefix_id = request_id.clone();
             let prefix_model = model_id.clone();
-            let prefix_prompt = prompt.clone();
+            let prefix_prompt = original_prompts[0].clone();
             vec![Ok::<Event, std::convert::Infallible>(json_event(json!({
                 "id": prefix_id,
                 "object": "text_completion.chunk",
@@ -4795,7 +5068,7 @@ pub(crate) async fn handle_completions(
             .into_response();
     }
 
-    if payload.stream && (choice_count > 1 || inputs.len() > 1) {
+    if logprobs.is_some() || (payload.stream && (choice_count > 1 || inputs.len() > 1)) {
         let generated_count = Arc::new(AtomicU64::new(0));
         let lifecycle = InferenceLifecycle::new(
             cancel_guard,
@@ -4809,26 +5082,43 @@ pub(crate) async fn handle_completions(
             },
             StreamExecution::Blocking,
         );
-        return crate::openai_choices::stream_text_choices(
-            Arc::clone(&state),
-            pipeline,
-            crate::openai_choices::TextChoiceStream {
-                request_id,
-                model_id,
-                inputs,
-                echo_prompts: echo.then_some(prompts),
-                choice_count,
-                params,
-                stop_sequences,
-                chat: false,
-                include_usage: false,
-                prompt_tokens: prompt_tokens as u64,
-            },
-            lifecycle,
-            generated_count,
-            cancel_token,
-            request_start,
-        );
+        let choices_request = crate::openai_choices::TextChoiceStream {
+            request_id,
+            model_id,
+            inputs,
+            echo_prompts: echo.then_some(original_prompts),
+            choice_count,
+            params,
+            stop_sequences,
+            response_format,
+            tool_config: None,
+            chat: false,
+            include_usage: false,
+            prompt_tokens: prompt_tokens as u64,
+            scheduled: None,
+        };
+        return if payload.stream {
+            crate::openai_choices::stream_text_choices(
+                Arc::clone(&state),
+                pipeline,
+                choices_request,
+                lifecycle,
+                generated_count,
+                cancel_token,
+                request_start,
+            )
+        } else {
+            crate::openai_choices::buffered_text_choices(
+                Arc::clone(&state),
+                pipeline,
+                choices_request,
+                lifecycle,
+                generated_count,
+                cancel_token,
+                request_start,
+            )
+            .await
+        };
     }
 
     if !payload.stream {
@@ -4929,7 +5219,7 @@ pub(crate) async fn handle_completions(
             let response_text = if echo {
                 format!(
                     "{}{generated_text}",
-                    prompts
+                    original_prompts
                         .get(prompt_index)
                         .map(String::as_str)
                         .unwrap_or_default()
@@ -5089,7 +5379,7 @@ pub(crate) async fn handle_completions(
     let echo_prefix_events = if echo {
         let prefix_id = request_id.clone();
         let prefix_model = model_id.clone();
-        let prefix_prompt = prompt.clone();
+        let prefix_prompt = original_prompts[0].clone();
         vec![Ok::<Event, std::convert::Infallible>(json_event(json!({
             "id": prefix_id,
             "object": "text_completion.chunk",

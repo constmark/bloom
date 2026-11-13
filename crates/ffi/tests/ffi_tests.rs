@@ -8,11 +8,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use bloom_ffi::{
     BLOOM_ABI_VERSION, BLOOM_STATUS_CANCELLED, BLOOM_STATUS_INVALID_ARGUMENT,
     BLOOM_STATUS_INVALID_INPUT_JSON, BLOOM_STATUS_INVALID_PARAMS_JSON, BLOOM_STATUS_INVALID_UTF8,
-    BLOOM_STATUS_OK, BloomCancellationToken, BloomOwnedBuffer, BloomPipeline, BloomSlice,
-    bloom_abi_version, bloom_buffer_free, bloom_cancellation_token_cancel,
-    bloom_cancellation_token_free, bloom_cancellation_token_new, bloom_pipeline_free,
-    bloom_pipeline_load, bloom_pipeline_load_v2, bloom_pipeline_run, bloom_pipeline_run_stream,
-    bloom_pipeline_run_stream_v2, bloom_pipeline_run_v2, bloom_string_free,
+    BLOOM_STATUS_OK, BLOOM_STATUS_UNSUPPORTED, BloomCancellationToken, BloomOwnedBuffer,
+    BloomPipeline, BloomSlice, bloom_abi_version, bloom_buffer_free,
+    bloom_cancellation_token_cancel, bloom_cancellation_token_free, bloom_cancellation_token_new,
+    bloom_pipeline_detokenize_v2, bloom_pipeline_free, bloom_pipeline_load, bloom_pipeline_load_v2,
+    bloom_pipeline_run, bloom_pipeline_run_stream, bloom_pipeline_run_stream_v2,
+    bloom_pipeline_run_v2, bloom_pipeline_tokenize_v2, bloom_string_free,
 };
 
 static CALLBACK_DATA: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
@@ -26,6 +27,104 @@ fn bloom_slice(bytes: &[u8]) -> BloomSlice {
     BloomSlice {
         data: bytes.as_ptr(),
         len: bytes.len(),
+    }
+}
+
+#[test]
+fn tokenization_extensions_reject_invalid_inputs_and_unsupported_models() {
+    unsafe {
+        let mut error = [0 as c_char; 512];
+        let pipeline = bloom_pipeline_load_v2(
+            bloom_slice(b"."),
+            bloom_slice(b"mock"),
+            bloom_slice(b"cpu"),
+            128,
+            error.as_mut_ptr(),
+            error.len(),
+        );
+        assert!(!pipeline.is_null());
+        let mut output = BloomOwnedBuffer::default();
+        for text in [b"".as_slice(), "中文 🌸".as_bytes()] {
+            assert_eq!(
+                bloom_pipeline_tokenize_v2(
+                    pipeline,
+                    bloom_slice(text),
+                    &mut output,
+                    error.as_mut_ptr(),
+                    error.len(),
+                ),
+                BLOOM_STATUS_UNSUPPORTED
+            );
+            assert!(output.data.is_null());
+        }
+        for tokens in [b"[]".as_slice(), b"[1,2]"] {
+            assert_eq!(
+                bloom_pipeline_detokenize_v2(
+                    pipeline,
+                    bloom_slice(tokens),
+                    &mut output,
+                    error.as_mut_ptr(),
+                    error.len(),
+                ),
+                BLOOM_STATUS_UNSUPPORTED
+            );
+        }
+        for tokens in [
+            b"[true]".as_slice(),
+            b"[-1]",
+            b"[4294967296]",
+            b"[1.5]",
+            b"{}",
+            b"null",
+        ] {
+            assert_eq!(
+                bloom_pipeline_detokenize_v2(
+                    pipeline,
+                    bloom_slice(tokens),
+                    &mut output,
+                    error.as_mut_ptr(),
+                    error.len(),
+                ),
+                BLOOM_STATUS_INVALID_INPUT_JSON
+            );
+        }
+        assert_eq!(
+            bloom_pipeline_tokenize_v2(
+                pipeline,
+                bloom_slice(b"\xff"),
+                &mut output,
+                error.as_mut_ptr(),
+                error.len(),
+            ),
+            BLOOM_STATUS_INVALID_UTF8
+        );
+        assert_eq!(
+            bloom_pipeline_tokenize_v2(
+                pipeline,
+                BloomSlice {
+                    data: b"x".as_ptr(),
+                    len: 8 * 1024 * 1024 + 1
+                },
+                &mut output,
+                error.as_mut_ptr(),
+                error.len(),
+            ),
+            BLOOM_STATUS_INVALID_ARGUMENT
+        );
+        output.len = 10;
+        assert_eq!(
+            bloom_pipeline_tokenize_v2(
+                std::ptr::null_mut(),
+                bloom_slice(b"x"),
+                &mut output,
+                error.as_mut_ptr(),
+                error.len(),
+            ),
+            BLOOM_STATUS_INVALID_ARGUMENT
+        );
+        assert!(output.data.is_null());
+        assert_eq!(output.len, 0);
+        bloom_pipeline_free(pipeline);
     }
 }
 
@@ -93,6 +192,10 @@ fn generation_params_fail_closed_through_every_abi_entry_point() {
         for extension in [
             r#""top_kk":40"#,
             r#""top_k":1,"top_k":2"#,
+            r#""logprobs":true"#,
+            r#""logprobs":-1"#,
+            r#""logprobs":1.5"#,
+            r#""logprobs":0,"logprobs":1"#,
             r#""response_format":{"type":"text","unknown":true}"#,
             r#""response_format":{"type":"text","json_schema":{}}"#,
             r#""response_format":{"type":"json_schema","json_schema":{},"strict":true}"#,
@@ -153,6 +256,85 @@ fn generation_params_fail_closed_through_every_abi_entry_point() {
                 CStr::from_ptr(error.as_ptr())
                     .to_string_lossy()
                     .contains("Failed to parse params JSON")
+            );
+        }
+        assert_eq!(callback_count.load(Ordering::Relaxed), 0);
+        bloom_pipeline_free(pipeline);
+    }
+}
+
+#[test]
+fn logprobs_requests_fail_closed_for_unsupported_models() {
+    unsafe {
+        let mut error = [0 as c_char; 512];
+        let pipeline = bloom_pipeline_load_v2(
+            bloom_slice(b"."),
+            bloom_slice(b"mock"),
+            bloom_slice(b"cpu"),
+            2048,
+            error.as_mut_ptr(),
+            error.len(),
+        );
+        assert!(!pipeline.is_null());
+        let input = CString::new(r#"{"Text":{"prompt":"hello"}}"#).unwrap();
+        let callback_count = AtomicUsize::new(0);
+        for (count, max_tokens) in [(0, 4), (20, 4), (21, 4), (0, 4097)] {
+            let params = CString::new(format!(
+                r#"{{"max_tokens":{max_tokens},"temperature":0.7,"top_p":0.9,"logprobs":{count}}}"#,
+            ))
+            .unwrap();
+            let mut output = BloomOwnedBuffer::default();
+            assert!(
+                bloom_pipeline_run(
+                    pipeline,
+                    input.as_ptr(),
+                    params.as_ptr(),
+                    error.as_mut_ptr(),
+                    error.len(),
+                )
+                .is_null()
+            );
+            assert_eq!(
+                bloom_pipeline_run_stream(
+                    pipeline,
+                    input.as_ptr(),
+                    params.as_ptr(),
+                    Some(test_stream_callback),
+                    0x12345678usize as *mut std::ffi::c_void,
+                    error.as_mut_ptr(),
+                    error.len(),
+                ),
+                -6
+            );
+            assert_eq!(
+                bloom_pipeline_run_v2(
+                    pipeline,
+                    bloom_slice(input.as_bytes()),
+                    bloom_slice(params.as_bytes()),
+                    &mut output,
+                    error.as_mut_ptr(),
+                    error.len(),
+                ),
+                bloom_ffi::BLOOM_STATUS_INFERENCE_ERROR
+            );
+            assert!(output.data.is_null());
+            assert_eq!(
+                bloom_pipeline_run_stream_v2(
+                    pipeline,
+                    bloom_slice(input.as_bytes()),
+                    bloom_slice(params.as_bytes()),
+                    Some(test_stream_callback_v2),
+                    (&callback_count as *const AtomicUsize).cast_mut().cast(),
+                    std::ptr::null(),
+                    error.as_mut_ptr(),
+                    error.len(),
+                ),
+                bloom_ffi::BLOOM_STATUS_INFERENCE_ERROR
+            );
+            assert!(
+                CStr::from_ptr(error.as_ptr())
+                    .to_string_lossy()
+                    .contains("logprobs")
             );
         }
         assert_eq!(callback_count.load(Ordering::Relaxed), 0);

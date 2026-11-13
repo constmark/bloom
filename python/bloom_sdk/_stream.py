@@ -46,10 +46,14 @@ class StreamBuffer:
         when no chunk or terminal state is observed before the deadline.
         """
         if timeout is not None:
+            try:
+                finite = isinstance(timeout, (int, float)) and math.isfinite(timeout)
+            except OverflowError:
+                finite = False
             if (
                 not isinstance(timeout, (int, float))
                 or isinstance(timeout, bool)
-                or not math.isfinite(timeout)
+                or not finite
                 or timeout < 0
             ):
                 raise ValueError("timeout must be a finite non-negative number or None")
@@ -75,7 +79,9 @@ class StreamBuffer:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise TimeoutError("Timed out waiting for streaming output")
-                    self._condition.wait(remaining)
+                    # Condition.wait delegates to a platform clock whose
+                    # timeout range is smaller than Python's finite floats.
+                    self._condition.wait(min(remaining, threading.TIMEOUT_MAX))
 
     def finish(self, error=None):
         with self._condition:

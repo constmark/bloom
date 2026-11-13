@@ -92,6 +92,8 @@ test_*.rs
 !scripts/test_architecture.py
 !scripts/test_bench_budget_check.py
 !scripts/test_python_package.py
+!scripts/test_python_native_wheel.py
+!scripts/test_native_wheel_contract.py
 !scripts/test_ffi_abi_compatibility.py
 !scripts/test_server_http_boundary.py
 !scripts/test_server_shutdown.py

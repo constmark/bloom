@@ -242,12 +242,17 @@ impl LoadedModel for OnnxRuntimeModel {
         input: ModelInput,
         _params: &bloomai_core::GenerationParams,
     ) -> Result<ModelOutput> {
+        anyhow::ensure!(
+            _params.logprobs.is_none(),
+            "this backend does not support token logprobs"
+        );
         if self.embedding.is_some() {
             let ModelInput::Text { prompt } = input else {
                 anyhow::bail!("ONNX embedding models require text input");
             };
             let mut output = self.embed_batch(&[prompt])?;
             return Ok(ModelOutput {
+                logprobs: None,
                 logits: Some(output.remove(0)),
                 text: None,
                 image: None,
@@ -286,6 +291,10 @@ impl LoadedModel for OnnxRuntimeModel {
         params: &bloomai_core::GenerationParams,
         sink: &mut dyn OutputSink,
     ) -> Result<()> {
+        anyhow::ensure!(
+            params.logprobs.is_none(),
+            "this backend does not support token logprobs"
+        );
         let output = self.infer(input, params)?;
         if let Some(text) = output.text {
             sink.on_chunk(OutputChunk::TextDelta(text))?;

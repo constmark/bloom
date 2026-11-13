@@ -252,4 +252,5 @@ require(tensorModel.isCompatible, "Tensor readiness should be accepted")
 require(!tensorModel.supportsChat, "Numeric model must not enable chat")
 
 try await runRegressionChecks()
+try await runDesktopToolsChecks()
 print("Bloom Desktop stream and lifecycle regression checks passed")

@@ -43,7 +43,9 @@ pub struct KvEvictionConfig {
     /// Must be finite and in [0, 1]; invalid thresholds reject all admissions.
     #[serde(default = "default_admission_threshold")]
     pub admission_threshold: f64,
-    /// Minimum fraction of the KV cache to retain during eviction.
+    /// Minimum fraction of candidate sessions' total KV tokens to retain.
+    /// Eviction removes whole sessions; a candidate that would cross this
+    /// floor is skipped. Must be finite and in [0, 1].
     #[serde(default = "default_retention_ratio")]
     pub retention_ratio: f64,
     /// Default token-value estimate when no prior information is available.
@@ -253,15 +255,30 @@ impl KvEvictionManager {
         }
     }
 
-    /// Select active sessions to free at least `tokens_to_free` KV-cache tokens.
+    /// Plan whole-session eviction to free at least `tokens_to_free` tokens.
     ///
-    /// Return evicted sessions in eviction order.
+    /// Respect the configured retention floor and return victims in eviction
+    /// order. An invalid ratio or insufficient reclaimable cache returns an
+    /// empty plan without updating counters, so callers never cancel sessions
+    /// for an admission that cannot succeed under this policy.
     pub fn select_eviction_victims(
         &mut self,
         sessions: &[KvSessionInfo],
         tokens_to_free: usize,
     ) -> Vec<EvictionDecision> {
         let _span = tracing::info_span!("kv_cache.evict", tokens_to_free).entered();
+        let ratio = self.config.retention_ratio;
+        if tokens_to_free == 0 || !ratio.is_finite() || !(0.0..=1.0).contains(&ratio) {
+            return Vec::new();
+        }
+        let total_tokens = sessions.iter().fold(0usize, |total, session| {
+            total.saturating_add(session.kv_cache_tokens)
+        });
+        let retained_tokens = ((total_tokens as f64 * ratio).ceil() as usize).min(total_tokens);
+        let eviction_budget = total_tokens - retained_tokens;
+        if tokens_to_free > eviction_budget {
+            return Vec::new();
+        }
         let mut heap = BinaryHeap::new();
 
         for session in sessions {
@@ -300,11 +317,12 @@ impl KvEvictionManager {
         while freed < tokens_to_free {
             match heap.pop() {
                 Some(candidate) => {
+                    if ratio > 0.0
+                        && candidate.kv_cache_tokens > eviction_budget.saturating_sub(freed)
+                    {
+                        continue;
+                    }
                     freed = freed.saturating_add(candidate.kv_cache_tokens);
-                    self.total_evictions = self.total_evictions.saturating_add(1);
-                    self.total_evicted_tokens = self
-                        .total_evicted_tokens
-                        .saturating_add(candidate.kv_cache_tokens);
                     decisions.push(EvictionDecision {
                         request_id: candidate.request_id,
                         freed_tokens: candidate.kv_cache_tokens,
@@ -315,6 +333,11 @@ impl KvEvictionManager {
             }
         }
 
+        if freed < tokens_to_free {
+            return Vec::new();
+        }
+        self.total_evictions = self.total_evictions.saturating_add(decisions.len());
+        self.total_evicted_tokens = self.total_evicted_tokens.saturating_add(freed);
         decisions
     }
 
@@ -423,7 +446,10 @@ mod tests {
         let mut large = small.clone();
         large.request_id = "large".into();
         large.kv_cache_tokens = 1000;
-        let mut manager = KvEvictionManager::new(KvEvictionConfig::default());
+        let mut manager = KvEvictionManager::new(KvEvictionConfig {
+            retention_ratio: 0.0,
+            ..Default::default()
+        });
         assert!(manager.score_session(&large) < manager.score_session(&small));
         let decisions = manager.select_eviction_victims(&[small, large], 1000);
         assert_eq!(decisions.len(), 1);
@@ -434,6 +460,7 @@ mod tests {
     fn eviction_skips_sessions_without_cache_and_saturates_accounting() {
         let mut manager = KvEvictionManager::new(KvEvictionConfig {
             policy: KvEvictionPolicy::Priority,
+            retention_ratio: 0.0,
             ..Default::default()
         });
         let sessions = [
@@ -544,8 +571,55 @@ mod tests {
     }
 
     #[test]
+    fn retention_floor_skips_large_sessions_without_partial_eviction() {
+        let sessions = [
+            make_session("large", 1, 80, 1000, 50, None),
+            make_session("small", 2, 20, 1000, 50, None),
+        ];
+        let mut manager = KvEvictionManager::new(KvEvictionConfig {
+            policy: KvEvictionPolicy::Priority,
+            retention_ratio: 0.5,
+            ..Default::default()
+        });
+        let decisions = manager.select_eviction_victims(&sessions, 20);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].request_id, "small");
+        // 40 fits the nominal 50-token budget, but no whole-session plan does.
+        assert!(manager.select_eviction_victims(&sessions, 40).is_empty());
+        assert!(manager.select_eviction_victims(&sessions, 51).is_empty());
+        assert_eq!(manager.total_evictions(), 1);
+        assert_eq!(manager.total_evicted_tokens(), 20);
+    }
+
+    #[test]
+    fn retention_rounds_up_and_rejects_invalid_ratios() {
+        let sessions = [
+            make_session("first", 1, 1, 1000, 50, None),
+            make_session("second", 2, 1, 1000, 50, None),
+            make_session("third", 3, 1, 1000, 50, None),
+        ];
+        for ratio in [f64::NAN, f64::INFINITY, -0.1, 1.1, 1.0] {
+            let mut manager = KvEvictionManager::new(KvEvictionConfig {
+                retention_ratio: ratio,
+                ..Default::default()
+            });
+            assert!(manager.select_eviction_victims(&sessions, 1).is_empty());
+            assert_eq!(manager.total_evictions(), 0);
+        }
+        let mut manager = KvEvictionManager::new(KvEvictionConfig {
+            retention_ratio: 0.5,
+            ..Default::default()
+        });
+        assert!(manager.select_eviction_victims(&sessions, 2).is_empty());
+        assert_eq!(manager.select_eviction_victims(&sessions, 1).len(), 1);
+    }
+
+    #[test]
     fn eviction_tracks_stats() {
-        let config = KvEvictionConfig::default();
+        let config = KvEvictionConfig {
+            retention_ratio: 0.0,
+            ..Default::default()
+        };
         let mut mgr = KvEvictionManager::new(config);
 
         let sessions = vec![

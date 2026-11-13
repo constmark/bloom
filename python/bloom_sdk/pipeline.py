@@ -5,7 +5,7 @@ import os
 import sys
 import threading
 from pathlib import Path
-from typing import Any, Dict, Generator, Mapping, Optional, Union
+from typing import Any, Dict, Generator, List, Mapping, Optional, Union
 
 from ._stream import MAX_STREAM_BYTES, StreamBuffer
 
@@ -41,11 +41,20 @@ def _find_lib():
     else:
         lib_names = ["libbloom_ffi.so"]
         
+    # Bundled wheels own their runtime. If it is present but cannot load,
+    # report that failure instead of silently selecting a workspace/system ABI.
+    for name in lib_names:
+        bundled = this_dir / name
+        if bundled.exists():
+            try:
+                return ctypes.CDLL(str(bundled))
+            except OSError as error:
+                raise RuntimeError(f"Could not load bundled Bloom native library {bundled}: {error}") from error
+
     search_dirs = [
         workspace_dir / "target" / "release",
         workspace_dir / "target" / "debug",
         workspace_dir / "crates" / "ffi",
-        this_dir,
     ]
     
     for search_dir in search_dirs:
@@ -109,6 +118,10 @@ BLOOM_STATUS_CANCELLED = -8
 # the length-delimited slice accepted by revision 2 and the CString boundary
 # used by revision 1.
 MAX_MODEL_PATH_BYTES = 128 * 1024
+MAX_IDENTIFIER_BYTES = 4 * 1024
+MAX_JSON_BYTES = 16 * 1024 * 1024
+MAX_TEXT_BYTES = 8 * 1024 * 1024
+MAX_TOKEN_COUNT = 4 * 1024 * 1024
 
 # Keep the Python boundary's diagnostic vocabulary stable while allowing
 # applications to present messages in their own UI language.  Native errors
@@ -389,6 +402,17 @@ def _configure_lib(native_lib):
         native_lib.bloom_cancellation_token_cancel.restype = ctypes.c_int32
         native_lib.bloom_cancellation_token_free.argtypes = [ctypes.c_void_p]
         native_lib.bloom_cancellation_token_free.restype = None
+        # Additive v2 extensions are optional so existing native libraries
+        # retain their generation support without an ABI upgrade.
+        for symbol in ("bloom_pipeline_tokenize_v2", "bloom_pipeline_detokenize_v2"):
+            if hasattr(native_lib, symbol):
+                function = getattr(native_lib, symbol)
+                function.argtypes = [
+                    BloomPipelinePtr, BloomSlice,
+                    ctypes.POINTER(BloomOwnedBuffer),
+                    ctypes.c_char_p, ctypes.c_size_t,
+                ]
+                function.restype = ctypes.c_int32
     native_lib._bloom_uses_v2 = has_v2
     return native_lib
 
@@ -465,6 +489,13 @@ class BloomPipeline:
             raise ValueError(
                 f"model_path exceeds the {MAX_MODEL_PATH_BYTES}-byte UTF-8 limit"
             )
+        for name, value in (("engine", engine), ("device", device)):
+            try:
+                encoded = value.encode("utf-8")
+            except UnicodeEncodeError as error:
+                raise ValueError(f"{name} must be valid UTF-8") from error
+            if len(encoded) > MAX_IDENTIFIER_BYTES:
+                raise ValueError(f"{name} exceeds the {MAX_IDENTIFIER_BYTES}-byte UTF-8 limit")
         if (
             not isinstance(context_size, int)
             or isinstance(context_size, bool)
@@ -557,6 +588,7 @@ class BloomPipeline:
         presence_penalty: float = 0.0,
         frequency_penalty: float = 0.0,
         logit_bias: Optional[Mapping[Union[int, str], float]] = None,
+        logprobs: Optional[int] = None,
     ):
         if isinstance(prompt_or_input, str):
             input_data = {"Text": {"prompt": prompt_or_input}}
@@ -609,6 +641,15 @@ class BloomPipeline:
                 raise ValueError(f"{name} must be a finite number between -2 and 2")
         native_logit_bias = _normalize_logit_bias(logit_bias)
         native_response_format = _normalize_response_format(response_format)
+        if logprobs is not None:
+            if (
+                not isinstance(logprobs, int)
+                or isinstance(logprobs, bool)
+                or not 0 <= logprobs <= 20
+            ):
+                raise ValueError("logprobs must be None or an integer between 0 and 20")
+            if max_tokens > 4096:
+                raise ValueError("logprobs requests support at most 4096 generated tokens")
 
         params_data = {
             "max_tokens": max_tokens,
@@ -625,11 +666,15 @@ class BloomPipeline:
             # remaining backwards-compatible when omitted.
             "response_format": native_response_format,
         }
+        # Older native libraries reject unknown parameter names. Do not send
+        # the additive control unless the caller explicitly requests metadata.
+        if logprobs is not None:
+            params_data["logprobs"] = logprobs
         try:
             # Avoid ASCII-only escaping so multilingual prompts and schema
             # descriptions remain inspectable in traces and examples.  The
             # native ABI consumes UTF-8 and receives the same JSON semantics.
-            return (
+            encoded = (
                 json.dumps(
                     input_data, ensure_ascii=False, allow_nan=False
                 ).encode("utf-8"),
@@ -642,6 +687,78 @@ class BloomPipeline:
                 "input and generation parameters must be JSON serializable: "
                 f"{error}"
             ) from error
+        for name, value in zip(("input", "generation parameters"), encoded):
+            if len(value) > MAX_JSON_BYTES:
+                raise ValueError(f"{name} exceeds the 16 MiB JSON limit")
+        return encoded
+
+    def tokenize(self, text: str) -> List[int]:
+        """Return exact model token IDs; unsupported models/libraries fail.
+
+        Text is UTF-8 and bounded to 8 MiB. Empty strings are allowed. Model
+        adapters own special-token handling; no approximate IDs are returned.
+        """
+        if not isinstance(text, str):
+            raise TypeError("text must be a string")
+        try:
+            encoded = text.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise ValueError("text must be valid UTF-8") from error
+        if len(encoded) > MAX_TEXT_BYTES:
+            raise ValueError("text exceeds the 8 MiB UTF-8 limit")
+        result = self._tokenization_call("bloom_pipeline_tokenize_v2", encoded)
+        if (not isinstance(result, list) or len(result) > MAX_TOKEN_COUNT
+                or any(not isinstance(token, int) or isinstance(token, bool)
+                       or not 0 <= token <= 0xFFFFFFFF for token in result)):
+            raise BloomInferenceError("Tokenizer returned an invalid token ID array")
+        return result
+
+    def detokenize(self, tokens: List[int]) -> str:
+        """Decode a list of unsigned 32-bit model token IDs to text."""
+        if not isinstance(tokens, (list, tuple)):
+            raise TypeError("tokens must be a list or tuple of unsigned 32-bit integers")
+        if len(tokens) > MAX_TOKEN_COUNT:
+            raise ValueError("tokens exceeds the 4M-token limit")
+        if any(not isinstance(token, int) or isinstance(token, bool)
+               or not 0 <= token <= 0xFFFFFFFF for token in tokens):
+            raise ValueError("tokens must contain unsigned 32-bit integers")
+        encoded = json.dumps(tokens, separators=(",", ":")).encode("utf-8")
+        if len(encoded) > MAX_JSON_BYTES:
+            raise ValueError("tokens exceeds the 16 MiB JSON limit")
+        result = self._tokenization_call("bloom_pipeline_detokenize_v2", encoded)
+        if not isinstance(result, str):
+            raise BloomInferenceError("Tokenizer returned an invalid text value")
+        return result
+
+    def _tokenization_call(self, symbol, encoded):
+        with self._call_lock:
+            if self._closing or not self._pipeline:
+                raise BloomError(_label(self.locale, "pipeline_closed"))
+            if not self._uses_v2 or not hasattr(self._lib, symbol):
+                raise BloomInferenceError("This native library does not support exact tokenization; rebuild bloomai-ffi")
+            input_slice, owner = _bytes_slice(encoded)
+            output = BloomOwnedBuffer()
+            err_buf = ctypes.create_string_buffer(512)
+            try:
+                status = getattr(self._lib, symbol)(
+                    self._pipeline, input_slice, ctypes.byref(output),
+                    err_buf, len(err_buf),
+                )
+                _ = owner
+                if status != 0:
+                    raise BloomInferenceError(
+                        f"Tokenization failed (code {status}): {_decode_error(err_buf)}"
+                    )
+                if (not output.data and output.len) or output.len > MAX_JSON_BYTES:
+                    raise BloomInferenceError("Tokenization returned an invalid output buffer")
+                result = ctypes.string_at(output.data, output.len).decode("utf-8")
+                return json.loads(result)
+            except BloomError:
+                raise
+            except Exception as error:
+                raise BloomInferenceError(f"Tokenization failed: {error}") from error
+            finally:
+                self._lib.bloom_buffer_free(ctypes.byref(output))
 
     def generate(
         self,
@@ -656,6 +773,7 @@ class BloomPipeline:
         presence_penalty: float = 0.0,
         frequency_penalty: float = 0.0,
         logit_bias: Optional[Mapping[Union[int, str], float]] = None,
+        logprobs: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Run full non-streaming inference.
@@ -664,12 +782,15 @@ class BloomPipeline:
         :param response_format: Optional response format string or OpenAI-style
             mapping, for example ``"json_object"`` or
             ``{"type": "json_schema", "json_schema": {"schema": {...}}}``.
+        :param logprobs: Optional selected-token log probabilities, with 0–20
+            alternatives per token. Requires max_tokens <= 4096 and a supported
+            native backend. None omits this control for older libraries.
         :return: Decoded ModelOutput dict.
         """
         input_bytes, params_bytes = self._prepare_input_params(
             prompt_or_input, max_tokens, temperature, top_p, seed, response_format,
             top_k=top_k, presence_penalty=presence_penalty,
-            frequency_penalty=frequency_penalty, logit_bias=logit_bias,
+            frequency_penalty=frequency_penalty, logit_bias=logit_bias, logprobs=logprobs,
         )
         err_buf = ctypes.create_string_buffer(512)
 
@@ -765,6 +886,7 @@ class BloomPipeline:
         presence_penalty: float = 0.0,
         frequency_penalty: float = 0.0,
         logit_bias: Optional[Mapping[Union[int, str], float]] = None,
+        logprobs: Optional[int] = None,
     ) -> Generator[Union[Dict[str, Any], str], None, None]:
         """
         Run streaming inference.
@@ -772,6 +894,8 @@ class BloomPipeline:
         Yields parsed OutputChunks progressively, with bounded backpressure.
         The native unit variant ``End`` is yielded as the string ``"End"``;
         data-carrying variants are dictionaries.
+        ``logprobs`` requests selected-token metadata with 0–20 alternatives
+        (max_tokens <= 4096). ``TokenLogprobs`` events are yielded unchanged.
         ``timeout`` optionally bounds each wait for the next chunk.  When the
         deadline expires, the stream is stopped and :class:`TimeoutError` is
         raised; the default ``None`` preserves an unbounded wait.
@@ -787,7 +911,7 @@ class BloomPipeline:
         input_bytes, params_bytes = self._prepare_input_params(
             prompt_or_input, max_tokens, temperature, top_p, seed, response_format,
             top_k=top_k, presence_penalty=presence_penalty,
-            frequency_penalty=frequency_penalty, logit_bias=logit_bias,
+            frequency_penalty=frequency_penalty, logit_bias=logit_bias, logprobs=logprobs,
         )
         buffer = StreamBuffer()
         err_buf = ctypes.create_string_buffer(512)

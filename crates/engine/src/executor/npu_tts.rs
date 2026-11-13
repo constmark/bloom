@@ -493,6 +493,10 @@ impl LoadedModel for NpuTtsModel {
     }
 
     fn infer(&self, input: ModelInput, params: &GenerationParams) -> Result<ModelOutput> {
+        anyhow::ensure!(
+            params.logprobs.is_none(),
+            "this backend does not support token logprobs"
+        );
         let text = match input {
             ModelInput::Text { prompt } => prompt,
             ModelInput::Multi { text: Some(t), .. } => t,
@@ -578,6 +582,7 @@ impl LoadedModel for NpuTtsModel {
         };
 
         Ok(ModelOutput {
+            logprobs: None,
             text: result_text,
             logits: None,
             image: None,
@@ -592,6 +597,10 @@ impl LoadedModel for NpuTtsModel {
         params: &GenerationParams,
         sink: &mut dyn crate::model::OutputSink,
     ) -> Result<()> {
+        anyhow::ensure!(
+            params.logprobs.is_none(),
+            "this backend does not support token logprobs"
+        );
         // TTS is inherently non-streaming — run full inference and emit result
         let output = self.infer(input, params)?;
 

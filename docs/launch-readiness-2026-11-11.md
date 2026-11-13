@@ -6,6 +6,11 @@ does not turn an experimental backend into a stable service. The
 [support matrix](support-matrix.md) remains authoritative. No release was
 published, and no model/device row was promoted as part of this work.
 
+The [2026-11-13 continuation](capability-continuation-2026-11-13.md) implements
+native conversation persistence and bundled SDK wheels, with local checks;
+the historical evidence below does not imply that their hosted/platform gates
+have passed.
+
 The smallest credible initial support scope is one pinned Qwen2 Q4_0 model,
 Candle CPU, a declared OS/hardware configuration, the packaged Web UI and pinned
 OpenAI/Ollama clients. Other model families, accelerators, external runtimes,
@@ -172,16 +177,19 @@ are local execution results, not claims that hosted release jobs have run.
   candidate image and remote publication are **not** validated. See the
   [container release procedure](container-release.md).
 
-### In progress: real 24-hour CPU workload
+### Completed: real 24-hour CPU workload (verified 2026-11-13)
 
 The final durable production workload is launched after packaging and browser
 acceptance, with the same exact packaged server hash, the pinned trained
 model, Candle CPU, two worker threads, concurrency 1/2 and preselected latency
-and memory budgets. Its preflight failure drills passed. The run is genuinely
-in progress and cannot count as a passed 24-hour acceptance result until the
-measured duration, request minimum, resource/latency budgets and final evidence
-validator all pass. Its exact start time is in `status.json`; completion needs
-at least another measured 24 hours of workload, with the machine awake.
+and memory budgets. Its preflight failure drills passed. The run completed on 2026-11-12. Revalidation on 2026-11-13 with the current
+production-profile evidence checker passed: 86,400.270313 measured seconds,
+132,378 requests, concurrency 1/2, p95 first content 1,279.559 ms, p95 total
+latency 1,342.682 ms and peak RSS 1,589,280,768 bytes. Disconnect recovery,
+failure injection and all declared budgets passed. This evidence belongs to
+server SHA-256 `bed498b42190e7c1eabf35e3add8522e88e3433a87c9f2796ac54411ec501172`;
+it does not validate later code changes or imply a stable support promotion.
+The retained report continues to declare `stable_claim: false`.
 
 The private run directory is
 `output/deployment-soak/qwen2-cpu-20261111-final-24h`. Its `status.json`, atomic progress,

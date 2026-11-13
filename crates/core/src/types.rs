@@ -272,6 +272,10 @@ pub struct GenerationParams {
     pub seed: Option<u64>,
     #[serde(default)]
     pub response_format: Option<ResponseFormat>,
+    /// Request selected-token log probabilities and up to 20 alternatives.
+    /// Values report adjusted model logits before temperature/top-k/top-p.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<usize>,
 }
 
 impl Default for GenerationParams {
@@ -286,6 +290,7 @@ impl Default for GenerationParams {
             logit_bias: None,
             seed: None,
             response_format: None,
+            logprobs: None,
         }
     }
 }
@@ -298,6 +303,12 @@ impl GenerationParams {
     /// protects direct Rust, FFI, plugin, and embedded callers from passing
     /// NaN/Inf values or a zero token budget into a backend.
     pub fn validate(&self) -> Result<(), String> {
+        if self.logprobs.is_some_and(|count| count > 20) {
+            return Err("logprobs alternatives must be between 0 and 20".to_string());
+        }
+        if self.logprobs.is_some() && self.max_tokens > 4096 {
+            return Err("logprobs requests support at most 4096 generated tokens".to_string());
+        }
         if self.max_tokens == 0 {
             return Err("max_tokens must be greater than zero".to_string());
         }
@@ -480,6 +491,27 @@ mod tests {
         assert_eq!(params.frequency_penalty, 0.0);
         assert_eq!(params.logit_bias, None);
         assert_eq!(params.seed, None);
+    }
+
+    #[test]
+    fn logprob_request_bounds_are_validated_and_disabled_field_is_omitted() {
+        let mut params = GenerationParams::default();
+        assert!(
+            !serde_json::to_value(&params)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("logprobs")
+        );
+        params.logprobs = Some(20);
+        assert!(params.validate().is_ok());
+        params.logprobs = Some(21);
+        assert!(params.validate().is_err());
+        params.logprobs = Some(0);
+        params.max_tokens = 4097;
+        assert!(params.validate().is_err());
+        params.logprobs = None;
+        assert!(params.validate().is_ok());
     }
 
     #[test]

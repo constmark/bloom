@@ -76,6 +76,11 @@ pub trait LoadedModel: Send + Sync {
         &[]
     }
 
+    /// Exact generated token log probabilities with lossless token bytes.
+    fn supports_logprobs(&self) -> bool {
+        false
+    }
+
     fn metadata(&self) -> &ModelMetadata;
     fn infer(&self, input: ModelInput, params: &GenerationParams) -> Result<ModelOutput>;
     fn infer_stream(
@@ -84,11 +89,25 @@ pub trait LoadedModel: Send + Sync {
         params: &GenerationParams,
         sink: &mut dyn OutputSink,
     ) -> Result<()> {
+        if params.logprobs.is_some() && !self.supports_logprobs() {
+            return Err(BloomError::InvalidInput(
+                "this model does not support token logprobs".into(),
+            )
+            .into());
+        }
         // Implementations must emit exactly one terminal `OutputChunk::End`
         // before returning `Ok(())`.  `InferencePipeline` enforces this at the
         // boundary so schedulers can release request ownership deterministically.
         let output = self.infer(input, params)?;
         output.validate().map_err(BloomError::InvalidInput)?;
+        if params.logprobs.is_some() && output.logprobs.is_none() {
+            return Err(BloomError::Engine("model omitted requested token logprobs".into()).into());
+        }
+        if let Some(records) = output.logprobs {
+            for record in records {
+                sink.on_chunk(OutputChunk::TokenLogprobs(record))?;
+            }
+        }
         if let Some(text) = output.text {
             sink.on_chunk(OutputChunk::TextDelta(text))?;
         }
@@ -134,6 +153,7 @@ pub trait LoadedModel: Send + Sync {
         }
 
         let params = GenerationParams {
+            logprobs: None,
             max_tokens: 1,
             temperature: 0.0,
             top_p: 1.0,
@@ -252,6 +272,12 @@ pub trait LoadedModel: Send + Sync {
 
     fn infer_request(&self, request: InferenceRequest, sink: &mut dyn OutputSink) -> Result<()> {
         request.validate().map_err(BloomError::InvalidInput)?;
+        if request.params.logprobs.is_some() && !self.supports_logprobs() {
+            return Err(BloomError::InvalidInput(
+                "this model does not support token logprobs".into(),
+            )
+            .into());
+        }
         let mut blocks = request.blocks;
         if let Some(registry) = self.processors() {
             for spec in &self.metadata().manifest.processors {
@@ -262,6 +288,7 @@ pub trait LoadedModel: Send + Sync {
         }
         let input = convert_blocks_to_model_input(blocks)?;
         let gen_params = GenerationParams {
+            logprobs: request.params.logprobs,
             max_tokens: request.params.max_tokens,
             temperature: request.params.temperature,
             top_p: request.params.top_p,
@@ -377,12 +404,17 @@ impl LoadedModel for EchoTextModel {
     }
 
     fn infer(&self, input: ModelInput, _params: &GenerationParams) -> Result<ModelOutput> {
+        anyhow::ensure!(
+            _params.logprobs.is_none(),
+            "this model does not support token logprobs"
+        );
         let text = match input {
             ModelInput::Text { prompt } => Some(format!("echo: {}", prompt)),
             _ => Some("model expects text input".to_string()),
         };
 
         Ok(ModelOutput {
+            logprobs: None,
             text,
             logits: None,
             image: None,
@@ -534,6 +566,7 @@ mod tests {
                     _ => None,
                 };
                 Ok(ModelOutput {
+                    logprobs: None,
                     text,
                     logits: None,
                     image: None,
@@ -690,6 +723,7 @@ mod tests {
             }
             fn infer(&self, _input: ModelInput, _params: &GenerationParams) -> Result<ModelOutput> {
                 Ok(ModelOutput {
+                    logprobs: None,
                     text: Some("ok".into()),
                     logits: None,
                     image: None,

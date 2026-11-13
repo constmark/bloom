@@ -6,6 +6,10 @@ promotion evidence tooling. The support matrix remains the executable support
 contract. This iteration closes the concrete software defects below; it does
 not establish complete llama.cpp parity or promote an unmeasured deployment.
 
+The [2026-11-13 continuation](capability-completion-2026-11-13.md) supersedes
+this historical review for multi-candidate structured/tool streaming, KV retention,
+CLI sampling, RTN export and SDK tokenization.
+
 ## Closed software gaps
 
 | Area | Previous gap | Delivered behavior and regression evidence |

@@ -74,3 +74,29 @@ The server exposes cache statistics through `/v1/kv-cache-stats` and `/metrics`.
 Scheduling contracts are covered in
 `crates/engine/src/scheduler/scheduler_test.rs`. Changes to admission order,
 token budgets, preemption, or KV-cache behavior must update those tests.
+
+## KV retention admission
+
+`KvEvictionConfig.retention_ratio` retains at least the configured fraction of
+all candidate sessions' KV tokens, rounded upward. Eviction cancels complete
+sessions, so a victim that would cross the retention floor is skipped. If the
+selected victims cannot release the full requested token count, no eviction
+plan is committed and the new request fails admission; existing requests are
+not cancelled for an insufficient plan. The ratio must be finite in `[0,1]`.
+Use zero to explicitly allow eviction of every candidate; the default is 0.1.
+
+Sampling now applies penalties and token bias before temperature, and random
+sampling spans the full probability interval. Correcting the prior biased RNG
+changes affected seeded output sequences. Draft speculation samples proposals
+from the distribution used by its verifier. Sampling/grammar combinations the
+speculative verifier cannot honor use ordinary decoding; this preserves output
+semantics without claiming acceleration for those combinations.
+
+Multiple OpenAI choices retain one HTTP admission/runtime lease while scheduling
+candidates sequentially with unique internal request IDs. External blocking
+workers use `cancel_request_and_wait` to retain that lease until any active
+execution/submission leaves the scheduler gate and candidate KV is released.
+This API must not be invoked from executor/backend callbacks; allocation
+callbacks retain the deferred `cancel_request` path. EOS detection is delegated
+to the executor's model, and speculative token tails are clipped at EOS or the
+remaining generation budget before publication.

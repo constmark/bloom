@@ -516,6 +516,10 @@ impl LoadedModel for FunASRModel {
     }
 
     fn infer(&self, input: ModelInput, params: &GenerationParams) -> Result<ModelOutput> {
+        anyhow::ensure!(
+            params.logprobs.is_none(),
+            "this backend does not support token logprobs"
+        );
         let mut text_parts = Vec::new();
         self.infer_stream(input, params, &mut |chunk: crate::io::OutputChunk| {
             match chunk {
@@ -537,6 +541,7 @@ impl LoadedModel for FunASRModel {
         };
 
         Ok(ModelOutput {
+            logprobs: None,
             text,
             logits: None,
             image: None,
@@ -551,6 +556,10 @@ impl LoadedModel for FunASRModel {
         _params: &GenerationParams,
         sink: &mut dyn crate::model::OutputSink,
     ) -> Result<()> {
+        anyhow::ensure!(
+            _params.logprobs.is_none(),
+            "this backend does not support token logprobs"
+        );
         let mut _temp_guard = None;
 
         let (audio_path, language) = match input {

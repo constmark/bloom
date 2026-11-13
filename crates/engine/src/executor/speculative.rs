@@ -198,6 +198,10 @@ pub struct DraftModelStrategy {
     acceptance_rate_ema: Mutex<f32>,
     /// Dynamically adjusted limit of speculative tokens to propose.
     dynamic_limit: Mutex<usize>,
+    /// Independent, persistent proposal RNG; rejection sampling assumes the
+    /// token was actually sampled from its returned draft distribution.
+    #[cfg(feature = "candle-engine")]
+    proposal_rng: Mutex<u64>,
 }
 
 impl DraftModelStrategy {
@@ -214,7 +218,16 @@ impl DraftModelStrategy {
             device_kind,
             acceptance_rate_ema: Mutex::new(0.8),
             dynamic_limit: Mutex::new(num_speculative),
+            #[cfg(feature = "candle-engine")]
+            proposal_rng: Mutex::new(42),
         }
+    }
+
+    /// Set the request seed for stochastic draft proposals.
+    #[cfg(feature = "candle-engine")]
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.proposal_rng = Mutex::new(seed);
+        self
     }
 
     /// Mark the draft model as loaded.
@@ -303,11 +316,13 @@ fn argmax(logits: &[f32]) -> u32 {
 ///
 /// Uses the same LCG constants as `batch_executor::sample_logits` for
 /// consistency across the codebase.
-fn lcg_next_f32(rng_state: &mut u64) -> f32 {
+pub(crate) fn lcg_next_f32(rng_state: &mut u64) -> f32 {
     *rng_state = rng_state
         .wrapping_mul(6364136223846793005)
         .wrapping_add(1442695040888963407);
-    (*rng_state >> 33) as f32 / (u32::MAX as f32)
+    // Exactly representable 24-bit mantissa in [0, 1). Shifting by 33 and
+    // dividing by u32::MAX only covered [0, 0.5), biasing every draw.
+    (*rng_state >> 40) as f32 * (1.0 / 16_777_216.0)
 }
 
 /// Sample a token from raw logits using temperature scaling and softmax.
@@ -322,7 +337,7 @@ fn sample_from_logits(logits: &[f32], temperature: f64, rng_state: &mut u64) -> 
     let mut cumulative = 0.0f32;
     for (i, &p) in probs.iter().enumerate() {
         cumulative += p;
-        if r <= cumulative {
+        if r < cumulative {
             return i as u32;
         }
     }
@@ -427,10 +442,10 @@ impl SpeculativeStrategy for DraftModelStrategy {
     /// (target-side rejection sampler) computes `q = softmax(logits / T)` and
     /// compares against the target distribution `p`.
     ///
-    /// The proposed token id at each position is the argmax of that position's
-    /// logits, so the behaviour matches `propose` when the caller only consumes
-    /// the token ids. When `temperature <= 0`, the caller falls back to greedy
-    /// verification, so empty logits are returned to avoid wasted work.
+    /// Each token is sampled from `softmax(logits / T)`, exactly the proposal
+    /// distribution used by rejection sampling. Greedy proposals with softmax
+    /// probabilities would bias the accepted output. With zero temperature,
+    /// empty logits are returned for exact-match greedy verification.
     fn propose_with_logits(
         &self,
         context: &[u32],
@@ -476,12 +491,13 @@ impl SpeculativeStrategy for DraftModelStrategy {
 
             let mut proposed: Vec<(u32, Vec<f32>)> = Vec::with_capacity(n);
             let mut current_pos = 0;
+            let mut rng = self.proposal_rng.lock().unwrap_or_else(|e| e.into_inner());
 
             // Step 0: Prefill the context.
             let input_ids = Tensor::new(context, device)?.unsqueeze(0)?;
             let logits = draft_model.forward(&input_ids, current_pos)?;
             let logits_vec = get_last_logits_vec(&logits)?;
-            let mut last_token = argmax(&logits_vec);
+            let mut last_token = sample_from_logits(&logits_vec, temperature, &mut rng);
             proposed.push((last_token, logits_vec));
             current_pos += context.len();
 
@@ -490,7 +506,7 @@ impl SpeculativeStrategy for DraftModelStrategy {
                 let input_ids = Tensor::new(&[[last_token]], device)?;
                 let logits = draft_model.forward(&input_ids, current_pos)?;
                 let logits_vec = get_last_logits_vec(&logits)?;
-                last_token = argmax(&logits_vec);
+                last_token = sample_from_logits(&logits_vec, temperature, &mut rng);
                 proposed.push((last_token, logits_vec));
                 current_pos += 1;
             }
@@ -692,7 +708,7 @@ pub fn verify_with_rejection_sampling(
                 let mut chosen = argmax(&residual);
                 for (idx, &val) in residual.iter().enumerate() {
                     cum += val;
-                    if r2 <= cum {
+                    if r2 < cum {
                         chosen = idx as u32;
                         break;
                     }
@@ -713,6 +729,37 @@ pub fn verify_with_rejection_sampling(
     }
 
     (accepted, None)
+}
+
+/// Whether the verifier can preserve the requested sampling distribution.
+/// Greedy n-gram verification cannot implement stochastic decoding. Draft
+/// rejection sampling currently supports temperature only; other transforms
+/// must use the normal sampler until both p and q apply them consistently.
+#[cfg(feature = "candle-engine")]
+pub(crate) fn supports_sampling(
+    mode: &SpeculativeMode,
+    params: &bloomai_core::GenerationParams,
+) -> bool {
+    if params
+        .response_format
+        .as_ref()
+        .is_some_and(|format| !matches!(format, bloomai_core::ResponseFormat::Text))
+        || params.presence_penalty != 0.0
+        || params.frequency_penalty != 0.0
+        || params
+            .logit_bias
+            .as_ref()
+            .is_some_and(|bias| !bias.is_empty())
+    {
+        return false;
+    }
+    match mode {
+        SpeculativeMode::NGram { .. } => params.temperature <= 1e-7,
+        SpeculativeMode::DraftModel { .. } => {
+            params.temperature <= 1e-7 || (params.top_k.is_none() && params.top_p == 1.0)
+        }
+        _ => false,
+    }
 }
 
 /// Speculative decoding mode configuration.
@@ -1211,9 +1258,17 @@ mod tests {
     #[test]
     fn test_lcg_next_f32_in_range() {
         let mut state = 42u64;
-        for _ in 0..100 {
+        let mut bins = [0usize; 4];
+        for _ in 0..10_000 {
             let r = lcg_next_f32(&mut state);
-            assert!((0.0..=1.0).contains(&r), "rng out of range: {}", r);
+            assert!((0.0..1.0).contains(&r), "rng out of range: {}", r);
+            bins[(r * 4.0) as usize] += 1;
+        }
+        for count in bins {
+            assert!(
+                (2200..2800).contains(&count),
+                "draws must cover the full unit interval: {bins:?}"
+            );
         }
     }
 }

@@ -580,6 +580,74 @@ def require_buffered_candidate_envelope(response: dict, model_id: str, count: in
     return choices
 
 
+def collect_candidate_stream(
+    events: list[str], model_id: str, count: int, *, chat: bool,
+) -> dict:
+    """Validate stream framing/identity and collect independent public choices."""
+    if not events or events.count("[DONE]") != 1 or events[-1] != "[DONE]":
+        raise AssertionError("candidate stream omitted its unique terminal marker")
+    choices = [{"index": index, "finish_reason": None,
+                "message": {"content": "", "tool_calls": []}, "text": ""}
+               for index in range(count)]
+    finished = set()
+    started = set()
+    identity = None
+    usage = None
+    for event in events[:-1]:
+        frame = json.loads(event)
+        if "error" in frame or frame.get("model") != model_id:
+            raise AssertionError(f"candidate stream failed or changed model: {frame}")
+        current = (frame.get("id"), frame.get("created"), frame.get("object"))
+        if identity is None:
+            identity = current
+        if current != identity:
+            raise AssertionError("candidate stream changed its identity")
+        if usage is not None:
+            raise AssertionError("candidate stream emitted data after usage")
+        if not frame.get("choices"):
+            usage = frame.get("usage")
+            continue
+        for choice in frame["choices"]:
+            index = choice.get("index")
+            if isinstance(index, bool) or index not in range(count) or index in finished:
+                raise AssertionError(f"invalid candidate stream order: {frame}")
+            result = choices[index]
+            if chat:
+                delta = choice.get("delta", {})
+                if delta.get("role") is not None:
+                    if delta["role"] != "assistant" or index in started:
+                        raise AssertionError("invalid or duplicate assistant role")
+                    started.add(index)
+                if index not in started:
+                    raise AssertionError("candidate content preceded its assistant role")
+                result["message"]["content"] += delta.get("content") or ""
+                for call in delta.get("tool_calls") or []:
+                    call_index = call.get("index")
+                    calls = result["message"]["tool_calls"]
+                    if call_index == len(calls):
+                        calls.append({"id": "", "type": "function",
+                                      "function": {"name": "", "arguments": ""}})
+                    if not isinstance(call_index, int) or not 0 <= call_index < len(calls):
+                        raise AssertionError("invalid streamed tool-call index")
+                    target = calls[call_index]
+                    if "id" in call:
+                        target["id"] += call["id"]
+                    function = call.get("function", {})
+                    for field in ("name", "arguments"):
+                        target["function"][field] += function.get(field) or ""
+            else:
+                result["text"] += choice.get("text", "")
+            if choice.get("finish_reason") is not None:
+                result["finish_reason"] = choice["finish_reason"]
+                finished.add(index)
+    if finished != set(range(count)) or (chat and started != finished):
+        raise AssertionError("candidate stream omitted a role or terminal choice")
+    result = {"model": model_id, "choices": choices, "usage": usage}
+    if chat:
+        require_buffered_candidate_envelope(result, model_id, count)
+    return result
+
+
 def validate_buffered_schema_choices(
     base_url: str, model_id: str, auth_headers: dict[str, str],
     *, max_tokens: int, response_format: dict,
@@ -603,6 +671,24 @@ def validate_buffered_schema_choices(
             f"{base_url}/v1/{'chat/completions' if chat else 'completions'}",
             payload, timeout=60.0, headers=auth_headers,
         ), chat=chat)
+        streamed_payload = dict(payload, stream=True)
+        if chat:
+            streamed_payload["stream_options"] = {"include_usage": True}
+        else:
+            streamed_payload["echo"] = True
+        collected = collect_candidate_stream(request_sse(
+            f"{base_url}/v1/{'chat/completions' if chat else 'completions'}",
+            streamed_payload, timeout=60.0, headers=auth_headers,
+        ), model_id, 2 if chat else 4, chat=chat)
+        for index, choice in enumerate(collected["choices"]):
+            content = choice["message"]["content"] if chat else choice["text"]
+            if not chat:
+                prefix = payload["prompt"][index // 2]
+                if not content.startswith(prefix):
+                    raise AssertionError("structured completion stream lost original prompt echo")
+                content = content[len(prefix):]
+            if choice["finish_reason"] != "stop" or json.loads(content) != {"ok": True}:
+                raise AssertionError(f"invalid streamed structured candidate: {collected}")
 
     sdk = "skipped"
     try:
@@ -622,8 +708,17 @@ def validate_buffered_schema_choices(
                 n=2, max_tokens=max_tokens, temperature=0, seed=42,
                 extra_body={"response_format": response_format},
             ).model_dump(mode="json"), chat=False)
+            with client.chat.completions.create(
+                model=model_id, messages=[{"role": "user", "content": "Return ok as JSON."}],
+                n=2, max_tokens=max_tokens, temperature=0, seed=42,
+                response_format=response_format, stream=True,
+                stream_options={"include_usage": True},
+            ) as stream:
+                events = [frame.model_dump_json() for frame in stream] + ["[DONE]"]
+            check(collect_candidate_stream(events, model_id, 2, chat=True), chat=True)
         sdk = "ok"
-    return {"chat_choices": 2, "completion_choices": 4, "sdk": sdk}
+    return {"chat_choices": 2, "completion_choices": 4, "streamed_chat_choices": 2,
+            "streamed_completion_choices": 4, "sdk": sdk}
 
 
 def validate_function_tool_round_trips(
@@ -706,6 +801,8 @@ def validate_function_tool_round_trips(
     def check_multiple_calls(response: dict) -> None:
         ids = set()
         for choice in require_buffered_candidate_envelope(response, model_id, 2):
+            if choice.get("message", {}).get("content") not in (None, ""):
+                raise AssertionError("tool candidate leaked private control content")
             call = require_chat_call({"choices": [choice]}, streamed=False)
             if call["id"] in ids:
                 raise AssertionError(f"tool candidates reused a call ID: {response}")
@@ -716,6 +813,12 @@ def validate_function_tool_round_trips(
         f"{base_url}/v1/chat/completions", multiple_payload,
         timeout=60.0, headers=auth_headers,
     ))
+    multiple_stream_payload = dict(multiple_payload, stream=True,
+                                   stream_options={"include_usage": True})
+    check_multiple_calls(collect_candidate_stream(request_sse(
+        f"{base_url}/v1/chat/completions", multiple_stream_payload,
+        timeout=60.0, headers=auth_headers,
+    ), model_id, 2, chat=True))
     legacy_payload = {key: value for key, value in multiple_payload.items()
                       if key not in {"tools", "tool_choice"}}
     legacy_payload["functions"] = [chat_tool["function"]]
@@ -735,6 +838,9 @@ def validate_function_tool_round_trips(
             check_multiple_calls(client.chat.completions.create(
                 **multiple_payload,
             ).model_dump(mode="json"))
+            with client.chat.completions.create(**multiple_stream_payload) as stream:
+                events = [frame.model_dump_json() for frame in stream] + ["[DONE]"]
+            check_multiple_calls(collect_candidate_stream(events, model_id, 2, chat=True))
         multiple_sdk = "ok"
 
 
@@ -935,7 +1041,7 @@ def validate_function_tool_round_trips(
         "responses_stream": "ok",
         "responses_continuation": "ok",
         "retained_state": "ok",
-        "multiple_choices": {"count": 2, "sdk": multiple_sdk, "legacy_alias": "ok"},
+        "multiple_choices": {"count": 2, "streamed_count": 2, "sdk": multiple_sdk, "legacy_alias": "ok"},
     }
 
 
@@ -2602,8 +2708,7 @@ def main() -> int:
             )
 
         streaming_choices = (
-            {"status": "unsupported_with_continuous_batching"}
-            if args.enable_ifb else check_streaming_choices(
+            check_streaming_choices(
                 base_url, model_id, payload, auth_headers, args.api_key or "bloom-smoke"
             )
         )

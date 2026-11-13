@@ -86,6 +86,30 @@ greater than 0 and at most 1. Unknown response-format or schema-wrapper fields
 are rejected instead of silently discarded. Existing positional arguments,
 including streaming `timeout`, retain their order.
 
+Both generation methods also accept keyword-only `logprobs=None` or an integer
+from 0 through 20. Zero requests only the selected token's log probability;
+larger values add that many top alternatives. These requests require
+`max_tokens <= 4096`. The native backend rejects unsupported models/devices,
+structured-output combinations, and other unsupported decoding modes instead
+of silently omitting metadata. `None` omits the new JSON field, so existing
+calls remain compatible with older native libraries.
+
+```python
+result = pipeline.generate("Continue this sentence", max_tokens=32, logprobs=3)
+for record in result["logprobs"]:
+    print(record["token"]["token_id"], record["token"]["logprob"])
+
+for chunk in pipeline.generate_stream("Continue this sentence", logprobs=0):
+    if isinstance(chunk, dict) and "TokenLogprobs" in chunk:
+        print(chunk["TokenLogprobs"])
+```
+
+Buffered `logprobs` arrays and streamed `TokenLogprobs` events preserve the
+native record: `token` and `top_logprobs` each contain `token_id`, display
+`token`, exact `bytes`, and `logprob`. Token bytes can contain partial UTF-8;
+join the selected tokens' byte arrays before decoding complete text. Values
+describe adjusted model logits before temperature/top-k/top-p sampling.
+
 Calls on one Python pipeline are serialized; consume or close a stream before
 starting another inference on that pipeline. Stream handoff is bounded to 64
 serialized chunks and 16 MiB of queued bytes. A slow consumer backpressures the
@@ -118,13 +142,82 @@ must still finish before the pipeline can be freed. For either revision, a
 backend stuck in prefill or external I/O may delay `pipeline.close()`; the SDK
 does not forcibly terminate threads or release a live native handle.
 
+## Exact tokenization
+
+Python callers can use the tokenizer owned by the loaded model without
+running generation:
+
+```python
+tokens = pipeline.tokenize("你好, Bloom 🌸")
+text = pipeline.detokenize(tokens)
+```
+
+`tokenize` accepts UTF-8 text up to 8 MiB and returns a list of unsigned 32-bit
+token IDs. `detokenize` accepts a list or tuple of unsigned 32-bit token IDs,
+bounded to 4M tokens and 16 MiB of serialized JSON, and returns text. Empty
+inputs are allowed. The model adapter controls special-token insertion and
+removal, so special-token spellings need not survive decoding. Both methods
+use exact model tokenization; a model without a tokenizer raises
+`BloomInferenceError` instead of fabricating IDs or estimating token counts.
+
+These methods use optional ABI revision 2 extension symbols:
+
+- `bloom_pipeline_tokenize_v2` accepts a raw UTF-8 `BloomSlice` and returns a
+  JSON array of token IDs in `BloomOwnedBuffer`.
+- `bloom_pipeline_detokenize_v2` accepts a JSON array of token IDs and returns
+  a JSON string in `BloomOwnedBuffer`.
+
+Both functions cap serialized output at 16 MiB, reset output on failure, and
+return `BLOOM_STATUS_UNSUPPORTED` (`-9`) when the model has no exact tokenizer.
+Initialize output to `{NULL, 0}` and release successful output with
+`bloom_buffer_free`. Invalid input uses the existing argument/UTF-8/JSON status
+codes; tokenizer execution errors use `BLOOM_STATUS_INFERENCE_ERROR` (`-5`),
+and caught panics use `BLOOM_STATUS_PANIC` (`-7`).
+
+Discover these symbols before calling an older revision 2 library: the ABI
+version remains 2, and older libraries may lack these additive extensions.
+The Python wrapper performs this check and reports an explicit upgrade error
+when needed; generation continues to work with older revision 1/2 libraries.
+Tokenization shares the pipeline call lock with generation and close, and
+releases native output buffers even when decoding or validation fails.
+
+The wrapper also checks engine/device identifiers against the native 4 KiB
+UTF-8 limit and caps each generation input/parameter JSON document at 16 MiB
+before invoking either ABI revision.
+
 ## Python distribution gate
 
-The SDK has a self-contained source distribution and pure-Python wheel,
-including its own README and Apache-2.0 license. Neither package contains the
-native library. Supply `BLOOM_FFI_LIB` for an installed package as shown above;
-platform binary wheels and a stable cross-version ABI window remain future
-work.
+The SDK has both the original source/pure-Python distribution and an optional
+platform-native wheel. The pure distribution requires a separate library;
+`build_python_native_wheel.py` builds from that source distribution and embeds
+a validated ABI-2 library into a non-pure `py3-none-<platform>` wheel. The
+wrapper uses `ctypes`, so it has no CPython extension ABI dependency. The tags
+follow the [Python packaging compatibility specification](https://packaging.python.org/en/latest/specifications/platform-compatibility-tags/).
+
+Native wheel metadata records the library SHA-256 and host platform; RECORD
+covers every member. A policy-checked CycloneDX inventory records the locked
+build-workspace dependency graph (which can include unlinked packages), with
+its own hash and the Laya fork notice. Install validation checks inventory/hashes and exercises
+buffered/streamed inference in an offline, fresh environment with no library
+override. Packaged libraries take precedence over workspace/system discovery,
+and a load failure does not silently select another runtime. An explicit
+`BLOOM_FFI_LIB` override retains priority.
+
+```sh
+cargo build --release -p bloomai-ffi --locked
+python scripts/build_python_native_wheel.py --native-library target/release/libbloom_ffi.dylib
+python scripts/test_python_native_wheel.py release-artifacts/python/*.whl
+```
+
+Select the platform-native `.so`/`.dll` name on Linux/Windows. Wheels currently
+use conservative host tags. Linux `linux_*` artifacts require compatible host
+system libraries; manylinux repair is not claimed. CI installs each OS artifact
+under Python 3.9/3.12/3.14. Release jobs independently build release-mode wheels
+and attest them, selecting only `release-bloom-*` artifacts to avoid mixing
+in CI/debug wheels with identical filenames. Local macOS installation passed;
+hosted matrix execution and publication remain acceptance evidence, not local
+claims. ABI-1/older ABI-2 compatibility remains covered through explicitly
+supplied external libraries; bundled wheels require ABI 2.
 
 The packaging gate builds an sdist, rebuilds the wheel from it, checks package
 metadata and license contents, installs into a clean temporary environment,
@@ -195,7 +288,8 @@ callers must observe these rules:
 - A pipeline handle is freed exactly once and is not used concurrently with
   `bloom_pipeline_free`.
 - `bloom_pipeline_run_v2` output is owned by Bloom and is released exactly once
-  with `bloom_buffer_free`; the free call also clears the caller's structure.
+  with `bloom_buffer_free`; the same rule applies to both tokenization
+  extensions. The free call also clears the caller's structure.
 - A cancellation token remains live until its stream returns. It may be marked
   concurrently, but it is freed exactly once and never concurrently with the
   stream.
@@ -205,7 +299,8 @@ callers must observe these rules:
 
 Revision 2 reports stable `BLOOM_STATUS_*` codes: `0` for success, `-1` through
 `-6` for argument, decoding, inference, or output failures, `-7` for a caught
-internal panic, and `-8` for cancellation. Invalid non-NULL pointers,
+internal panic, `-8` for cancellation, and `-9` for an unsupported exact
+tokenizer. Invalid non-NULL pointers,
 double-free, callback unwinding, and freeing a live handle or token during a
 native call remain caller contract violations that no C ABI can validate
 safely.
@@ -216,7 +311,10 @@ streaming. Its historical stream error-code mapping is unchanged.
 
 Both ABI revisions accept the same generation-parameter JSON fields:
 `max_tokens`, `temperature`, `top_p`, `top_k`, `presence_penalty`,
-`frequency_penalty`, `logit_bias`, `seed`, and `response_format`.
+`frequency_penalty`, `logit_bias`, `seed`, `response_format`, and optional
+`logprobs` (null or 0–20). This is an additive JSON capability; the ABI version
+remains unchanged. Older libraries reject an explicitly requested `logprobs`
+field, so omit it when targeting a library without this capability.
 `max_tokens`, `temperature`, and `top_p` are required; other controls default
 to their native neutral values. Unknown or duplicate generation fields and
 unknown response-format fields fail during parameter decoding. Revision 2

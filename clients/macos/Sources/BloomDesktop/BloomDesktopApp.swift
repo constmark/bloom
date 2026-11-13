@@ -14,10 +14,10 @@ struct BloomDesktopApp: App {
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("New Conversation") {
-                    viewModel.clearConversation()
+                    viewModel.newConversation()
                 }
                 .keyboardShortcut("n", modifiers: .command)
-                .disabled(viewModel.isGenerating)
+                .disabled(viewModel.storageNeedsRecovery)
             }
         }
     }
@@ -25,6 +25,7 @@ struct BloomDesktopApp: App {
 
 private struct ContentView: View {
     @ObservedObject var viewModel: ChatViewModel
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         HStack(spacing: 0) {
@@ -37,11 +38,21 @@ private struct ContentView: View {
         .task {
             await viewModel.bootstrap()
         }
+        .onChange(of: scenePhase) { phase in
+            if phase != .active { viewModel.checkpoint() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
+            viewModel.stop()
+            viewModel.checkpoint()
+        }
     }
 }
 
 private struct Sidebar: View {
     @ObservedObject var viewModel: ChatViewModel
+    @State private var pendingDeletion: DesktopConversation?
+    @State private var showsModels = false
+    @State private var showsEmbeddings = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -122,19 +133,95 @@ private struct Sidebar: View {
                     LabeledContent("Context", value: "\(contextWindow) tokens")
                         .font(.caption)
                 }
+                HStack {
+                    Button("Models…") { showsModels = true }
+                    Button("Embeddings…") { showsEmbeddings = true }
+                }
+                if !viewModel.modelTasks.isEmpty {
+                    Text(viewModel.modelTasks.joined(separator: ", ")).font(.caption2).foregroundStyle(.secondary)
+                }
             }
             .padding(14)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
 
-            Spacer()
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("Conversations").font(.headline)
+                    Spacer()
+                    Button {
+                        viewModel.newConversation()
+                    } label: {
+                        Image(systemName: "square.and.pencil")
+                    }
+                    .help("New conversation (⌘N)")
+                    .accessibilityLabel("New conversation")
+                    .disabled(viewModel.storageNeedsRecovery)
+                }
+                ScrollView {
+                    LazyVStack(spacing: 5) {
+                        ForEach(viewModel.conversations) { conversation in
+                            Button {
+                                viewModel.selectConversation(conversation.id)
+                            } label: {
+                                HStack(alignment: .top, spacing: 8) {
+                                    Image(systemName: "bubble.left")
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text(conversation.title).lineLimit(2)
+                                        Text(conversation.updatedAt, style: .date)
+                                            .font(.caption2).foregroundStyle(.secondary)
+                                    }
+                                    Spacer(minLength: 0)
+                                    if conversation.id == viewModel.selectedConversationID {
+                                        Image(systemName: "checkmark").font(.caption)
+                                    }
+                                }
+                                .padding(9)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(conversation.id == viewModel.selectedConversationID
+                                    ? Color.accentColor.opacity(0.15) : Color.clear,
+                                    in: RoundedRectangle(cornerRadius: 8))
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("Open \(conversation.title)")
+                            .contextMenu {
+                                Button("Delete conversation", role: .destructive) {
+                                    pendingDeletion = conversation
+                                }
+                            }
+                        }
+                    }
+                }
+                .frame(minHeight: 80)
+                if let conversation = viewModel.conversations.first(where: { $0.id == viewModel.selectedConversationID }) {
+                    Button("Delete conversation", systemImage: "trash") {
+                        pendingDeletion = conversation
+                    }
+                    .font(.caption)
+                    .disabled(viewModel.storageNeedsRecovery)
+                }
+            }
 
-            Text("Messages go directly to the configured local Bloom API. No browser or embedded web UI is used.")
+            Text("History is saved on this Mac. API keys stay in memory. Switching conversations stops the current response.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(20)
         .background(Color(nsColor: .underPageBackgroundColor))
+        .sheet(isPresented: $showsModels) {
+            DesktopModelsView(tools: viewModel.tools, chat: viewModel)
+        }
+        .sheet(isPresented: $showsEmbeddings) {
+            DesktopEmbeddingsView(tools: viewModel.tools, chat: viewModel)
+        }
+        .alert(item: $pendingDeletion) { conversation in
+            Alert(title: Text("Delete \(conversation.title)?"),
+                  message: Text("This removes the conversation from this Mac. This cannot be undone."),
+                  primaryButton: .destructive(Text("Delete")) {
+                      viewModel.deleteConversation(conversation.id)
+                  }, secondaryButton: .cancel())
+        }
     }
 
     private var statusColor: Color {
@@ -155,8 +242,9 @@ private struct ChatWorkspace: View {
         VStack(spacing: 0) {
             HStack {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Local conversation")
+                    Text(viewModel.conversationTitle)
                         .font(.title2.weight(.semibold))
+                        .lineLimit(1)
                     Text(viewModel.modelName ?? "Connect to a Bloom server to begin")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -171,6 +259,26 @@ private struct ChatWorkspace: View {
             .padding(.vertical, 17)
 
             Divider()
+
+            if let storageError = viewModel.storageError {
+                VStack(alignment: .leading, spacing: 8) {
+                    Label(storageError, systemImage: "externaldrive.badge.exclamationmark")
+                        .font(.callout).textSelection(.enabled)
+                    HStack {
+                        Button(viewModel.storageNeedsRecovery ? "Retry loading history" : "Retry saving") {
+                            viewModel.retryStorage()
+                        }
+                        if viewModel.storageNeedsRecovery {
+                            Button("Back up damaged history and start fresh") {
+                                viewModel.preserveDamagedHistoryAndReset()
+                            }
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(12)
+                .background(Color.orange.opacity(0.12))
+            }
 
             if viewModel.messages.isEmpty {
                 EmptyConversation(state: viewModel.connectionState)
@@ -200,6 +308,7 @@ private struct ChatWorkspace: View {
             }
 
             Composer(viewModel: viewModel, focused: $composerFocused)
+                .disabled(viewModel.storageNeedsRecovery)
                 .padding(20)
         }
         .onChange(of: viewModel.connectionState) { state in

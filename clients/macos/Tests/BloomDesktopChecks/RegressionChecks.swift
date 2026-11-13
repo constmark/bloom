@@ -72,8 +72,39 @@ func runRegressionChecks() async throws {
     try await lifecycle.testConnectionEditsRequireNewReadinessAndIgnoreStaleResult()
     try await lifecycle.testCancelledConnectionCanBeRetried()
     try await lifecycle.testGenerationUsesConnectedClientSnapshot()
+    let conversations = ConversationChecks()
+    try conversations.testFileStorageBoundsAndRecovery()
+    try await conversations.testRestartSelectionDraftAndCredentialIsolation()
+    try await conversations.testSwitchAndDeleteIsolateLateGenerations()
+    try await conversations.testPartialOutputCheckpointAndSwitch()
+    try await conversations.testSaveFailureAndUnreadableHistoryRecovery()
     try checkStreamValidation()
     try await checkHTTPTransport()
+}
+
+private final class MemoryConversationStore: ConversationPersistence {
+    var archive: ConversationArchive?
+    var loadError: Error?
+    var saveError: Error?
+    var quarantineError: Error?
+    var saves = 0
+    var quarantined = false
+    func load() throws -> ConversationArchive? {
+        if let loadError { throw loadError }
+        return archive
+    }
+    func save(_ archive: ConversationArchive) throws {
+        if let saveError { throw saveError }
+        try archive.validate()
+        self.archive = archive
+        saves += 1
+    }
+    func quarantine() throws {
+        if let quarantineError { throw quarantineError }
+        quarantined = true
+        archive = nil
+        loadError = nil
+    }
 }
 
 private struct SSEParserChecks {
@@ -155,6 +186,9 @@ private final class ControlledClient: BloomAPITransport {
     var streamFinished: (() -> Void)?
     var pendingStreams: [CheckedContinuation<[ChatCompletionChunk], Error>] = []
     var requests: [[APIChatMessage]] = []
+    var holdAfterChunks = false
+    var chunksDelivered: (() -> Void)?
+    var pendingCompletion: CheckedContinuation<Void, Never>?
 
     static func ready() throws -> BloomReadiness {
         try JSONDecoder().decode(BloomReadiness.self, from: Data(readinessFixture.utf8))
@@ -179,6 +213,12 @@ private final class ControlledClient: BloomAPITransport {
             streamStarted?()
         }
         for chunk in chunks { onChunk(chunk) }
+        if holdAfterChunks {
+            await withCheckedContinuation {
+                pendingCompletion = $0
+                chunksDelivered?()
+            }
+        }
     }
 }
 
@@ -191,7 +231,7 @@ private struct ChatViewModelChecks {
         let client = ControlledClient()
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
-        let model = ChatViewModel(defaults: defaults) { _, _ in client }
+        let model = ChatViewModel(defaults: defaults, storage: MemoryConversationStore()) { _, _ in client }
         await model.connect()
         let firstStarted = AsyncSignal("first stream started")
         client.streamStarted = { firstStarted.signal() }
@@ -241,7 +281,7 @@ private struct ChatViewModelChecks {
         client.readinessStarted = { started.signal() }
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
-        let model = ChatViewModel(defaults: defaults) { _, _ in client }
+        let model = ChatViewModel(defaults: defaults, storage: MemoryConversationStore()) { _, _ in client }
         let connecting = Task { await model.connect() }
         try await started.wait()
         model.serverURL = "http://localhost:4567"
@@ -268,7 +308,7 @@ private struct ChatViewModelChecks {
         var constructions = 0
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
-        let model = ChatViewModel(defaults: defaults) { _, _ in
+        let model = ChatViewModel(defaults: defaults, storage: MemoryConversationStore()) { _, _ in
             constructions += 1
             return client
         }
@@ -294,7 +334,7 @@ private struct ChatViewModelChecks {
         client.readinessStarted = { started.signal() }
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
-        let model = ChatViewModel(defaults: defaults) { _, _ in client }
+        let model = ChatViewModel(defaults: defaults, storage: MemoryConversationStore()) { _, _ in client }
         let connecting = Task { await model.connect() }
         try await started.wait()
         connecting.cancel()
@@ -305,6 +345,256 @@ private struct ChatViewModelChecks {
         client.delayReadiness = false
         await model.connect()
         expectEqual(model.connectionState, .ready)
+    }
+}
+
+@MainActor
+private struct ConversationChecks {
+    private func temporaryDirectory() throws -> URL {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("BloomConversationChecks-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    }
+
+    func testFileStorageBoundsAndRecovery() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = FileConversationStore(url: root.appendingPathComponent("private/conversations.json"))
+        expectNil(try store.load())
+        var archive = ConversationArchive.empty()
+        archive.conversations[0].messages = [DesktopMessage(role: .user, content: "你好 🌸")]
+        archive.conversations[0].draft = "saved draft"
+        try store.save(archive)
+        expectEqual(try store.load(), archive)
+        let attributes = try FileManager.default.attributesOfItem(atPath: store.url.path)
+        expectEqual((attributes[.posixPermissions] as! NSNumber).intValue, 0o600)
+        let original = try Data(contentsOf: store.url)
+        var invalid = archive
+        invalid.conversations.append(invalid.conversations[0])
+        expectThrows(try store.save(invalid)) { _ in }
+        expectEqual(try Data(contentsOf: store.url), original, "Rejected saves must preserve the old archive")
+
+        var oversized = archive
+        let text = String(repeating: "x", count: ConversationArchive.maxTextBytes)
+        oversized.conversations[0].draft = ""
+        oversized.conversations[0].messages = (0..<16).map { _ in
+            DesktopMessage(role: .user, content: text)
+        }
+        try oversized.validate() // Exactly 16 MiB of raw text is permitted.
+        var otherConversation = DesktopConversation()
+        otherConversation.draft = "🌸"
+        oversized.conversations.append(otherConversation)
+        expectThrows(try oversized.validate()) { error in
+            expectTrue(error.localizedDescription.contains("16 MiB archive limit"))
+        }
+        expectThrows(try store.save(oversized)) { _ in }
+        expectEqual(try Data(contentsOf: store.url), original,
+                    "Aggregate limits must reject before encoding or replacing the archive")
+
+        for bytes in [Data("{invalid".utf8), try JSONEncoder().encode(ConversationArchive(version: 999, selectedID: archive.selectedID, conversations: archive.conversations)), try JSONEncoder().encode(invalid)] {
+            try bytes.write(to: store.url)
+            expectThrows(try store.load()) { _ in }
+            expectEqual(try Data(contentsOf: store.url), bytes, "Failed reads must not alter the source")
+        }
+        let handle = try FileHandle(forWritingTo: store.url)
+        try handle.truncate(atOffset: UInt64(ConversationArchive.maxBytes + 1))
+        try handle.close()
+        expectThrows(try store.load()) { error in
+            expectTrue(error.localizedDescription.contains("16 MiB"))
+        }
+        try original.write(to: store.url)
+        try store.quarantine()
+        expectNil(try store.load())
+        let files = try FileManager.default.contentsOfDirectory(at: store.url.deletingLastPathComponent(), includingPropertiesForKeys: nil)
+        expectEqual(files.count, 1)
+        expectTrue(files[0].lastPathComponent.hasPrefix("conversations-recovery-"))
+        expectEqual(try Data(contentsOf: files[0]), original)
+        try FileManager.default.createSymbolicLink(at: store.url, withDestinationURL: files[0])
+        expectThrows(try store.load()) { _ in }
+        try FileManager.default.removeItem(at: store.url)
+        try FileManager.default.createDirectory(at: store.url, withIntermediateDirectories: false)
+        expectThrows(try store.load()) { _ in }
+        expectThrows(try store.save(archive)) { _ in }
+        let afterFailure = try FileManager.default.contentsOfDirectory(atPath: store.url.deletingLastPathComponent().path)
+        expectFalse(afterFailure.contains(where: { $0.hasSuffix(".tmp") }), "Failed atomic writes must clean their temporary files")
+    }
+
+    func testRestartSelectionDraftAndCredentialIsolation() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let suite = "BloomConversationChecks.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = FileConversationStore(url: root.appendingPathComponent("conversations.json"))
+        let client = ControlledClient()
+        let model = ChatViewModel(defaults: defaults, storage: store) { _, _ in client }
+        model.apiKey = "credential-must-not-be-persisted"
+        await model.connect()
+        let firstID = model.selectedConversationID!
+        model.draft = "你好 🌸"
+        let started = AsyncSignal("persisted conversation stream")
+        client.streamStarted = { started.signal() }
+        model.send()
+        try await started.wait()
+        let finished = AsyncSignal("persisted conversation completed")
+        client.streamFinished = { finished.signal() }
+        let chunk = try JSONDecoder().decode(ChatCompletionChunk.self, from: Data(
+            #"{"choices":[{"delta":{"content":"你好，用户"}}]}"#.utf8))
+        client.pendingStreams[0].resume(returning: [chunk])
+        try await finished.wait()
+        expectFalse(model.isGenerating)
+        model.newConversation()
+        let secondID = model.selectedConversationID!
+        model.draft = "A draft for later"
+        model.checkpoint()
+        let fileText = String(decoding: try Data(contentsOf: store.url), as: UTF8.self)
+        expectFalse(fileText.contains("credential-must-not-be-persisted"))
+        expectFalse(fileText.contains("apiKey"))
+        expectFalse(fileText.contains("serverURL"))
+        let restarted = ChatViewModel(defaults: defaults, storage: store) { _, _ in client }
+        expectEqual(restarted.selectedConversationID, secondID)
+        expectEqual(restarted.draft, "A draft for later")
+        expectEqual(restarted.apiKey, "")
+        expectEqual(restarted.connectionState, .disconnected)
+        expectFalse(restarted.isGenerating)
+        restarted.selectConversation(firstID)
+        expectEqual(restarted.messages.map(\.content), ["你好 🌸", "你好，用户"])
+        expectEqual(restarted.conversationTitle, "你好 🌸")
+        restarted.selectConversation(secondID)
+        expectEqual(restarted.draft, "A draft for later")
+        restarted.deleteConversation(firstID)
+        expectEqual(restarted.conversations.count, 1)
+        restarted.deleteConversation(secondID)
+        expectEqual(restarted.conversations.count, 1, "Deleting the last conversation creates an empty replacement")
+        expectTrue(restarted.messages.isEmpty)
+        expectEqual(restarted.draft, "")
+        expectTrue(restarted.selectedConversationID != secondID)
+        expectEqual(try store.load()?.selectedID, restarted.selectedConversationID)
+    }
+
+    func testSwitchAndDeleteIsolateLateGenerations() async throws {
+        let suite = "BloomConversationChecks.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = MemoryConversationStore()
+        let client = ControlledClient()
+        let model = ChatViewModel(defaults: defaults, storage: store) { _, _ in client }
+        await model.connect()
+        let firstID = model.selectedConversationID!
+        model.draft = "first conversation"
+        let started = AsyncSignal("conversation one started")
+        client.streamStarted = { started.signal() }
+        model.send()
+        try await started.wait()
+        model.newConversation()
+        let secondID = model.selectedConversationID!
+        expectFalse(model.isGenerating)
+        model.draft = "second conversation"
+        let secondStarted = AsyncSignal("conversation two started")
+        client.streamStarted = { secondStarted.signal() }
+        model.send()
+        try await secondStarted.wait()
+        expectEqual(client.requests[1].map(\.content), ["second conversation"], "Requests must contain only the selected conversation")
+        let late = try JSONDecoder().decode(ChatCompletionChunk.self, from: Data(
+            #"{"choices":[{"delta":{"content":"STALE"}}]}"#.utf8))
+        let finished = AsyncSignal("old conversation ended late")
+        client.streamFinished = { finished.signal() }
+        client.pendingStreams[0].resume(returning: [late])
+        try await finished.wait()
+        expectTrue(model.isGenerating)
+        expectFalse(model.messages.contains(where: { $0.content == "STALE" }))
+        model.deleteConversation(secondID)
+        expectFalse(model.isGenerating)
+        expectEqual(model.selectedConversationID, firstID)
+        expectEqual(model.messages.map(\.content), ["first conversation"])
+        let deletedFinished = AsyncSignal("deleted conversation ended late")
+        client.streamFinished = { deletedFinished.signal() }
+        client.pendingStreams[1].resume(throwing: URLError(.networkConnectionLost))
+        try await deletedFinished.wait()
+        expectNil(model.errorMessage)
+        expectEqual(model.messages.map(\.content), ["first conversation"])
+        expectEqual(store.archive?.conversations.count, 1)
+        expectFalse(store.archive!.conversations[0].messages.contains(where: { $0.role == .assistant }))
+    }
+
+    func testSaveFailureAndUnreadableHistoryRecovery() async throws {
+        let suite = "BloomConversationChecks.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let client = ControlledClient()
+        let store = MemoryConversationStore()
+        store.loadError = ConversationStorageError.invalid("damaged")
+        let model = ChatViewModel(defaults: defaults, storage: store) { _, _ in client }
+        await model.connect()
+        expectTrue(model.storageNeedsRecovery)
+        model.draft = "unsaved"
+        model.send()
+        model.newConversation()
+        model.checkpoint()
+        expectEqual(store.saves, 0, "Unreadable history must never be overwritten automatically")
+        expectTrue(model.conversations.isEmpty)
+        store.quarantineError = ConversationStorageError.io("disk failure")
+        model.preserveDamagedHistoryAndReset()
+        expectTrue(model.storageNeedsRecovery)
+        store.quarantineError = nil
+        model.preserveDamagedHistoryAndReset()
+        expectTrue(store.quarantined)
+        expectFalse(model.storageNeedsRecovery)
+        expectNil(model.storageError)
+        store.saveError = ConversationStorageError.io("disk full")
+        model.draft = "Keep this in memory"
+        model.checkpoint()
+        expectTrue(model.storageError?.contains("disk full") == true)
+        expectEqual(model.draft, "Keep this in memory")
+        store.saveError = nil
+        model.retryStorage()
+        expectNil(model.storageError)
+        expectEqual(store.archive?.conversations[0].draft, "Keep this in memory")
+    }
+
+    func testPartialOutputCheckpointAndSwitch() async throws {
+        let suite = "BloomConversationChecks.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = MemoryConversationStore()
+        let client = ControlledClient()
+        client.holdAfterChunks = true
+        let model = ChatViewModel(defaults: defaults, storage: store) { _, _ in client }
+        await model.connect()
+        let firstID = model.selectedConversationID!
+        model.newConversation()
+        let secondID = model.selectedConversationID!
+        model.draft = "second draft"
+        model.selectConversation(firstID)
+        model.draft = "stream me"
+        let started = AsyncSignal("partial stream started")
+        let delivered = AsyncSignal("partial chunk delivered")
+        client.streamStarted = { started.signal() }
+        client.chunksDelivered = { delivered.signal() }
+        model.send()
+        try await started.wait()
+        let chunk = try JSONDecoder().decode(ChatCompletionChunk.self, from: Data(
+            #"{"choices":[{"delta":{"content":"Partial response 🌸"}}]}"#.utf8))
+        client.pendingStreams[0].resume(returning: [chunk])
+        try await delivered.wait()
+        try await Task.sleep(nanoseconds: 650_000_000)
+        expectTrue(model.isGenerating)
+        let restored = ChatViewModel(defaults: defaults, storage: store) { _, _ in client }
+        expectEqual(restored.messages.map(\.content), ["stream me", "Partial response 🌸"])
+        expectFalse(restored.isGenerating, "A restart must never resurrect an active request")
+        expectNil(restored.metrics)
+        model.selectConversation(secondID)
+        expectFalse(model.isGenerating)
+        expectEqual(model.draft, "second draft")
+        let finished = AsyncSignal("partial stream cancelled late")
+        client.streamFinished = { finished.signal() }
+        client.pendingCompletion?.resume()
+        try await finished.wait()
+        expectTrue(model.messages.isEmpty)
+        expectNil(model.metrics)
+        expectNil(model.errorMessage)
+        model.selectConversation(firstID)
+        expectEqual(model.messages.map(\.content), ["stream me", "Partial response 🌸"])
     }
 }
 

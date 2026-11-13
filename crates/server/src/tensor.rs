@@ -458,6 +458,7 @@ mod tests {
                 anyhow::bail!("private model path /secret/weights; private input");
             }
             Ok(ModelOutput {
+                logprobs: None,
                 logits: Some(match self.engine.kind {
                     "nan" => vec![f32::NAN],
                     "empty" => vec![],
@@ -608,6 +609,7 @@ mod tests {
         ]));
         assert!(
             numeric_output(ModelOutput {
+                logprobs: None,
                 text: None,
                 logits: Some(vec![0.0; MAX_TENSOR_VALUES + 1]),
                 image: None,

@@ -198,6 +198,10 @@ impl LoadedModel for LlamaCppModel {
     }
 
     fn infer(&self, input: ModelInput, params: &GenerationParams) -> Result<ModelOutput> {
+        anyhow::ensure!(
+            params.logprobs.is_none(),
+            "this backend does not support token logprobs"
+        );
         let prompt = match input {
             ModelInput::Text { prompt } => prompt,
             _ => bail!("llamacpp backend only supports text input"),
@@ -208,6 +212,7 @@ impl LoadedModel for LlamaCppModel {
         );
         let text = self.complete(&prompt, params)?;
         Ok(ModelOutput {
+            logprobs: None,
             text: Some(text),
             logits: None,
             image: None,
@@ -222,6 +227,10 @@ impl LoadedModel for LlamaCppModel {
         params: &GenerationParams,
         sink: &mut dyn OutputSink,
     ) -> Result<()> {
+        anyhow::ensure!(
+            params.logprobs.is_none(),
+            "this backend does not support token logprobs"
+        );
         params.validate().map_err(anyhow::Error::msg)?;
         let prompt = match input {
             ModelInput::Text { prompt } => prompt,

@@ -37,6 +37,15 @@ class ReleaseWorkflowSecurityTests(unittest.TestCase):
     def test_accepts_current_release_workflow(self) -> None:
         self.assertEqual(validate_text(self.workflow), [])
 
+    def test_rejects_ci_and_release_artifact_mixing(self) -> None:
+        for pattern in ("", "          pattern: native-sdk-*\n", "          pattern: bloom-*\n"):
+            mutated = self.workflow.replace("          pattern: release-bloom-*\n", pattern)
+            self.assert_rejected(mutated, "select only release-bloom-*")
+
+    def test_native_wheels_require_attestation(self) -> None:
+        mutated = self.workflow[:self.attest_start] + self.workflow[self.attest_start:].replace("            artifacts/*.whl\n", "", 1)
+        self.assert_rejected(mutated, "artifacts/*.whl")
+
     def test_rejects_top_level_write_permission(self) -> None:
         mutated = self.workflow.replace("  contents: read", "  contents: write", 1)
         self.assert_rejected(mutated, "must default contents permission to read")
