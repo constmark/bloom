@@ -11,22 +11,31 @@
 #
 # Environment:
 #   BLOOM_PACKAGE_UI=0  Build a server-only archive instead of the default embedded-UI package.
+#   BLOOM_RELEASE_DIR   Empty destination directory; existing artifacts are never removed.
 #   SOURCE_DATE_EPOCH   Optional archive timestamp; defaults to the current Git commit time.
 
 set -euo pipefail
 
 TARGET="${1:-}"
 WORKSPACE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RELEASE_DIR="${WORKSPACE_DIR}/release-artifacts"
+RELEASE_DIR="${BLOOM_RELEASE_DIR:-${WORKSPACE_DIR}/release-artifacts}"
 
 echo "=== Bloom Release Packaging ==="
 echo "Workspace: $WORKSPACE_DIR"
 echo "Artifacts destination: $RELEASE_DIR"
 cd "$WORKSPACE_DIR"
 
-# Clean and create release directory
-rm -rf "$RELEASE_DIR"
+# Refuse to erase previous release evidence, even when a later build fails.
+if [ -L "$RELEASE_DIR" ] || { [ -e "$RELEASE_DIR" ] && [ ! -d "$RELEASE_DIR" ]; }; then
+    echo "Error: release destination must be a real directory." >&2
+    exit 1
+fi
 mkdir -p "$RELEASE_DIR"
+if [ -n "$(find "$RELEASE_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+    echo "Error: release destination is not empty; set BLOOM_RELEASE_DIR to a new directory." >&2
+    exit 1
+fi
+RELEASE_DIR="$(cd "$RELEASE_DIR" && pwd)"
 
 # Check build and packaging dependencies.
 if ! command -v cargo >/dev/null 2>&1; then
@@ -338,7 +347,7 @@ else
 fi
 "$PYTHON_BIN" "${WORKSPACE_DIR}/scripts/create_release_archive.py" \
     "$PKG_DIR" "${RELEASE_DIR}/${ARCHIVE_FILE}" \
-    --source-date-epoch "$RELEASE_SOURCE_DATE_EPOCH"
+    --source-date-epoch "$RELEASE_SOURCE_DATE_EPOCH" --no-overwrite
 
 # Generate Checksums
 cd "$RELEASE_DIR"
@@ -353,9 +362,8 @@ digest = hashlib.sha256()
 with archive_path.open("rb") as handle:
     for chunk in iter(lambda: handle.read(1024 * 1024), b""):
         digest.update(chunk)
-pathlib.Path(sys.argv[2]).write_text(
-    f"{digest.hexdigest()}  {archive_path.name}\n", encoding="utf-8"
-)
+with pathlib.Path(sys.argv[2]).open("x", encoding="utf-8") as handle:
+    handle.write(f"{digest.hexdigest()}  {archive_path.name}\n")
 PY
 
 VALIDATOR_ARGS=(

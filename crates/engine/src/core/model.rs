@@ -81,6 +81,12 @@ pub trait LoadedModel: Send + Sync {
         false
     }
 
+    /// Whether successful generation streams emit exact cumulative TokenUsage
+    /// and one GenerationFinished event before End. Legacy adapters are optional.
+    fn supports_generation_metadata(&self) -> bool {
+        false
+    }
+
     fn metadata(&self) -> &ModelMetadata;
     fn infer(&self, input: ModelInput, params: &GenerationParams) -> Result<ModelOutput>;
     fn infer_stream(
@@ -110,6 +116,30 @@ pub trait LoadedModel: Send + Sync {
         }
         if let Some(text) = output.text {
             sink.on_chunk(OutputChunk::TextDelta(text))?;
+        }
+        if let Some(values) = output.logits {
+            sink.on_chunk(OutputChunk::Embedding(values))?;
+        }
+        if let Some(bytes) = output.image {
+            sink.on_chunk(OutputChunk::Image(bytes))?;
+        }
+        if let Some((samples, sample_rate)) = output.audio {
+            sink.on_chunk(OutputChunk::TtsAudioChunk {
+                samples,
+                sample_rate,
+                is_final: true,
+            })?;
+        }
+        if let Some(video) = output.video {
+            for frame in video.frames {
+                sink.on_chunk(OutputChunk::VideoFrame(frame))?;
+            }
+            sink.on_chunk(OutputChunk::VideoComplete {
+                width: video.width,
+                height: video.height,
+                fps: video.fps,
+                frame_count: video.frame_count,
+            })?;
         }
         sink.on_chunk(OutputChunk::End)?;
         Ok(())
@@ -428,6 +458,85 @@ impl LoadedModel for EchoTextModel {
 mod tests {
     use super::*;
     use crate::io::ModelInput;
+
+    #[test]
+    fn default_stream_adapter_preserves_every_buffered_output_modality() {
+        struct BufferedModel {
+            meta: ModelMetadata,
+            output: ModelOutput,
+        }
+        impl LoadedModel for BufferedModel {
+            fn metadata(&self) -> &ModelMetadata {
+                &self.meta
+            }
+            fn infer(&self, _: ModelInput, _: &GenerationParams) -> Result<ModelOutput> {
+                Ok(self.output.clone())
+            }
+        }
+        let model = BufferedModel {
+            meta: EchoTextModel::default().meta,
+            output: ModelOutput {
+                text: Some("generated".into()),
+                logprobs: None,
+                logits: Some(vec![1.25, -2.5]),
+                image: Some(vec![1, 2, 3]),
+                audio: Some((vec![0.25, -0.25], 24000)),
+                video: Some(crate::io::VideoOutput {
+                    width: 1,
+                    height: 1,
+                    fps: 24.0,
+                    frame_count: 2,
+                    frames: vec![vec![1, 2, 3], vec![4, 5, 6]],
+                }),
+            },
+        };
+        let mut chunks = Vec::new();
+        model
+            .infer_stream(
+                ModelInput::Text {
+                    prompt: "input".into(),
+                },
+                &GenerationParams::default(),
+                &mut |chunk| {
+                    chunks.push(chunk);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| matches!(chunk, OutputChunk::End))
+                .count(),
+            1
+        );
+        assert!(matches!(chunks.last(), Some(OutputChunk::End)));
+        let restored = ModelOutput::from(chunks);
+        restored.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(restored).unwrap(),
+            serde_json::to_value(&model.output).unwrap()
+        );
+
+        let mut received = 0;
+        let error = model
+            .infer_stream(
+                ModelInput::Text {
+                    prompt: "input".into(),
+                },
+                &GenerationParams::default(),
+                &mut |chunk| {
+                    received += 1;
+                    if matches!(chunk, OutputChunk::Embedding(_)) {
+                        anyhow::bail!("cancelled numeric output");
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("cancelled numeric output"));
+        assert_eq!(received, 2, "a sink error must stop all later events");
+    }
 
     struct ScalarEmbeddingModel {
         meta: ModelMetadata,

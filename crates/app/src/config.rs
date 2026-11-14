@@ -29,6 +29,7 @@ pub struct InferConfig {
     pub frequency_penalty: Option<f64>,
     pub logit_bias: Option<std::collections::BTreeMap<u32, f64>>,
     pub response_format: Option<bloomai_core::ResponseFormat>,
+    pub logprobs: Option<usize>,
     pub seed: Option<u64>,
     pub stream: Option<bool>,
     pub device: Option<String>,

@@ -14,35 +14,18 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{Result, anyhow};
-use bloomai_core::{BenchmarkResult, DType, DeviceKind, GenerationParams, ResponseFormat};
+use bloomai_app::text_metrics::TextTokenCounter;
+use bloomai_core::{BenchmarkResult, DeviceKind, GenerationParams, ResponseFormat};
 use clap::builder::BoolishValueParser;
 use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 use tracing_subscriber::EnvFilter;
 
-#[cfg(feature = "candle-engine")]
-use bloomai_engine::executor::candle::CandleEngine;
-use bloomai_engine::executor::coreml::CoreMlEngine;
-use bloomai_engine::executor::funasr::FunASREngine;
-use bloomai_engine::executor::intel_npu::IntelNpuEngine;
-use bloomai_engine::executor::laya::LayaEngine;
-use bloomai_engine::executor::llamacpp::LlamaCppEngine;
-use bloomai_engine::executor::longcat_image_edit::LongCatImageEditEngine;
-use bloomai_engine::executor::mlx::MlxEngine;
-use bloomai_engine::executor::npu_tts::NpuTtsEngine;
-use bloomai_engine::executor::onnx::OnnxRuntimeEngine;
-use bloomai_engine::executor::openvino::OpenVINOEngine;
-use bloomai_engine::executor::tensorrt::TensorRtEngine;
-use bloomai_engine::executor::vulkan::VulkanEngine;
-
-#[cfg(feature = "candle-engine")]
-use bloomai_engine::executor::qwen3_vl::Qwen3VLEngine;
-#[cfg(feature = "candle-engine")]
-use bloomai_engine::executor::wan::WanEngine;
-use bloomai_engine::{
-    Engine, EngineRegistry, InferencePipeline, ModelInput, model_manifest_supports_embeddings,
-    speculative_mode_is_mtp,
+use bloomai_app::{
+    SUPPORTED_ENGINES_HINT, build_engine_registry, parse_cli_dtype, select_backend_name,
+    validate_cli_model_task,
 };
+use bloomai_engine::{Engine, EngineRegistry, InferencePipeline, ModelInput};
 
 /// Chat completion message.
 #[derive(serde::Deserialize, Debug, Clone)]
@@ -66,6 +49,7 @@ struct PromptJson {
     frequency_penalty: Option<f64>,
     logit_bias: Option<BTreeMap<u32, f64>>,
     response_format: Option<ResponseFormat>,
+    logprobs: Option<usize>,
 }
 
 /// Resolved input from prompt parsing.
@@ -80,6 +64,7 @@ struct ResolvedInput {
     frequency_penalty: f64,
     logit_bias: Option<BTreeMap<u32, f64>>,
     response_format: Option<ResponseFormat>,
+    logprobs: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -160,13 +145,22 @@ struct Args {
     #[arg(long, value_parser = parse_response_format)]
     response_format: Option<ResponseFormat>,
 
+    /// Emit selected-token log probabilities and 0..20 alternatives. Requires
+    /// --json; --stream emits TokenLogprobs events, buffered output includes logprobs.
+    #[arg(long, requires = "json")]
+    logprobs: Option<usize>,
+
     /// Random seed for reproducible generation.
     #[arg(long)]
     seed: Option<u64>,
 
     /// Enable streaming output (print tokens as they are generated).
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, overrides_with = "no_stream")]
     stream: bool,
+
+    /// Disable streaming output, overriding `infer.stream` in the config.
+    #[arg(long, default_value_t = false, overrides_with = "stream")]
+    no_stream: bool,
 
     /// Print the complete ModelOutput as JSON; with --stream, emit one
     /// complete OutputChunk JSON value per line (including the End event).
@@ -297,16 +291,30 @@ struct Args {
     output: PathBuf,
 
     /// Start an interactive chat-style terminal UI after loading the model.
-    #[arg(short = 'i', long, visible_alias = "tui", default_value_t = false)]
+    #[arg(
+        short = 'i',
+        long,
+        visible_alias = "tui",
+        default_value_t = false,
+        overrides_with = "no_interactive"
+    )]
     interactive: bool,
+
+    /// Run a single prompt, overriding `infer.interactive` in the config.
+    #[arg(long, default_value_t = false, overrides_with = "interactive")]
+    no_interactive: bool,
 
     /// Print registered engines and exit.
     #[arg(long, default_value_t = false)]
     list_engines: bool,
 
     /// Run the benchmarking suite instead of a single prompt.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, overrides_with = "no_bench")]
     bench: bool,
+
+    /// Skip the benchmarking suite, overriding `infer.bench` in the config.
+    #[arg(long, default_value_t = false, overrides_with = "bench")]
+    no_bench: bool,
 
     /// Inspect model metadata, engine capabilities, and memory estimates, then exit.
     #[arg(long, default_value_t = false)]
@@ -325,8 +333,12 @@ struct Args {
     bench_json: bool,
 
     /// Quiet mode: only print the generated text, no headers or metrics.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, overrides_with = "no_quiet")]
     quiet: bool,
+
+    /// Print headers and metrics, overriding `infer.quiet` in the config.
+    #[arg(long, default_value_t = false, overrides_with = "quiet")]
+    no_quiet: bool,
 }
 
 macro_rules! apply_config_value {
@@ -349,6 +361,23 @@ macro_rules! apply_config_option {
     };
 }
 
+/// Apply a config boolean that has a `--no-<flag>` CLI negation. Either CLI
+/// spelling takes precedence over the config value; the negation wins last.
+macro_rules! apply_config_flag {
+    ($args:expr_2021, $matches:expr_2021, $config:expr_2021, $field:ident, $negation:ident) => {
+        if should_use_config($matches, stringify!($field))
+            && should_use_config($matches, stringify!($negation))
+        {
+            if let Some(value) = $config.$field {
+                $args.$field = value;
+            }
+        }
+        if $args.$negation {
+            $args.$field = false;
+        }
+    };
+}
+
 fn should_use_config(matches: &ArgMatches, id: &str) -> bool {
     matches
         .value_source(id)
@@ -364,8 +393,13 @@ fn parse_args() -> Result<(Args, ArgMatches)> {
 
 fn apply_config(args: &mut Args, matches: &ArgMatches, config: &bloomai_app::InferConfig) {
     apply_config_option!(args, matches, config, model);
-    apply_config_value!(args, matches, config, prompt);
-    apply_config_option!(args, matches, config, prompt_file);
+    // `--prompt` and `--prompt-file` are one input choice: naming either on
+    // the CLI must not let a config `prompt_file` (which is read first)
+    // silently replace the prompt the user typed.
+    if should_use_config(matches, "prompt") && should_use_config(matches, "prompt_file") {
+        apply_config_value!(args, matches, config, prompt);
+        apply_config_option!(args, matches, config, prompt_file);
+    }
     apply_config_option!(args, matches, config, system_prompt);
     apply_config_value!(args, matches, config, max_tokens);
     apply_config_value!(args, matches, config, temperature);
@@ -375,8 +409,13 @@ fn apply_config(args: &mut Args, matches: &ArgMatches, config: &bloomai_app::Inf
     apply_config_value!(args, matches, config, frequency_penalty);
     apply_config_option!(args, matches, config, logit_bias);
     apply_config_option!(args, matches, config, response_format);
+    // Logprobs are only representable in --json output, so a config default
+    // must not break text, interactive, inspection, or benchmark runs.
+    if args.json {
+        apply_config_option!(args, matches, config, logprobs);
+    }
     apply_config_option!(args, matches, config, seed);
-    apply_config_value!(args, matches, config, stream);
+    apply_config_flag!(args, matches, config, stream, no_stream);
     apply_config_value!(args, matches, config, device);
     apply_config_value!(args, matches, config, backend);
     apply_config_option!(args, matches, config, engine);
@@ -401,98 +440,20 @@ fn apply_config(args: &mut Args, matches: &ArgMatches, config: &bloomai_app::Inf
     apply_config_value!(args, matches, config, num_steps);
     apply_config_option!(args, matches, config, negative_prompt);
     apply_config_value!(args, matches, config, output);
-    apply_config_value!(args, matches, config, interactive);
+    apply_config_flag!(args, matches, config, interactive, no_interactive);
     apply_config_value!(args, matches, config, list_engines);
-    apply_config_value!(args, matches, config, bench);
+    apply_config_flag!(args, matches, config, bench, no_bench);
     apply_config_value!(args, matches, config, inspect);
     apply_config_value!(args, matches, config, repetitions);
     apply_config_value!(args, matches, config, warmup);
     apply_config_value!(args, matches, config, bench_json);
-    apply_config_value!(args, matches, config, quiet);
-}
-
-fn select_backend_name(
-    explicit_engine: Option<&str>,
-    backend: &str,
-    speculative: &str,
-    manifest: &bloomai_core::ModelManifest,
-) -> String {
-    if explicit_engine.is_none() && backend == "candle" {
-        let has_format = |format| manifest.files.iter().any(|file| file.format == format);
-        let is_qwen_vl = manifest.family == bloomai_core::ModelFamily::Qwen
-            && (manifest.id.to_lowercase().contains("vl")
-                || manifest
-                    .parameters
-                    .get("model_type")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.contains("vl"))
-                    .unwrap_or(false));
-        if speculative_mode_is_mtp(speculative) {
-            "llamacpp".to_string()
-        } else if has_format(bloomai_core::ModelFormat::Onnx) {
-            "onnxruntime".to_string()
-        } else if has_format(bloomai_core::ModelFormat::OpenVinoIr) {
-            "openvino".to_string()
-        } else if has_format(bloomai_core::ModelFormat::CoreMl) {
-            "coreml".to_string()
-        } else if has_format(bloomai_core::ModelFormat::TensorRtEngine) {
-            "tensorrt".to_string()
-        } else if has_format(bloomai_core::ModelFormat::Mlx) {
-            "mlx".to_string()
-        } else if has_format(bloomai_core::ModelFormat::VulkanSpirv) {
-            "vulkan".to_string()
-        } else if manifest
-            .runtime_hints
-            .preferred_backends
-            .iter()
-            .any(|backend| backend == "qwen3_vl")
-        {
-            "qwen3_vl".to_string()
-        } else if manifest
-            .runtime_hints
-            .preferred_backends
-            .iter()
-            .any(|backend| backend == "llamacpp")
-        {
-            // GGUF families such as Phi-3/4, Gemma 3, SmolLM3, Ministral 3,
-            // Granite 3.3 and LFM2 have no Candle native loader in this
-            // build. Manifest inference marks them for the external bridge.
-            "llamacpp".to_string()
-        } else if is_qwen_vl {
-            "qwen3_vl".to_string()
-        } else if matches!(&manifest.family, bloomai_core::ModelFamily::Custom(c) if c == "longcat-image-edit")
-        {
-            "longcat".to_string()
-        } else if manifest.family == bloomai_core::ModelFamily::FunAsr {
-            "funasr".to_string()
-        } else if matches!(&manifest.family, bloomai_core::ModelFamily::Custom(c) if c == "laya") {
-            "laya".to_string()
-        } else if matches!(&manifest.family, bloomai_core::ModelFamily::Custom(c) if c == "wan") {
-            "wan".to_string()
-        } else {
-            "candle".to_string()
-        }
-    } else {
-        explicit_engine.unwrap_or(backend).to_string()
-    }
+    apply_config_flag!(args, matches, config, quiet, no_quiet);
 }
 
 fn parse_device(s: &str, supported_devices: &[DeviceKind]) -> Result<DeviceKind> {
     bloomai_engine::BackendRegistry::default()
         .resolve_device_selector(s, supported_devices)
         .map_err(|error| anyhow!("could not resolve device '{}': {error}", s))
-}
-
-/// Parse a dtype string from the CLI into a DType enum value.
-fn parse_dtype_str(s: &str) -> Option<DType> {
-    match s.to_lowercase().as_str() {
-        "f32" | "float32" => Some(DType::F32),
-        "f16" | "float16" => Some(DType::F16),
-        "bf16" | "bfloat16" => Some(DType::BF16),
-        "q4" | "int4" => Some(DType::Q4),
-        "q8" | "int8" => Some(DType::Q8),
-        _ => None,
-    }
 }
 
 /// Build the final prompt string by prepending system prompt if provided.
@@ -660,29 +621,84 @@ fn manifest_chat_template(manifest: &bloomai_core::ModelManifest) -> CliChatTemp
     }
 }
 
+/// Read the raw prompt text from `--prompt-file`, `--prompt`, or stdin
+/// (when `--prompt` is empty or `-`).
+fn read_raw_prompt(args: &Args) -> Result<String> {
+    if let Some(ref path) = args.prompt_file {
+        return std::fs::read_to_string(path)
+            .map_err(|e| anyhow!("failed to read prompt file '{}': {}", path.display(), e));
+    }
+    if !args.prompt.is_empty() && args.prompt != "-" {
+        return Ok(args.prompt.clone());
+    }
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() && !args.quiet {
+        eprintln!("(Reading prompt from stdin. Press Ctrl+D to end input)");
+    }
+    let mut buffer = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buffer)
+        .map_err(|e| anyhow!("failed to read from stdin: {}", e))?;
+    Ok(buffer)
+}
+
 fn resolve_and_parse_input(
     args: &Args,
     template: CliChatTemplate,
     tensor: bool,
 ) -> Result<ResolvedInput> {
-    let raw_input = if let Some(ref path) = args.prompt_file {
-        std::fs::read_to_string(path)
-            .map_err(|e| anyhow!("failed to read prompt file '{}': {}", path.display(), e))?
-    } else if !args.prompt.is_empty() && args.prompt != "-" {
-        args.prompt.clone()
-    } else {
-        use std::io::IsTerminal;
-        if std::io::stdin().is_terminal() && !args.quiet {
-            eprintln!("(Reading prompt from stdin. Press Ctrl+D to end input)");
-        }
-        let mut buffer = String::new();
-        std::io::stdin()
-            .read_to_string(&mut buffer)
-            .map_err(|e| anyhow!("failed to read from stdin: {}", e))?;
-        buffer
-    };
+    let raw_input = read_raw_prompt(args)?;
+    parse_input(args, &raw_input, template, tensor)
+}
 
+/// Merge `--system-prompt` into JSON chat messages. A list that already opens
+/// with the same system message is left alone; a different one is ambiguous
+/// and rejected instead of silently dropping either instruction.
+fn merge_system_prompt(
+    system_prompt: Option<&str>,
+    mut messages: Vec<ChatCompletionMessage>,
+) -> Result<Vec<ChatCompletionMessage>> {
+    let Some(system) = system_prompt.filter(|system| !system.is_empty()) else {
+        return Ok(messages);
+    };
+    match messages.first() {
+        Some(first) if first.role == "system" && first.content == system => {}
+        Some(first) if first.role == "system" => {
+            return Err(anyhow!(
+                "--system-prompt conflicts with the system message already present in the JSON messages; remove one of them"
+            ));
+        }
+        _ => messages.insert(
+            0,
+            ChatCompletionMessage {
+                role: "system".to_string(),
+                content: system.to_string(),
+            },
+        ),
+    }
+    Ok(messages)
+}
+
+fn parse_input(
+    args: &Args,
+    raw_input: &str,
+    template: CliChatTemplate,
+    tensor: bool,
+) -> Result<ResolvedInput> {
     let trimmed = raw_input.trim();
+    let from_args = |prompt: String| ResolvedInput {
+        prompt,
+        max_tokens: args.max_tokens,
+        temperature: args.temperature,
+        top_p: args.top_p,
+        top_k: args.top_k,
+        seed: args.seed,
+        presence_penalty: args.presence_penalty,
+        frequency_penalty: args.frequency_penalty,
+        logit_bias: args.logit_bias.clone(),
+        response_format: args.response_format.clone(),
+        logprobs: args.logprobs,
+    };
 
     if tensor {
         let value: serde_json::Value = serde_json::from_str(trimmed)
@@ -692,18 +708,7 @@ fn resolve_and_parse_input(
                 "tensor input must be a JSON array or named tensor object"
             ));
         }
-        return Ok(ResolvedInput {
-            prompt: trimmed.to_string(),
-            max_tokens: args.max_tokens,
-            temperature: args.temperature,
-            top_p: args.top_p,
-            top_k: args.top_k,
-            seed: args.seed,
-            presence_penalty: args.presence_penalty,
-            frequency_penalty: args.frequency_penalty,
-            logit_bias: args.logit_bias.clone(),
-            response_format: args.response_format.clone(),
-        });
+        return Ok(from_args(trimmed.to_string()));
     }
 
     if trimmed.starts_with('{') {
@@ -715,18 +720,7 @@ fn resolve_and_parse_input(
             && value.get("state").is_some()
             && value.get("questions").is_some()
         {
-            return Ok(ResolvedInput {
-                prompt: trimmed.to_string(),
-                max_tokens: args.max_tokens,
-                temperature: args.temperature,
-                top_p: args.top_p,
-                top_k: args.top_k,
-                seed: args.seed,
-                presence_penalty: args.presence_penalty,
-                frequency_penalty: args.frequency_penalty,
-                logit_bias: args.logit_bias.clone(),
-                response_format: args.response_format.clone(),
-            });
+            return Ok(from_args(trimmed.to_string()));
         }
         if serde_json::from_str::<serde_json::Value>(trimmed)
             .ok()
@@ -739,8 +733,17 @@ fn resolve_and_parse_input(
                     "generation request must specify either prompt or messages, not both"
                 ));
             }
+            let system_prompt = args.system_prompt.as_deref();
             let prompt = if let Some(messages) = json_obj.messages {
-                chat_prompt_for_model(&messages, template)
+                chat_prompt_for_model(&merge_system_prompt(system_prompt, messages)?, template)
+            } else if system_prompt.is_some_and(|system| !system.is_empty()) {
+                // A raw completion prompt has no role slot for the system
+                // text, so frame both as a chat turn like plain-text input.
+                build_prompt_for_model(
+                    system_prompt,
+                    &json_obj.prompt.unwrap_or_default(),
+                    template,
+                )
             } else {
                 json_obj.prompt.unwrap_or_default()
             };
@@ -751,6 +754,7 @@ fn resolve_and_parse_input(
                 top_p: json_obj.top_p.unwrap_or(args.top_p),
                 top_k: json_obj.top_k.or(args.top_k),
                 seed: json_obj.seed.or(args.seed),
+                logprobs: json_obj.logprobs.or(args.logprobs),
                 presence_penalty: json_obj.presence_penalty.unwrap_or(args.presence_penalty),
                 frequency_penalty: json_obj.frequency_penalty.unwrap_or(args.frequency_penalty),
                 logit_bias: json_obj.logit_bias.or_else(|| args.logit_bias.clone()),
@@ -762,34 +766,15 @@ fn resolve_and_parse_input(
     } else if trimmed.starts_with('[')
         && let Ok(messages) = serde_json::from_str::<Vec<ChatCompletionMessage>>(trimmed)
     {
-        let prompt = chat_prompt_for_model(&messages, template);
-        return Ok(ResolvedInput {
-            prompt,
-            max_tokens: args.max_tokens,
-            temperature: args.temperature,
-            top_p: args.top_p,
-            top_k: args.top_k,
-            seed: args.seed,
-            presence_penalty: args.presence_penalty,
-            frequency_penalty: args.frequency_penalty,
-            logit_bias: args.logit_bias.clone(),
-            response_format: args.response_format.clone(),
-        });
+        let messages = merge_system_prompt(args.system_prompt.as_deref(), messages)?;
+        return Ok(from_args(chat_prompt_for_model(&messages, template)));
     }
 
-    let prompt = build_prompt_for_model(args.system_prompt.as_deref(), &raw_input, template);
-    Ok(ResolvedInput {
-        prompt,
-        max_tokens: args.max_tokens,
-        temperature: args.temperature,
-        top_p: args.top_p,
-        top_k: args.top_k,
-        seed: args.seed,
-        presence_penalty: args.presence_penalty,
-        frequency_penalty: args.frequency_penalty,
-        logit_bias: args.logit_bias.clone(),
-        response_format: args.response_format.clone(),
-    })
+    Ok(from_args(build_prompt_for_model(
+        args.system_prompt.as_deref(),
+        raw_input,
+        template,
+    )))
 }
 
 fn resolve_model_path_arg(model: &std::path::Path) -> Result<PathBuf> {
@@ -798,29 +783,6 @@ fn resolve_model_path_arg(model: &std::path::Path) -> Result<PathBuf> {
     } else {
         Err(anyhow!("model path does not exist: {}", model.display()))
     }
-}
-
-fn build_engine_registry() -> EngineRegistry {
-    let mut registry = EngineRegistry::default();
-    #[cfg(feature = "candle-engine")]
-    registry.register("candle", Box::new(CandleEngine));
-    registry.register("openvino", Box::new(OpenVINOEngine));
-    registry.register("funasr", Box::new(FunASREngine));
-    registry.register("laya", Box::new(LayaEngine));
-    #[cfg(feature = "candle-engine")]
-    registry.register("qwen3_vl", Box::new(Qwen3VLEngine));
-    registry.register("longcat", Box::new(LongCatImageEditEngine));
-    registry.register("intel-npu", Box::new(IntelNpuEngine));
-    registry.register("npu-tts", Box::new(NpuTtsEngine));
-    registry.register("onnxruntime", Box::new(OnnxRuntimeEngine));
-    registry.register("coreml", Box::new(CoreMlEngine));
-    registry.register("tensorrt", Box::new(TensorRtEngine));
-    registry.register("mlx", Box::new(MlxEngine));
-    registry.register("vulkan", Box::new(VulkanEngine));
-    registry.register("llamacpp", Box::new(LlamaCppEngine));
-    #[cfg(feature = "candle-engine")]
-    registry.register("wan", Box::new(WanEngine));
-    registry
 }
 
 fn configure_process_environment(args: &Args) {
@@ -882,6 +844,20 @@ fn format_inference_output(
     }
 }
 
+fn format_buffered_generation_output(
+    output: &bloomai_engine::ModelOutput,
+    generation: Option<bloomai_engine::GenerationMetadata>,
+    json: bool,
+) -> Result<Option<String>> {
+    if json && let Some(generation) = generation {
+        output.validate().map_err(anyhow::Error::msg)?;
+        let mut value = serde_json::to_value(output)?;
+        value["generation"] = serde_json::to_value(generation)?;
+        return Ok(Some(serde_json::to_string(&value)?));
+    }
+    format_inference_output(output, json)
+}
+
 fn format_stream_output(
     chunk: &bloomai_engine::io::OutputChunk,
     json: bool,
@@ -894,6 +870,15 @@ fn format_stream_output(
     } else {
         Ok(None)
     }
+}
+
+fn validate_logprob_output_mode(args: &Args, logprobs: Option<usize>) -> Result<()> {
+    if logprobs.is_some() && !args.json {
+        return Err(anyhow!(
+            "logprobs requires --json so token metadata is preserved in the output"
+        ));
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -914,8 +899,9 @@ fn main() -> Result<()> {
     }
     let config = bloomai_app::load_config(&config_path)?;
     apply_config(&mut args, &matches, &config.infer);
+    validate_logprob_output_mode(&args, args.logprobs)?;
     GenerationParams {
-        logprobs: None,
+        logprobs: args.logprobs,
         max_tokens: args.max_tokens,
         temperature: args.temperature,
         top_p: args.top_p,
@@ -965,7 +951,7 @@ fn main() -> Result<()> {
 
     let engine = registry
         .get(&backend_name)
-        .map_err(|e| anyhow!("{}. Supported engines are: candle, laya, openvino, funasr, qwen3_vl, longcat, intel-npu, npu-tts, onnxruntime, llamacpp, wan.", e))?;
+        .map_err(|e| anyhow!("{e}. Supported engines are: {SUPPORTED_ENGINES_HINT}."))?;
 
     if args.inspect {
         return print_inspect(
@@ -978,11 +964,7 @@ fn main() -> Result<()> {
         );
     }
 
-    if model_manifest_supports_embeddings(&manifest) {
-        return Err(anyhow!(
-            "bloom_infer serves text generation and cannot run an embedding encoder; start bloom_server and use /v1/embeddings, /v1/rerank, /api/embed, or /api/embeddings"
-        ));
-    }
+    validate_cli_model_task("bloom_infer", &manifest)?;
 
     let tensor_model = bloomai_engine::model_manifest_tasks(&manifest) == ["tensor"];
     if tensor_model
@@ -1006,7 +988,7 @@ fn main() -> Result<()> {
     }
 
     if args.bench {
-        return run_bench(&args, engine, &model_path);
+        return run_bench(&args, engine, &model_path, chat_template);
     }
 
     let device = parse_device(&args.device, &engine.supported_devices())?;
@@ -1105,10 +1087,11 @@ fn main() -> Result<()> {
 
     // --- Resolve and parse prompt / input overrides ---
     let resolved_input = resolve_and_parse_input(&args, chat_template, tensor_model)?;
+    validate_logprob_output_mode(&args, resolved_input.logprobs)?;
 
     // Build generation parameters
     let params = GenerationParams {
-        logprobs: None,
+        logprobs: resolved_input.logprobs,
         max_tokens: resolved_input.max_tokens,
         temperature: resolved_input.temperature,
         top_p: resolved_input.top_p,
@@ -1150,7 +1133,7 @@ fn main() -> Result<()> {
     let dtype_label = args
         .dtype
         .as_deref()
-        .and_then(parse_dtype_str)
+        .and_then(parse_cli_dtype)
         .unwrap_or(mem.weight_dtype);
 
     if !args.quiet && !args.bench_json {
@@ -1174,6 +1157,10 @@ fn main() -> Result<()> {
     let first_token_time: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
 
     if args.stream {
+        let text_tokens = Arc::new(Mutex::new(TextTokenCounter::default()));
+        let text_tokens_for_sink = Arc::clone(&text_tokens);
+        let maximum_tokens = params.max_tokens;
+        let mut has_text = false;
         // Streaming mode: print tokens as they arrive
         let tc = Arc::clone(&token_count);
         let ftt = Arc::clone(&first_token_time);
@@ -1195,23 +1182,27 @@ fn main() -> Result<()> {
         pipeline.run_stream(
             input,
             &params,
-            &mut move |chunk: bloomai_engine::io::OutputChunk| {
+            &mut |chunk: bloomai_engine::io::OutputChunk| {
+                has_text |= matches!(
+                    chunk,
+                    bloomai_engine::io::OutputChunk::TextDelta(_)
+                        | bloomai_engine::io::OutputChunk::TokenUsage { .. }
+                );
+                text_tokens_for_sink
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .observe(&chunk, maximum_tokens)?;
                 if !bench && let Some(line) = format_stream_output(&chunk, json_output)? {
                     println!("{line}");
                 }
                 match chunk {
-                    bloomai_engine::io::OutputChunk::TextDelta(text) => {
+                    bloomai_engine::io::OutputChunk::TextDelta(text) if !text.is_empty() => {
                         // Record first token time
                         {
                             let mut ftt_guard = ftt.lock().unwrap_or_else(|e| e.into_inner());
                             if ftt_guard.is_none() {
                                 *ftt_guard = Some(Instant::now());
                             }
-                        }
-                        // Count tokens
-                        {
-                            let mut count = tc.lock().unwrap_or_else(|e| e.into_inner());
-                            *count += 1;
                         }
                         if !bench && !json_output {
                             print!("{}", text);
@@ -1267,6 +1258,13 @@ fn main() -> Result<()> {
             },
         )?;
 
+        if has_text {
+            *token_count.lock().unwrap_or_else(|e| e.into_inner()) = text_tokens
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .count(&pipeline)?;
+        }
+
         // Save collected video frames to file
         #[cfg(feature = "candle-engine")]
         {
@@ -1306,9 +1304,13 @@ fn main() -> Result<()> {
         }
     } else {
         // Non-streaming mode: collect full output
-        let output = pipeline.run(input, &params)?;
+        let (output, generation) =
+            bloomai_app::text_metrics::run_buffered(&pipeline, input, &params)?;
+        if let Some(metadata) = generation {
+            *token_count.lock().unwrap_or_else(|e| e.into_inner()) = metadata.output_tokens;
+        }
         if !args.bench_json
-            && let Some(line) = format_inference_output(&output, args.json)?
+            && let Some(line) = format_buffered_generation_output(&output, generation, args.json)?
         {
             println!("{line}");
         }
@@ -1342,9 +1344,11 @@ fn main() -> Result<()> {
             *token_count.lock().unwrap_or_else(|e| e.into_inner()) = video.frame_count as usize;
             *first_token_time.lock().unwrap_or_else(|e| e.into_inner()) = Some(infer_start);
         } else if let Some(ref text) = output.text {
-            let approx_tokens = text.split_whitespace().count().max(1);
-            *token_count.lock().unwrap_or_else(|e| e.into_inner()) = approx_tokens;
-            *first_token_time.lock().unwrap_or_else(|e| e.into_inner()) = Some(infer_start);
+            *token_count.lock().unwrap_or_else(|e| e.into_inner()) = match generation {
+                Some(metadata) => metadata.output_tokens,
+                None if text.is_empty() => 0,
+                None => pipeline.tokenize(text)?.len(),
+            };
 
             if args.quiet && !args.bench_json && !args.json {
                 println!("{}", text);
@@ -1546,6 +1550,35 @@ struct InteractiveSession {
     chat_template: CliChatTemplate,
 }
 
+impl InteractiveSession {
+    fn new(args: &Args, chat_template: CliChatTemplate) -> Self {
+        Self {
+            history: Vec::new(),
+            system_prompt: args.system_prompt.clone(),
+            stream: args.stream,
+            last_stats: None,
+            chat_template,
+        }
+    }
+
+    /// Record a completed turn. An empty reply drops the whole exchange so the
+    /// history keeps strict user/assistant alternation; two consecutive user
+    /// turns break role-alternating templates such as Llama 2 and Gemma.
+    fn record_turn(&mut self, user_prompt: &str, reply: &str) {
+        if reply.trim().is_empty() {
+            return;
+        }
+        self.history.push(ChatCompletionMessage {
+            role: "user".to_string(),
+            content: user_prompt.to_string(),
+        });
+        self.history.push(ChatCompletionMessage {
+            role: "assistant".to_string(),
+            content: reply.to_string(),
+        });
+    }
+}
+
 fn run_interactive(
     args: &Args,
     pipeline: &InferencePipeline,
@@ -1554,13 +1587,7 @@ fn run_interactive(
 ) -> Result<()> {
     use std::io::Write;
 
-    let mut session = InteractiveSession {
-        history: Vec::new(),
-        system_prompt: args.system_prompt.clone(),
-        stream: true,
-        last_stats: None,
-        chat_template,
-    };
+    let mut session = InteractiveSession::new(args, chat_template);
 
     if !args.quiet {
         println!("Bloom interactive TUI");
@@ -1568,8 +1595,10 @@ fn run_interactive(
         println!("Type /help for commands, /bye to exit.");
     }
 
-    if let Some(initial_prompt) = resolve_interactive_initial_prompt(args)? {
-        run_interactive_turn(pipeline, &mut session, &initial_prompt, &params)?;
+    if let Some(initial_prompt) = resolve_interactive_initial_prompt(args)?
+        && let Err(error) = run_interactive_turn(pipeline, &mut session, &initial_prompt, &params)
+    {
+        eprintln!("Generation failed: {error}");
     }
 
     loop {
@@ -1602,7 +1631,9 @@ fn run_interactive(
             continue;
         }
 
-        run_interactive_turn(pipeline, &mut session, line, &params)?;
+        if let Err(error) = run_interactive_turn(pipeline, &mut session, line, &params) {
+            eprintln!("Generation failed: {error}");
+        }
     }
 
     Ok(())
@@ -1621,17 +1652,7 @@ fn run_interactive_turn(
         session.chat_template,
     );
     let stats = run_text_generation(pipeline, prompt, params, session.stream)?;
-
-    session.history.push(ChatCompletionMessage {
-        role: "user".to_string(),
-        content: user_prompt.to_string(),
-    });
-    if !stats.text.trim().is_empty() {
-        session.history.push(ChatCompletionMessage {
-            role: "assistant".to_string(),
-            content: stats.text.clone(),
-        });
-    }
+    session.record_turn(user_prompt, &stats.text);
     session.last_stats = Some(stats);
     Ok(())
 }
@@ -1644,7 +1665,8 @@ fn run_text_generation(
 ) -> Result<TextGenerationStats> {
     let infer_start = Instant::now();
     let mut text = String::new();
-    let mut generated_tokens = 0usize;
+    let mut counter = TextTokenCounter::default();
+    let generated_tokens;
     let mut first_token_time: Option<Instant> = None;
 
     if stream {
@@ -1652,12 +1674,12 @@ fn run_text_generation(
             ModelInput::Text { prompt },
             params,
             &mut |chunk: bloomai_engine::io::OutputChunk| {
+                counter.observe(&chunk, params.max_tokens)?;
                 match chunk {
-                    bloomai_engine::io::OutputChunk::TextDelta(delta) => {
+                    bloomai_engine::io::OutputChunk::TextDelta(delta) if !delta.is_empty() => {
                         if first_token_time.is_none() {
                             first_token_time = Some(Instant::now());
                         }
-                        generated_tokens += 1;
                         text.push_str(&delta);
                         print!("{}", delta);
                         use std::io::Write;
@@ -1671,11 +1693,18 @@ fn run_text_generation(
                 Ok(())
             },
         )?;
+        generated_tokens = counter.count(pipeline)?;
     } else {
-        let output = pipeline.run(ModelInput::Text { prompt }, params)?;
+        let (output, generation) =
+            bloomai_app::text_metrics::run_buffered(pipeline, ModelInput::Text { prompt }, params)?;
+        generated_tokens = match generation {
+            Some(metadata) => metadata.output_tokens,
+            None => match output.text.as_deref().filter(|text| !text.is_empty()) {
+                Some(text) => pipeline.tokenize(text)?.len(),
+                None => 0,
+            },
+        };
         if let Some(output_text) = output.text {
-            generated_tokens = output_text.split_whitespace().count().max(1);
-            first_token_time = Some(infer_start);
             println!("{}", output_text);
             text = output_text;
         }
@@ -1725,7 +1754,9 @@ fn handle_interactive_command(
             Ok(false)
         }
         "/set" => {
-            set_interactive_option(key, value, params, stream, system_prompt)?;
+            if let Err(error) = set_interactive_option(key, value, params, stream, system_prompt) {
+                eprintln!("Invalid setting: {error}");
+            }
             Ok(false)
         }
         _ => {
@@ -1757,7 +1788,7 @@ fn print_interactive_help() {
 fn print_interactive_stats(last_stats: &Option<TextGenerationStats>) {
     if let Some(stats) = last_stats {
         println!(
-            "Last turn: {} chunks/tokens, {:.2}s, {:.2} tok/s, TTFT {}",
+            "Last turn: {} tokens, {:.2}s, {:.2} tok/s, TTFT {}",
             stats.generated_tokens,
             stats.infer_secs,
             stats.tokens_per_sec,
@@ -1926,7 +1957,29 @@ fn parse_on_off(value: &str) -> Result<bool> {
 // Benchmarking Suite Implementation
 // ==========================================
 
-fn run_bench(args: &Args, engine: &dyn Engine, model_path: &std::path::Path) -> Result<()> {
+/// Prompt benchmarked when neither `--prompt` nor `--prompt-file` is given.
+const DEFAULT_BENCH_PROMPT: &str = "Explain quantum computing in simple terms";
+
+/// Resolve the benchmark prompt through the same file/stdin/JSON/system-prompt
+/// and chat-template path as a normal run, so `--bench` measures the prompt a
+/// regular invocation would send.
+fn resolve_bench_input(args: &Args, template: CliChatTemplate) -> Result<ResolvedInput> {
+    let raw_input = if args.prompt_file.is_none() && args.prompt.is_empty() {
+        DEFAULT_BENCH_PROMPT.to_string()
+    } else {
+        read_raw_prompt(args)?
+    };
+    parse_input(args, &raw_input, template, false)
+}
+
+fn run_bench(
+    args: &Args,
+    engine: &dyn Engine,
+    model_path: &std::path::Path,
+    template: CliChatTemplate,
+) -> Result<()> {
+    // Read stdin/files before loading weights so input errors fail fast.
+    let resolved = resolve_bench_input(args, template)?;
     let device_kind = parse_device(&args.device, &engine.supported_devices())?;
     let load_start = Instant::now();
     let pipeline = InferencePipeline::load_standalone_with_context(
@@ -1949,22 +2002,19 @@ fn run_bench(args: &Args, engine: &dyn Engine, model_path: &std::path::Path) -> 
 
     let params = GenerationParams {
         logprobs: None,
-        max_tokens: args.max_tokens,
-        temperature: args.temperature,
-        top_p: args.top_p,
-        top_k: args.top_k,
-        presence_penalty: args.presence_penalty,
-        frequency_penalty: args.frequency_penalty,
-        logit_bias: args.logit_bias.clone(),
-        seed: args.seed.or(Some(42)),
-        response_format: args.response_format.clone(),
+        max_tokens: resolved.max_tokens,
+        temperature: resolved.temperature,
+        top_p: resolved.top_p,
+        top_k: resolved.top_k,
+        presence_penalty: resolved.presence_penalty,
+        frequency_penalty: resolved.frequency_penalty,
+        logit_bias: resolved.logit_bias,
+        seed: resolved.seed.or(Some(42)),
+        response_format: resolved.response_format,
     };
+    params.validate().map_err(anyhow::Error::msg)?;
 
-    let prompt = if args.prompt.is_empty() {
-        "Explain quantum computing in simple terms".to_string()
-    } else {
-        args.prompt.clone()
-    };
+    let prompt = resolved.prompt;
     let input = ModelInput::Text {
         prompt: prompt.clone(),
     };
@@ -1980,12 +2030,13 @@ fn run_bench(args: &Args, engine: &dyn Engine, model_path: &std::path::Path) -> 
     let mut ttft_values = Vec::new();
     let mut speed_values = Vec::new();
     let mut latency_values = Vec::new();
+    let mut duration_values = Vec::new();
     let mut generated_counts = Vec::new();
     let mut prompt_speeds = Vec::new();
     let mut decode_speeds = Vec::new();
     let mut tbt_values = Vec::new();
 
-    let prompt_tokens_count = pipeline.tokenize(&prompt).unwrap_or_default().len();
+    let prompt_tokens_count = pipeline.tokenize(&prompt)?.len();
 
     if !args.bench_json {
         eprintln!("Benchmarking with {} repetitions...", args.repetitions);
@@ -1993,24 +2044,32 @@ fn run_bench(args: &Args, engine: &dyn Engine, model_path: &std::path::Path) -> 
     for rep in 0..args.repetitions {
         let infer_start = Instant::now();
         let first_token_time: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
-        let token_count = Arc::new(Mutex::new(0));
+        let token_count = Arc::new(Mutex::new(TextTokenCounter::default()));
 
         let tc = Arc::clone(&token_count);
         let ftt = Arc::clone(&first_token_time);
 
+        let maximum_tokens = params.max_tokens;
         pipeline.run_stream(input.clone(), &params, &mut move |chunk| {
-            if let bloomai_engine::io::OutputChunk::TextDelta(_) = chunk {
+            tc.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .observe(&chunk, maximum_tokens)?;
+            if let bloomai_engine::io::OutputChunk::TextDelta(text) = chunk
+                && !text.is_empty()
+            {
                 let mut ftt_guard = ftt.lock().unwrap_or_else(|e| e.into_inner());
                 if ftt_guard.is_none() {
                     *ftt_guard = Some(Instant::now());
                 }
-                *tc.lock().unwrap_or_else(|e| e.into_inner()) += 1;
             }
             Ok(())
         })?;
 
         let duration = infer_start.elapsed();
-        let generated = *token_count.lock().unwrap_or_else(|e| e.into_inner());
+        let generated = token_count
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .count(&pipeline)?;
         let ttft = first_token_time
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -2021,6 +2080,7 @@ fn run_bench(args: &Args, engine: &dyn Engine, model_path: &std::path::Path) -> 
             let avg_lat = duration.as_secs_f64() * 1000.0 / generated as f64;
             speed_values.push(speed);
             latency_values.push(avg_lat);
+            duration_values.push(duration.as_secs_f64());
             generated_counts.push(generated);
 
             if let Some(t_ms) = ttft {
@@ -2091,12 +2151,7 @@ fn run_bench(args: &Args, engine: &dyn Engine, model_path: &std::path::Path) -> 
     let dtype_label = args
         .dtype
         .as_deref()
-        .and_then(|s| match s.to_lowercase().as_str() {
-            "f32" | "float32" => Some(DType::F32),
-            "f16" | "float16" => Some(DType::F16),
-            "bf16" | "bfloat16" => Some(DType::BF16),
-            _ => None,
-        })
+        .and_then(parse_cli_dtype)
         .or_else(|| {
             pipeline
                 .memory_estimate()
@@ -2105,7 +2160,8 @@ fn run_bench(args: &Args, engine: &dyn Engine, model_path: &std::path::Path) -> 
         .unwrap_or(pipeline.metadata().manifest.primary_dtype);
 
     let notes = format!(
-        "Warmup runs: {}, repetitions: {}. Prompt tokens: {}. Avg Prompt Speed: {:.2} tok/s, Avg Decode Speed: {:.2} tok/s, Avg TBT: {:.2}ms. Machine: {}, OS: {}, Arch: {}",
+        "Model load: {:.3}s. token_count=native_usage_or_complete_output_tokenizer. Warmup runs: {}, repetitions: {}. Prompt tokens: {}. Avg Prompt Speed: {:.2} tok/s, Avg Decode Speed: {:.2} tok/s, Avg TBT: {:.2}ms. Machine: {}, OS: {}, Arch: {}",
+        load_time,
         args.warmup,
         args.repetitions,
         prompt_tokens_count,
@@ -2132,7 +2188,7 @@ fn run_bench(args: &Args, engine: &dyn Engine, model_path: &std::path::Path) -> 
         avg_latency_ms: avg_latency,
         peak_memory_bytes: peak_memory,
         tokens_generated: avg_generated as usize,
-        duration_secs: load_time,
+        duration_secs: duration_values.iter().sum::<f64>() / duration_values.len() as f64,
         timestamp: chrono_now(),
         notes: Some(notes),
     };
@@ -2192,6 +2248,161 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_rejects_rerank_only_models_before_generation() {
+        let mut manifest = bloomai_core::ModelManifest {
+            family: bloomai_core::ModelFamily::Bert,
+            ..Default::default()
+        };
+        manifest.parameters.insert(
+            "bloom_encoder_kind".into(),
+            serde_json::json!("cross_encoder"),
+        );
+        let error = validate_cli_model_task("bloom_infer", &manifest)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("rerank-only"), "{error}");
+        assert!(error.contains("/v1/rerank"), "{error}");
+        validate_cli_model_task("bloom_infer", &bloomai_core::ModelManifest::default()).unwrap();
+    }
+
+    #[test]
+    fn buffered_cli_json_preserves_explicit_generation_metadata() {
+        let output = bloomai_engine::ModelOutput::from(Vec::<bloomai_engine::OutputChunk>::new());
+        let metadata = bloomai_engine::GenerationMetadata {
+            input_tokens: 7,
+            output_tokens: 1,
+            reason: bloomai_engine::GenerationFinishReason::Eos,
+        };
+        let encoded = format_buffered_generation_output(&output, Some(metadata), true)
+            .unwrap()
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            value["generation"],
+            serde_json::json!({"input_tokens":7,"output_tokens":1,"reason":"eos"})
+        );
+        let legacy = format_buffered_generation_output(&output, None, true)
+            .unwrap()
+            .unwrap();
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&legacy)
+                .unwrap()
+                .get("generation")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn logprob_controls_preserve_metadata_and_config_json_precedence() {
+        assert!(Args::try_parse_from(["bloom_infer", "--logprobs", "2"]).is_err());
+        let matches = Args::command()
+            .try_get_matches_from([
+                "bloom_infer",
+                "--json",
+                "--logprobs",
+                "2",
+                "--prompt",
+                r#"{"prompt":"hello","logprobs":0}"#,
+            ])
+            .unwrap();
+        let mut args = Args::from_arg_matches(&matches).unwrap();
+        apply_config(
+            &mut args,
+            &matches,
+            &bloomai_app::InferConfig {
+                logprobs: Some(5),
+                ..Default::default()
+            },
+        );
+        assert_eq!(args.logprobs, Some(2));
+        let resolved = resolve_and_parse_input(&args, CliChatTemplate::Legacy, false).unwrap();
+        assert_eq!(resolved.logprobs, Some(0));
+        validate_logprob_output_mode(&args, resolved.logprobs).unwrap();
+        args.json = false;
+        assert!(validate_logprob_output_mode(&args, resolved.logprobs).is_err());
+        let probability = bloomai_engine::TokenLogprobs {
+            token: bloomai_engine::TokenLogprob {
+                token_id: 1,
+                token: "a".into(),
+                bytes: vec![b'a'],
+                logprob: -0.1,
+            },
+            top_logprobs: Vec::new(),
+        };
+        let encoded = format_stream_output(
+            &bloomai_engine::io::OutputChunk::TokenLogprobs(probability.clone()),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(encoded.contains("TokenLogprobs"));
+        let output = bloomai_engine::ModelOutput {
+            text: Some("a".into()),
+            logprobs: Some(vec![probability]),
+            logits: None,
+            image: None,
+            audio: None,
+            video: None,
+        };
+        let encoded: serde_json::Value =
+            serde_json::from_str(&format_inference_output(&output, true).unwrap().unwrap())
+                .unwrap();
+        assert_eq!(
+            encoded["logprobs"][0]["token"]["bytes"],
+            serde_json::json!([97])
+        );
+    }
+
+    #[test]
+    fn interactive_invalid_command_preserves_session_and_accepts_the_next_command() {
+        let mut params = GenerationParams::default();
+        let original = params.clone();
+        let mut stream = true;
+        let mut system = Some("Keep context".to_string());
+        let mut history = vec![ChatCompletionMessage {
+            role: "user".into(),
+            content: "Earlier turn".into(),
+        }];
+        assert!(
+            !handle_interactive_command(
+                "/set temperature NaN",
+                &mut params,
+                &mut stream,
+                &mut system,
+                &mut history,
+                &None
+            )
+            .unwrap()
+        );
+        assert_eq!(params, original);
+        assert_eq!(history[0].content, "Earlier turn");
+        assert_eq!(system.as_deref(), Some("Keep context"));
+        assert!(
+            !handle_interactive_command(
+                "/set temperature 0.4",
+                &mut params,
+                &mut stream,
+                &mut system,
+                &mut history,
+                &None
+            )
+            .unwrap()
+        );
+        assert_eq!(params.temperature, 0.4);
+        assert!(
+            handle_interactive_command(
+                "/bye",
+                &mut params,
+                &mut stream,
+                &mut system,
+                &mut history,
+                &None
+            )
+            .unwrap()
+        );
+    }
 
     #[test]
     fn sampling_controls_flow_through_flags_config_and_json() {
@@ -2378,122 +2589,204 @@ mod tests {
         assert_eq!(resolved, file);
     }
 
-    #[test]
-    fn select_backend_auto_routes_mtp_to_llamacpp() {
-        let manifest = bloomai_core::ModelManifest::default();
-        assert_eq!(
-            select_backend_name(None, "candle", "native-mtp", &manifest),
-            "llamacpp"
-        );
+    fn args_with_config(argv: &[&str], config: &bloomai_app::InferConfig) -> Args {
+        let matches = Args::command()
+            .try_get_matches_from(std::iter::once("bloom_infer").chain(argv.iter().copied()))
+            .unwrap();
+        let mut args = Args::from_arg_matches(&matches).unwrap();
+        apply_config(&mut args, &matches, config);
+        args
     }
 
     #[test]
-    fn select_backend_auto_routes_known_model_formats() {
-        let registry = build_engine_registry();
-        for (format, expected) in [
-            (bloomai_core::ModelFormat::Onnx, "onnxruntime"),
-            (bloomai_core::ModelFormat::OpenVinoIr, "openvino"),
-            (bloomai_core::ModelFormat::CoreMl, "coreml"),
-            (bloomai_core::ModelFormat::TensorRtEngine, "tensorrt"),
-            (bloomai_core::ModelFormat::Mlx, "mlx"),
-            (bloomai_core::ModelFormat::VulkanSpirv, "vulkan"),
+    fn cli_prompt_choice_suppresses_both_config_prompt_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_file = dir.path().join("config-prompt.txt");
+        let cli_file = dir.path().join("cli-prompt.txt");
+        std::fs::write(&config_file, "from config file").unwrap();
+        std::fs::write(&cli_file, "from cli file").unwrap();
+        let config = bloomai_app::InferConfig {
+            prompt: Some("from config".into()),
+            prompt_file: Some(config_file.clone()),
+            ..Default::default()
+        };
+
+        let args = args_with_config(&["--prompt", "from cli"], &config);
+        assert_eq!(args.prompt_file, None);
+        let resolved = resolve_and_parse_input(&args, CliChatTemplate::Legacy, false).unwrap();
+        assert_eq!(resolved.prompt, "from cli");
+        assert_eq!(
+            resolve_interactive_initial_prompt(&args)
+                .unwrap()
+                .as_deref(),
+            Some("from cli")
+        );
+
+        let args = args_with_config(&["--prompt-file", cli_file.to_str().unwrap()], &config);
+        assert_eq!(args.prompt, "");
+        let resolved = resolve_and_parse_input(&args, CliChatTemplate::Legacy, false).unwrap();
+        assert_eq!(resolved.prompt, "from cli file");
+
+        let args = args_with_config(&[], &config);
+        assert_eq!(args.prompt, "from config");
+        assert_eq!(args.prompt_file, Some(config_file));
+    }
+
+    #[test]
+    fn config_boolean_modes_can_be_negated_from_the_cli() {
+        let config = bloomai_app::InferConfig {
+            stream: Some(true),
+            quiet: Some(true),
+            interactive: Some(true),
+            bench: Some(true),
+            ..Default::default()
+        };
+        let args = args_with_config(&[], &config);
+        assert!(args.stream && args.quiet && args.interactive && args.bench);
+
+        let args = args_with_config(
+            &[
+                "--no-stream",
+                "--no-quiet",
+                "--no-interactive",
+                "--no-bench",
+            ],
+            &config,
+        );
+        assert!(!args.stream && !args.quiet && !args.interactive && !args.bench);
+
+        // The last spelling wins, and an explicit positive flag beats a
+        // config `false`.
+        let off = bloomai_app::InferConfig {
+            stream: Some(false),
+            quiet: Some(false),
+            ..Default::default()
+        };
+        let args = args_with_config(&["--no-stream", "--stream", "--quiet"], &off);
+        assert!(args.stream && args.quiet);
+        let args = args_with_config(&["--stream", "--no-stream"], &config);
+        assert!(!args.stream);
+    }
+
+    #[test]
+    fn config_logprobs_only_apply_to_json_output() {
+        let config = bloomai_app::InferConfig {
+            logprobs: Some(3),
+            ..Default::default()
+        };
+        for argv in [
+            &["--list-engines"][..],
+            &["-i"],
+            &["--bench"],
+            &["--inspect"],
+            &[],
         ] {
-            let mut manifest = bloomai_core::ModelManifest::default();
-            manifest.files.push(bloomai_core::ModelFile {
-                name: "model.bin".to_string(),
-                format,
-                size_bytes: 1,
-                hash_sha256: None,
-                required: true,
-            });
-            assert_eq!(
-                select_backend_name(None, "candle", "none", &manifest),
-                expected,
-                "format {format:?}"
-            );
-            assert!(
-                registry.get(expected).is_ok(),
-                "unregistered route: {expected}"
-            );
+            let args = args_with_config(argv, &config);
+            assert_eq!(args.logprobs, None, "{argv:?}");
+            validate_logprob_output_mode(&args, args.logprobs).unwrap();
         }
+        let args = args_with_config(&["--json"], &config);
+        assert_eq!(args.logprobs, Some(3));
+        validate_logprob_output_mode(&args, args.logprobs).unwrap();
     }
 
     #[test]
-    fn select_backend_routes_external_gguf_architectures_to_llamacpp() {
-        let mut manifest = bloomai_core::ModelManifest::default();
-        manifest.files.push(bloomai_core::ModelFile {
-            name: "model.gguf".to_string(),
-            format: bloomai_core::ModelFormat::Gguf,
-            size_bytes: 1,
-            hash_sha256: None,
-            required: true,
-        });
-        manifest
-            .runtime_hints
-            .preferred_backends
-            .push("llamacpp".to_string());
+    fn system_prompt_is_merged_into_json_chat_inputs() {
+        let expected = "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n";
+        for prompt in [
+            r#"{"messages":[{"role":"user","content":"Hi"}]}"#,
+            r#"[{"role":"user","content":"Hi"}]"#,
+            r#"{"prompt":"Hi"}"#,
+            r#"{"messages":[{"role":"system","content":"Be brief."},{"role":"user","content":"Hi"}]}"#,
+        ] {
+            let args = Args::parse_from([
+                "bloom_infer",
+                "--system-prompt",
+                "Be brief.",
+                "--prompt",
+                prompt,
+            ]);
+            let resolved = resolve_and_parse_input(&args, CliChatTemplate::ChatMl, false).unwrap();
+            assert_eq!(resolved.prompt, expected, "{prompt}");
+        }
+
+        for prompt in [
+            r#"{"messages":[{"role":"system","content":"Be verbose."},{"role":"user","content":"Hi"}]}"#,
+            r#"[{"role":"system","content":"Be verbose."},{"role":"user","content":"Hi"}]"#,
+        ] {
+            let args = Args::parse_from([
+                "bloom_infer",
+                "--system-prompt",
+                "Be brief.",
+                "--prompt",
+                prompt,
+            ]);
+            let error = resolve_and_parse_input(&args, CliChatTemplate::ChatMl, false)
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(error.contains("--system-prompt conflicts"), "{error}");
+        }
+
+        // Without --system-prompt a raw JSON completion prompt stays verbatim.
+        let args = Args::parse_from(["bloom_infer", "--prompt", r#"{"prompt":"Hi"}"#]);
+        let resolved = resolve_and_parse_input(&args, CliChatTemplate::ChatMl, false).unwrap();
+        assert_eq!(resolved.prompt, "Hi");
+    }
+
+    #[test]
+    fn bench_prompt_uses_the_normal_input_resolver() {
+        let args = Args::parse_from(["bloom_infer", "--bench", "--system-prompt", "Be brief."]);
+        let resolved = resolve_bench_input(&args, CliChatTemplate::ChatMl).unwrap();
         assert_eq!(
-            select_backend_name(None, "candle", "none", &manifest),
-            "llamacpp"
+            resolved.prompt,
+            build_prompt_for_model(
+                Some("Be brief."),
+                DEFAULT_BENCH_PROMPT,
+                CliChatTemplate::ChatMl
+            )
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("prompt.json");
+        std::fs::write(&file, r#"{"prompt":"From file","max_tokens":7}"#).unwrap();
+        let args = Args::parse_from([
+            "bloom_infer",
+            "--bench",
+            "--prompt-file",
+            file.to_str().unwrap(),
+        ]);
+        let resolved = resolve_bench_input(&args, CliChatTemplate::Qwen3NoThink).unwrap();
+        assert_eq!(resolved.prompt, "From file");
+        assert_eq!(resolved.max_tokens, 7);
+
+        let args = Args::parse_from(["bloom_infer", "--bench", "--prompt", "Hello"]);
+        let resolved = resolve_bench_input(&args, CliChatTemplate::Qwen3NoThink).unwrap();
+        assert_eq!(
+            resolved.prompt,
+            build_prompt_for_model(None, "Hello", CliChatTemplate::Qwen3NoThink)
         );
     }
 
     #[test]
-    fn select_backend_routes_qwen3_vl_hint_to_vision_engine() {
-        let mut manifest = bloomai_core::ModelManifest {
-            family: bloomai_core::ModelFamily::Qwen,
-            ..Default::default()
-        };
-        manifest
-            .runtime_hints
-            .preferred_backends
-            .push("qwen3_vl".to_string());
-        assert_eq!(
-            select_backend_name(None, "candle", "none", &manifest),
-            "qwen3_vl"
-        );
-    }
+    fn interactive_session_honours_stream_flag_and_keeps_turns_alternating() {
+        let args = Args::parse_from(["bloom_infer", "-i"]);
+        assert!(!InteractiveSession::new(&args, CliChatTemplate::Legacy).stream);
+        let args = Args::parse_from(["bloom_infer", "-i", "--stream"]);
+        let mut session = InteractiveSession::new(&args, CliChatTemplate::Legacy);
+        assert!(session.stream);
 
-    #[test]
-    fn select_backend_keeps_explicit_engine() {
-        let manifest = bloomai_core::ModelManifest::default();
-        assert_eq!(
-            select_backend_name(Some("openvino"), "candle", "mtp", &manifest),
-            "openvino"
-        );
-    }
-
-    #[test]
-    fn select_backend_keeps_explicit_backend() {
-        let manifest = bloomai_core::ModelManifest::default();
-        assert_eq!(
-            select_backend_name(None, "openvino", "mtp", &manifest),
-            "openvino"
-        );
-    }
-
-    #[test]
-    fn select_backend_preserves_existing_auto_routes() {
-        let mut manifest = bloomai_core::ModelManifest {
-            family: bloomai_core::ModelFamily::FunAsr,
-            ..Default::default()
-        };
-        assert_eq!(
-            select_backend_name(None, "candle", "none", &manifest),
-            "funasr"
-        );
-
-        manifest.family = bloomai_core::ModelFamily::Custom("wan".to_string());
-        assert_eq!(
-            select_backend_name(None, "candle", "none", &manifest),
-            "wan"
-        );
-
-        manifest.family = bloomai_core::ModelFamily::Custom("laya".to_string());
-        assert_eq!(
-            select_backend_name(None, "candle", "none", &manifest),
-            "laya"
-        );
+        session.record_turn("first", "  \n");
+        assert!(session.history.is_empty());
+        session.record_turn("second", "answer");
+        session.record_turn("third", "");
+        let roles = session
+            .history
+            .iter()
+            .map(|message| message.role.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(roles, ["user", "assistant"]);
+        assert_eq!(session.history[0].content, "second");
     }
 
     #[test]

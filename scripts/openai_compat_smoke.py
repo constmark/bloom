@@ -823,7 +823,29 @@ def validate_function_tool_round_trips(
                       if key not in {"tools", "tool_choice"}}
     legacy_payload["functions"] = [chat_tool["function"]]
     legacy_payload["function_call"] = {"name": "get_weather"}
-    check_multiple_calls(request_json(
+    legacy_payload.pop("parallel_tool_calls", None)
+
+    def check_legacy_calls(response: dict) -> None:
+        # Legacy requests return OpenAI's single `function_call` shape.
+        for choice in require_buffered_candidate_envelope(response, model_id, 2):
+            message = choice.get("message", {})
+            call = message.get("function_call")
+            if (
+                choice.get("finish_reason") != "function_call"
+                or message.get("content") is not None
+                or "tool_calls" in message
+                or not isinstance(call, dict)
+                or call.get("name") != "get_weather"
+            ):
+                raise AssertionError(f"legacy function call had an invalid shape: {choice}")
+            try:
+                decoded_arguments = json.loads(call.get("arguments"))
+            except (TypeError, json.JSONDecodeError) as error:
+                raise AssertionError(f"legacy function arguments were not JSON: {call}") from error
+            if decoded_arguments != {"city": "Paris"}:
+                raise AssertionError(f"legacy function call selected invalid output: {call}")
+
+    check_legacy_calls(request_json(
         f"{base_url}/v1/chat/completions", legacy_payload,
         timeout=60.0, headers=auth_headers,
     ))
@@ -846,27 +868,20 @@ def validate_function_tool_round_trips(
 
     streaming_payload = dict(chat_payload)
     streaming_payload["stream"] = True
+    streaming_payload["stream_options"] = {"include_usage": True}
     stream_events = request_sse(
         f"{base_url}/v1/chat/completions",
         streaming_payload,
         timeout=60.0,
         headers=auth_headers,
     )
-    if not stream_events or stream_events[-1] != "[DONE]":
-        raise AssertionError(f"function-call stream omitted [DONE]: {stream_events}")
-    stream_terminal = None
-    for event in stream_events[:-1]:
-        decoded = json.loads(event)
-        choices = decoded.get("choices")
-        if (
-            isinstance(choices, list)
-            and len(choices) == 1
-            and choices[0].get("finish_reason") == "tool_calls"
-        ):
-            stream_terminal = decoded
-    if stream_terminal is None:
-        raise AssertionError(f"function-call stream omitted its terminal call: {stream_events}")
-    require_chat_call(stream_terminal, streamed=True)
+    # Tool deltas and finish_reason may arrive in separate events, including
+    # for n=1. Validate the accumulated call and the complete stream lifecycle
+    # rather than requiring the final delta to repeat previously sent data.
+    require_chat_call(
+        collect_candidate_stream(stream_events, model_id, 1, chat=True),
+        streamed=False,
+    )
     if '"type":"function_calls"' in "".join(stream_events):
         raise AssertionError("function-call stream leaked Bloom's private control protocol")
 

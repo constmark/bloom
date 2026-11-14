@@ -1,7 +1,6 @@
 use super::*;
 
-#[test]
-fn native_bert_usage_includes_special_tokens_and_excludes_batch_padding() {
+fn encoder_fixture() -> tempfile::TempDir {
     let directory = tempfile::tempdir().unwrap();
     let config = candle_transformers::models::bert::Config {
         vocab_size: 8,
@@ -58,6 +57,12 @@ fn native_bert_usage_includes_special_tokens_and_excludes_batch_padding() {
     tokenizer
         .save(directory.path().join("tokenizer.json"), false)
         .unwrap();
+    directory
+}
+
+#[test]
+fn native_bert_usage_includes_special_tokens_and_excludes_batch_padding() {
+    let directory = encoder_fixture();
     let model = CandleEngine
         .load(directory.path(), DeviceKind::Cpu)
         .unwrap();
@@ -71,4 +76,29 @@ fn native_bert_usage_includes_special_tokens_and_excludes_batch_padding() {
             .iter()
             .all(|vector| vector.len() == 8 && vector.iter().all(|value| value.is_finite()))
     );
+}
+
+#[test]
+fn native_bert_buffered_inference_preserves_streamed_embedding_output() {
+    let directory = encoder_fixture();
+    let model = CandleEngine
+        .load(directory.path(), DeviceKind::Cpu)
+        .unwrap();
+    let input = ModelInput::Text {
+        prompt: "hello world".into(),
+    };
+    let params = GenerationParams::default();
+    let mut chunks = Vec::new();
+    model
+        .infer_stream(input.clone(), &params, &mut |chunk| {
+            chunks.push(chunk);
+            Ok(())
+        })
+        .unwrap();
+    let streamed = ModelOutput::from(chunks);
+    let buffered = model.infer(input, &params).unwrap();
+    buffered.validate().unwrap();
+    assert_eq!(streamed.logits.as_ref().unwrap().len(), 8);
+    assert_eq!(buffered.logits, streamed.logits);
+    assert!(buffered.text.is_none());
 }

@@ -109,3 +109,18 @@ receives the same backend/device, warmup and repetition settings.
 `llama-cli` or `main` when exact prompt text parity is required. The harness
 remains a measurement aid; release promotion still requires the full protocol
 and raw artifacts described in [llama.cpp parity](llamacpp-parity.md).
+
+`--min-decode-ratio` must be finite and nonnegative. A positive threshold
+requires both runtimes and valid finite throughput; missing models/reference
+binaries cannot pass the gate. Executed runtime failures always fail, even
+without `--require-llama`. CLI timing output with per-token latency and
+scientific-notation throughput is parsed as complete numbers, never suffixes.
+Native CLI/benchmark streams use cumulative model token usage when available
+(including sampled EOS), otherwise tokenize the complete emitted text instead
+of counting chunks. Native Candle buffered CLI generation consumes the same
+validated stream internally, so its count also includes EOS; JSON adds a
+`generation` object containing exact input/output counts and the explicit
+termination reason. Other buffered adapters count emitted text with the pipeline
+tokenizer; tokenization may remain approximate without an exact tokenizer.
+Buffered-only timing does not fabricate a first-token measurement. See the
+[generation metadata contract](generation-metadata.md) for scope and lifecycle.

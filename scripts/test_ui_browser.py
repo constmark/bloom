@@ -601,6 +601,64 @@ async (page) => {
     hasText: 'Exported 1 conversation(s).',
   }).count() === 1, 'conversation export did not publish its success state');
 
+  // Exercise the actual WASM router with a rerank-only task contract. These
+  // deterministic API fixtures prove browser behavior, not model quality.
+  const readyFixture = await (await page.request.get(`${baseUrl}/ready`)).json();
+  Object.assign(readyFixture, {
+    status: 'ready', progress: 100, model: 'browser-cross-encoder', loading: false,
+    load_error: null, input_modalities: ['text'], model_tasks: ['rerank'], context_window: 512,
+  });
+  await page.route('**/ready', (route) => route.fulfill({
+    status: 200, contentType: 'application/json', body: JSON.stringify(readyFixture),
+  }));
+  let rerankRequests = 0;
+  await page.route('**/v1/rerank', async (route) => {
+    const request = route.request().postDataJSON();
+    assert(request.model === 'browser-cross-encoder', 'rerank request lost model identity');
+    assert(request.query === 'local inference' && request.top_n === 2 && request.return_documents === true,
+      'rerank request controls drifted');
+    assert(JSON.stringify(request.documents) === JSON.stringify(['local inference engine', 'unrelated document']),
+      'rerank request documents drifted');
+    rerankRequests += 1;
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
+      id: 'rerank-browser-fixture', object: 'rerank', model: request.model,
+      results: [
+        { index: 0, relevance_score: 9.25, document: { text: request.documents[0] } },
+        { index: 1, relevance_score: -4.5, document: { text: request.documents[1] } },
+      ], usage: { prompt_tokens: 9, total_tokens: 9 },
+    }) });
+  });
+  await page.reload();
+  await page.getByRole('heading', { name: 'Document reranking', exact: true }).waitFor();
+  assert(await page.getByRole('tab', { name: 'Embeddings', exact: true }).isDisabled(),
+    'rerank-only model exposes an unsupported embedding operation');
+  assert(await page.getByRole('tab', { name: 'Rerank', exact: true }).getAttribute('aria-selected') === 'true',
+    'rerank-only workspace did not select its supported operation');
+  await page.getByRole('textbox', { name: 'Rerank query', exact: true }).fill('local inference');
+  await page.getByRole('textbox', { name: 'Rerank documents', exact: true }).fill('local inference engine\nunrelated document');
+  await page.getByRole('spinbutton', { name: 'Top results', exact: true }).fill('2');
+  await page.getByRole('button', { name: 'Rank documents', exact: true }).click();
+  await page.getByText('2 result(s)', { exact: true }).waitFor();
+  assert(rerankRequests === 1, 'rerank-only workflow did not make exactly one request');
+  assert(await page.locator('.rerank-card').count() === 2, 'rerank results are missing');
+  const rerankDownloadPromise = page.waitForEvent('download');
+  await page.getByRole('button', { name: 'Export JSON', exact: true }).click();
+  const rerankDownload = await rerankDownloadPromise;
+  const rerankStream = await rerankDownload.createReadStream();
+  assert(rerankStream !== null, 'rerank export has no readable payload');
+  let rerankText = '';
+  for await (const chunk of rerankStream) rerankText += chunk.toString('utf8');
+  const rerankArchive = JSON.parse(rerankText);
+  assert(rerankArchive.model === 'browser-cross-encoder' && rerankArchive.results?.length === 2,
+    'rerank export lost identity or results');
+  assert(rerankArchive.results[0].relevance_score === 9.25 && rerankArchive.results[1].relevance_score === -4.5,
+    'cross-encoder export clipped raw classifier scores');
+  await page.setViewportSize({ width: 1280, height: 1200 });
+  await page.locator('.embedding-workspace').evaluate((element) => { element.scrollTop = 0; });
+  await page.screenshot({ path: __RERANK_SCREENSHOT_PATH__, fullPage: true });
+  await page.addScriptTag({ path: axeCorePath });
+  await scanAccessibility(null, 'rerank-only workspace');
+
   await page.waitForTimeout(250);
   const unexpectedConsoleErrors = consoleErrors.filter((entry) => !(
     entry.url.endsWith('/ready') &&
@@ -626,7 +684,8 @@ async (page) => {
     clipboard: expectedBrowser === 'firefox' ? 'trusted user-gesture copy and paste' : 'Clipboard API readback',
     title: await page.title(),
     dialogs: ['Models', 'Settings', 'Import conversations'],
-    transfers: ['clipboard', 'conversation download'],
+    transfers: ['clipboard', 'conversation download', 'rerank download'],
+    encoderWorkflows: ['rerank-only readiness, request, results and export (API fixtures)'],
     accessibility: { axeVersion, scans: accessibilityScans },
     expectedReadinessErrors: consoleErrors.length,
   };
@@ -636,6 +695,7 @@ async (page) => {
         source.replace("__BASE_URL__", json.dumps(base_url))
         .replace("__BROWSER__", json.dumps(browser))
         .replace("__SCREENSHOT_PATH__", json.dumps(str(axe_core_path.with_name("application-shell.png"))))
+        .replace("__RERANK_SCREENSHOT_PATH__", json.dumps(str(axe_core_path.with_name("rerank-workspace.png"))))
         .replace("__AXE_CORE_PATH__", json.dumps(str(axe_core_path)))
         .replace("__AXE_CORE_VERSION__", json.dumps(AXE_CORE_VERSION))
     )
@@ -735,6 +795,9 @@ def main() -> int:
                 screenshot = workdir / "application-shell.png"
                 if screenshot.is_file():
                     shutil.copyfile(screenshot, args.report.with_suffix(".png"))
+                rerank_screenshot = workdir / "rerank-workspace.png"
+                if rerank_screenshot.is_file():
+                    shutil.copyfile(rerank_screenshot, args.report.with_name(args.report.stem + "-rerank.png"))
                 args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         except BaseException as error:
             if "before" in identity:
@@ -748,6 +811,9 @@ def main() -> int:
                 screenshot = workdir / "application-shell.png"
                 if screenshot.is_file():
                     shutil.copyfile(screenshot, args.report.with_suffix(".png"))
+                rerank_screenshot = workdir / "rerank-workspace.png"
+                if rerank_screenshot.is_file():
+                    shutil.copyfile(rerank_screenshot, args.report.with_name(args.report.stem + "-rerank.png"))
                 args.report.write_text(json.dumps({"object": "bloom.browser_acceptance", "schema_version": 1,
                                                  "browser": args.browser, "status": "failed", "error": str(error),
                                                  "artifact_identity": identity},

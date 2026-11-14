@@ -94,6 +94,23 @@ structured-output combinations, and other unsupported decoding modes instead
 of silently omitting metadata. `None` omits the new JSON field, so existing
 calls remain compatible with older native libraries.
 
+Buffered `generate` results from models with exact native accounting include
+a `generation` dictionary with `input_tokens`, `output_tokens` (including an
+accepted EOS token) and `reason` (`"eos"`, `"length"` or `"stop"`), so callers
+can tell a natural stop from an exhausted `max_tokens` budget. The key is
+absent for legacy adapters and older native libraries; malformed metadata
+raises `BloomInferenceError`.
+
+```python
+result = pipeline.generate("Continue this sentence", max_tokens=32)
+if result.get("generation", {}).get("reason") == "length":
+    print("truncated after", result["generation"]["output_tokens"], "tokens")
+```
+
+`device` defaults to `"cpu"`. Pass `device="auto"` to use the same selection
+as the CLI and server: the first available GPU, NPU or CPU declared by the
+selected engine.
+
 ```python
 result = pipeline.generate("Continue this sentence", max_tokens=32, logprobs=3)
 for record in result["logprobs"]:
@@ -281,9 +298,13 @@ callers must observe these rules:
 
 - Every `BloomSlice` points to exactly `len` readable bytes for the complete
   call. Input is UTF-8; JSON slices must contain the documented object shapes.
-- Device names accept `cpu`, `gpu`, `cuda`, `metal`, `npu`, and `intel-npu`.
-  The accelerator aliases map to Bloom's generic device class and are shared
-  with the HTTP server's CLI configuration.
+- Device names accept `auto`, `cpu`, `gpu`, `cuda`, `metal`, `npu`, and
+  `intel-npu` (case-insensitive). The accelerator aliases map to Bloom's
+  generic device class and are shared with the HTTP server's CLI
+  configuration. `auto` is resolved at load time exactly like the CLI and
+  server default: the first available of GPU, NPU and CPU that the selected
+  engine declares in its supported devices. Explicit names are passed through
+  unchanged.
 - A non-NULL error buffer points to `error_buffer_len` writable bytes.
 - A pipeline handle is freed exactly once and is not used concurrently with
   `bloom_pipeline_free`.
@@ -304,6 +325,21 @@ tokenizer. Invalid non-NULL pointers,
 double-free, callback unwinding, and freeing a live handle or token during a
 native call remain caller contract violations that no C ABI can validate
 safely.
+
+Buffered results (`bloom_pipeline_run_v2` and `bloom_pipeline_run`) are a
+JSON `ModelOutput` object. When the loaded model reports exact native
+generation accounting (currently the Candle text adapters), Bloom runs the
+validated stream internally and adds a `generation` object, matching the
+CLI's buffered `--json` output:
+
+```json
+{"text": "...", "generation": {"input_tokens": 12, "output_tokens": 32, "reason": "length"}}
+```
+
+`reason` is `eos`, `length` or `stop`; `output_tokens` counts accepted token
+IDs including EOS. The key is omitted for legacy adapters. It is additive, so
+the ABI revision is unchanged and consumers that ignore unknown keys keep
+working.
 
 Revision 1 consumers use NUL-terminated inputs, release
 `bloom_pipeline_run` output with `bloom_string_free`, and cannot cancel native

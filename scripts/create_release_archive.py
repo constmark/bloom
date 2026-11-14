@@ -117,7 +117,7 @@ def create_zip(
 
 
 def create_archive(
-    package_root: pathlib.Path, destination: pathlib.Path, epoch: int
+    package_root: pathlib.Path, destination: pathlib.Path, epoch: int, *, overwrite: bool = True
 ) -> None:
     if (
         isinstance(epoch, bool)
@@ -125,8 +125,13 @@ def create_archive(
         or not (0 <= epoch <= MAX_SOURCE_DATE_EPOCH)
     ):
         raise ArchiveError("archive timestamp is outside the supported unsigned 32-bit range")
+    if package_root.is_symlink() or destination.is_symlink():
+        raise ArchiveError("symbolic links are not allowed for the package root or destination")
     package_root = package_root.resolve()
-    destination = destination.resolve()
+    # Resolve the parent without following a destination link introduced later.
+    destination = destination.parent.resolve() / destination.name
+    if not overwrite and destination.exists():
+        raise ArchiveError("archive destination already exists")
     try:
         destination.relative_to(package_root)
     except ValueError:
@@ -153,7 +158,12 @@ def create_archive(
         else:
             create_zip(package_root, temporary, entries, epoch)
         temporary.chmod(0o644)
-        os.replace(temporary, destination)
+        if overwrite:
+            os.replace(temporary, destination)
+        else:
+            # Same-filesystem no-overwrite publication also closes the race
+            # between the initial existence check and archive generation.
+            os.link(temporary, destination)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -162,6 +172,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("package_root", type=pathlib.Path)
     parser.add_argument("destination", type=pathlib.Path)
+    parser.add_argument("--no-overwrite", action="store_true", help="Refuse to replace any existing destination.")
     parser.add_argument(
         "--source-date-epoch",
         default=os.environ.get("SOURCE_DATE_EPOCH"),
@@ -172,7 +183,7 @@ def main() -> int:
         parser.error("--source-date-epoch or SOURCE_DATE_EPOCH is required")
     try:
         epoch = parse_source_date_epoch(args.source_date_epoch)
-        create_archive(args.package_root, args.destination, epoch)
+        create_archive(args.package_root, args.destination, epoch, overwrite=not args.no_overwrite)
     except (ArchiveError, OSError, tarfile.TarError, zipfile.BadZipFile) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1

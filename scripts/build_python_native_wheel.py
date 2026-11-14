@@ -119,7 +119,7 @@ def main() -> None:
         # A separate process releases the loaded DLL before TemporaryDirectory
         # cleanup on Windows; ctypes does not unload libraries automatically.
         subprocess.run([sys.executable, str(ROOT / "scripts/check_ffi_abi_compatibility.py"),
-                        "--library", str(snapshot), "--min-abi", "2", "--max-abi", "2"],
+                        "--library", str(snapshot), "--min-abi", "2", "--max-abi", "2", "--exercise-inference"],
                        check=True, timeout=60, cwd=work)
         abi = 2
         version = subprocess.check_output(["rustc", "-vV"], text=True, cwd=ROOT, timeout=30)

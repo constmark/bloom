@@ -783,6 +783,67 @@ class BloomPipelineTests(unittest.TestCase):
             next(pipeline.generate_stream("hello"))
         self.assertEqual(self.fake_lib.freed_tokens, 1)
 
+    def test_additive_generation_metadata_is_preserved_until_transport_end(self):
+        events = [
+            {"TextDelta": "你好"},
+            {"GenerationFinished": {"input_tokens": 3, "output_tokens": 2, "reason": "eos"}},
+            {"Metrics": {"ttft_ms": 1.0}},
+            "End",
+        ]
+        for revision in (1, 2):
+            with self.subTest(revision=revision):
+                self.fake_lib._bloom_uses_v2 = revision == 2
+
+                def stream(_pipeline, _input, _params, callback, *_rest):
+                    for event in events:
+                        encoded = json.dumps(event, ensure_ascii=False).encode()
+                        if revision == 2:
+                            owner = ctypes.create_string_buffer(encoded)
+                            callback(None, ctypes.cast(owner, ctypes.POINTER(ctypes.c_uint8)), len(encoded))
+                        else:
+                            callback(None, encoded)
+                    return 0
+
+                name = "bloom_pipeline_run_stream" + ("_v2" if revision == 2 else "")
+                setattr(self.fake_lib, name, FakeFunction(stream))
+                with pipeline_module.BloomPipeline(".", engine="mock") as pipeline:
+                    self.assertEqual(list(pipeline.generate_stream("hello")), events)
+
+    def test_buffered_generation_metadata_is_surfaced_for_both_abis(self):
+        generation = {"input_tokens": 3, "output_tokens": 2, "reason": "length"}
+        expected = {"text": "你好", "generation": generation}
+        for revision in (1, 2):
+            with self.subTest(revision=revision):
+                self.fake_lib._bloom_uses_v2 = revision == 2
+                self.fake_lib.output_buffer = ctypes.create_string_buffer(
+                    json.dumps(expected, ensure_ascii=False).encode()
+                )
+                with pipeline_module.BloomPipeline(".", engine="mock") as pipeline:
+                    result = pipeline.generate("hello", max_tokens=2)
+                self.assertEqual(result, expected)
+                self.assertEqual(result["generation"]["reason"], "length")
+
+    def test_malformed_buffered_generation_metadata_is_rejected(self):
+        for generation in (
+            None,
+            [],
+            {"input_tokens": 3, "output_tokens": 2},
+            {"input_tokens": -1, "output_tokens": 2, "reason": "eos"},
+            {"input_tokens": 3, "output_tokens": True, "reason": "eos"},
+            {"input_tokens": 3, "output_tokens": 2.0, "reason": "eos"},
+            {"input_tokens": 3, "output_tokens": 2, "reason": ""},
+        ):
+            with self.subTest(generation=generation):
+                self.fake_lib.output_buffer = ctypes.create_string_buffer(
+                    json.dumps({"text": "ok", "generation": generation}).encode()
+                )
+                with pipeline_module.BloomPipeline(".", engine="mock") as pipeline:
+                    with self.assertRaisesRegex(
+                        pipeline_module.BloomInferenceError, "generation metadata"
+                    ):
+                        pipeline.generate("hello")
+                self.assertGreaterEqual(self.fake_lib.freed_buffers, 1)
+
 
 @unittest.skipUnless(
     os.environ.get("BLOOM_TEST_NATIVE_FFI") == "1",
@@ -804,6 +865,17 @@ class NativeFfiIntegrationTests(unittest.TestCase):
         self.assertEqual(output["text"], "echo: hello")
         self.assertEqual(chunks[0], {"TextDelta": "echo: hello"})
         self.assertEqual(chunks[-1], "End")
+
+    def test_native_auto_device_resolves_for_the_selected_engine(self):
+        for device in ("auto", "AUTO"):
+            with self.subTest(device=device):
+                with pipeline_module.BloomPipeline(".", engine="mock", device=device) as pipeline:
+                    output = pipeline.generate("hello", max_tokens=4)
+                self.assertEqual(output["text"], "echo: hello")
+                # Legacy adapters without exact accounting keep the historical shape.
+                self.assertNotIn("generation", output)
+        with self.assertRaisesRegex(pipeline_module.BloomLoadError, "Unknown device kind: tpu"):
+            pipeline_module.BloomPipeline(".", engine="mock", device="tpu")
 
     def test_native_model_without_tokenizer_fails_explicitly(self):
         with pipeline_module.BloomPipeline(".", engine="mock") as pipeline:

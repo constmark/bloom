@@ -314,6 +314,96 @@ impl TokenLogprobs {
     }
 }
 
+/// The model's observed reason for ending generation, independent of transport
+/// completion. Callers must still require `End` and a successful backend return.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationFinishReason {
+    Eos,
+    Length,
+    Stop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerationMetadata {
+    pub input_tokens: usize,
+    /// Accepted output token IDs, including EOS and tokens consumed by a stop filter.
+    pub output_tokens: usize,
+    pub reason: GenerationFinishReason,
+}
+
+/// Validates optional exact accounting without changing legacy text adapters.
+#[derive(Debug, Default)]
+pub struct GenerationStreamState {
+    usage: Option<(usize, usize)>,
+    finished: Option<GenerationMetadata>,
+}
+
+impl GenerationStreamState {
+    pub fn observe(&mut self, chunk: &OutputChunk, maximum: usize) -> Result<(), String> {
+        if self.finished.is_some()
+            && !matches!(chunk, OutputChunk::Metrics { .. } | OutputChunk::End)
+        {
+            return Err("backend emitted generation output after its completion metadata".into());
+        }
+        match chunk {
+            OutputChunk::TokenUsage {
+                input_tokens,
+                output_tokens,
+            } => {
+                if *input_tokens > MAX_TOKEN_COUNT
+                    || *output_tokens > maximum
+                    || self.usage.is_some_and(|(input, output)| {
+                        input != *input_tokens || output > *output_tokens
+                    })
+                {
+                    return Err("backend emitted inconsistent or out-of-range token usage".into());
+                }
+                self.usage = Some((*input_tokens, *output_tokens));
+            }
+            OutputChunk::GenerationFinished(metadata) => {
+                if self.usage != Some((metadata.input_tokens, metadata.output_tokens)) {
+                    return Err(
+                        "backend completion metadata does not match cumulative token usage".into(),
+                    );
+                }
+                match metadata.reason {
+                    GenerationFinishReason::Eos if metadata.output_tokens == 0 => {
+                        return Err("EOS completion must include its accepted token".into());
+                    }
+                    GenerationFinishReason::Length if metadata.output_tokens != maximum => {
+                        return Err("length completion did not exhaust its token budget".into());
+                    }
+                    _ => {}
+                }
+                self.finished = Some(*metadata);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub fn output_tokens(&self) -> Option<usize> {
+        self.usage.map(|(_, output)| output)
+    }
+
+    pub fn input_tokens(&self) -> Option<usize> {
+        self.usage.map(|(input, _)| input)
+    }
+
+    pub fn metadata(&self) -> Option<GenerationMetadata> {
+        self.finished
+    }
+
+    pub fn finish(&self, required: bool) -> Result<(), String> {
+        if required && self.finished.is_none() {
+            Err("backend omitted required generation completion metadata".into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OutputChunk {
     TextDelta(String),
@@ -326,6 +416,9 @@ pub enum OutputChunk {
         input_tokens: usize,
         output_tokens: usize,
     },
+    /// Exact final accounting and model termination reason. This is not the
+    /// terminal transport event; Metrics and exactly one End may follow.
+    GenerationFinished(GenerationMetadata),
     AudioDelta(Vec<f32>),
     Image(Vec<u8>),
     Embedding(Vec<f32>),
@@ -534,6 +627,15 @@ impl OutputChunk {
                     return Err("VLM bounding box must contain four finite values".to_string());
                 }
                 Ok(())
+            }
+            Self::GenerationFinished(metadata) => {
+                if metadata.input_tokens > MAX_TOKEN_COUNT
+                    || metadata.output_tokens > MAX_TOKEN_COUNT
+                {
+                    Err("generation completion token count exceeds the limit".into())
+                } else {
+                    Ok(())
+                }
             }
             Self::TokenUsage { .. } | Self::End => Ok(()),
         }
@@ -850,6 +952,88 @@ impl From<Vec<OutputChunk>> for ModelOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generation_metadata_requires_consistent_usage_and_explicit_termination() {
+        for reason in [
+            GenerationFinishReason::Eos,
+            GenerationFinishReason::Length,
+            GenerationFinishReason::Stop,
+        ] {
+            let mut state = GenerationStreamState::default();
+            state
+                .observe(
+                    &OutputChunk::TokenUsage {
+                        input_tokens: 2,
+                        output_tokens: 3,
+                    },
+                    3,
+                )
+                .unwrap();
+            let complete = OutputChunk::GenerationFinished(GenerationMetadata {
+                input_tokens: 2,
+                output_tokens: 3,
+                reason,
+            });
+            state.observe(&complete, 3).unwrap();
+            state.finish(true).unwrap();
+            assert_eq!(state.metadata().unwrap().reason, reason);
+            assert!(state.observe(&complete, 3).is_err());
+            assert!(
+                state
+                    .observe(&OutputChunk::TextDelta("late".into()), 3)
+                    .is_err()
+            );
+            assert!(
+                state
+                    .observe(
+                        &OutputChunk::TokenUsage {
+                            input_tokens: 2,
+                            output_tokens: 3
+                        },
+                        3
+                    )
+                    .is_err()
+            );
+            state.observe(&OutputChunk::End, 3).unwrap();
+        }
+        let mut state = GenerationStreamState::default();
+        state.finish(false).unwrap();
+        assert!(state.finish(true).is_err());
+        state
+            .observe(
+                &OutputChunk::TokenUsage {
+                    input_tokens: 2,
+                    output_tokens: 1,
+                },
+                3,
+            )
+            .unwrap();
+        for metadata in [
+            GenerationMetadata {
+                input_tokens: 2,
+                output_tokens: 2,
+                reason: GenerationFinishReason::Eos,
+            },
+            GenerationMetadata {
+                input_tokens: 3,
+                output_tokens: 1,
+                reason: GenerationFinishReason::Eos,
+            },
+            GenerationMetadata {
+                input_tokens: 2,
+                output_tokens: 1,
+                reason: GenerationFinishReason::Length,
+            },
+        ] {
+            assert!(
+                state
+                    .observe(&OutputChunk::GenerationFinished(metadata), 3)
+                    .is_err()
+            );
+            assert!(state.metadata().is_none());
+        }
+    }
 
     #[test]
     fn logprob_records_validate_probabilities_bytes_and_bounded_candidates() {

@@ -6,9 +6,11 @@ protocol BloomAPITransport {
     @MainActor func loadCatalogModel(_ id: String) async throws
     @MainActor func unloadCatalogModel() async throws
     @MainActor func embeddings(model: String, inputs: [String], dimensions: Int?) async throws -> DesktopEmbeddingResult
+    @MainActor func rerank(model: String, query: String, documents: [String], topN: Int?) async throws -> DesktopRerankResult
     @MainActor func streamChat(
         model: String,
         messages: [APIChatMessage],
+        maxTokens: Int,
         onChunk: (ChatCompletionChunk) -> Void
     ) async throws
 }
@@ -18,6 +20,9 @@ extension BloomAPITransport {
     @MainActor func loadCatalogModel(_ id: String) async throws { throw BloomClientError.incompatibleServer }
     @MainActor func unloadCatalogModel() async throws { throw BloomClientError.incompatibleServer }
     @MainActor func embeddings(model: String, inputs: [String], dimensions: Int?) async throws -> DesktopEmbeddingResult {
+        throw BloomClientError.incompatibleServer
+    }
+    @MainActor func rerank(model: String, query: String, documents: [String], topN: Int?) async throws -> DesktopRerankResult {
         throw BloomClientError.incompatibleServer
     }
 }
@@ -138,8 +143,12 @@ struct BloomAPIClient: BloomAPITransport {
     func streamChat(
         model: String,
         messages: [APIChatMessage],
+        maxTokens: Int = GenerationSettings.defaultMaxTokens,
         onChunk: (ChatCompletionChunk) -> Void
     ) async throws {
+        guard GenerationSettings.maxTokensRange.contains(maxTokens) else {
+            throw BloomClientError.requestLimitExceeded
+        }
         var request = URLRequest(url: endpoint("v1/chat/completions"))
         request.httpMethod = "POST"
         request.timeoutInterval = 300
@@ -151,9 +160,9 @@ struct BloomAPIClient: BloomAPITransport {
             ChatCompletionRequest(
                 model: model,
                 messages: messages,
-                maxTokens: 256,
-                temperature: 0.7,
-                topP: 0.9,
+                maxTokens: maxTokens,
+                temperature: GenerationSettings.temperature,
+                topP: GenerationSettings.topP,
                 stream: true,
                 streamOptions: .init(includeUsage: true)
             )
@@ -255,6 +264,20 @@ struct BloomAPIClient: BloomAPITransport {
         let bytes = try await jsonRequest("v1/embeddings", body: body, limit: 32 * 1024 * 1024)
         let result = try JSONDecoder().decode(DesktopEmbeddingResult.self, from: bytes)
         try result.validate(model: model, count: inputs.count, dimensions: dimensions)
+        return result
+    }
+
+    @MainActor
+    func rerank(model: String, query: String, documents: [String], topN: Int?) async throws -> DesktopRerankResult {
+        try DesktopRerankResult.validateInput(model: model, query: query, documents: documents, topN: topN)
+        var payload: [String: Any] = ["model": model, "query": query, "documents": documents, "return_documents": true]
+        if let topN { payload["top_n"] = topN }
+        let body = try JSONSerialization.data(withJSONObject: payload)
+        // Returned document text can expand sixfold when JSON escapes control
+        // characters; retain the aggregate input limit without truncating it.
+        let bytes = try await jsonRequest("v1/rerank", body: body, limit: 6 * 1024 * 1024)
+        let result = try JSONDecoder().decode(DesktopRerankResult.self, from: bytes)
+        try result.validate(model: model, documents: documents, topN: topN)
         return result
     }
 

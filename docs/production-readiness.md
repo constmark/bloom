@@ -15,7 +15,10 @@ criteria that cut across those capabilities.
 - Release archives are deterministic at the archive layer and self-checked;
   the publication workflow requires build-provenance attestations.
 - Pinned trained CPU gates cover maintained Qwen2, Qwen3, SmolLM2, and MiniLM
-  profiles through the native runtime and compatibility APIs.
+  profiles through the native runtime and compatibility APIs. The trained
+  MS MARCO MiniLM cross-encoder gate adds raw-score ranking margins, padded
+  batch consistency and task isolation; its small authored dataset does not
+  establish general retrieval benchmark parity.
 - Non-loopback listeners fail closed without authentication. The Dockerfile
   uses immutable base-image digests, a non-root runtime, isolated mutable state,
   and strict security and memory admission.
@@ -64,8 +67,11 @@ promote other model families, accelerators, or external-runtime adapters.
 The pinned Qwen2 Q4_0 Candle CPU profile is the first candidate. Its short
 CI workload records identity, concurrent streaming latency, disconnect
 recovery, and host RSS using the [HTTP workload procedure](http-workload.md).
-The final 24-hour local CPU run uses the exact packaged server and remains
-pending final validation. Local physical HFS+ disk-full and
+The previous packaged server completed a revalidated 24-hour local CPU run
+with 132,378 requests; its exact build/model identity is retained in the
+[completion review](capability-completion-2026-11-13.md). This historical result
+does not validate subsequent code changes. Current-build sustained validation
+remains required. Local physical HFS+ disk-full and
 distinct-binary trained rollback drills have also passed. Exact target-host
 evidence, reference comparisons and the service-manager checks above are still
 required before `stable` classification; see the
@@ -112,14 +118,16 @@ remains part of the release gate.
 - Add dedicated target-hardware runners and published performance budgets for
   each claimed Metal or CUDA deployment. Feature compilation alone is not
   execution evidence.
-- Continue stabilizing and package the C ABI and Python SDK. Revision 2 now
+- Complete hosted compatibility validation for the packaged C ABI and Python SDK. Revision 2 now
   provides version negotiation, bounded length-delimited buffers, explicit
   ownership/status contracts, cooperative stream cancellation, and revision 1
   fallback tests. Python streaming now has bounded byte/chunk backpressure and
   close-safe cancellation; a self-contained sdist-to-wheel gate verifies clean
-  installation and native ABI v2 interoperation. Platform binary wheels, a
-  declared compatibility window, packaged cross-version ABI tests, and the
-  complete supported Python/platform matrix remain before production support.
+  installation and native ABI v2 interoperation. Bundled host-native wheels and
+  packaged ABI checks are implemented, with local macOS isolated installation
+  evidence. The hosted Linux/macOS/Windows and Python 3.9/3.12/3.14 matrix,
+  a declared compatibility window and broader binary portability still require
+  release-candidate evidence before production support.
 - Exercise signed-index v3 urgent revocation through a multi-host deployment
   drill, including forced refresh latency, operator alerting, state backup, and
   replacement-digest recovery evidence. The protocol and local fail-closed

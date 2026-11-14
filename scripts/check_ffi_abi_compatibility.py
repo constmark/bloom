@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import json
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
@@ -145,7 +146,136 @@ def _exercise_v2_error_and_lifecycle(library: ctypes.CDLL) -> None:
     buffer_free(ctypes.byref(empty))
 
 
-def inspect_library(path: Path, *, min_version: int = 1, max_version: int = 2) -> int:
+def _exercise_inference(library: ctypes.CDLL, version: int) -> None:
+    """Exercise argument layouts, owned results and callbacks of both ABIs.
+
+    This optional current-runtime gate uses only the built-in mock engine. Keep
+    it opt-in for historical libraries that do not promise that engine.
+    """
+    prompt = "ABI smoke: 你好 🌸\0"
+    expected = "echo: " + prompt
+    encoded_input = json.dumps({"Text": {"prompt": prompt}}, ensure_ascii=False).encode()
+    encoded_params = json.dumps({
+        "max_tokens": 4, "temperature": 0.0, "top_p": 1.0,
+        "seed": None, "response_format": None,
+    }).encode()
+    error = ctypes.create_string_buffer(512)
+    free = library.bloom_pipeline_free
+    free.argtypes = [ctypes.c_void_p]
+    free.restype = None
+
+    def read_output(data: bytes) -> None:
+        if json.loads(data).get("text") != expected:
+            raise RuntimeError("ABI inference returned a mismatched text result")
+
+    def check_stream(chunks: list) -> None:
+        if not chunks or chunks[-1] != "End" or chunks.count("End") != 1:
+            raise RuntimeError("ABI stream omitted its unique final End event")
+        if "".join(chunk.get("TextDelta", "") for chunk in chunks if isinstance(chunk, dict)) != expected:
+            raise RuntimeError("ABI stream returned mismatched UTF-8 text")
+
+    pointer = library.bloom_pipeline_load(b".", b"mock", b"cpu", 64, error, len(error))
+    if not pointer:
+        raise RuntimeError(f"ABI-1 mock load failed: {error.value!r}")
+    try:
+        run = library.bloom_pipeline_run
+        run.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t]
+        run.restype = ctypes.c_void_p
+        free_string = library.bloom_string_free
+        free_string.argtypes = [ctypes.c_void_p]
+        free_string.restype = None
+        output = run(pointer, encoded_input, encoded_params, error, len(error))
+        if not output:
+            raise RuntimeError(f"ABI-1 inference failed: {error.value!r}")
+        try:
+            read_output(ctypes.string_at(output))
+        finally:
+            free_string(output)
+        chunks, callback_errors = [], []
+        callback_type = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_char_p)
+
+        @callback_type
+        def callback(_context, chunk):
+            try:
+                if _context != 0xB100:
+                    raise ValueError("callback context was not preserved")
+                chunks.append(json.loads(chunk))
+            except Exception as exc:
+                callback_errors.append(str(exc))
+
+        stream = library.bloom_pipeline_run_stream
+        stream.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, callback_type, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
+        stream.restype = ctypes.c_int32
+        if stream(pointer, encoded_input, encoded_params, callback, 0xB100, error, len(error)) != 0 or callback_errors:
+            raise RuntimeError(f"ABI-1 stream failed: {error.value!r}, {callback_errors}")
+        check_stream(chunks)
+    finally:
+        free(pointer)
+    if version < 2:
+        return
+
+    # All owners remain alive until both length-delimited calls have returned.
+    values = (b".", b"mock", b"cpu", encoded_input, encoded_params)
+    # Deliberately put invalid UTF-8 outside every borrowed slice. A library
+    # that accidentally reads a CString instead of respecting len must fail.
+    owners = [ctypes.create_string_buffer(value + b"\xff") for value in values]
+    slices = [BloomSlice(ctypes.cast(owner, ctypes.POINTER(ctypes.c_uint8)), len(value)) for owner, value in zip(owners, values)]
+    model, engine, device, input_slice, params_slice = slices
+    pointer = library.bloom_pipeline_load_v2(model, engine, device, 64, error, len(error))
+    if not pointer:
+        raise RuntimeError(f"ABI-2 mock load failed: {error.value!r}")
+    try:
+        run = library.bloom_pipeline_run_v2
+        run.argtypes = [ctypes.c_void_p, BloomSlice, BloomSlice, ctypes.POINTER(BloomOwnedBuffer), ctypes.c_char_p, ctypes.c_size_t]
+        run.restype = ctypes.c_int32
+        output = BloomOwnedBuffer()
+        try:
+            if run(pointer, input_slice, params_slice, ctypes.byref(output), error, len(error)) != 0:
+                raise RuntimeError(f"ABI-2 inference failed: {error.value!r}")
+            if not output.data or not 0 < output.len <= 64 * 1024:
+                raise RuntimeError("ABI-2 smoke returned an invalid output buffer")
+            read_output(ctypes.string_at(output.data, output.len))
+        finally:
+            library.bloom_buffer_free(ctypes.byref(output))
+        if output.data or output.len:
+            raise RuntimeError("ABI-2 buffer free did not reset ownership")
+        chunks, callback_errors = [], []
+        callback_type = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t)
+
+        @callback_type
+        def callback_v2(_context, chunk, length):
+            try:
+                if _context != 0xB100:
+                    raise ValueError("callback context was not preserved")
+                if not chunk or not 0 < length <= 64 * 1024:
+                    raise ValueError("invalid callback slice")
+                chunks.append(json.loads(ctypes.string_at(chunk, length)))
+            except Exception as exc:
+                callback_errors.append(str(exc))
+
+        stream = library.bloom_pipeline_run_stream_v2
+        stream.argtypes = [ctypes.c_void_p, BloomSlice, BloomSlice, callback_type, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
+        stream.restype = ctypes.c_int32
+        if stream(pointer, input_slice, params_slice, callback_v2, 0xB100, None, error, len(error)) != 0 or callback_errors:
+            raise RuntimeError(f"ABI-2 stream failed: {error.value!r}, {callback_errors}")
+        check_stream(chunks)
+        token = library.bloom_cancellation_token_new()
+        if not token:
+            raise RuntimeError("ABI-2 cancellation-token allocation returned NULL")
+        try:
+            if library.bloom_cancellation_token_cancel(token) != 0:
+                raise RuntimeError("ABI-2 cancellation failed")
+            chunks.clear()
+            status = stream(pointer, input_slice, params_slice, callback_v2, 0xB100, token, error, len(error))
+            if status != -8 or chunks or callback_errors:
+                raise RuntimeError("ABI-2 cancelled stream emitted output or returned the wrong status")
+        finally:
+            library.bloom_cancellation_token_free(token)
+    finally:
+        free(pointer)
+
+
+def inspect_library(path: Path, *, min_version: int = 1, max_version: int = 2, exercise_inference: bool = False) -> int:
     """Load and validate one library, returning its declared ABI revision."""
     path = path.expanduser().resolve()
     if not path.is_file():
@@ -166,6 +296,8 @@ def inspect_library(path: Path, *, min_version: int = 1, max_version: int = 2) -
     _exercise_legacy_error_path(library)
     if version >= 2:
         _exercise_v2_error_and_lifecycle(library)
+    if exercise_inference:
+        _exercise_inference(library, version)
     return version
 
 
@@ -191,6 +323,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     parser.add_argument("--min-abi", type=int, default=1)
     parser.add_argument("--max-abi", type=int, default=2)
+    parser.add_argument("--exercise-inference", action="store_true", help="also run UTF-8 buffered/streamed inference through both ABI revisions using the built-in mock engine")
     args = parser.parse_args(argv)
     if args.min_abi < 1 or args.max_abi < args.min_abi:
         parser.error("ABI range must be positive and ordered")
@@ -199,7 +332,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not paths:
             parser.error("at least one --library is required")
         reports = [
-            (path, inspect_library(path, min_version=args.min_abi, max_version=args.max_abi))
+            (path, inspect_library(path, min_version=args.min_abi, max_version=args.max_abi, exercise_inference=args.exercise_inference))
             for path in paths
         ]
     except (FileNotFoundError, OSError, RuntimeError, ValueError) as error:
@@ -208,6 +341,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for path, version in reports:
         print(f"OK: {path} exports and exercises ABI revision {version}")
     print(f"PASS: validated {len(reports)} packaged native ABI library(s)")
+    if args.exercise_inference:
+        print("PASS: native ABI buffered/streamed UTF-8 calls and pre-cancelled ABI-2 stream")
     return 0
 
 

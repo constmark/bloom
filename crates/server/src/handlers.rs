@@ -2253,104 +2253,6 @@ async fn collect_scheduled_text(
     })
 }
 
-fn run_cancellable_text_inference(
-    pipeline: &InferencePipeline,
-    input: ModelInput,
-    params: &GenerationParams,
-    cancel_token: &CancellationToken,
-    stop_sequences: Vec<String>,
-) -> Result<GeneratedText> {
-    if cancel_token.is_cancelled() {
-        return Err(anyhow!("request cancelled"));
-    }
-    let mut filter = StopSequenceFilter::new(stop_sequences);
-    let mut generated_text = String::new();
-    let run_result = pipeline.run_stream(input, params, &mut |chunk| {
-        if cancel_token.is_cancelled() {
-            return Err(anyhow!("request cancelled"));
-        }
-        if let OutputChunk::TextDelta(text) = chunk {
-            let update = filter.push(&text);
-            generated_text.push_str(&update.text);
-            if update.stopped {
-                return Err(anyhow!("stop sequence reached"));
-            }
-        }
-        Ok(())
-    });
-    let stopped = filter.stopped();
-    if let Err(error) = run_result
-        && !stopped
-    {
-        return Err(error);
-    }
-    if cancel_token.is_cancelled() {
-        return Err(anyhow!("request cancelled"));
-    }
-    generated_text.push_str(&filter.finish());
-    Ok(GeneratedText {
-        text: generated_text,
-        stopped,
-    })
-}
-
-/// Run a bounded set of independent generations for OpenAI's `n` option.
-///
-/// Each candidate gets its own parameter clone. When a seed is supplied, the
-/// first candidate keeps it and later candidates receive deterministic,
-/// non-overlapping seed values so `n > 1` does not return identical samples.
-fn run_cancellable_text_choices(
-    pipeline: &InferencePipeline,
-    input: ModelInput,
-    params: &GenerationParams,
-    cancel_token: &CancellationToken,
-    stop_sequences: &[String],
-    choice_count: usize,
-) -> Result<Vec<GeneratedText>> {
-    let mut outputs = Vec::with_capacity(choice_count);
-    for index in 0..choice_count {
-        let mut choice_params = params.clone();
-        if let Some(seed) = choice_params.seed {
-            choice_params.seed = Some(seed.wrapping_add(index as u64));
-        }
-        outputs.push(run_cancellable_text_inference(
-            pipeline,
-            input.clone(),
-            &choice_params,
-            cancel_token,
-            stop_sequences.to_vec(),
-        )?);
-    }
-    Ok(outputs)
-}
-
-fn run_cancellable_text_prompt_choices(
-    pipeline: &InferencePipeline,
-    inputs: &[ModelInput],
-    params: &GenerationParams,
-    cancel_token: &CancellationToken,
-    stop_sequences: &[String],
-    choice_count: usize,
-) -> Result<Vec<GeneratedText>> {
-    let mut outputs = Vec::with_capacity(inputs.len().saturating_mul(choice_count));
-    for (prompt_index, input) in inputs.iter().cloned().enumerate() {
-        let mut prompt_params = params.clone();
-        if let Some(seed) = prompt_params.seed {
-            let offset = (prompt_index as u64).wrapping_mul(choice_count as u64);
-            prompt_params.seed = Some(seed.wrapping_add(offset));
-        }
-        outputs.extend(run_cancellable_text_choices(
-            pipeline,
-            input,
-            &prompt_params,
-            cancel_token,
-            stop_sequences,
-            choice_count,
-        )?);
-    }
-    Ok(outputs)
-}
-
 pub(crate) async fn handle_chat_completions(
     State(state): State<Arc<ServerState>>,
     Json(payload): Json<ChatRequest>,
@@ -2935,12 +2837,13 @@ async fn handle_chat_completions_inner(
                 };
             client_guard.finish(true);
             let completion_tokens = generated_count.load(Ordering::Relaxed) as usize;
+            let legacy = legacy_function_output(tool_config.as_ref());
             let finish_reason = if generated_output.stopped {
                 "stop"
             } else {
-                chat_output_finish_reason(&parsed_output, completion_tokens, max_tokens)
+                chat_output_finish_reason(&parsed_output, completion_tokens, max_tokens, legacy)
             };
-            let message = chat_output_message(&request_id, &parsed_output);
+            let message = chat_output_message(&request_id, &parsed_output, legacy);
 
             return Json(json!({
                 "id": request_id,
@@ -3216,6 +3119,7 @@ async fn handle_chat_completions_inner(
                             &output,
                             generated_count_for_finish.load(Ordering::Relaxed) as usize,
                             max_tokens,
+                            legacy_function_output(tool_config_for_final.as_ref()),
                         )))
                     }
                     Ok(_) => {
@@ -3247,193 +3151,7 @@ async fn handle_chat_completions_inner(
             .into_response();
     }
 
-    if logprobs.is_some() || (payload.stream && choice_count > 1) {
-        let generated_count = Arc::new(AtomicU64::new(0));
-        let lifecycle = InferenceLifecycle::new(
-            cancel_guard,
-            InferenceLifecycleResources {
-                metrics: Arc::clone(&state.app.metrics),
-                request_start,
-                generated_tokens: Arc::clone(&generated_count),
-                prompt_tokens: prompt_tokens as u64,
-                permit,
-                runtime_lease: runtime_lease.clone(),
-            },
-            StreamExecution::Blocking,
-        );
-        let choices_request = crate::openai_choices::TextChoiceStream {
-            request_id,
-            model_id,
-            inputs: vec![input],
-            echo_prompts: None,
-            choice_count,
-            params,
-            stop_sequences,
-            response_format,
-            tool_config,
-            chat: true,
-            include_usage,
-            prompt_tokens: prompt_tokens as u64,
-            scheduled: None,
-        };
-        return if payload.stream {
-            crate::openai_choices::stream_text_choices(
-                Arc::clone(&state),
-                pipeline,
-                choices_request,
-                lifecycle,
-                generated_count,
-                cancel_token,
-                request_start,
-            )
-        } else {
-            crate::openai_choices::buffered_text_choices(
-                Arc::clone(&state),
-                pipeline,
-                choices_request,
-                lifecycle,
-                generated_count,
-                cancel_token,
-                request_start,
-            )
-            .await
-        };
-    }
-
-    if !payload.stream {
-        let generated_count = Arc::new(AtomicU64::new(0));
-        let lifecycle = InferenceLifecycle::new(
-            cancel_guard,
-            InferenceLifecycleResources {
-                metrics: Arc::clone(&state.app.metrics),
-                request_start,
-                generated_tokens: Arc::clone(&generated_count),
-                prompt_tokens: prompt_tokens as u64,
-                permit,
-                runtime_lease: runtime_lease.clone(),
-            },
-            StreamExecution::Blocking,
-        );
-        let worker_lifecycle = lifecycle.worker_guard();
-        let mut client_guard = lifecycle.client_guard();
-        let pipeline_for_run = Arc::clone(&pipeline);
-        let cancel_token_for_run = cancel_token.clone();
-        let stop_sequences_for_run = stop_sequences.clone();
-        let choice_count_for_run = choice_count;
-        let inference_start = std::time::Instant::now();
-        let res = task::spawn_blocking(move || {
-            let _worker_lifecycle = worker_lifecycle;
-            run_cancellable_text_choices(
-                &pipeline_for_run,
-                input,
-                &params,
-                &cancel_token_for_run,
-                &stop_sequences_for_run,
-                choice_count_for_run,
-            )
-        })
-        .await;
-        state
-            .app
-            .metrics
-            .record_inference_latency(inference_start.elapsed().as_secs_f64());
-
-        let generated_outputs = match res {
-            Ok(Ok(outputs)) => outputs,
-            Ok(Err(e)) => {
-                client_guard.finish(false);
-                if cancel_token.is_cancelled() {
-                    return error_response(
-                        axum::http::StatusCode::REQUEST_TIMEOUT,
-                        "request_cancelled",
-                        "The generation request was cancelled.",
-                    );
-                }
-                return error_response(
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal_error",
-                    format!("Inference failed: {}", e),
-                );
-            }
-            Err(e) => {
-                client_guard.finish(false);
-                return error_response(
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal_error",
-                    format!("Task join failed: {}", e),
-                );
-            }
-        };
-
-        let mut completion_tokens = 0_usize;
-        let mut choices = Vec::with_capacity(generated_outputs.len());
-        for (index, generated_output) in generated_outputs.into_iter().enumerate() {
-            let generated_text = generated_output.text;
-            let parsed_output =
-                match parse_chat_output(&generated_text, &response_format, tool_config.as_ref()) {
-                    Ok(output) => output,
-                    Err(message) => {
-                        client_guard.finish(false);
-                        return error_response(
-                            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
-                            if tool_config.is_some() {
-                                "invalid_tool_call"
-                            } else {
-                                "invalid_response_format"
-                            },
-                            message,
-                        );
-                    }
-                };
-            let output_tokens = match pipeline.tokenize(&generated_text) {
-                Ok(tokens) => tokens.len(),
-                Err(error) => {
-                    client_guard.finish(false);
-                    return error_response(
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        "tokenization_error",
-                        format!("Completion tokenization failed: {error}"),
-                    );
-                }
-            };
-            completion_tokens = completion_tokens.saturating_add(output_tokens);
-            let finish_reason = if generated_output.stopped {
-                "stop"
-            } else {
-                chat_output_finish_reason(&parsed_output, output_tokens, max_tokens)
-            };
-            choices.push(json!({
-                "index": index,
-                "message": chat_output_message_for_choice(&request_id, index, &parsed_output),
-                "finish_reason": finish_reason
-            }));
-        }
-        generated_count.store(completion_tokens as u64, Ordering::Relaxed);
-
-        client_guard.finish(true);
-
-        return Json(json!({
-            "id": request_id,
-            "object": "chat.completion",
-            "created": created,
-            "model": model_id.clone(),
-            "choices": choices,
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens
-            }
-        }))
-        .into_response();
-    }
-
-    // Streaming
-    let (tx, rx) = mpsc::channel::<std::result::Result<String, String>>(100);
-    let pipeline_for_stream_run = Arc::clone(&pipeline);
-    let cancel_token_clone = cancel_token.clone();
-    let stop_sequence_hit = Arc::new(AtomicBool::new(false));
-    let stop_sequence_hit_for_worker = Arc::clone(&stop_sequence_hit);
-    let stop_sequences_for_stream = stop_sequences.clone();
+    // Direct text requests share one bounded, cancellation-aware collector.
     let generated_count = Arc::new(AtomicU64::new(0));
     let lifecycle = InferenceLifecycle::new(
         cancel_guard,
@@ -3447,222 +3165,43 @@ async fn handle_chat_completions_inner(
         },
         StreamExecution::Blocking,
     );
-    let worker_lifecycle = lifecycle.worker_guard();
-    task::spawn_blocking(move || {
-        let _worker_lifecycle = worker_lifecycle;
-        let tx_clone = tx.clone();
-        let mut stop_filter = StopSequenceFilter::new(stop_sequences_for_stream);
-        let run_res = pipeline_for_stream_run.run_stream(
-            input,
-            &params,
-            &mut |chunk: bloomai_engine::io::OutputChunk| {
-                // Check for cancellation
-                if cancel_token_clone.is_cancelled() {
-                    return Err(anyhow!("request cancelled"));
-                }
-                if let bloomai_engine::io::OutputChunk::TextDelta(text) = chunk {
-                    let update = stop_filter.push(&text);
-                    if !update.text.is_empty() && tx_clone.blocking_send(Ok(update.text)).is_err() {
-                        return Err(anyhow!("client disconnected"));
-                    }
-                    if update.stopped {
-                        stop_sequence_hit_for_worker.store(true, Ordering::Release);
-                        return Err(anyhow!("stop sequence reached"));
-                    }
-                }
-                Ok(())
-            },
-        );
-        if run_res.is_ok() {
-            let tail = stop_filter.finish();
-            if !tail.is_empty() {
-                let _ = tx.blocking_send(Ok(tail));
-            }
-        } else if !stop_sequence_hit_for_worker.load(Ordering::Acquire) {
-            let e = run_res.expect_err("failed stream result must contain an error");
-            let _ = tx.blocking_send(Err(e.to_string()));
-        }
-    });
-
-    let req_id = request_id.clone();
-    let model = model_id.clone();
-    let state_for_stream = Arc::clone(&state);
-    let first_token_seen = Arc::new(AtomicBool::new(false));
-    let last_token_time = Arc::new(std::sync::Mutex::new(None));
-    let stream_failed = Arc::new(AtomicBool::new(false));
-    let generated_count_for_stream = Arc::clone(&generated_count);
-    let first_token_for_stream = Arc::clone(&first_token_seen);
-    let last_token_for_stream = Arc::clone(&last_token_time);
-    let stream_failed_for_stream = Arc::clone(&stream_failed);
-
-    let accumulated_text = Arc::new(std::sync::Mutex::new(String::new()));
-    let accumulated_text_for_stream = Arc::clone(&accumulated_text);
-
-    let pipeline_for_stream = Arc::clone(&pipeline);
-    let expose_text_deltas = tool_config.is_none();
-    let sse_stream = ReceiverStream::new(rx)
-        .map(move |item| {
-            let chunk = match item {
-                Ok(token) => {
-                    {
-                        let mut acc = accumulated_text_for_stream
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner());
-                        acc.push_str(&token);
-                    }
-                    let token_count = estimate_delta_tokens(&pipeline_for_stream, &token);
-                    record_stream_tokens(
-                        &state_for_stream,
-                        request_start,
-                        &first_token_for_stream,
-                        &last_token_for_stream,
-                        &generated_count_for_stream,
-                        token_count,
-                    );
-                    if !expose_text_deltas {
-                        return None;
-                    }
-                    json!({
-                        "id": req_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": { "content": token },
-                            "finish_reason": null
-                        }]
-                    })
-                }
-                Err(message) => {
-                    stream_failed_for_stream.store(true, Ordering::Relaxed);
-                    json!({
-                        "error": {
-                            "message": message,
-                            "type": "internal_error"
-                        }
-                    })
-                }
-            };
-            Some(Ok::<Event, std::convert::Infallible>(json_event(chunk)))
-        })
-        .filter_map(futures::future::ready);
-
-    let final_request_id = request_id.clone();
-    let final_model_id = model_id.clone();
-    let stream_failed_for_final = Arc::clone(&stream_failed);
-    let stream_failed_for_validation = Arc::clone(&stream_failed);
-    let accumulated_text_for_final = Arc::clone(&accumulated_text);
-    let response_format_for_final = response_format.clone();
-    let tool_config_for_final = tool_config.clone();
-    let generated_count_for_validation = Arc::clone(&generated_count);
-    let stop_sequence_hit_for_final = Arc::clone(&stop_sequence_hit);
-    let pipeline_for_validation = Arc::clone(&pipeline);
-    let usage_request_id = request_id.clone();
-    let usage_model_id = model_id.clone();
-    let start_request_id = request_id.clone();
-    let start_model_id = model_id.clone();
-    let generated_count_for_usage = Arc::clone(&generated_count);
-    let stream_failed_for_usage = Arc::clone(&stream_failed);
-    let usage_stream = futures::stream::once(async move {
-        (include_usage && !stream_failed_for_usage.load(Ordering::Acquire)).then(|| {
-            Ok::<Event, std::convert::Infallible>(chat_usage_chunk(
-                usage_request_id,
-                usage_model_id,
-                created,
-                prompt_tokens as u64,
-                generated_count_for_usage.load(Ordering::Relaxed),
-            ))
-        })
-    })
-    .filter_map(futures::future::ready);
-    let start_stream = futures::stream::once(async move {
-        Ok::<Event, std::convert::Infallible>(chat_start_chunk(
-            start_request_id,
-            start_model_id,
-            created,
-        ))
-    });
-    let mut lifecycle_for_final = lifecycle.client_guard();
-
-    let final_stream = start_stream
-        .chain(sse_stream)
-        .chain(futures::stream::once(async move {
-            let text = {
-                let acc = accumulated_text_for_final
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                acc.clone()
-            };
-            let completion_tokens = match pipeline_for_validation.tokenize(&text) {
-                Ok(tokens) => tokens.len() as u64,
-                Err(error) => {
-                    stream_failed_for_validation.store(true, Ordering::Release);
-                    return Ok::<Event, std::convert::Infallible>(json_event(
-                        stream_error_payload(
-                            "tokenization_error",
-                            format!("Completion tokenization failed: {error}"),
-                        ),
-                    ));
-                }
-            };
-            generated_count_for_validation.store(completion_tokens, Ordering::Relaxed);
-            match parse_chat_output(
-                &text,
-                &response_format_for_final,
-                tool_config_for_final.as_ref(),
-            ) {
-                Err(message) => {
-                    stream_failed_for_validation.store(true, Ordering::Relaxed);
-                    let err_chunk = json!({
-                        "error": {
-                            "message": format!("Stream terminal output validation failed: {message}"),
-                            "type": if tool_config_for_final.is_some() {
-                                "invalid_tool_call"
-                            } else {
-                                "invalid_response_format"
-                            }
-                        }
-                    });
-                    Ok::<Event, std::convert::Infallible>(json_event(err_chunk))
-                }
-                Ok(output) if tool_config_for_final.is_some() => {
-                    Ok::<Event, std::convert::Infallible>(chat_tool_output_chunk(
-                        final_request_id,
-                        final_model_id,
-                        created,
-                        &output,
-                        generated_count_for_validation.load(Ordering::Relaxed) as usize,
-                        max_tokens,
-                    ))
-                }
-                Ok(_) => {
-                    let finish_reason = if stop_sequence_hit_for_final.load(Ordering::Acquire) {
-                        "stop"
-                    } else {
-                        generation_finish_reason(
-                            generated_count_for_validation.load(Ordering::Relaxed) as usize,
-                            max_tokens,
-                        )
-                    };
-                    Ok::<Event, std::convert::Infallible>(chat_stop_chunk(
-                        final_request_id,
-                        final_model_id,
-                        created,
-                        finish_reason,
-                    ))
-                }
-            }
-        }))
-        .chain(usage_stream)
-        .chain(futures::stream::once(async move {
-            lifecycle_for_final.finish(!stream_failed_for_final.load(Ordering::Relaxed));
-            Ok::<Event, std::convert::Infallible>(Event::default().data("[DONE]"))
-        }));
-
-    Sse::new(final_stream)
-        .keep_alive(axum::response::sse::KeepAlive::default())
-        .into_response()
+    let choices_request = crate::openai_choices::TextChoiceStream {
+        request_id,
+        model_id,
+        inputs: vec![input],
+        echo_prompts: None,
+        choice_count,
+        params,
+        stop_sequences,
+        response_format,
+        tool_config,
+        chat: true,
+        include_usage,
+        prompt_tokens: prompt_tokens as u64,
+        scheduled: None,
+    };
+    if payload.stream {
+        crate::openai_choices::stream_text_choices(
+            Arc::clone(&state),
+            pipeline,
+            choices_request,
+            lifecycle,
+            generated_count,
+            cancel_token,
+            request_start,
+        )
+    } else {
+        crate::openai_choices::buffered_text_choices(
+            Arc::clone(&state),
+            pipeline,
+            choices_request,
+            lifecycle,
+            generated_count,
+            cancel_token,
+            request_start,
+        )
+        .await
+    }
 }
 
 // ─── /v1/responses ─────────────────────────────────────────────────────────
@@ -4064,6 +3603,7 @@ pub(crate) async fn handle_responses(
         tool_choice: tool_bridge.chat_tool_choice,
         parallel_tool_calls: tool_bridge.parallel_tool_calls,
         internal_request_id: Some(response_request_id.clone()),
+        legacy_function_calling: false,
         extensions: {
             let mut extensions = std::collections::BTreeMap::new();
             if let Some(top_k) = top_k {
@@ -4551,8 +4091,8 @@ pub(crate) async fn handle_completions(
         }
     }
     let prompt_tokens = prompt_token_counts.iter().copied().sum::<usize>();
-    let (prompt, prompt_tokens_vec) = match (prompts.first(), prompt_tokens_vecs.first()) {
-        (Some(prompt), Some(tokens)) => (prompt.clone(), tokens.clone()),
+    let prompt_tokens_vec = match prompt_tokens_vecs.first() {
+        Some(tokens) => tokens.clone(),
         _ => {
             state.app.metrics.record_request_end(
                 false,
@@ -4572,9 +4112,6 @@ pub(crate) async fn handle_completions(
         .cloned()
         .map(|prompt| ModelInput::Text { prompt })
         .collect::<Vec<_>>();
-    let input = ModelInput::Text {
-        prompt: prompt.clone(),
-    };
     let request_id = next_request_id(&state, "cmpl");
     let cancel_scheduler = if state.app.enable_ifb {
         scheduler_opt.clone()
@@ -4810,6 +4347,8 @@ pub(crate) async fn handle_completions(
 
         // Streaming under IFB scheduler
         let req_id = request_id.clone();
+        // OpenAI uses one object type and creation time for every chunk.
+        let created = unix_seconds();
         let model = model_id.clone();
         let state_clone = Arc::clone(&state);
         let generated_count = Arc::new(AtomicU64::new(0));
@@ -4904,8 +4443,8 @@ pub(crate) async fn handle_completions(
                         }
                         json!({
                             "id": req_id,
-                            "object": "text_completion.chunk",
-                            "created": unix_seconds(),
+                            "object": "text_completion",
+                            "created": created,
                             "model": model,
                             "choices": [{
                                 "index": 0,
@@ -4970,8 +4509,8 @@ pub(crate) async fn handle_completions(
             (!tail.is_empty()).then(|| {
                 Ok::<Event, std::convert::Infallible>(json_event(json!({
                     "id": flush_request_id,
-                    "object": "text_completion.chunk",
-                    "created": unix_seconds(),
+                    "object": "text_completion",
+                    "created": created,
                     "model": flush_model_id,
                     "choices": [{
                         "index": 0,
@@ -5002,8 +4541,8 @@ pub(crate) async fn handle_completions(
             let prefix_prompt = original_prompts[0].clone();
             vec![Ok::<Event, std::convert::Infallible>(json_event(json!({
                 "id": prefix_id,
-                "object": "text_completion.chunk",
-                "created": unix_seconds(),
+                "object": "text_completion",
+                "created": created,
                 "model": prefix_model,
                 "choices": [{
                     "index": 0,
@@ -5047,8 +4586,8 @@ pub(crate) async fn handle_completions(
                     };
                     Some(Ok::<Event, std::convert::Infallible>(json_event(json!({
                         "id": final_request_id,
-                        "object": "text_completion.chunk",
-                        "created": unix_seconds(),
+                        "object": "text_completion",
+                        "created": created,
                         "model": final_model_id,
                         "choices": [{
                             "index": 0,
@@ -5068,197 +4607,7 @@ pub(crate) async fn handle_completions(
             .into_response();
     }
 
-    if logprobs.is_some() || (payload.stream && (choice_count > 1 || inputs.len() > 1)) {
-        let generated_count = Arc::new(AtomicU64::new(0));
-        let lifecycle = InferenceLifecycle::new(
-            cancel_guard,
-            InferenceLifecycleResources {
-                metrics: Arc::clone(&state.app.metrics),
-                request_start,
-                generated_tokens: Arc::clone(&generated_count),
-                prompt_tokens: prompt_tokens as u64,
-                permit,
-                runtime_lease: runtime_lease.clone(),
-            },
-            StreamExecution::Blocking,
-        );
-        let choices_request = crate::openai_choices::TextChoiceStream {
-            request_id,
-            model_id,
-            inputs,
-            echo_prompts: echo.then_some(original_prompts),
-            choice_count,
-            params,
-            stop_sequences,
-            response_format,
-            tool_config: None,
-            chat: false,
-            include_usage: false,
-            prompt_tokens: prompt_tokens as u64,
-            scheduled: None,
-        };
-        return if payload.stream {
-            crate::openai_choices::stream_text_choices(
-                Arc::clone(&state),
-                pipeline,
-                choices_request,
-                lifecycle,
-                generated_count,
-                cancel_token,
-                request_start,
-            )
-        } else {
-            crate::openai_choices::buffered_text_choices(
-                Arc::clone(&state),
-                pipeline,
-                choices_request,
-                lifecycle,
-                generated_count,
-                cancel_token,
-                request_start,
-            )
-            .await
-        };
-    }
-
-    if !payload.stream {
-        let generated_count = Arc::new(AtomicU64::new(0));
-        let lifecycle = InferenceLifecycle::new(
-            cancel_guard,
-            InferenceLifecycleResources {
-                metrics: Arc::clone(&state.app.metrics),
-                request_start,
-                generated_tokens: Arc::clone(&generated_count),
-                prompt_tokens: prompt_tokens as u64,
-                permit,
-                runtime_lease: runtime_lease.clone(),
-            },
-            StreamExecution::Blocking,
-        );
-        let worker_lifecycle = lifecycle.worker_guard();
-        let mut client_guard = lifecycle.client_guard();
-        let pipeline_for_run = Arc::clone(&pipeline);
-        let cancel_token_for_run = cancel_token.clone();
-        let stop_sequences_for_run = stop_sequences.clone();
-        let inputs_for_run = inputs.clone();
-        let choice_count_for_run = choice_count;
-        let inference_start = std::time::Instant::now();
-        let res = task::spawn_blocking(move || {
-            let _worker_lifecycle = worker_lifecycle;
-            run_cancellable_text_prompt_choices(
-                &pipeline_for_run,
-                &inputs_for_run,
-                &params,
-                &cancel_token_for_run,
-                &stop_sequences_for_run,
-                choice_count_for_run,
-            )
-        })
-        .await;
-        state
-            .app
-            .metrics
-            .record_inference_latency(inference_start.elapsed().as_secs_f64());
-
-        let generated_outputs = match res {
-            Ok(Ok(outputs)) => outputs,
-            Ok(Err(e)) => {
-                client_guard.finish(false);
-                if cancel_token.is_cancelled() {
-                    return error_response(
-                        axum::http::StatusCode::REQUEST_TIMEOUT,
-                        "request_cancelled",
-                        "The generation request was cancelled.",
-                    );
-                }
-                return error_response(
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal_error",
-                    format!("Inference failed: {}", e),
-                );
-            }
-            Err(e) => {
-                client_guard.finish(false);
-                return error_response(
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal_error",
-                    format!("Task join failed: {}", e),
-                );
-            }
-        };
-        let mut completion_tokens = 0_usize;
-        let mut choices = Vec::with_capacity(generated_outputs.len());
-        for (index, generated_output) in generated_outputs.into_iter().enumerate() {
-            let generated_text = generated_output.text;
-            if let Err(message) = validate_structured_output(&generated_text, &response_format) {
-                client_guard.finish(false);
-                return error_response(
-                    axum::http::StatusCode::UNPROCESSABLE_ENTITY,
-                    "invalid_response_format",
-                    message,
-                );
-            }
-            let output_tokens = match pipeline.tokenize(&generated_text) {
-                Ok(tokens) => tokens.len(),
-                Err(error) => {
-                    client_guard.finish(false);
-                    return error_response(
-                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                        "tokenization_error",
-                        format!("Completion tokenization failed: {error}"),
-                    );
-                }
-            };
-            completion_tokens = completion_tokens.saturating_add(output_tokens);
-            let finish_reason = if generated_output.stopped {
-                "stop"
-            } else {
-                generation_finish_reason(output_tokens, max_tokens)
-            };
-            let prompt_index = index / choice_count;
-            let response_text = if echo {
-                format!(
-                    "{}{generated_text}",
-                    original_prompts
-                        .get(prompt_index)
-                        .map(String::as_str)
-                        .unwrap_or_default()
-                )
-            } else {
-                generated_text
-            };
-            choices.push(json!({
-                "index": index,
-                "text": response_text,
-                "finish_reason": finish_reason
-            }));
-        }
-        generated_count.store(completion_tokens as u64, Ordering::Relaxed);
-
-        client_guard.finish(true);
-
-        return Json(json!({
-            "id": request_id,
-            "object": "text_completion",
-            "created": unix_seconds(),
-            "model": model_id.clone(),
-            "choices": choices,
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens
-            }
-        }))
-        .into_response();
-    }
-
-    // Streaming
-    let (tx, rx) = mpsc::channel::<std::result::Result<String, String>>(100);
-    let pipeline_for_stream_run = Arc::clone(&pipeline);
-    let cancel_token_clone = cancel_token.clone();
-    let stop_sequence_hit = Arc::new(AtomicBool::new(false));
-    let stop_sequence_hit_for_worker = Arc::clone(&stop_sequence_hit);
-    let stop_sequences_for_stream = stop_sequences.clone();
+    // Direct text requests share one bounded, cancellation-aware collector.
     let generated_count = Arc::new(AtomicU64::new(0));
     let lifecycle = InferenceLifecycle::new(
         cancel_guard,
@@ -5272,176 +4621,43 @@ pub(crate) async fn handle_completions(
         },
         StreamExecution::Blocking,
     );
-    let worker_lifecycle = lifecycle.worker_guard();
-    task::spawn_blocking(move || {
-        let _worker_lifecycle = worker_lifecycle;
-        let tx_clone = tx.clone();
-        let mut stop_filter = StopSequenceFilter::new(stop_sequences_for_stream);
-        let run_res = pipeline_for_stream_run.run_stream(
-            input,
-            &params,
-            &mut |chunk: bloomai_engine::io::OutputChunk| {
-                if cancel_token_clone.is_cancelled() {
-                    return Err(anyhow!("request cancelled"));
-                }
-                if let bloomai_engine::io::OutputChunk::TextDelta(text) = chunk {
-                    let update = stop_filter.push(&text);
-                    if !update.text.is_empty() && tx_clone.blocking_send(Ok(update.text)).is_err() {
-                        return Err(anyhow!("client disconnected"));
-                    }
-                    if update.stopped {
-                        stop_sequence_hit_for_worker.store(true, Ordering::Release);
-                        return Err(anyhow!("stop sequence reached"));
-                    }
-                }
-                Ok(())
-            },
-        );
-        if run_res.is_ok() {
-            let tail = stop_filter.finish();
-            if !tail.is_empty() {
-                let _ = tx.blocking_send(Ok(tail));
-            }
-        } else if !stop_sequence_hit_for_worker.load(Ordering::Acquire) {
-            let e = run_res.expect_err("failed stream result must contain an error");
-            let _ = tx.blocking_send(Err(e.to_string()));
-        }
-    });
-
-    let req_id = request_id.clone();
-    let model = model_id.clone();
-    let state_for_stream = Arc::clone(&state);
-    let first_token_seen = Arc::new(AtomicBool::new(false));
-    let last_token_time = Arc::new(std::sync::Mutex::new(None));
-    let stream_failed = Arc::new(AtomicBool::new(false));
-    let generated_count_for_stream = Arc::clone(&generated_count);
-    let first_token_for_stream = Arc::clone(&first_token_seen);
-    let last_token_for_stream = Arc::clone(&last_token_time);
-    let stream_failed_for_stream = Arc::clone(&stream_failed);
-
-    let accumulated_text = Arc::new(std::sync::Mutex::new(String::new()));
-    let accumulated_text_for_stream = Arc::clone(&accumulated_text);
-
-    let pipeline_for_stream = Arc::clone(&pipeline);
-    let sse_stream = ReceiverStream::new(rx).map(move |item| {
-        let chunk = match item {
-            Ok(token) => {
-                {
-                    let mut acc = accumulated_text_for_stream
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    acc.push_str(&token);
-                }
-                let token_count = estimate_delta_tokens(&pipeline_for_stream, &token);
-                record_stream_tokens(
-                    &state_for_stream,
-                    request_start,
-                    &first_token_for_stream,
-                    &last_token_for_stream,
-                    &generated_count_for_stream,
-                    token_count,
-                );
-                json!({
-                    "id": req_id,
-                    "object": "text_completion.chunk",
-                    "created": unix_seconds(),
-                    "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "text": token,
-                        "finish_reason": null
-                    }]
-                })
-            }
-            Err(message) => {
-                stream_failed_for_stream.store(true, Ordering::Relaxed);
-                json!({
-                    "error": {
-                        "message": message,
-                        "type": "internal_error"
-                    }
-                })
-            }
-        };
-        Ok::<Event, std::convert::Infallible>(json_event(chunk))
-    });
-
-    let stream_failed_for_final = Arc::clone(&stream_failed);
-    let stream_failed_for_validation = Arc::clone(&stream_failed);
-    let accumulated_text_for_final = Arc::clone(&accumulated_text);
-    let response_format_for_final = response_format.clone();
-    let stop_sequence_hit_for_final = Arc::clone(&stop_sequence_hit);
-    let generated_count_for_final = Arc::clone(&generated_count);
-    let final_request_id = request_id.clone();
-    let final_model_id = model_id.clone();
-    let mut lifecycle_for_final = lifecycle.client_guard();
-
-    let echo_prefix_events = if echo {
-        let prefix_id = request_id.clone();
-        let prefix_model = model_id.clone();
-        let prefix_prompt = original_prompts[0].clone();
-        vec![Ok::<Event, std::convert::Infallible>(json_event(json!({
-            "id": prefix_id,
-            "object": "text_completion.chunk",
-            "created": unix_seconds(),
-            "model": prefix_model,
-            "choices": [{
-                "index": 0,
-                "text": prefix_prompt,
-                "finish_reason": null
-            }]
-        })))]
-    } else {
-        Vec::new()
+    let choices_request = crate::openai_choices::TextChoiceStream {
+        request_id,
+        model_id,
+        inputs,
+        echo_prompts: echo.then_some(original_prompts),
+        choice_count,
+        params,
+        stop_sequences,
+        response_format,
+        tool_config: None,
+        chat: false,
+        include_usage: false,
+        prompt_tokens: prompt_tokens as u64,
+        scheduled: None,
     };
-    let final_stream = futures::stream::iter(echo_prefix_events)
-        .chain(sse_stream)
-        .chain(futures::stream::once(async move {
-            let text = {
-                let acc = accumulated_text_for_final
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                acc.clone()
-            };
-            if let Err(message) = validate_structured_output(&text, &response_format_for_final) {
-                stream_failed_for_validation.store(true, Ordering::Relaxed);
-                let err_chunk = json!({
-                    "error": {
-                        "message": format!("Stream structured output validation failed: {}", message),
-                        "type": "invalid_response_format"
-                    }
-                });
-                Ok::<Event, std::convert::Infallible>(json_event(err_chunk))
-            } else {
-                let finish_reason = if stop_sequence_hit_for_final.load(Ordering::Acquire) {
-                    "stop"
-                } else {
-                    generation_finish_reason(
-                        generated_count_for_final.load(Ordering::Relaxed) as usize,
-                        max_tokens,
-                    )
-                };
-                Ok::<Event, std::convert::Infallible>(json_event(json!({
-                    "id": final_request_id,
-                    "object": "text_completion.chunk",
-                    "created": unix_seconds(),
-                    "model": final_model_id,
-                    "choices": [{
-                        "index": 0,
-                        "text": "",
-                        "finish_reason": finish_reason
-                    }]
-                })))
-            }
-        }))
-        .chain(futures::stream::once(async move {
-            lifecycle_for_final.finish(!stream_failed_for_final.load(Ordering::Relaxed));
-            Ok::<Event, std::convert::Infallible>(Event::default().data("[DONE]"))
-        }));
-
-    Sse::new(final_stream)
-        .keep_alive(axum::response::sse::KeepAlive::default())
-        .into_response()
+    if payload.stream {
+        crate::openai_choices::stream_text_choices(
+            Arc::clone(&state),
+            pipeline,
+            choices_request,
+            lifecycle,
+            generated_count,
+            cancel_token,
+            request_start,
+        )
+    } else {
+        crate::openai_choices::buffered_text_choices(
+            Arc::clone(&state),
+            pipeline,
+            choices_request,
+            lifecycle,
+            generated_count,
+            cancel_token,
+            request_start,
+        )
+        .await
+    }
 }
 
 // ─── /v1/embeddings ────────────────────────────────────────────────────────
@@ -5539,7 +4755,9 @@ pub(crate) async fn handle_rerank(
         texts,
         false,
         EmbeddingProjection::Rerank {
-            top_n: payload.top_n.unwrap_or(payload.documents.len()),
+            top_n: payload.top_n.map_or(payload.documents.len(), |top_n| {
+                top_n.min(payload.documents.len())
+            }),
         },
     )
     .await
@@ -5962,6 +5180,9 @@ pub(crate) fn validate_multimodal_request(
         payload.params.temperature,
         payload.params.top_p,
     )?;
+    // Reject every invalid control before admission and the 200 SSE commit;
+    // the pipeline repeats this check for embedded and FFI callers.
+    payload.params.validate()?;
     if !matches!(
         payload.params.response_format.as_ref(),
         None | Some(bloomai_core::ResponseFormat::Text)

@@ -292,6 +292,22 @@ def _normalize_logit_bias(logit_bias):
     return normalized
 
 
+def _is_generation_metadata(value) -> bool:
+    """Check the additive buffered ``generation`` object's shape.
+
+    ``reason`` is any non-empty string so newer native termination reasons
+    remain readable; current libraries report ``eos``, ``length`` or ``stop``.
+    """
+    if not isinstance(value, dict):
+        return False
+    for key in ("input_tokens", "output_tokens"):
+        count = value.get(key)
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            return False
+    reason = value.get("reason")
+    return isinstance(reason, str) and bool(reason)
+
+
 def _bytes_slice(value: bytes):
     """Return a length-delimited ABI slice and an owner that keeps it alive."""
     owner = ctypes.create_string_buffer(value, max(1, len(value)))
@@ -785,7 +801,11 @@ class BloomPipeline:
         :param logprobs: Optional selected-token log probabilities, with 0–20
             alternatives per token. Requires max_tokens <= 4096 and a supported
             native backend. None omits this control for older libraries.
-        :return: Decoded ModelOutput dict.
+        :return: Decoded ModelOutput dict. Models with exact native accounting
+            add ``"generation": {"input_tokens", "output_tokens", "reason"}``,
+            where ``reason`` is ``"eos"``, ``"length"`` or ``"stop"``.
+            Output tokens include an accepted EOS token. The key is absent for
+            legacy adapters and older native libraries.
         """
         input_bytes, params_bytes = self._prepare_input_params(
             prompt_or_input, max_tokens, temperature, top_p, seed, response_format,
@@ -869,6 +889,10 @@ class BloomPipeline:
         if not isinstance(result, dict):
             raise BloomInferenceError(
                 f"{_label(self.locale, 'invalid_json')}: expected a JSON object"
+            )
+        if "generation" in result and not _is_generation_metadata(result["generation"]):
+            raise BloomInferenceError(
+                f"{_label(self.locale, 'invalid_json')}: malformed generation metadata"
             )
         return result
 

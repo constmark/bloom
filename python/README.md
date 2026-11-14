@@ -42,6 +42,22 @@ python scripts/build_python_native_wheel.py --native-library target/release/libb
 python scripts/test_python_native_wheel.py release-artifacts/python/*.whl
 ```
 
+The builder checks real buffered and streamed calls through both C ABI
+revisions, including Unicode and cancellation, before packaging. The install
+gate disables inherited pip destination/configuration overrides and installs
+offline into a fresh virtual environment. To verify an existing compatible
+trained CPU model without downloading weights, add:
+
+```sh
+python scripts/test_python_native_wheel.py /path/to/native-wheel.whl \
+  --model /path/to/qwen2.gguf --require-generation-metadata --check-logprobs
+```
+
+This additionally checks multilingual tokenizer round trips, deterministic
+buffered/streamed text equality, the current generation metadata contract,
+and matching token log probabilities. `--check-logprobs` requires a model and
+tokenizer that advertise that capability; it is optional for other models.
+
 Use the appropriate native filename on Linux/Windows. CI builds on all three
 OS families and installs the same artifact under Python 3.9, 3.12 and 3.14.
 Hosted execution remains a required acceptance gate; local macOS checks do not
@@ -113,8 +129,24 @@ Unsupported models, devices, and decoding combinations fail explicitly.
 probabilities. Join selected token byte arrays before decoding split UTF-8.
 The default `logprobs=None` omits the field for older-library compatibility.
 
+Buffered `generate` results from models with exact native accounting include
+`result["generation"]`: `input_tokens`, `output_tokens` (including an accepted
+EOS token) and `reason` (`"eos"`, `"length"` or `"stop"`). A `"length"` reason
+means `max_tokens` was exhausted. The key is absent for legacy adapters and
+older native libraries.
+
+`device` defaults to `"cpu"`; `device="auto"` selects the first available GPU,
+NPU or CPU declared by the chosen engine, matching the CLI and server default.
+
 Streaming buffers at most 64 serialized chunks and 16 MiB of queued bytes.
 Data chunks are dictionaries; the native terminal event is the string `"End"`.
+Current native text runtimes can additionally emit
+`{"GenerationFinished": {"input_tokens": 12, "output_tokens": 4, "reason": "length"}}`
+after the text and before `End`. Reasons are `eos`, `length`, or `stop`;
+accepted-token counts include EOS. This additive event is passed through
+unchanged by both ABI revisions and does not end the Python iterator. Continue
+consuming through `End` to observe the complete stream. Runtimes without this
+capability can omit the event.
 Slow consumers apply backpressure to native callbacks. Individual chunks over
 16 MiB fail with `BloomInferenceError`. Close partially consumed generators to
 release their workers; leaving the pipeline context also stops its streams and

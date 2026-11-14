@@ -374,6 +374,10 @@ impl ConnectionState {
         )
     }
 
+    fn uses_encoder_workspace(&self) -> bool {
+        (self.can_embed() || self.can_rerank()) && !self.can_chat()
+    }
+
     fn can_transcribe(&self) -> bool {
         matches!(
             self,
@@ -602,6 +606,7 @@ fn launch_generation(request: GenerationRequest, signals: GenerationSignals) {
         let mut first_token_ms = None;
         let mut usage = None::<ChatUsage>;
         let mut response_model = None::<String>;
+        let mut truncated = false;
         let result = {
             let on_update = |update| match update {
                 StreamUpdate::RequestId(request_id) => {
@@ -624,6 +629,9 @@ fn launch_generation(request: GenerationRequest, signals: GenerationSignals) {
                     });
                 }
                 StreamUpdate::Usage(stream_usage) => usage = Some(stream_usage),
+                update @ StreamUpdate::FinishReason(_) => {
+                    truncated = update.is_length_finish();
+                }
             };
             if let Some(image) = attachment.as_ref() {
                 match multimodal_prompt.as_deref() {
@@ -664,7 +672,8 @@ fn launch_generation(request: GenerationRequest, signals: GenerationSignals) {
             prompt_tokens,
             completion_tokens,
             response_model,
-        );
+        )
+        .with_truncation(truncated);
         conversations.with_mut(|store| {
             let _ = store.set_assistant_generation_stats(conversation_id, assistant_index, stats);
         });
@@ -1345,7 +1354,7 @@ fn App() -> Element {
         ConnectionStatusAction::Models => show_models.set(true),
         ConnectionStatusAction::Diagnostics => show_diagnostics.set(true),
     };
-    let show_embedding_workspace = connection().can_embed() && !connection().can_chat();
+    let show_embedding_workspace = connection().uses_encoder_workspace();
     let show_speech_workspace = connection().can_transcribe() && !connection().can_chat();
     let show_specialized_workspace = show_embedding_workspace || show_speech_workspace;
     let embedding_workspace_model = connection()
@@ -1354,6 +1363,8 @@ fn App() -> Element {
         .unwrap_or_default()
         .to_string();
     let embedding_workspace_rerank = connection().can_rerank();
+    let embedding_workspace_vectors = connection().can_embed();
+    let encoder_title = encoder_workspace_title(selected_locale, embedding_workspace_vectors);
     let speech_workspace_model = connection()
         .active_model()
         .filter(|_| show_speech_workspace)
@@ -1610,7 +1621,7 @@ fn App() -> Element {
                                 if show_speech_workspace {
                                     "{copy.brand_speech}"
                                 } else if show_embedding_workspace {
-                                    "{copy.brand_embedding}"
+                                    "{encoder_title}"
                                 } else {
                                     "{copy.brand_chat}"
                                 }
@@ -1765,9 +1776,10 @@ fn App() -> Element {
                     }
                 } else if show_embedding_workspace {
                     EmbeddingWorkspace {
-                        key: "{embedding_workspace_model}",
+                        key: "{embedding_workspace_model}:{embedding_workspace_vectors}:{embedding_workspace_rerank}",
                         config,
                         model: embedding_workspace_model,
+                        supports_embeddings: embedding_workspace_vectors,
                         supports_rerank: embedding_workspace_rerank,
                         locale: selected_locale,
                     }
@@ -4360,6 +4372,13 @@ fn generation_outcome_label(outcome: GenerationOutcome) -> Option<&'static str> 
     }
 }
 
+/// Visible notice for answers that stopped at the generated-token limit.
+const TRUNCATION_NOTICE: &str = "Response truncated at the token limit. Raise Maximum generated tokens in Settings or ask the model to continue.";
+
+fn generation_truncation_notice(stats: &GenerationStats) -> Option<&'static str> {
+    stats.truncated.then_some(TRUNCATION_NOTICE)
+}
+
 fn validate_context_reservation(
     max_tokens: usize,
     context_window: Option<u64>,
@@ -4902,6 +4921,28 @@ enum EmbeddingWorkspaceMode {
     Rerank,
 }
 
+impl EmbeddingWorkspaceMode {
+    fn initial(supports_embeddings: bool) -> Self {
+        if supports_embeddings {
+            Self::Embeddings
+        } else {
+            Self::Rerank
+        }
+    }
+}
+
+fn encoder_workspace_title(locale: Locale, supports_embeddings: bool) -> &'static str {
+    if supports_embeddings {
+        ui_copy(locale).brand_embedding
+    } else {
+        match locale {
+            Locale::English => "Document reranking",
+            Locale::SimplifiedChinese => "文档重排",
+            Locale::Japanese => "文書の再ランキング",
+        }
+    }
+}
+
 fn parse_optional_embedding_dimensions(value: &str) -> Result<Option<usize>, String> {
     let value = value.trim();
     if value.is_empty() {
@@ -4956,11 +4997,12 @@ fn encoder_input_preview(input: &str) -> String {
 fn EmbeddingWorkspace(
     config: Signal<ConnConfig>,
     model: String,
+    supports_embeddings: bool,
     supports_rerank: bool,
     locale: Locale,
 ) -> Element {
-    let copy = ui_copy(locale);
-    let mut mode = use_signal(|| EmbeddingWorkspaceMode::Embeddings);
+    let title = encoder_workspace_title(locale, supports_embeddings);
+    let mut mode = use_signal(move || EmbeddingWorkspaceMode::initial(supports_embeddings));
     let mut embedding_input = use_signal(String::new);
     let mut dimensions_input = use_signal(String::new);
     let mut rerank_query = use_signal(String::new);
@@ -4976,7 +5018,7 @@ fn EmbeddingWorkspace(
 
     let embedding_model = model.clone();
     let run_embeddings = move |_| {
-        if pending() {
+        if pending() || !supports_embeddings {
             return;
         }
         let inputs = match api::parse_embedding_lines(&embedding_input()) {
@@ -5080,10 +5122,10 @@ fn EmbeddingWorkspace(
         section { class: "embedding-workspace", aria_labelledby: "embedding-workspace-title",
             div { class: "embedding-workspace-header",
                 div {
-                    span { class: "workspace-eyebrow", "{copy.brand_embedding}" }
-                    h2 { id: "embedding-workspace-title", "{copy.brand_embedding}" }
+                    span { class: "workspace-eyebrow", "{title}" }
+                    h2 { id: "embedding-workspace-title", "{title}" }
                     p {
-                        "Run bounded local vector operations with "
+                        "Run bounded local encoder operations with "
                         strong { "{model}" }
                         ". Input and results stay between this browser and the configured Bloom server."
                     }
@@ -5091,7 +5133,9 @@ fn EmbeddingWorkspace(
                 div { class: "workspace-model-meta",
                     span { "Active task" }
                     strong {
-                        if supports_rerank { "Embedding + rerank" } else { "Embedding" }
+                        if supports_embeddings && supports_rerank { "Embedding + rerank" }
+                        else if supports_embeddings { "Embedding" }
+                        else { "Rerank" }
                     }
                 }
             }
@@ -5101,6 +5145,8 @@ fn EmbeddingWorkspace(
                     class: if mode() == EmbeddingWorkspaceMode::Embeddings { "workspace-tab active" } else { "workspace-tab" },
                     role: "tab",
                     aria_selected: mode() == EmbeddingWorkspaceMode::Embeddings,
+                    disabled: !supports_embeddings,
+                    title: if supports_embeddings { "Create sentence vectors" } else { "The active model does not advertise embeddings" },
                     onclick: move |_| {
                         mode.set(EmbeddingWorkspaceMode::Embeddings);
                         workspace_error.set(None);
@@ -5113,7 +5159,7 @@ fn EmbeddingWorkspace(
                     role: "tab",
                     aria_selected: mode() == EmbeddingWorkspaceMode::Rerank,
                     disabled: !supports_rerank,
-                    title: if supports_rerank { "Rank documents by query similarity" } else { "The active model does not advertise reranking" },
+                    title: if supports_rerank { "Rank documents by query relevance" } else { "The active model does not advertise reranking" },
                     onclick: move |_| {
                         mode.set(EmbeddingWorkspaceMode::Rerank);
                         workspace_error.set(None);
@@ -5163,7 +5209,7 @@ fn EmbeddingWorkspace(
                         }
                         button {
                             class: "btn-primary workspace-run",
-                            disabled: pending() || embedding_input().trim().is_empty(),
+                            disabled: pending() || !supports_embeddings || embedding_input().trim().is_empty(),
                             onclick: run_embeddings,
                             if pending() { "Running…" } else { "Create embeddings" }
                         }
@@ -5259,7 +5305,7 @@ fn EmbeddingWorkspace(
                             disabled: pending(),
                             oninput: move |event| rerank_documents.set(event.value()),
                         }
-                        small { "Documents are returned in descending similarity order." }
+                        small { "Documents are ordered by relevance. Scores are model-specific and are not probabilities." }
                     }
                     div { class: "workspace-inline-controls",
                         label { class: "workspace-field compact-field",
@@ -5594,6 +5640,13 @@ fn MessageList(
                                     "{message.content}"
                                 }
                                 if message.role == "assistant" && !is_streaming {
+                                    if let Some(notice) = message
+                                        .generation
+                                        .as_ref()
+                                        .and_then(generation_truncation_notice)
+                                    {
+                                        p { class: "generation-truncation-notice", role: "note", "{notice}" }
+                                    }
                                     if let Some(stats) = message.generation.as_ref() {
                                         div { class: "generation-stats", aria_label: "Generation statistics",
                                             if let Some(label) = generation_outcome_label(stats.outcome) {
@@ -6637,21 +6690,22 @@ fn ConfirmDialog(
 mod tests {
     use super::{
         ChatMessage, ConnectionState, ConnectionStatusAction, ConversationImportMode,
-        ConversationStore, DisplayMessage, EmptyStateAction, GenerationOutcome, GenerationStats,
-        Locale, ModalKeyAction, ModelIndexLocalState, Readiness, api, append_transcript_segment,
-        connection_probe_is_current, connection_status_action, conversation_context_status,
-        conversation_import_candidate, conversation_model_transition, embedding_vector_norm,
-        embedding_vector_preview, empty_state_view, encoder_input_preview, format_duration,
+        ConversationStore, DisplayMessage, EmbeddingWorkspaceMode, EmptyStateAction,
+        GenerationOutcome, GenerationStats, Locale, ModalKeyAction, ModelIndexLocalState,
+        Readiness, api, append_transcript_segment, connection_probe_is_current,
+        connection_status_action, conversation_context_status, conversation_import_candidate,
+        conversation_model_transition, embedding_vector_norm, embedding_vector_preview,
+        empty_state_view, encoder_input_preview, encoder_workspace_title, format_duration,
         format_duration_seconds, format_generation_millis, format_inventory_changes,
         format_inventory_drift_severity, format_inventory_drift_status, format_load_phase,
         format_model_precision, format_model_tasks, format_optional_bytes, format_optional_count,
-        format_parameter_count, format_percent, generation_outcome_label, integrity_phase_label,
-        license_policy_allows, message_window, modal_key_action, model_index_local_state,
-        model_index_poll_interval_seconds, model_index_upgrade_source_is_active,
-        model_provenance_summary, optional_seed, parse_optional_embedding_dimensions,
-        probe_generation_is_current, supported_image_mime, supported_model_import_filename,
-        unconfirmed_conversation_model_transition, valid_sha256_input,
-        validate_context_reservation,
+        format_parameter_count, format_percent, generation_outcome_label,
+        generation_truncation_notice, integrity_phase_label, license_policy_allows, message_window,
+        modal_key_action, model_index_local_state, model_index_poll_interval_seconds,
+        model_index_upgrade_source_is_active, model_provenance_summary, optional_seed,
+        parse_optional_embedding_dimensions, probe_generation_is_current, supported_image_mime,
+        supported_model_import_filename, unconfirmed_conversation_model_transition,
+        valid_sha256_input, validate_context_reservation,
     };
     use dioxus::prelude::Key;
 
@@ -7076,6 +7130,19 @@ mod tests {
     }
 
     #[test]
+    fn truncated_generations_show_a_token_limit_notice() {
+        let stats = |truncated| {
+            GenerationStats::observed(GenerationOutcome::Completed, 50.0, None, None, None, None)
+                .with_truncation(truncated)
+        };
+        assert_eq!(generation_truncation_notice(&stats(false)), None);
+        let notice = generation_truncation_notice(&stats(true)).unwrap();
+        assert!(notice.starts_with("Response truncated at the token limit"));
+        // Truncation is informational, not a failure outcome.
+        assert_eq!(generation_outcome_label(stats(true).outcome), None);
+    }
+
+    #[test]
     fn context_budget_validation_and_warning_are_actionable() {
         assert!(validate_context_reservation(1_024, Some(4_096)).is_ok());
         assert!(validate_context_reservation(4_096, Some(4_096)).is_err());
@@ -7235,6 +7302,7 @@ mod tests {
         assert!(ready.supports_vision());
         assert!(!ready.can_embed());
         assert!(!ready.can_rerank());
+        assert!(!ready.uses_encoder_workspace());
         assert!(!ready.can_transcribe());
         assert_eq!(ready.context_window(), Some(8_192));
 
@@ -7263,7 +7331,33 @@ mod tests {
         assert!(!encoder.can_chat());
         assert!(encoder.can_embed());
         assert!(encoder.can_rerank());
+        assert!(encoder.uses_encoder_workspace());
         assert_eq!(encoder.context_window(), Some(256));
+
+        let reranker = ConnectionState::from_readiness(Readiness {
+            status: "ready".into(),
+            model: "cross-encoder".into(),
+            input_modalities: vec!["text".into()],
+            model_tasks: vec!["rerank".into()],
+            context_window: Some(512),
+            ..Readiness::default()
+        });
+        assert!(!reranker.can_chat());
+        assert!(!reranker.can_embed());
+        assert!(reranker.can_rerank());
+        assert!(reranker.uses_encoder_workspace());
+        assert_eq!(
+            EmbeddingWorkspaceMode::initial(reranker.can_embed()),
+            EmbeddingWorkspaceMode::Rerank
+        );
+        assert_eq!(
+            EmbeddingWorkspaceMode::initial(encoder.can_embed()),
+            EmbeddingWorkspaceMode::Embeddings
+        );
+        assert_eq!(
+            encoder_workspace_title(Locale::English, false),
+            "Document reranking"
+        );
 
         let empty = ConnectionState::from_readiness(Readiness {
             status: "not_ready".into(),
@@ -7271,6 +7365,7 @@ mod tests {
         });
         assert_eq!(empty, ConnectionState::NoModel);
         assert_eq!(empty.active_model(), None);
+        assert!(!empty.uses_encoder_workspace());
 
         let failed = ConnectionState::from_readiness(Readiness {
             status: "not_ready".into(),

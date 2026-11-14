@@ -26,7 +26,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use bloomai_core::{GenerationParams, ResponseFormat};
 use candle_core::{Device, Tensor};
 
@@ -534,7 +534,7 @@ impl CandleBatchExecutor {
                             // defer all stochastic or adjusted distributions
                             // to the normal per-request sampler.
                             || req_params.is_none_or(|params| {
-                                params.temperature > 1e-7
+                                params.temperature > super::GREEDY_TEMPERATURE
                                     || !super::speculative::supports_sampling(speculative_mode_ref, params)
                             })
                         {
@@ -783,8 +783,7 @@ impl CandleBatchExecutor {
                 .to_vec1::<f32>()?
         };
 
-        let next_tok = sample_logits(&logits_vec, req_params, generated_tokens);
-        Ok(next_tok)
+        sample_logits(&logits_vec, req_params, generated_tokens)
     }
 
     /// Extract KV for `[start_pos, start_pos + seq_len)` from every layer of
@@ -1214,11 +1213,14 @@ impl TokenBudget {
 /// Sample a token from logits using temperature, top-p, and optional seed.
 ///
 /// When `params` is `None` or temperature is 0, falls back to greedy (argmax).
+/// NaN or positive-infinite logits are model numeric failures and negative
+/// infinity marks a masked token; a step without any sampleable token fails
+/// instead of selecting an arbitrary or masked id.
 fn sample_logits(
     logits: &[f32],
     params: Option<&GenerationParams>,
     generated_tokens: &[u32],
-) -> u32 {
+) -> Result<u32> {
     let (temperature, top_p, top_k, seed, presence_penalty, frequency_penalty, logit_bias) =
         match params {
             Some(p) => (
@@ -1234,7 +1236,13 @@ fn sample_logits(
         };
 
     if logits.is_empty() {
-        return 0;
+        bail!("the model produced empty logits");
+    }
+    if let Some(index) = logits
+        .iter()
+        .position(|logit| logit.is_nan() || *logit == f32::INFINITY)
+    {
+        bail!("the model produced a non-finite logit at token {index}");
     }
 
     // Apply repetition penalties and logit bias before top-k/top-p selection,
@@ -1253,11 +1261,7 @@ fn sample_logits(
         .iter()
         .enumerate()
         .map(|(token, &logit)| {
-            let mut value = if logit.is_finite() {
-                logit
-            } else {
-                f32::NEG_INFINITY
-            };
+            let mut value = logit;
             if let Some(count) = counts
                 .as_ref()
                 .and_then(|counts| counts.get(&(token as u32)))
@@ -1270,15 +1274,20 @@ fn sample_logits(
             (token, value)
         })
         .collect();
+    // Penalties and bias are finite, so only masked tokens remain at -inf.
+    candidates.retain(|(_, logit)| *logit > f32::NEG_INFINITY);
+    if candidates.is_empty() {
+        bail!("every token was masked before sampling");
+    }
 
     // Greedy sampling never needs a softmax. Top-k does not change argmax,
     // but penalties and bias have already been applied above.
-    if temperature <= 1e-6 {
+    if temperature <= super::GREEDY_TEMPERATURE {
         return candidates
             .iter()
             .max_by(|(_, a), (_, b)| a.total_cmp(b))
             .map(|(idx, _)| *idx as u32)
-            .unwrap_or(0);
+            .context("no sampleable token");
     }
 
     // Select the largest k logits in O(vocab) average time, then sort only the
@@ -1301,12 +1310,7 @@ fn sample_logits(
         .collect();
 
     if weighted.is_empty() {
-        return logits
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.total_cmp(b))
-            .map(|(idx, _)| idx as u32)
-            .unwrap_or(0);
+        bail!("no token has a finite sampling weight");
     }
 
     // Top-p requires probability order. With top_k present this sorts only k
@@ -1328,7 +1332,7 @@ fn sample_logits(
 
     let total: f32 = weighted.iter().map(|(_, weight)| *weight).sum();
     if !(total.is_finite() && total > 0.0) {
-        return weighted.first().map(|(idx, _)| *idx as u32).unwrap_or(0);
+        bail!("token sampling weights do not form a distribution");
     }
 
     // Position-derived seeded draws survive batching, preemption and request
@@ -1348,10 +1352,13 @@ fn sample_logits(
     for (token, weight) in &weighted {
         cumulative += *weight / total;
         if threshold < cumulative {
-            return *token as u32;
+            return Ok(*token as u32);
         }
     }
-    weighted.last().map(|(idx, _)| *idx as u32).unwrap_or(0)
+    weighted
+        .last()
+        .map(|(idx, _)| *idx as u32)
+        .context("no sampleable token")
 }
 
 #[cfg(test)]
@@ -1385,10 +1392,10 @@ mod tests {
         let mut counts = [0usize; 4];
         let history = vec![0; 1024];
         for position in 0..history.len() {
-            let token = sample_logits(&[0.0; 4], Some(&params), &history[..position]);
+            let token = sample_logits(&[0.0; 4], Some(&params), &history[..position]).unwrap();
             assert_eq!(
                 token,
-                sample_logits(&[0.0; 4], Some(&params), &history[..position])
+                sample_logits(&[0.0; 4], Some(&params), &history[..position]).unwrap()
             );
             counts[token as usize] += 1;
         }
@@ -1409,7 +1416,10 @@ mod tests {
             seed: Some(7),
             ..Default::default()
         };
-        assert_eq!(sample_logits(&[10.0, 9.0, 8.0], Some(&top_k), &[]), 0);
+        assert_eq!(
+            sample_logits(&[10.0, 9.0, 8.0], Some(&top_k), &[]).unwrap(),
+            0
+        );
 
         let penalized = GenerationParams {
             temperature: 0.0,
@@ -1418,7 +1428,10 @@ mod tests {
             ..Default::default()
         };
         // Token 0 falls below token 1 after its presence penalty.
-        assert_eq!(sample_logits(&[10.0, 9.0, 8.0], Some(&penalized), &[0]), 1);
+        assert_eq!(
+            sample_logits(&[10.0, 9.0, 8.0], Some(&penalized), &[0]).unwrap(),
+            1
+        );
 
         let mut bias = BTreeMap::new();
         bias.insert(2, 5.0);
@@ -1427,7 +1440,70 @@ mod tests {
             logit_bias: Some(bias),
             ..Default::default()
         };
-        assert_eq!(sample_logits(&[1.0, 2.0, 1.5], Some(&biased), &[]), 2);
+        assert_eq!(
+            sample_logits(&[1.0, 2.0, 1.5], Some(&biased), &[]).unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn batch_sampler_rejects_numeric_failures_and_never_selects_masked_tokens() {
+        let sampled = GenerationParams {
+            temperature: 1.0,
+            seed: Some(3),
+            ..Default::default()
+        };
+        for params in [None, Some(&sampled)] {
+            for logits in [
+                vec![f32::NAN, 1.0],
+                vec![f32::NAN; 3],
+                vec![1.0, f32::INFINITY],
+                vec![f32::NEG_INFINITY; 2],
+                Vec::new(),
+            ] {
+                assert!(
+                    sample_logits(&logits, params, &[]).is_err(),
+                    "{logits:?} must not produce a token"
+                );
+            }
+            for seed in 0..32 {
+                let params = params.map(|params| GenerationParams {
+                    seed: Some(seed),
+                    ..params.clone()
+                });
+                assert_eq!(
+                    sample_logits(
+                        &[f32::NEG_INFINITY, 0.0, f32::NEG_INFINITY],
+                        params.as_ref(),
+                        &[]
+                    )
+                    .unwrap(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn batch_top_k_then_top_p_renormalizes_before_the_nucleus() {
+        // Four equal logits with k=2 leave two tokens at probability 0.5
+        // each after renormalization, so top_p=0.3 keeps only one of them.
+        let params = GenerationParams {
+            temperature: 1.0,
+            top_p: 0.3,
+            top_k: Some(2),
+            ..Default::default()
+        };
+        let mut batch = std::collections::BTreeSet::new();
+        for seed in 0..64 {
+            let params = GenerationParams {
+                seed: Some(seed),
+                ..params.clone()
+            };
+            batch.insert(sample_logits(&[0.0; 4], Some(&params), &[]).unwrap());
+        }
+        // The direct path has the matching usage test in `candle::usage_tests`.
+        assert_eq!(batch.len(), 1, "batch nucleus: {batch:?}");
     }
 
     #[test]

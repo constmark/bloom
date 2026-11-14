@@ -16,10 +16,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from typing import Any
 from pathlib import Path
+
+
+MAX_VALUES = 16 * 1024 * 1024
 
 
 def _embedding_encoder(session: Any, model_path: str, config: dict[str, Any]):
@@ -105,7 +109,7 @@ def _embed(session: Any, model_path: str, request: dict[str, Any]) -> dict[str, 
     # includes special tokens and respects truncation; batch padding is excluded.
     prompt_tokens = int(mask.sum())
     result = np.asarray(session.run([config["output_name"]], feed)[0])
-    if result.dtype.kind != "f" or result.shape[0] != len(texts):
+    if result.dtype.kind != "f" or result.ndim not in (2, 3) or result.shape[0] != len(texts):
         raise ValueError("encoder output must be a floating tensor with the requested batch")
     pooling = config["pooling"]
     if pooling == "none":
@@ -140,7 +144,9 @@ def _provider_configuration(requested: str, device: str) -> tuple[str, dict[str,
         return "OpenVINOExecutionProvider", {
             "device_type": "NPU" if device.upper() in {"NPU", "OPENVINO"} else "CPU"
         }
-    return "CPUExecutionProvider", {}
+    if normalized in {"CPU", "CPUEXECUTIONPROVIDER"}:
+        return "CPUExecutionProvider", {}
+    raise ValueError(f"unsupported ONNX Runtime provider: {requested!r}")
 
 
 def _session(model_path: str, device: str, requested_provider: str, ort: Any):
@@ -155,12 +161,18 @@ def _session(model_path: str, device: str, requested_provider: str, ort: Any):
         # A non-CPU request must fail when the selected EP cannot cover the
         # graph; silently appending CPU would make Bloom report a false device.
         session_options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
-    return ort.InferenceSession(
+    session = ort.InferenceSession(
         model_path,
         sess_options=session_options,
         providers=[provider],
         provider_options=[options],
-    ), provider
+    )
+    # ORT can retry session construction with a fallback provider internally.
+    # Verify the actual session before reporting the requested device as active.
+    if provider not in session.get_providers():
+        raise RuntimeError(f"ONNX Runtime did not activate requested provider {provider}")
+    session.disable_fallback()
+    return session, provider
 
 
 def _input_value(request: dict[str, Any]) -> Any:
@@ -188,42 +200,56 @@ def _coerce(value: Any, input_meta: Any):
     import numpy as np
 
     type_name = str(input_meta.type)
-    if "string" in type_name:
-        return np.asarray([str(value)], dtype=object)
-    if isinstance(value, str):
-        try:
-            value = [int(token) for token in value.split()]
-        except ValueError as exc:
-            raise ValueError(
-                "the ONNX model expects numeric input; Text must contain whitespace-separated integers"
-            ) from exc
-    if "int64" in type_name:
-        dtype = np.int64
-    elif "int32" in type_name:
-        dtype = np.int32
-    elif "int16" in type_name:
-        dtype = np.int16
-    elif "uint8" in type_name:
-        dtype = np.uint8
-    elif "int8" in type_name:
-        dtype = np.int8
-    elif "float16" in type_name:
-        dtype = np.float16
-    elif "double" in type_name or "float64" in type_name:
-        dtype = np.float64
+    types = {"tensor(int64)": np.int64, "tensor(int32)": np.int32,
+             "tensor(int16)": np.int16, "tensor(int8)": np.int8,
+             "tensor(uint64)": np.uint64, "tensor(uint32)": np.uint32,
+             "tensor(uint16)": np.uint16, "tensor(uint8)": np.uint8,
+             "tensor(float16)": np.float16, "tensor(float)": np.float32,
+             "tensor(double)": np.float64, "tensor(bool)": np.bool_}
+    if type_name == "tensor(string)":
+        if not isinstance(value, str):
+            raise ValueError("string ONNX inputs require text")
+        array = np.asarray([value], dtype=object)
+    elif type_name not in types:
+        raise ValueError(f"unsupported ONNX input type: {type_name}")
     else:
-        dtype = np.float32
-    array = np.asarray(value, dtype=dtype)
-    shape = getattr(input_meta, "shape", None) or []
+        if isinstance(value, str):
+            try:
+                value = [int(token) for token in value.split()]
+            except ValueError as exc:
+                raise ValueError(
+                    "the ONNX model expects numeric input; Text must contain whitespace-separated integers"
+                ) from exc
+        if not isinstance(value, list) or not 1 <= len(value) <= MAX_VALUES:
+            raise ValueError("numeric ONNX input must be a bounded nonempty list")
+        dtype = np.dtype(types[type_name])
+        for item in value:
+            if type(item) not in (int, float) or (isinstance(item, float) and not math.isfinite(item)):
+                raise ValueError("numeric ONNX input requires finite numbers, not booleans")
+            if dtype.kind in "iub":
+                low, high = (0, 1) if dtype.kind == "b" else (int(np.iinfo(dtype).min), int(np.iinfo(dtype).max))
+                if int(item) != item or not low <= item <= high:
+                    raise ValueError("numeric ONNX input exceeds integer dtype bounds or is fractional")
+            elif abs(item) > float(np.finfo(dtype).max):
+                raise ValueError("numeric ONNX input exceeds floating dtype bounds")
+        array = np.asarray(value, dtype=dtype)
+    shape = getattr(input_meta, "shape", None)
+    if shape is None:
+        raise ValueError("ONNX input rank must be declared")
     static_shape = [int(dim) if isinstance(dim, (int, np.integer)) else None for dim in shape]
-    if array.ndim == 1 and len(static_shape) > 1 and static_shape[0] == 1:
-        array = array.reshape((1, *array.shape))
-    expected = 1
-    if static_shape and all(dim is not None and dim > 0 for dim in static_shape):
-        for dim in static_shape:
-            expected *= dim
-        if expected == array.size:
-            array = array.reshape(static_shape)
+    if len(static_shape) > 8 or any(dim is not None and dim <= 0 for dim in static_shape):
+        raise ValueError("unsupported ONNX input shape")
+    if all(dim is not None for dim in static_shape):
+        if math.prod(static_shape) != array.size:
+            raise ValueError("ONNX input count does not match its static shape")
+        array = array.reshape(static_shape)
+    elif array.ndim == 1 and len(static_shape) == 2 and static_shape[0] == 1:
+        array = array.reshape((1, -1))
+    if array.ndim != len(static_shape) or any(
+        declared is not None and declared != actual
+        for declared, actual in zip(static_shape, array.shape)
+    ):
+        raise ValueError("ONNX input shape does not match the graph")
     return array
 
 
@@ -231,12 +257,20 @@ def _jsonable(value: Any) -> Any:
     import numpy as np
 
     array = np.asarray(value)
-    if array.dtype.kind in "fiu":
-        return array.reshape(-1).tolist()
+    if array.size > MAX_VALUES:
+        raise ValueError("ONNX output exceeds the element limit")
+    if array.dtype.kind in "fiub":
+        # ModelOutput.logits is f32, even when a graph uses wider numeric I/O.
+        # Reject invalid values before producing JSON or narrowing in Rust.
+        if not np.isfinite(array).all() or np.any(np.abs(array.astype(np.float64)) > float(np.finfo(np.float32).max)):
+            raise ValueError("ONNX output contains nonfinite or float32-overflowing values")
+        return array.reshape(-1).astype(np.float64).tolist() if array.dtype.kind == "b" else array.reshape(-1).tolist()
     if array.dtype.kind in "SUO":
         flat = array.reshape(-1).tolist()
-        return "".join(str(item) for item in flat)
-    return str(value)
+        if any(not isinstance(item, (str, bytes)) for item in flat):
+            raise ValueError("ONNX string output contains non-string values")
+        return "".join(item.decode("utf-8") if isinstance(item, bytes) else item for item in flat)
+    raise ValueError(f"unsupported ONNX output type: {array.dtype}")
 
 
 def main() -> int:
@@ -289,7 +323,7 @@ def main() -> int:
             result["text"] = _jsonable(first)
         else:
             result["logits"] = _jsonable(first)
-        print(json.dumps(result, ensure_ascii=False))
+        print(json.dumps(result, ensure_ascii=False, allow_nan=False))
         return 0
     except Exception as exc:  # noqa: BLE001 - bridge errors are sent to Bloom
         print(f"ONNX Runtime inference failed: {exc}", file=sys.stderr)

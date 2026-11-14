@@ -89,7 +89,7 @@
       "required": ["index", "relevance_score", "document"],
       "properties": {
         "index": { "type": "integer", "minimum": 0, "maximum": 255 },
-        "relevance_score": { "type": "number", "minimum": -1, "maximum": 1 },
+        "relevance_score": { "type": "number", "description": "Model-specific relevance: cosine for bi-encoders, raw classifier score for cross-encoders; not a calibrated probability." },
         "document": {
           "type": "string",
           "minLength": 1,

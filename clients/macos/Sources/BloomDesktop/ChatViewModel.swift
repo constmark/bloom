@@ -23,6 +23,11 @@ struct GenerationMetrics: Equatable {
     let completionTokens: Int?
     let ttftMilliseconds: Double?
     let elapsedMilliseconds: Double
+    /// The validated terminal `finish_reason` (`stop`, `length`, or `content_filter`).
+    var finishReason: String? = nil
+
+    /// True when the server stopped at the generated-token limit, not a natural end.
+    var truncated: Bool { finishReason == lengthFinishReason }
 }
 
 @MainActor
@@ -53,6 +58,15 @@ final class ChatViewModel: ObservableObject {
     }
     @Published var operatorKey = "" {
         didSet { configureTools() }
+    }
+    /// Maximum generated tokens per response, persisted across launches.
+    @Published var maxTokens: Int {
+        didSet {
+            let clamped = GenerationSettings.clampedMaxTokens(maxTokens)
+            // Assigning inside didSet does not re-enter the observer.
+            if clamped != maxTokens { maxTokens = clamped }
+            defaults.set(maxTokens, forKey: GenerationSettings.maxTokensDefaultsKey)
+        }
     }
     let tools: DesktopToolsViewModel
     @Published private(set) var modelTasks: [String] = []
@@ -91,6 +105,10 @@ final class ChatViewModel: ObservableObject {
         self.defaults = defaults
         self.storage = storage
         serverURL = defaults.string(forKey: "bloom.serverURL") ?? "http://127.0.0.1:3000"
+        maxTokens = GenerationSettings.clampedMaxTokens(
+            defaults.object(forKey: GenerationSettings.maxTokensDefaultsKey) as? Int
+                ?? GenerationSettings.defaultMaxTokens
+        )
         self.makeClient = makeClient
         tools = DesktopToolsViewModel(makeClient: makeClient)
         restoreHistory()
@@ -127,6 +145,7 @@ final class ChatViewModel: ObservableObject {
 
     func connect() async {
         guard !isGenerating else { return }
+        tools.invalidateEncoderResults()
         let attemptID = UUID()
         connectionID = attemptID
         connectedClient = nil
@@ -135,6 +154,7 @@ final class ChatViewModel: ObservableObject {
         errorMessage = nil
         modelName = nil
         contextWindow = nil
+        modelTasks = []
 
         do {
             let client = try makeClient(requestedURL, apiKey)
@@ -197,6 +217,7 @@ final class ChatViewModel: ObservableObject {
                 client: client,
                 model: modelName,
                 requestMessages: requestMessages,
+                maxTokens: self.maxTokens,
                 assistantID: assistantID,
                 conversationID: conversationID
             )
@@ -327,19 +348,24 @@ final class ChatViewModel: ObservableObject {
         client: any BloomAPITransport,
         model: String,
         requestMessages: [APIChatMessage],
+        maxTokens: Int,
         assistantID: UUID,
         conversationID: UUID
     ) async {
         let started = Date()
         var firstTokenAt: Date?
         var usage: ChatCompletionChunk.Usage?
+        var finishReason: String?
 
         do {
             try Task.checkCancellation()
-            try await client.streamChat(model: model, messages: requestMessages) { [weak self] chunk in
+            try await client.streamChat(
+                model: model, messages: requestMessages, maxTokens: maxTokens
+            ) { [weak self] chunk in
                 guard let self, self.activeGenerationID == assistantID,
                       self.selectedConversationID == conversationID, !Task.isCancelled else { return }
                 usage = chunk.usage ?? usage
+                finishReason = chunk.choices.first?.finishReason ?? finishReason
                 let content = chunk.choices.first?.delta.content ?? ""
                 guard !content.isEmpty else { return }
                 if firstTokenAt == nil {
@@ -362,7 +388,8 @@ final class ChatViewModel: ObservableObject {
                 promptTokens: usage?.promptTokens,
                 completionTokens: usage?.completionTokens,
                 ttftMilliseconds: firstTokenAt.map { $0.timeIntervalSince(started) * 1_000 },
-                elapsedMilliseconds: finished.timeIntervalSince(started) * 1_000
+                elapsedMilliseconds: finished.timeIntervalSince(started) * 1_000,
+                finishReason: finishReason
             )
         } catch {
             guard activeGenerationID == assistantID, selectedConversationID == conversationID else { return }

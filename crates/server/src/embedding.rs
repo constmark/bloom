@@ -411,11 +411,13 @@ async fn execute_embedding_batch_inner(
                 message,
             ));
         }
+        // Unsupported models were rejected before admission, so a backend
+        // failure here is a server fault that clients may retry, not 501.
         Ok(Err(EmbeddingWorkerError::Inference(message))) => {
             client_guard.finish(false);
             return Err(EmbeddingExecutionError::new(
-                axum::http::StatusCode::NOT_IMPLEMENTED,
-                "unsupported_operation",
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
                 format!("Embedding inference failed: {message}"),
             ));
         }

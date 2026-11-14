@@ -8,7 +8,7 @@ from unittest import mock
 import zipfile
 
 from build_python_native_wheel import bundle_wheel, host_platform_tag, library_name
-from test_python_native_wheel import verify_archive
+from test_python_native_wheel import isolated_install_environment, verify_archive
 
 
 class NativeWheelTests(unittest.TestCase):
@@ -76,6 +76,24 @@ class NativeWheelTests(unittest.TestCase):
             self.assertEqual(host_platform_tag(), 'linux_x86_64')
         with mock.patch('build_python_native_wheel.sys.platform', 'darwin'), mock.patch('build_python_native_wheel.platform.mac_ver', return_value=('26.1', (), '')), mock.patch('build_python_native_wheel.platform.machine', return_value='arm64'):
             self.assertEqual(host_platform_tag(), 'macosx_26_0_arm64')
+
+    def test_clean_install_cannot_inherit_pip_destinations_or_config(self):
+        source = {
+            'PATH': '/runtime/bin', 'SYSTEMROOT': 'C:\\Windows',
+            'PIP_TARGET': '/outside/target', 'PIP_PREFIX': '/outside/prefix',
+            'PIP_USER': '1', 'PIP_CONFIG_FILE': '/outside/pip.ini',
+            'PIP_REQUIRE_VIRTUALENV': 'false', 'pip_index_url': 'https://example.invalid',
+            'PYTHONPATH': '/outside/python', 'PYTHONHOME': '/outside/home',
+            'BLOOM_FFI_LIB': '/outside/library', 'BLOOM_SDK_TEST_MODEL': '/outside/model',
+            'BLOOM_SDK_REQUIRE_GENERATION_METADATA': '1',
+            'BLOOM_SDK_CHECK_LOGPROBS': '1',
+        }
+        import os
+        self.assertEqual(isolated_install_environment(source), {
+            'PATH': '/runtime/bin', 'SYSTEMROOT': 'C:\\Windows',
+            'PIP_CONFIG_FILE': os.devnull, 'PIP_REQUIRE_VIRTUALENV': 'true',
+        })
+        self.assertEqual(source['PIP_TARGET'], '/outside/target')
 
 
 if __name__ == '__main__':

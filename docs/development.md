@@ -14,6 +14,9 @@ python3 scripts/test_server_http_boundary.py
 ./scripts/test_tiny_model_runtime.sh
 python3 -m pip install -r requirements/schema-validation.txt
 ./scripts/validate_json_artifacts.py
+python3 -m pip install -r requirements/onnx-runtime-test.txt
+python3 scripts/test_onnxruntime_infer.py
+python3 scripts/test_onnx_embedding.py
 ```
 
 The Python SDK boundary tests do not require a model or compiled native

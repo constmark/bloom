@@ -58,6 +58,10 @@ pub struct GenerationStats {
     pub prompt_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_tokens: Option<u64>,
+    /// The server reported `finish_reason: "length"`: the answer stopped at the
+    /// generated-token limit rather than at a natural end.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
 }
 
 impl GenerationStats {
@@ -96,7 +100,15 @@ impl GenerationStats {
             first_token_ms,
             prompt_tokens,
             completion_tokens,
+            truncated: false,
         }
+    }
+
+    /// Records a token-limit truncation. Only completed generations carry a
+    /// server finish reason, so other outcomes ignore the flag.
+    pub fn with_truncation(mut self, truncated: bool) -> Self {
+        self.truncated = truncated && self.outcome == GenerationOutcome::Completed;
+        self
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -127,6 +139,9 @@ impl GenerationStats {
             .is_some_and(|model| !valid_generation_model_id(model))
         {
             return Err("conversation contains invalid generation model metadata".to_string());
+        }
+        if self.truncated && self.outcome != GenerationOutcome::Completed {
+            return Err("conversation contains invalid generation truncation metadata".to_string());
         }
         Ok(())
     }
@@ -1888,6 +1903,7 @@ mod tests {
             first_token_ms: Some(500),
             prompt_tokens: Some(12),
             completion_tokens: Some(4),
+            truncated: true,
         };
 
         store
@@ -1941,6 +1957,7 @@ mod tests {
             first_token_ms: Some(101),
             prompt_tokens: None,
             completion_tokens: None,
+            truncated: false,
         };
         assert!(invalid.validate().is_err());
 
@@ -1953,6 +1970,7 @@ mod tests {
             first_token_ms: None,
             prompt_tokens: None,
             completion_tokens: None,
+            truncated: false,
         });
         assert!(store.validate_persisted().is_err());
 
@@ -1964,6 +1982,7 @@ mod tests {
             first_token_ms: None,
             prompt_tokens: None,
             completion_tokens: None,
+            truncated: false,
         });
         let mut invalid_model_store = ConversationStore::default();
         invalid_model_store
@@ -1991,6 +2010,45 @@ mod tests {
         assert!(normalized.completion_tokens.is_none());
         assert!(normalized.model.is_none());
         assert!(normalized.validate().is_ok());
+    }
+
+    #[test]
+    fn generation_stats_record_truncation_only_for_completed_generations() {
+        let completed = GenerationStats::observed(
+            GenerationOutcome::Completed,
+            100.0,
+            None,
+            Some(3),
+            Some(256),
+            None,
+        )
+        .with_truncation(true);
+        assert!(completed.truncated);
+        assert!(completed.validate().is_ok());
+        let encoded = serde_json::to_string(&completed).unwrap();
+        assert!(encoded.contains("\"truncated\":true"));
+        assert_eq!(
+            serde_json::from_str::<GenerationStats>(&encoded).unwrap(),
+            completed
+        );
+
+        let natural =
+            GenerationStats::observed(GenerationOutcome::Completed, 100.0, None, None, None, None)
+                .with_truncation(false);
+        assert!(
+            !serde_json::to_string(&natural)
+                .unwrap()
+                .contains("truncated")
+        );
+
+        let stopped =
+            GenerationStats::observed(GenerationOutcome::Stopped, 100.0, None, None, None, None)
+                .with_truncation(true);
+        assert!(!stopped.truncated);
+
+        let mut invalid = stopped;
+        invalid.truncated = true;
+        assert!(invalid.validate().is_err());
     }
 
     #[test]

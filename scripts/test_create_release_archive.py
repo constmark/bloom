@@ -6,7 +6,9 @@ from __future__ import annotations
 import gzip
 import os
 import pathlib
+import shutil
 import stat
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -110,6 +112,44 @@ class DeterministicReleaseArchiveTests(unittest.TestCase):
                 with self.assertRaises(ArchiveError):
                     parse_source_date_epoch(invalid)
 
+    def test_root_and_destination_symlinks_cannot_be_resolved_away(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_temp:
+            temp = pathlib.Path(raw_temp)
+            root = self.make_package(temp)
+            root_link = temp / "linked-root"
+            victim = temp / "existing.tar.gz"
+            victim.write_bytes(b"keep original")
+            destination_link = temp / "linked.tar.gz"
+            try:
+                root_link.symlink_to(root, target_is_directory=True)
+                destination_link.symlink_to(victim)
+            except (NotImplementedError, OSError):
+                self.skipTest("symbolic links are not available on this host")
+            for source, destination in ((root_link, temp / "new.zip"), (root, destination_link)):
+                with self.assertRaisesRegex(ArchiveError, "symbolic links"):
+                    create_archive(source, destination, SOURCE_EPOCH)
+            self.assertEqual(victim.read_bytes(), b"keep original")
+
+    def test_no_overwrite_rejects_existing_and_concurrently_created_destinations(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_temp:
+            temp = pathlib.Path(raw_temp)
+            root = self.make_package(temp)
+            destination = temp / "release.tar.gz"
+            create_archive(root, destination, SOURCE_EPOCH, overwrite=False)
+            original = destination.read_bytes()
+            with self.assertRaisesRegex(ArchiveError, "already exists"):
+                create_archive(root, destination, SOURCE_EPOCH, overwrite=False)
+            self.assertEqual(destination.read_bytes(), original)
+            destination.unlink()
+            def raced_creation(_root, temporary, _entries, _epoch):
+                temporary.write_bytes(b"new archive")
+                destination.write_bytes(b"other process output")
+            with mock.patch("create_release_archive.create_tar_gz", side_effect=raced_creation):
+                with self.assertRaises(FileExistsError):
+                    create_archive(root, destination, SOURCE_EPOCH, overwrite=False)
+            self.assertEqual(destination.read_bytes(), b"other process output")
+            self.assertEqual(list(temp.glob(".release.tar.gz.*.tmp")), [])
+
     def test_failed_creation_preserves_an_existing_destination(self) -> None:
         with tempfile.TemporaryDirectory() as raw_temp:
             temp = pathlib.Path(raw_temp)
@@ -124,6 +164,21 @@ class DeterministicReleaseArchiveTests(unittest.TestCase):
                     create_archive(root, destination, SOURCE_EPOCH)
             self.assertEqual(destination.read_bytes(), b"existing archive")
             self.assertEqual(list(temp.glob(".release.tar.gz.*.tmp")), [])
+
+    @unittest.skipUnless(shutil.which("bash"), "release packaging requires bash")
+    def test_packaging_refuses_nonempty_output_before_build_or_removal(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_temp:
+            destination = pathlib.Path(raw_temp) / "release output"
+            destination.mkdir()
+            previous = destination / "previous.tar.gz"
+            previous.write_bytes(b"retained release evidence")
+            environment = {**os.environ, "BLOOM_RELEASE_DIR": str(destination)}
+            result = subprocess.run(["bash", str(pathlib.Path(__file__).with_name("package_release.sh"))],
+                                    env=environment, capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("release destination is not empty", result.stderr)
+            self.assertEqual(previous.read_bytes(), b"retained release evidence")
+            self.assertEqual(list(destination.iterdir()), [previous])
 
 
 if __name__ == "__main__":

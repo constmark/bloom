@@ -16,7 +16,8 @@ rank order, original document indices, scores, and complete documents.
 Both formats use `schema_version: 1`. Their Draft-07
 [JSON Schema](../examples/encoder-result.schema.json) and
 [embedding](../examples/embedding-result.json) and
-[rerank](../examples/rerank-result.json) examples are included in application
+[rerank](../examples/rerank-result.json) and
+[cross-encoder](../examples/cross-encoder-result.json) examples are included in application
 archives.
 
 ## Validation and limits
@@ -28,10 +29,15 @@ aggregate, finite components, an L2 norm within 0.001 of one, and at most
 768 KiB of associated input. Its encoded download is limited to 40 MiB.
 
 A rerank artifact must contain a bounded request ID and query plus 1 through
-256 unique document results. Scores must be finite and within `[-1, 1]`, sorted
-descending with the original document index breaking ties. Query and returned
+256 unique document results. Scores must be finite, sorted descending with
+the original document index breaking ties. Bi-encoder cosine scores lie within
+`[-1, 1]`; cross-encoders return native classifier scores that can exceed that
+range. Clients and exports preserve these values without clipping or converting
+them into probabilities. Scores are only comparable within the same model and
+query. Query and returned
 document content is limited to 768 KiB in aggregate, and the encoded download
-is limited to 4 MiB.
+is limited to 6 MiB, matching the response limit and leaving space for JSON
+escaping of the maximum accepted raw content plus result metadata.
 
 Copying a vector writes its complete JSON float array. Copying a rerank result
 writes one JSON object containing `index`, `relevance_score`, and `document`.

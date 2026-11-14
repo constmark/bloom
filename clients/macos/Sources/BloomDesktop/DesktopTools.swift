@@ -102,8 +102,8 @@ struct DesktopEmbeddingResult: Codable {
         let embedding: [Double]
     }
     struct Usage: Codable {
-        let prompt_tokens: UInt64?
-        let total_tokens: UInt64?
+        let prompt_tokens: UInt64
+        let total_tokens: UInt64
     }
     let object: String
     let model: String
@@ -112,12 +112,14 @@ struct DesktopEmbeddingResult: Codable {
 
     func validate(model expected: String, count: Int, dimensions: Int?) throws {
         guard object == "list", model == expected, data.count == count,
+              (1...256).contains(count), usage.prompt_tokens == usage.total_tokens,
               let width = data.first?.embedding.count, (1...16_384).contains(width),
               dimensions == nil || width == dimensions,
               data.count * width <= 1_048_576,
               data.enumerated().allSatisfy({ index, row in
                   row.object == "embedding" && row.index == index && row.embedding.count == width
                       && row.embedding.allSatisfy(\.isFinite)
+                      && abs(sqrt(row.embedding.reduce(0) { $0 + $1 * $1 }) - 1) <= 0.001
               }) else { throw BloomClientError.serverNotReady("The server returned invalid embedding vectors.") }
     }
 
@@ -125,6 +127,64 @@ struct DesktopEmbeddingResult: Codable {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         return try encoder.encode(self)
+    }
+}
+
+struct DesktopRerankResult: Codable {
+    struct RankedDocument: Codable, Identifiable {
+        struct Document: Codable { let text: String }
+        var id: Int { index }
+        let index: Int
+        let relevance_score: Double
+        let document: Document
+    }
+    let id: String
+    let object: String
+    let model: String
+    let results: [RankedDocument]
+    let usage: DesktopEmbeddingResult.Usage
+
+    static func validateInput(model: String, query: String, documents: [String], topN: Int?) throws {
+        guard !model.isEmpty, model.utf8.count <= 1024,
+              !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              query.unicodeScalars.count <= 65_536, (1...256).contains(documents.count),
+              documents.allSatisfy({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && $0.unicodeScalars.count <= 262_144 }),
+              documents.reduce(query.utf8.count, { $0 + $1.utf8.count }) <= 768 * 1024,
+              topN == nil || (1...documents.count).contains(topN!) else {
+            throw BloomClientError.serverNotReady("Enter a query (up to 65536 characters), 1–256 document lines (up to 768 KiB combined), and a result count between 1 and the document count, or leave it empty.")
+        }
+    }
+
+    func validate(model expected: String, documents: [String], topN: Int?) throws {
+        guard object == "rerank", model == expected, !id.isEmpty, id.utf8.count <= 128,
+              id.utf8.allSatisfy({ (65...90).contains($0) || (97...122).contains($0) || (48...57).contains($0) || [45, 46, 58, 95].contains($0) }),
+              !results.isEmpty, results.count == (topN ?? documents.count),
+              usage.prompt_tokens == usage.total_tokens else {
+            throw BloomClientError.serverNotReady("The server returned invalid reranking metadata.")
+        }
+        var seen = Set<Int>()
+        var previous: RankedDocument?
+        for row in results {
+            guard documents.indices.contains(row.index), seen.insert(row.index).inserted,
+                  row.document.text == documents[row.index], row.relevance_score.isFinite,
+                  previous.map({ row.relevance_score < $0.relevance_score || (row.relevance_score == $0.relevance_score && row.index > $0.index) }) ?? true else {
+                throw BloomClientError.serverNotReady("The server returned invalid document identities or ranking order.")
+            }
+            previous = row
+        }
+    }
+
+    // Match the browser's versioned portable encoder-result schema, including
+    // the submitted query and exact documents instead of detached scores.
+    func jsonData(query: String) throws -> Data {
+        let payload: [String: Any] = [
+            "schema_version": 1, "object": "bloom.rerank_result", "id": id,
+            "model": model, "query": query, "prompt_tokens": usage.prompt_tokens,
+            "results": results.map { ["index": $0.index, "relevance_score": $0.relevance_score, "document": $0.document.text] as [String: Any] }
+        ]
+        let bytes = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+        guard bytes.count <= 6 * 1024 * 1024 else { throw BloomClientError.responseLimitExceeded }
+        return bytes
     }
 }
 
@@ -140,6 +200,13 @@ final class DesktopToolsViewModel: ObservableObject {
     @Published private(set) var embeddingError: String?
     @Published private(set) var embeddingResult: DesktopEmbeddingResult?
     @Published private(set) var embeddingInputs: [String] = []
+    @Published var rerankQuery = ""
+    @Published var rerankDocuments = ""
+    @Published var rerankTopN = ""
+    @Published private(set) var isReranking = false
+    @Published private(set) var rerankError: String?
+    @Published private(set) var rerankResult: DesktopRerankResult?
+    @Published private(set) var rerankResultQuery = ""
 
     var onRuntimeWillChange: (() -> Void)?
     var onRuntimeDidChange: (() async -> Void)?
@@ -152,6 +219,8 @@ final class DesktopToolsViewModel: ObservableObject {
     private var embeddingID: UUID?
     private var managementTask: Task<Void, Never>?
     private var embeddingTask: Task<Void, Never>?
+    private var rerankID: UUID?
+    private var rerankTask: Task<Void, Never>?
     private let pollNanoseconds: UInt64
 
     init(pollNanoseconds: UInt64 = 750_000_000,
@@ -164,7 +233,7 @@ final class DesktopToolsViewModel: ObservableObject {
         guard self.serverURL != serverURL || self.apiKey != apiKey || self.operatorKey != operatorKey else { return }
         epoch = UUID()
         stopMonitoring()
-        cancelEmbedding()
+        invalidateEncoderResults()
         self.serverURL = serverURL
         self.apiKey = apiKey
         self.operatorKey = operatorKey
@@ -204,8 +273,7 @@ final class DesktopToolsViewModel: ObservableObject {
         managementNotice = nil
         let mutating = loadID != nil || unload
         if mutating {
-            cancelEmbedding()
-            embeddingResult = nil
+            invalidateEncoderResults()
             onRuntimeWillChange?()
         }
         let key = operatorKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? apiKey : operatorKey
@@ -252,7 +320,7 @@ final class DesktopToolsViewModel: ObservableObject {
     }
 
     func generateEmbeddings(model: String) {
-        guard !isEmbedding, !isManaging else { return }
+        guard !isEmbedding, !isReranking, !isManaging else { return }
         let inputs = embeddingInput.components(separatedBy: .newlines)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
         let rawDimensions = embeddingDimensions.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -296,5 +364,65 @@ final class DesktopToolsViewModel: ObservableObject {
         embeddingTask?.cancel()
         embeddingTask = nil
         isEmbedding = false
+    }
+
+    func invalidateEncoderResults() {
+        cancelEmbedding()
+        cancelReranking()
+        embeddingResult = nil
+        embeddingInputs = []
+        embeddingError = nil
+        rerankResult = nil
+        rerankResultQuery = ""
+        rerankError = nil
+    }
+
+    func rerank(model: String) {
+        guard !isReranking, !isEmbedding, !isManaging else { return }
+        let query = rerankQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        let documents = rerankDocuments.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        let rawTopN = rerankTopN.trimmingCharacters(in: .whitespacesAndNewlines)
+        let topN = rawTopN.isEmpty ? nil : Int(rawTopN)
+        do {
+            if !rawTopN.isEmpty && topN == nil {
+                throw BloomClientError.serverNotReady("Result count must be an integer, or left empty for all documents.")
+            }
+            try DesktopRerankResult.validateInput(model: model, query: query, documents: documents, topN: topN)
+        } catch { rerankError = error.localizedDescription; return }
+        let operation = UUID()
+        let currentEpoch = epoch
+        let requestedURL = serverURL
+        let key = apiKey
+        rerankID = operation
+        isReranking = true
+        rerankError = nil
+        rerankResult = nil
+        rerankTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if rerankID == operation { isReranking = false; rerankID = nil; rerankTask = nil }
+            }
+            do {
+                let client = try makeClient(requestedURL, key)
+                try Task.checkCancellation()
+                let result = try await client.rerank(model: model, query: query, documents: documents, topN: topN)
+                guard epoch == currentEpoch, rerankID == operation else { return }
+                try Task.checkCancellation()
+                try result.validate(model: model, documents: documents, topN: topN)
+                rerankResultQuery = query
+                rerankResult = result
+            } catch {
+                guard epoch == currentEpoch, rerankID == operation else { return }
+                if !(error is CancellationError) && !Task.isCancelled { rerankError = error.localizedDescription }
+            }
+        }
+    }
+
+    func cancelReranking() {
+        rerankID = nil
+        rerankTask?.cancel()
+        rerankTask = nil
+        isReranking = false
     }
 }

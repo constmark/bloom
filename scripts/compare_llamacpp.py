@@ -30,7 +30,7 @@ from typing import Any
 def run(
     cmd: list[str], timeout: int, *, env: dict[str, str] | None = None
 ) -> dict[str, Any]:
-    started = time.time()
+    started = time.monotonic()
     proc = subprocess.run(
         cmd,
         capture_output=True,
@@ -38,7 +38,7 @@ def run(
         timeout=timeout,
         env=env,
     )
-    elapsed = time.time() - started
+    elapsed = time.monotonic() - started
     return {
         "command": cmd,
         "exit_code": proc.returncode,
@@ -52,9 +52,14 @@ def parse_json_or_tail(text: str) -> Any:
     stripped = text.strip()
     if not stripped:
         return None
+    def finite_float(value: str) -> float:
+        result = float(value)
+        if not math.isfinite(result):
+            raise ValueError("nonfinite benchmark value")
+        return result
     try:
-        return json.loads(stripped)
-    except json.JSONDecodeError:
+        return json.loads(stripped, parse_float=finite_float, parse_constant=finite_float)
+    except ValueError:
         return {"raw_tail": stripped[-4000:]}
 
 
@@ -79,7 +84,7 @@ def benchmark_metrics(result: Any) -> dict[str, float | int]:
         value = result.get(name)
         if isinstance(value, bool):
             continue
-        if isinstance(value, int) and value >= 0:
+        if isinstance(value, int) and 0 <= value <= sys.float_info.max:
             metrics[name] = value
         elif isinstance(value, float) and value >= 0 and math.isfinite(value):
             metrics[name] = value
@@ -90,14 +95,16 @@ def parse_llama_metrics(stdout: str, stderr: str) -> dict[str, float]:
     """Parse decode/prompt throughput from llama-cli or llama-bench output."""
     text = f"{stdout}\n{stderr}"
     metrics: dict[str, float] = {}
+    number = r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
+    rate = rf"\((?:[^\r\n)]*,\s*)?\s*({number})\s+tokens per second\s*\)"
 
     prompt_matches = re.findall(
-        r"prompt eval time\s*=.*?\(\s*([0-9]+(?:\.[0-9]+)?)\s+tokens per second\s*\)",
+        r"prompt eval time\s*=.*?" + rate,
         text,
         flags=re.IGNORECASE,
     )
     decode_matches = re.findall(
-        r"(?<!prompt )eval time\s*=.*?\(\s*([0-9]+(?:\.[0-9]+)?)\s+tokens per second\s*\)",
+        r"(?<!prompt )eval time\s*=.*?" + rate,
         text,
         flags=re.IGNORECASE,
     )
@@ -108,12 +115,12 @@ def parse_llama_metrics(stdout: str, stderr: str) -> dict[str, float]:
 
     # llama-bench markdown row: ... | tg64 | 12.34 ± 0.12 |
     bench_decode = re.findall(
-        r"\|\s*tg\d+\s*\|\s*([0-9]+(?:\.[0-9]+)?)",
+        rf"\|\s*tg\d+\s*\|\s*({number})(?=\s*(?:±|\|))",
         text,
         flags=re.IGNORECASE,
     )
     bench_prompt = re.findall(
-        r"\|\s*pp\d+\s*\|\s*([0-9]+(?:\.[0-9]+)?)",
+        rf"\|\s*pp\d+\s*\|\s*({number})(?=\s*(?:±|\|))",
         text,
         flags=re.IGNORECASE,
     )
@@ -121,7 +128,7 @@ def parse_llama_metrics(stdout: str, stderr: str) -> dict[str, float]:
         metrics["decode_tokens_per_second"] = float(bench_decode[-1])
     if bench_prompt:
         metrics["prompt_tokens_per_second"] = float(bench_prompt[-1])
-    return metrics
+    return {name: value for name, value in metrics.items() if math.isfinite(value) and value >= 0}
 
 
 def find_llama_binary(explicit: str | None) -> str | None:
@@ -305,7 +312,7 @@ def benchmark_environment(args: argparse.Namespace) -> dict[str, str]:
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    for name in ("max_tokens", "context_size", "repetitions"):
+    for name in ("max_tokens", "context_size", "repetitions", "timeout"):
         if getattr(args, name) <= 0:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
     for name in ("warmup",):
@@ -317,8 +324,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--temperature must be finite and between 0 and 2")
     if not 0.0 < args.top_p <= 1.0 or not args.top_p == args.top_p:
         raise ValueError("--top-p must be finite and between 0 and 1")
-    if args.seed < 0:
-        raise ValueError("--seed cannot be negative")
+    if not 0 <= args.seed <= 2**64 - 1:
+        raise ValueError("--seed must fit an unsigned 64-bit integer")
+    if not math.isfinite(args.min_decode_ratio) or args.min_decode_ratio < 0:
+        raise ValueError("--min-decode-ratio must be finite and nonnegative")
 
 
 def main() -> int:
@@ -352,7 +361,7 @@ def main() -> int:
         report["status"] = "skipped"
         report["reason"] = f"model not found at {model}"
         print(json.dumps(report, indent=2))
-        return 1 if args.require_model else 0
+        return 1 if args.require_model or args.min_decode_ratio > 0 else 0
 
     if args.build or not Path(args.bloom_bin).exists():
         subprocess.run(["cargo", "build", "--release", "--bin", "bloom_bench"], check=True)
@@ -377,7 +386,7 @@ def main() -> int:
             "reason": "llama.cpp binary not found; set LLAMA_CPP_BIN or --llama-bin",
         }
         print(json.dumps(report, indent=2))
-        return 1 if args.require_llama else 0
+        return 1 if args.require_llama or args.min_decode_ratio > 0 or bloom_run["exit_code"] != 0 else 0
 
     llama_cmd = build_llama_command(args, model, llama_bin)
     llama_run = run(llama_cmd, args.timeout, env=environment)
@@ -391,13 +400,11 @@ def main() -> int:
         "stderr_tail": llama_run["stderr"][-4000:],
     }
 
-    bloom_decode = (
-        bloom_result.get("tokens_per_second")
-        if isinstance(bloom_result, dict)
-        else None
-    )
+    bloom_decode = report["bloom"]["metrics"].get("tokens_per_second")
     llama_decode = llama_metrics.get("decode_tokens_per_second")
-    if isinstance(bloom_decode, (int, float)) and llama_decode and llama_decode > 0:
+    if (report["bloom"]["status"] == "ok" and report["llama_cpp"]["status"] == "ok"
+            and bloom_decode is not None and llama_decode and llama_decode > 0
+            and math.isfinite(float(bloom_decode) / llama_decode)):
         decode_ratio = float(bloom_decode) / llama_decode
         report["comparison"] = {
             "bloom_decode_tokens_per_second": float(bloom_decode),
@@ -416,7 +423,7 @@ def main() -> int:
     print(json.dumps(report, indent=2))
     if report["bloom"]["status"] != "ok":
         return 1
-    if args.require_llama and report["llama_cpp"]["status"] != "ok":
+    if report["llama_cpp"]["status"] != "ok":
         return 1
     if args.min_decode_ratio > 0:
         comparison = report["comparison"]

@@ -20,10 +20,10 @@ continues because the API has no load-cancellation endpoint.
 
 Model management uses the optional **Operator API key**. When empty it uses the
 sidebar API key, which works when the server has not configured separate operator
-credentials. Chat and embeddings always use the sidebar API key. Both keys stay
+credentials. Chat, embeddings and reranking always use the sidebar API key. Both keys stay
 in memory. Changing connection settings or credentials cancels outstanding tool
 requests and discards their late responses. Loading or unloading stops the active
-chat and embedding request, clears readiness, and verifies the runtime again
+chat and encoder request, clears readiness, and verifies the runtime again
 after the operation. An encoder can connect successfully; chat is enabled only
 for a runtime that advertises generation.
 
@@ -33,10 +33,24 @@ width, and select **Generate vectors**. Input is limited to 256 lines, 262,144
 characters per line, and 768 KiB of UTF-8 total; dimensions must be 1–16,384.
 The panel shows a vector preview and token usage and can copy or save the complete
 JSON response. It validates the returned model, row indices, vector widths, and
-finite values before displaying results. **Cancel** stops the client request;
+finite values, L2 normalization and matching token usage before displaying results. **Cancel** stops the client request;
 late results cannot replace a newer request. Inputs and vectors stay in memory
-unless explicitly copied or saved. Model download/import and reranking panels
-are not included in this native client.
+unless explicitly copied or saved. Reconnecting clears encoder results and
+cancels pending encoder requests, including when another operator has changed
+the model remotely. Model download/import panels are not included in this native client.
+
+**Reranking…** ranks documents against a query using an active model that
+advertises `rerank`, including both embedding-based and classifier-head
+cross-encoders. Enter a query and one document per line; optionally limit the
+result count, or leave it empty to return every document. Limits are 65,536
+Unicode scalars per query, 256 documents, 262,144 scalars per document, and
+768 KiB of combined UTF-8 input. Returned documents, unique indices, descending
+scores, stable tie order, model identity and usage are validated before display.
+Cancel, connection changes, reconnect and model changes discard late results.
+Copy/save exports the original query and ranked documents using the same
+versioned `bloom.rerank_result` schema as the browser UI. Editing the query after
+completion cannot change the exported request identity. Query, documents and
+scores remain outside conversation history and are saved only on explicit export.
 
 Use the sidebar or **Command-N** to create a conversation, select a conversation
 to restore its messages and draft, and use **Delete conversation** (or its
@@ -49,6 +63,12 @@ Partial text remains with its original conversation. Late chunks, errors, and
 metrics from the cancelled request cannot alter another conversation. Changing
 connection settings still requires a fresh readiness check, and an already
 started request retains the verified client it started with.
+
+**Max tokens** in the Connection panel bounds each response (1–32,768; default
+256) and is saved in user defaults; the next message uses the new value. When
+the server reports `finish_reason: "length"`, a notice below the conversation
+says the response was truncated at the token limit. Temperature (0.7) and
+top-p (0.9) remain fixed.
 
 History is stored at:
 
@@ -90,7 +110,8 @@ partial responses, deletion, and delayed callbacks after conversation changes,
 in addition to the HTTP/readiness/SSE checks. Model and encoder checks cover the
 published catalog fixtures, authenticated routes, load/error/retry/unload,
 readiness invalidation, cancelled and superseded operations, response bounds,
-invalid vectors, and JSON export. They use simulated HTTP/model responses and
+invalid vectors and usage, reranking-only task support, ranking validation,
+request bounds, cancelled/obsolete ranking results, and JSON export. They use simulated HTTP/model responses and
 temporary conversation storage; they do not load, unload, or alter real models.
 
 A separate [live acceptance run](../../docs/capability-logprobs-metal-2026-11-13.md)

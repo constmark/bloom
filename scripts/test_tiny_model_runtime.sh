@@ -72,6 +72,8 @@ REPEATED_TOOL_MODEL_DIR="${TINY_RUNTIME_DIR}/tiny-qwen2-tool-fixture-repeat"
 
 cd "$WORKSPACE_ROOT"
 
+python3 scripts/test_openai_stream_contract.py
+
 echo "Generating deterministic Qwen2 CPU fixture..."
 cargo run --quiet --locked -p bloomai-engine \
     --example generate_tiny_qwen2_fixture -- \

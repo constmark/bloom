@@ -53,6 +53,7 @@ private struct Sidebar: View {
     @State private var pendingDeletion: DesktopConversation?
     @State private var showsModels = false
     @State private var showsEmbeddings = false
+    @State private var showsRerank = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -109,6 +110,25 @@ private struct Sidebar: View {
                 }
                 .buttonStyle(.bordered)
                 .disabled(viewModel.isGenerating || viewModel.connectionState == .connecting)
+
+                LabeledContent("Max tokens") {
+                    HStack(spacing: 4) {
+                        TextField("Max tokens", value: $viewModel.maxTokens, format: .number.grouping(.never))
+                            .textFieldStyle(.roundedBorder)
+                            .multilineTextAlignment(.trailing)
+                            .frame(width: 72)
+                            .accessibilityLabel("Maximum generated tokens")
+                        Stepper(
+                            "Maximum generated tokens",
+                            value: $viewModel.maxTokens,
+                            in: GenerationSettings.maxTokensRange,
+                            step: 64
+                        )
+                        .labelsHidden()
+                    }
+                }
+                .font(.caption)
+                .help("Upper bound on tokens generated per response (\(GenerationSettings.maxTokensRange.lowerBound)–\(GenerationSettings.maxTokensRange.upperBound)). Applies to the next message.")
             }
 
             VStack(alignment: .leading, spacing: 10) {
@@ -137,6 +157,7 @@ private struct Sidebar: View {
                     Button("Models…") { showsModels = true }
                     Button("Embeddings…") { showsEmbeddings = true }
                 }
+                Button("Reranking…") { showsRerank = true }
                 if !viewModel.modelTasks.isEmpty {
                     Text(viewModel.modelTasks.joined(separator: ", ")).font(.caption2).foregroundStyle(.secondary)
                 }
@@ -214,6 +235,9 @@ private struct Sidebar: View {
         }
         .sheet(isPresented: $showsEmbeddings) {
             DesktopEmbeddingsView(tools: viewModel.tools, chat: viewModel)
+        }
+        .sheet(isPresented: $showsRerank) {
+            DesktopRerankView(tools: viewModel.tools, chat: viewModel)
         }
         .alert(item: $pendingDeletion) { conversation in
             Alert(title: Text("Delete \(conversation.title)?"),
@@ -299,6 +323,22 @@ private struct ChatWorkspace: View {
                 .padding(12)
                 .background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
                 .padding(.horizontal, 24)
+            }
+
+            if viewModel.metrics?.truncated == true {
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: "text.badge.xmark")
+                        .foregroundStyle(.orange)
+                        .accessibilityHidden(true)
+                    Text("Response truncated at the token limit. Raise Max tokens or ask the model to continue.")
+                        .font(.callout)
+                    Spacer()
+                }
+                .padding(12)
+                .background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
+                .padding(.horizontal, 24)
+                .padding(.top, 8)
+                .accessibilityElement(children: .combine)
             }
 
             if let metrics = viewModel.metrics {

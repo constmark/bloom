@@ -127,6 +127,7 @@ fn spawn_choices(
     let worker_cancel = cancel;
     task::spawn_blocking(move || {
         let _worker_guard = worker_guard;
+        let inference_start = Instant::now();
         let result = run_choices(
             &state,
             &pipeline,
@@ -137,6 +138,10 @@ fn spawn_choices(
             created,
             request_start,
         );
+        state
+            .app
+            .metrics
+            .record_inference_latency(inference_start.elapsed().as_secs_f64());
         let item = match result {
             Ok(()) => StreamItem::Complete,
             Err(error) => StreamItem::Error(
@@ -242,6 +247,11 @@ pub(crate) async fn buffered_text_choices(
                         content_bytes = content_bytes.saturating_add(calls.to_string().len());
                         target["message"]["content"] = serde_json::Value::Null;
                         target["message"]["tool_calls"] = calls;
+                    }
+                    if let Some(call) = choice["delta"].get("function_call") {
+                        content_bytes = content_bytes.saturating_add(call.to_string().len());
+                        target["message"]["content"] = serde_json::Value::Null;
+                        target["message"]["function_call"] = call.clone();
                     }
                     if let Some(probabilities) =
                         choice.get("logprobs").filter(|value| !value.is_null())
@@ -349,8 +359,12 @@ fn run_choices(
     let first_token = Arc::new(AtomicBool::new(false));
     let last_token = Arc::new(std::sync::Mutex::new(None));
     let mut completion_tokens = 0_u64;
+    let requires_generation_metadata =
+        request.scheduled.is_none() && pipeline.model().supports_generation_metadata();
+    let mut exact_prompt_counts = vec![None; request.inputs.len()];
     // Never publish unvalidated structured content or the private tool control
     // protocol. Only one unvalidated candidate is accumulated at a time.
+    let legacy = legacy_function_output(request.tool_config.as_ref());
     let buffer_output = request.tool_config.is_some()
         || !matches!(request.response_format, ResponseFormatMode::Text);
     let output_bytes = std::sync::atomic::AtomicUsize::new(0);
@@ -394,6 +408,7 @@ fn run_choices(
             }
             let mut filter = StopSequenceFilter::new(request.stop_sequences.clone());
             let mut text = String::new();
+            let timing_count = AtomicU64::new(0);
             let mut send_delta = |delta: String| -> Result<()> {
                 if delta.is_empty() {
                     return Ok(());
@@ -407,7 +422,11 @@ fn run_choices(
                     request_start,
                     &first_token,
                     &last_token,
-                    generated_count,
+                    if requires_generation_metadata {
+                        &timing_count
+                    } else {
+                        generated_count
+                    },
                     estimate_delta_tokens(pipeline, &delta),
                 );
                 if buffer_output {
@@ -423,20 +442,19 @@ fn run_choices(
             let mut probability_bytes = Vec::new();
             let mut probability_count = 0usize;
             let mut probability_memory = 0usize;
-            let mut exact_output_tokens: Option<usize> = None;
+            let mut generation = bloomai_engine::GenerationStreamState::default();
             let mut sink = |output| {
                 if cancel.is_cancelled() {
                     return Err(anyhow!("request cancelled"));
                 }
+                generation
+                    .observe(&output, params.max_tokens)
+                    .map_err(anyhow::Error::msg)?;
                 if let OutputChunk::TokenUsage { output_tokens, .. } = output {
-                    if params.logprobs.is_some() {
-                        if output_tokens > params.max_tokens
-                            || exact_output_tokens.is_some_and(|previous| output_tokens < previous)
-                        {
-                            return Err(anyhow!("backend emitted invalid token usage"));
-                        }
-                        exact_output_tokens = Some(output_tokens);
-                    }
+                    generated_count.store(
+                        completion_tokens.saturating_add(output_tokens as u64),
+                        Ordering::Relaxed,
+                    );
                 } else if let OutputChunk::TokenLogprobs(probability) = output {
                     let Some(top_count) = params.logprobs else {
                         return Err(anyhow!(
@@ -499,18 +517,37 @@ fn run_choices(
             // Only our explicit stop sentinel is successful early termination.
             check_candidate_result(result)?;
             send_delta(filter.finish())?;
-            let (tokens, ended_on_eos) = if params.logprobs.is_some() {
+            if !filter.stopped() {
+                generation
+                    .finish(requires_generation_metadata || params.logprobs.is_some())
+                    .map_err(anyhow::Error::msg)?;
+            }
+            let metadata = generation.metadata();
+            let tokens = if params.logprobs.is_some() {
                 if probability_bytes != text.as_bytes() {
                     return Err(anyhow!(
                         "backend token logprob bytes do not match generated text"
                     ));
                 }
-                validated_logprob_usage(probability_count, exact_output_tokens, params.max_tokens)?
+                validated_logprob_usage(probability_count, metadata, params.max_tokens)?
             } else if request.scheduled.is_some() {
-                (scheduled_tokens, false)
+                scheduled_tokens
+            } else if let Some(exact) = generation.output_tokens() {
+                exact
+            } else if text.is_empty() {
+                0
             } else {
-                (pipeline.tokenize(&text)?.len(), false)
+                pipeline.tokenize(&text)?.len()
             };
+            if let Some(input_count) = generation.input_tokens() {
+                if exact_prompt_counts[prompt_index].is_some_and(|previous| previous != input_count)
+                {
+                    return Err(anyhow!(
+                        "backend changed prompt token usage between choices"
+                    ));
+                }
+                exact_prompt_counts[prompt_index] = Some(input_count);
+            }
             completion_tokens = completion_tokens.saturating_add(tokens as u64);
             generated_count.store(completion_tokens, Ordering::Relaxed);
             let parsed = if buffer_output {
@@ -528,7 +565,7 @@ fn run_choices(
                     message,
                 })?;
                 let content = if request.chat {
-                    chat_output_delta_for_choice(&request.request_id, index, &output)
+                    chat_output_delta_for_choice(&request.request_id, index, &output, legacy)
                 } else {
                     json!(text)
                 };
@@ -537,10 +574,18 @@ fn run_choices(
             } else {
                 None
             };
-            let reason = if filter.stopped() || ended_on_eos {
+            let reason = if filter.stopped() {
                 "stop"
+            } else if let Some(metadata) = metadata {
+                match metadata.reason {
+                    bloomai_engine::GenerationFinishReason::Length => "length",
+                    bloomai_engine::GenerationFinishReason::Eos
+                    | bloomai_engine::GenerationFinishReason::Stop => parsed
+                        .as_ref()
+                        .map_or("stop", |output| chat_output_stop_reason(output, legacy)),
+                }
             } else if let Some(output) = &parsed {
-                chat_output_finish_reason(output, tokens, params.max_tokens)
+                chat_output_finish_reason(output, tokens, params.max_tokens, legacy)
             } else {
                 generation_finish_reason(tokens, params.max_tokens)
             };
@@ -552,6 +597,12 @@ fn run_choices(
         }
     }
     if request.include_usage {
+        let prompt_tokens = exact_prompt_counts
+            .iter()
+            .try_fold(0_u64, |sum, count| {
+                count.map(|value| sum.saturating_add(value as u64))
+            })
+            .unwrap_or(request.prompt_tokens);
         send(json!({
             "id": request.request_id,
             "object": if request.chat { "chat.completion.chunk" } else { "text_completion" },
@@ -559,30 +610,35 @@ fn run_choices(
             "model": request.model_id,
             "choices": [],
             "usage": {
-                "prompt_tokens": request.prompt_tokens,
+                "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
-                "total_tokens": request.prompt_tokens.saturating_add(completion_tokens)
+                "total_tokens": prompt_tokens.saturating_add(completion_tokens)
             }
         }))?;
     }
     Ok(())
 }
 
-// The model reports all accepted samples, including EOS; metadata covers only
-// visible tokens. Exactly one extra sample means EOS, even at the token budget.
+// Logprob records cover visible samples; only an explicit EOS finish permits
+// one additional accepted token. Counts must never be used to guess EOS.
 fn validated_logprob_usage(
     visible: usize,
-    reported: Option<usize>,
+    metadata: Option<bloomai_engine::GenerationMetadata>,
     maximum: usize,
-) -> Result<(usize, bool)> {
-    let count =
-        reported.ok_or_else(|| anyhow!("backend omitted exact token usage for logprobs"))?;
-    if count > maximum || count < visible || count.saturating_sub(visible) > 1 {
+) -> Result<usize> {
+    let metadata =
+        metadata.ok_or_else(|| anyhow!("backend omitted completion metadata for logprobs"))?;
+    let expected = visible
+        .checked_add(usize::from(
+            metadata.reason == bloomai_engine::GenerationFinishReason::Eos,
+        ))
+        .ok_or_else(|| anyhow!("logprob token count overflowed"))?;
+    if metadata.output_tokens > maximum || metadata.output_tokens != expected {
         return Err(anyhow!(
-            "backend token usage does not match logprob records"
+            "backend token usage does not match logprob records and termination reason"
         ));
     }
-    Ok((count, count > visible))
+    Ok(metadata.output_tokens)
 }
 
 // Count only complete Unicode scalar values before a token. A byte fragment
@@ -808,17 +864,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn logprob_usage_counts_eos_without_changing_terminal_reason() {
-        assert_eq!(validated_logprob_usage(0, Some(1), 4).unwrap(), (1, true));
-        assert_eq!(validated_logprob_usage(3, Some(4), 4).unwrap(), (4, true));
-        assert_eq!(validated_logprob_usage(4, Some(4), 4).unwrap(), (4, false));
-        for (visible, reported, max) in [
+    fn logprob_usage_requires_the_explicit_termination_reason() {
+        use bloomai_engine::{GenerationFinishReason as Reason, GenerationMetadata};
+        let metadata = |output_tokens, reason| {
+            Some(GenerationMetadata {
+                input_tokens: 1,
+                output_tokens,
+                reason,
+            })
+        };
+        assert_eq!(
+            validated_logprob_usage(0, metadata(1, Reason::Eos), 4).unwrap(),
+            1
+        );
+        assert_eq!(
+            validated_logprob_usage(3, metadata(4, Reason::Eos), 4).unwrap(),
+            4
+        );
+        assert_eq!(
+            validated_logprob_usage(4, metadata(4, Reason::Length), 4).unwrap(),
+            4
+        );
+        for (visible, reported, maximum) in [
             (1, None, 4),
-            (2, Some(1), 4),
-            (0, Some(2), 4),
-            (4, Some(5), 4),
+            (2, metadata(1, Reason::Eos), 4),
+            (0, metadata(2, Reason::Eos), 4),
+            (4, metadata(5, Reason::Eos), 4),
+            (3, metadata(4, Reason::Length), 4),
         ] {
-            assert!(validated_logprob_usage(visible, reported, max).is_err());
+            assert!(validated_logprob_usage(visible, reported, maximum).is_err());
         }
     }
 

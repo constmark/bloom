@@ -458,6 +458,82 @@ struct OpenAiVisionStreamState {
     events: usize,
     output_bytes: usize,
     buffered: String,
+    accounting: MultimodalGenerationAccounting,
+}
+
+/// Native generation accounting forwarded by `/v1/multimodal/stream`.
+///
+/// Models that opt into the engine metadata contract emit cumulative
+/// `TokenUsage` and one `GenerationFinished`; the pipeline has already
+/// validated their consistency. Adapters re-check the shape and map the
+/// finish reason. Models without metadata keep the legacy `stop` mapping.
+#[derive(Default)]
+pub(crate) struct MultimodalGenerationAccounting {
+    usage: Option<(u64, u64)>,
+    finished: Option<(u64, u64, bool)>,
+}
+
+impl MultimodalGenerationAccounting {
+    /// Consume an accounting chunk. Returns `Ok(false)` for other chunks.
+    pub(crate) fn observe(
+        &mut self,
+        chunk: &serde_json::Map<String, serde_json::Value>,
+    ) -> std::result::Result<bool, String> {
+        let counts = |value: &serde_json::Value| {
+            Some((
+                value.get("input_tokens")?.as_u64()?,
+                value.get("output_tokens")?.as_u64()?,
+            ))
+        };
+        if let Some(usage) = chunk.get("TokenUsage") {
+            let usage = counts(usage)
+                .filter(|_| self.finished.is_none())
+                .filter(|(input, output)| {
+                    self.usage.is_none_or(|(previous_input, previous_output)| {
+                        previous_input == *input && previous_output <= *output
+                    })
+                })
+                .ok_or_else(|| {
+                    "the internal multimodal stream emitted inconsistent token usage".to_string()
+                })?;
+            self.usage = Some(usage);
+            return Ok(true);
+        }
+        if let Some(finished) = chunk.get("GenerationFinished") {
+            let length = match finished.get("reason").and_then(serde_json::Value::as_str) {
+                Some("length") => true,
+                Some("eos" | "stop") => false,
+                _ => {
+                    return Err(
+                        "the internal multimodal stream emitted an unknown finish reason"
+                            .to_string(),
+                    );
+                }
+            };
+            let (input, output) = counts(finished)
+                .filter(|counts| self.finished.is_none() && self.usage == Some(*counts))
+                .ok_or_else(|| {
+                    "the internal multimodal stream emitted inconsistent completion metadata"
+                        .to_string()
+                })?;
+            self.finished = Some((input, output, length));
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// OpenAI finish reason; Ollama uses the same `stop`/`length` values.
+    pub(crate) fn finish_reason(&self) -> &'static str {
+        match self.finished {
+            Some((_, _, true)) => "length",
+            _ => "stop",
+        }
+    }
+
+    /// Prompt and completion tokens, available only with native metadata.
+    pub(crate) fn usage(&self) -> Option<(u64, u64)> {
+        self.finished.map(|(input, output, _)| (input, output))
+    }
 }
 
 impl OpenAiVisionStreamState {
@@ -533,6 +609,9 @@ impl OpenAiVisionStreamState {
             if !chunk["Metrics"].is_object() {
                 return Err("The internal multimodal stream emitted invalid metrics.".to_string());
             }
+            return Ok(None);
+        }
+        if self.accounting.observe(chunk)? {
             return Ok(None);
         }
         let text = if let Some(text) = chunk.get("TextDelta") {
@@ -619,12 +698,12 @@ impl OpenAiVisionStreamState {
 
     fn finish_streaming(&self) -> std::result::Result<serde_json::Value, String> {
         self.validate_complete()?;
-        Ok(self.chunk(json!({}), Some("stop")))
+        Ok(self.chunk(json!({}), Some(self.accounting.finish_reason())))
     }
 
     fn finish_buffered(&self) -> std::result::Result<serde_json::Value, String> {
         self.validate_complete()?;
-        Ok(json!({
+        let mut response = json!({
             "id": self.id.as_deref().unwrap_or_default(),
             "object": "chat.completion",
             "created": self.created.unwrap_or_default(),
@@ -632,9 +711,17 @@ impl OpenAiVisionStreamState {
             "choices": [{
                 "index": 0,
                 "message": {"role": "assistant", "content": self.buffered},
-                "finish_reason": "stop"
+                "finish_reason": self.accounting.finish_reason()
             }]
-        }))
+        });
+        if let Some((prompt_tokens, completion_tokens)) = self.accounting.usage() {
+            response["usage"] = json!({
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens.saturating_add(completion_tokens)
+            });
+        }
+        Ok(response)
     }
 
     fn validate_complete(&self) -> std::result::Result<(), String> {
@@ -764,5 +851,57 @@ mod tests {
             .unwrap();
         let terminal = streaming.finish_streaming().unwrap();
         assert_eq!(terminal["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn native_multimodal_metadata_maps_length_and_usage() {
+        let event = |chunk: serde_json::Value| json!({"id":"mms-3","object":"multimodal.chunk","created":9,"model":"vision","chunk":chunk});
+        for (reason, expected) in [("length", "length"), ("eos", "stop")] {
+            for collect in [true, false] {
+                let mut state = OpenAiVisionStreamState::default();
+                for chunk in [
+                    serde_json::Value::Null,
+                    json!({"TokenUsage":{"input_tokens":5,"output_tokens":0}}),
+                    json!({"TextDelta":"A"}),
+                    json!({"TokenUsage":{"input_tokens":5,"output_tokens":2}}),
+                    json!({"GenerationFinished":{"input_tokens":5,"output_tokens":2,"reason":reason}}),
+                    json!("End"),
+                ] {
+                    state.ingest(event(chunk), collect).unwrap();
+                }
+                if collect {
+                    let response = state.finish_buffered().unwrap();
+                    assert_eq!(response["choices"][0]["finish_reason"], expected);
+                    assert_eq!(response["usage"]["prompt_tokens"], 5);
+                    assert_eq!(response["usage"]["completion_tokens"], 2);
+                    assert_eq!(response["usage"]["total_tokens"], 7);
+                } else {
+                    let terminal = state.finish_streaming().unwrap();
+                    assert_eq!(terminal["choices"][0]["finish_reason"], expected);
+                }
+            }
+        }
+
+        for invalid in [
+            vec![
+                json!({"TokenUsage":{"input_tokens":5,"output_tokens":3}}),
+                json!({"TokenUsage":{"input_tokens":5,"output_tokens":2}}),
+            ],
+            vec![
+                json!({"TokenUsage":{"input_tokens":5,"output_tokens":2}}),
+                json!({"GenerationFinished":{"input_tokens":5,"output_tokens":3,"reason":"eos"}}),
+            ],
+            vec![
+                json!({"TokenUsage":{"input_tokens":5,"output_tokens":2}}),
+                json!({"GenerationFinished":{"input_tokens":5,"output_tokens":2,"reason":"bogus"}}),
+            ],
+        ] {
+            let mut state = OpenAiVisionStreamState::default();
+            state.ingest(event(serde_json::Value::Null), true).unwrap();
+            let failed = invalid
+                .into_iter()
+                .any(|chunk| state.ingest(event(chunk), true).is_err());
+            assert!(failed);
+        }
     }
 }

@@ -37,9 +37,10 @@ pub use crate::core::engine::{
     SupportLevel, default_engine_supports, device_kind_from_capability,
 };
 pub use crate::core::io::{
-    DataBlock, InferenceParams, InferenceRequest, MAX_AUDIO_SAMPLES, MAX_FRAME_BYTES,
-    MAX_IMAGE_BYTES, MAX_STATE_ID_BYTES, MAX_TENSOR_VALUES, MAX_TEXT_BYTES, MAX_TOKEN_COUNT,
-    MAX_VIDEO_FRAMES, ModelInput, ModelOutput, OutputChunk, TokenLogprob, TokenLogprobs,
+    DataBlock, GenerationFinishReason, GenerationMetadata, GenerationStreamState, InferenceParams,
+    InferenceRequest, MAX_AUDIO_SAMPLES, MAX_FRAME_BYTES, MAX_IMAGE_BYTES, MAX_STATE_ID_BYTES,
+    MAX_TENSOR_VALUES, MAX_TEXT_BYTES, MAX_TOKEN_COUNT, MAX_VIDEO_FRAMES, ModelInput, ModelOutput,
+    OutputChunk, TokenLogprob, TokenLogprobs,
 };
 pub use crate::core::manifest::{
     MemoryEstimate, estimate_memory, estimate_memory_for_device, format_bytes, infer_quantization,

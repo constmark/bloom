@@ -226,8 +226,11 @@ requests must retain their protocol JSON, no-store, and correlation headers.
   throughput, peak memory, and client-disconnect drain behavior.
 - Run `scripts/openai_compat_smoke.py --embedding-only --require-model` against
   the production embedding model. Confirm stable rerank ties, descending finite
-  scores in `[-1, 1]`, `top_n`, returned document identity, unique response IDs,
+  cosine scores in `[-1, 1]`, `top_n`, returned document identity, unique response IDs,
   tokenizer-backed usage, and bounded drain after disconnect.
+- Validate native cross-encoders separately using their unbounded finite
+  classifier scores and ranking margins. Preserve raw scores through native
+  and browser clients and exports; do not interpret them as probabilities.
 - Exercise Responses `text.format` with both `json_object` and `json_schema` in
   streaming and non-streaming modes. Confirm valid output preserves the format
   in response lifecycle objects, invalid non-streaming output returns HTTP 422,

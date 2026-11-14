@@ -18,6 +18,23 @@ import venv
 import zipfile
 
 
+def isolated_install_environment(source: dict) -> dict:
+    """Keep pip destination/configuration and native overrides outside the gate.
+
+    Python's -I does not ignore PIP_TARGET/PIP_PREFIX or pip configuration.
+    Disable all pip config files explicitly so installation cannot escape the
+    fresh environment through a developer's persistent preferences.
+    """
+    env = {
+        name: value for name, value in source.items()
+        if not name.upper().startswith(("PIP_", "PYTHON"))
+        and name.upper() not in ("BLOOM_FFI_LIB", "BLOOM_SDK_TEST_MODEL", "BLOOM_SDK_REQUIRE_GENERATION_METADATA", "BLOOM_SDK_CHECK_LOGPROBS")
+    }
+    env["PIP_CONFIG_FILE"] = os.devnull
+    env["PIP_REQUIRE_VIRTUALENV"] = "true"
+    return env
+
+
 def verify_archive(path: Path) -> dict:
     with zipfile.ZipFile(path) as archive:
         names = archive.namelist()
@@ -97,7 +114,35 @@ if os.environ.get('BLOOM_SDK_TEST_MODEL'):
         assert pipeline.detokenize(pipeline.tokenize(original)) == original
         output = pipeline.generate('Hello', max_tokens=4, temperature=0, seed=42)
         assert isinstance(output.get('text'), str) and output['text']
-    print('PASS: bundled native model load, multilingual tokenizer and generation')
+        chunks = list(pipeline.generate_stream('Hello', max_tokens=4, temperature=0, seed=42))
+        assert chunks[-1] == 'End' and chunks.count('End') == 1
+        text = ''.join(chunk.get('TextDelta', '') for chunk in chunks if isinstance(chunk, dict))
+        assert text == output['text'], (text, output['text'])
+        if os.environ.get('BLOOM_SDK_REQUIRE_GENERATION_METADATA') == '1':
+            finished = [chunk['GenerationFinished'] for chunk in chunks if isinstance(chunk, dict) and 'GenerationFinished' in chunk]
+            assert len(finished) == 1, chunks
+            assert finished[0]['reason'] in ('eos', 'length', 'stop'), finished
+            assert 1 <= finished[0]['output_tokens'] <= 4 and finished[0]['input_tokens'] > 0
+            final_index = next(i for i, chunk in enumerate(chunks) if isinstance(chunk, dict) and 'GenerationFinished' in chunk)
+            assert final_index < len(chunks) - 1
+            assert not any(isinstance(chunk, dict) and 'TextDelta' in chunk for chunk in chunks[final_index + 1:])
+            assert finished[0]['reason'] != 'length' or finished[0]['output_tokens'] == 4
+            print('PASS: installed native generation metadata:', json.dumps(finished[0], sort_keys=True))
+        if os.environ.get('BLOOM_SDK_CHECK_LOGPROBS') == '1':
+            probabilities = pipeline.generate('Hello', max_tokens=4, temperature=0, seed=42, logprobs=2)
+            records = probabilities['logprobs']
+            assert bytes(byte for record in records for byte in record['token']['bytes']) == probabilities['text'].encode()
+            assert all(len(record['top_logprobs']) <= 2 for record in records)
+            scored_chunks = list(pipeline.generate_stream('Hello', max_tokens=4, temperature=0, seed=42, logprobs=2))
+            assert scored_chunks[-1] == 'End'
+            assert [chunk['TokenLogprobs'] for chunk in scored_chunks if isinstance(chunk, dict) and 'TokenLogprobs' in chunk] == records
+            assert ''.join(chunk.get('TextDelta', '') for chunk in scored_chunks if isinstance(chunk, dict)) == probabilities['text']
+            if os.environ.get('BLOOM_SDK_REQUIRE_GENERATION_METADATA') == '1':
+                scored_finished = [chunk['GenerationFinished'] for chunk in scored_chunks if isinstance(chunk, dict) and 'GenerationFinished' in chunk]
+                assert scored_finished == finished
+                assert scored_finished[0]['output_tokens'] == len(records) + (scored_finished[0]['reason'] == 'eos')
+            print('PASS: installed native buffered/streamed token logprobs')
+    print('PASS: bundled native model load, multilingual tokenizer and buffered/streamed generation')
 print('PASS: isolated bundled ABI, buffered/streamed inference, exact-tokenizer rejection')
 '''
 
@@ -106,7 +151,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("wheel", type=Path)
     parser.add_argument("--model", type=Path, help="optional existing text model for native execution; no downloads")
+    parser.add_argument("--require-generation-metadata", action="store_true", help="require the current native GenerationFinished contract (requires --model)")
+    parser.add_argument("--check-logprobs", action="store_true", help="verify buffered/streamed token logprobs with a supporting CPU text model (requires --model)")
     args = parser.parse_args()
+    if (args.require_generation_metadata or args.check_logprobs) and not args.model:
+        parser.error("--require-generation-metadata and --check-logprobs require --model")
     wheel = args.wheel.resolve()
     manifest = verify_archive(wheel)
     with tempfile.TemporaryDirectory(prefix="bloom-native-install-") as temporary:
@@ -114,12 +163,14 @@ def main() -> None:
         environment = work / "venv"
         venv.EnvBuilder(with_pip=True).create(environment)
         python = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-        env = os.environ.copy()
-        for name in ("BLOOM_FFI_LIB", "BLOOM_SDK_TEST_MODEL", "PYTHONPATH", "PYTHONHOME"):
-            env.pop(name, None)
+        env = isolated_install_environment(os.environ)
         if args.model:
             env["BLOOM_SDK_TEST_MODEL"] = str(args.model.resolve())
-        subprocess.run([str(python), "-I", "-m", "pip", "install", "--no-index", "--no-deps", str(wheel)], cwd=work, env=env, check=True, timeout=180)
+        if args.require_generation_metadata:
+            env["BLOOM_SDK_REQUIRE_GENERATION_METADATA"] = "1"
+        if args.check_logprobs:
+            env["BLOOM_SDK_CHECK_LOGPROBS"] = "1"
+        subprocess.run([str(python), "-I", "-m", "pip", "--disable-pip-version-check", "install", "--no-cache-dir", "--no-index", "--no-deps", str(wheel)], cwd=work, env=env, check=True, timeout=180)
         subprocess.run([str(python), "-I", "-c", SMOKE], cwd=work, env=env, check=True, timeout=60)
     print(f"PASS: {wheel.name} ({manifest['platform_tag']}, ABI 2)")
 

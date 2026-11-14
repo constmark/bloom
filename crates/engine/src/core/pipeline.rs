@@ -15,10 +15,27 @@ use crate::{
 struct ValidatingOutputSink<'a> {
     inner: &'a mut dyn OutputSink,
     ended: bool,
+    failure: Option<String>,
+    generation: crate::GenerationStreamState,
+    maximum_tokens: usize,
+    require_generation_metadata: bool,
 }
 
 impl OutputSink for ValidatingOutputSink<'_> {
     fn on_chunk(&mut self, chunk: OutputChunk) -> Result<()> {
+        if let Some(failure) = &self.failure {
+            return Err(BloomError::Engine(failure.clone()).into());
+        }
+        let result = self.validate_and_forward(chunk);
+        if let Err(error) = &result {
+            self.failure = Some(error.to_string());
+        }
+        result
+    }
+}
+
+impl ValidatingOutputSink<'_> {
+    fn validate_and_forward(&mut self, chunk: OutputChunk) -> Result<()> {
         chunk.validate().map_err(BloomError::InvalidInput)?;
         if self.ended {
             return Err(BloomError::Engine(
@@ -26,14 +43,20 @@ impl OutputSink for ValidatingOutputSink<'_> {
             )
             .into());
         }
-        if matches!(chunk, OutputChunk::End) {
-            self.ended = true;
+        self.generation
+            .observe(&chunk, self.maximum_tokens)
+            .map_err(BloomError::Engine)?;
+        let ended = matches!(chunk, OutputChunk::End);
+        if ended {
+            self.generation
+                .finish(self.require_generation_metadata)
+                .map_err(BloomError::Engine)?;
         }
-        self.inner.on_chunk(chunk)
+        self.inner.on_chunk(chunk)?;
+        self.ended = ended;
+        Ok(())
     }
-}
 
-impl ValidatingOutputSink<'_> {
     /// Complete the stream contract after the backend returns.
     ///
     /// Backends are allowed to emit chunks synchronously, but the terminal
@@ -42,8 +65,14 @@ impl ValidatingOutputSink<'_> {
     /// external scheduler believe the request completed and could leave a
     /// request lease/KV allocation live indefinitely.
     fn finish(&self) -> Result<()> {
+        if let Some(failure) = &self.failure {
+            return Err(BloomError::Engine(failure.clone()).into());
+        }
         if self.ended {
-            Ok(())
+            self.generation
+                .finish(self.require_generation_metadata)
+                .map_err(BloomError::Engine)
+                .map_err(Into::into)
         } else {
             Err(
                 BloomError::Engine("backend completed without a terminal output event".to_string())
@@ -452,6 +481,10 @@ impl InferencePipeline {
         let mut validating_sink = ValidatingOutputSink {
             inner: sink,
             ended: false,
+            failure: None,
+            generation: Default::default(),
+            maximum_tokens: params.max_tokens,
+            require_generation_metadata: self.model.supports_generation_metadata(),
         };
         self.model
             .infer_stream(input, params, &mut validating_sink)?;
@@ -515,6 +548,10 @@ impl InferencePipeline {
         let mut validating_sink = ValidatingOutputSink {
             inner: sink,
             ended: false,
+            failure: None,
+            generation: Default::default(),
+            maximum_tokens: params.max_tokens,
+            require_generation_metadata: self.model.supports_generation_metadata(),
         };
         self.model.infer_request(request, &mut validating_sink)?;
         validating_sink.finish()
@@ -707,6 +744,10 @@ mod tests {
                 Ok(())
             },
             ended: false,
+            failure: None,
+            generation: Default::default(),
+            maximum_tokens: 128,
+            require_generation_metadata: false,
         };
         sink.on_chunk(OutputChunk::TextDelta("partial".to_string()))
             .unwrap();
@@ -724,12 +765,61 @@ mod tests {
                 Ok(())
             },
             ended: false,
+            failure: None,
+            generation: Default::default(),
+            maximum_tokens: 128,
+            require_generation_metadata: false,
         };
         sink.on_chunk(OutputChunk::End).unwrap();
         sink.finish().unwrap();
         let error = sink.on_chunk(OutputChunk::TextDelta("late".to_string()));
         assert!(error.is_err());
         assert_eq!(received.len(), 1);
+    }
+
+    #[test]
+    fn validating_stream_latches_ignored_protocol_and_downstream_errors() {
+        for reject_end in [false, true] {
+            let mut forwarded = Vec::new();
+            let mut consumer = |chunk| {
+                if reject_end && matches!(chunk, OutputChunk::End) {
+                    anyhow::bail!("downstream rejected End");
+                }
+                forwarded.push(chunk);
+                Ok(())
+            };
+            let mut sink = ValidatingOutputSink {
+                inner: &mut consumer,
+                ended: false,
+                failure: None,
+                generation: Default::default(),
+                maximum_tokens: 4,
+                require_generation_metadata: !reject_end,
+            };
+            // Model code can ignore errors; the validator must still fail and
+            // refuse every later event, even a superficially valid terminal.
+            let _ = sink.on_chunk(OutputChunk::End);
+            let _ = sink.on_chunk(OutputChunk::TokenUsage {
+                input_tokens: 1,
+                output_tokens: 4,
+            });
+            let _ = sink.on_chunk(OutputChunk::GenerationFinished(crate::GenerationMetadata {
+                input_tokens: 1,
+                output_tokens: 4,
+                reason: crate::GenerationFinishReason::Length,
+            }));
+            let _ = sink.on_chunk(OutputChunk::End);
+            let error = sink.finish().unwrap_err().to_string();
+            assert!(
+                error.contains(if reject_end {
+                    "downstream rejected End"
+                } else {
+                    "metadata"
+                }),
+                "{error}"
+            );
+            assert!(forwarded.is_empty());
+        }
     }
 
     #[test]

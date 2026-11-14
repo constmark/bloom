@@ -33,6 +33,7 @@ jobs:
             requirements/schema-validation.txt
             requirements/python-package.txt
             requirements/tensor-runtime-test.txt
+            requirements/onnx-runtime-test.txt
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Install pinned official compatibility clients
         run: python -m pip install --disable-pip-version-check -r requirements/compat-smoke.txt
@@ -42,6 +43,12 @@ jobs:
         run: python -m pip install --disable-pip-version-check -r requirements/tensor-runtime-test.txt
       - name: Test TensorRT numeric bridge contract
         run: python3 scripts/test_tensorrt_infer.py
+      - name: Install pinned ONNX CPU runtime test dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements/onnx-runtime-test.txt
+      - name: Test ONNX numeric and real encoder contracts
+        run: |
+          python3 scripts/test_onnxruntime_infer.py
+          python3 scripts/test_onnx_embedding.py
       - name: Format
         run: cargo fmt --all -- --check
       - name: Check local Markdown links
@@ -199,6 +206,14 @@ jobs:
         env:
           BLOOM_TRAINED_HTTP_WORKLOAD_OUTPUT: ${{ runner.temp }}/bloom-qwen2-http-workload.json
         run: ./scripts/test_trained_qwen2_runtime.sh
+      - name: Test installed native SDK with trained generation
+        shell: bash
+        run: |
+          for sdk_wheel in native-sdk/*.whl; do
+            python scripts/test_python_native_wheel.py "$sdk_wheel" \
+              --model /tmp/bloom-trained-qwen2-runtime/qwen2-0_5b-instruct-q4_0.gguf \
+              --require-generation-metadata --check-logprobs
+          done
       - name: Upload pinned Qwen2 HTTP workload evidence
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
@@ -245,6 +260,24 @@ jobs:
         run: ./scripts/test_trained_embedding_runtime.sh --require-official-clients
       - name: Package and check exact crate release set
         run: ./scripts/test_crate_packages.sh
+      - name: Cache pinned trained MiniLM cross-encoder
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /tmp/bloom-trained-cross-encoder-runtime
+          key: trained-cross-encoder-minilm-821d1aa69520101d6e0737f78a042ae25b19e5cb9160701909d10434f4aeb0ae
+      - name: Test pinned trained cross-encoder CPU quality
+        timeout-minutes: 15
+        run: |
+          python3 scripts/test_trained_cross_encoder_runtime.py
+          ./scripts/test_trained_cross_encoder_runtime.sh --report "$RUNNER_TEMP/bloom-cross-encoder.json"
+      - name: Upload cross-encoder quality evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: bloom-cross-encoder-quality
+          path: ${{ runner.temp }}/bloom-cross-encoder.json
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Check CUDA features when nvcc is available
         run: |
           if command -v nvcc >/dev/null 2>&1; then

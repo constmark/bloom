@@ -10,6 +10,7 @@ request.
 - [Release manifest](release-manifest.md)
 - [GGUF models](gguf.md)
 - [Pinned trained-model validation](trained-model-validation.md)
+- [Trained cross-encoder CPU acceptance](trained-cross-encoder-validation-2026-11-14.md)
 - [Small-model support added in October 2026](model-support-2026-10.md)
 - [Qwen2-MoE validation](qwen2-moe.md)
 - [HTTP workload evidence](http-workload.md)
@@ -22,6 +23,7 @@ request.
 - [Encoder result exports](encoder-result-export.md)
 - [OpenAI API compatibility](openai-compatibility.md)
 - [Token log probabilities](token-logprobs.md)
+- [Native generation metadata and accounting](generation-metadata.md)
 - [Ollama API compatibility](ollama-compatibility.md)
 - [Structured output](structured-output.md)
 - [Packed RTN model conversion and loading](quantization-export.md)
@@ -44,6 +46,9 @@ request.
 - [Capability continuation: logprobs, native tools and Metal](capability-logprobs-metal-2026-11-13.md)
 - [Metal runtime validation](metal-runtime-validation-2026-11-13.md)
 - [Native logprob runtime validation](logprobs-runtime-validation-2026-11-13.md)
+- [Cross-layer correctness and client completion audit (2026-11-14)](completion-audit-2026-11-14.md)
+- [Completion continuation: generation, trained reranking and SDK delivery](completion-continuation-2026-11-14.md)
+- [Protocol, sampling and client iteration (2026-11-14)](protocol-sampling-iteration-2026-11-14.md)
 
 ## Understand and extend Bloom
 

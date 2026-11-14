@@ -11,7 +11,9 @@ use bloomai_core::{
 };
 use bloomai_engine::InferencePipeline;
 use bloomai_engine::core::engine::{BackendMaturity, Engine, EngineCapability, EngineRegistry};
-use bloomai_engine::core::io::{ModelInput, OutputChunk};
+use bloomai_engine::core::io::{
+    GenerationMetadata, GenerationStreamState, MAX_TEXT_BYTES, ModelInput, ModelOutput, OutputChunk,
+};
 use bloomai_engine::model::{EchoTextModel, LoadedModel, OutputSink};
 
 #[cfg(feature = "candle-engine")]
@@ -111,6 +113,63 @@ fn parse_generation_params(json: &str) -> Result<GenerationParams, serde_json::E
             }
         }),
     })
+}
+
+/// Run buffered inference. Models with native generation metadata are run
+/// through the validated stream so the result can report exact token counts
+/// and why generation stopped (mirroring the CLI's buffered `--json` output);
+/// legacy adapters keep their existing buffered implementation and shape.
+fn run_buffered(
+    pipeline: &InferencePipeline,
+    input: ModelInput,
+    params: &GenerationParams,
+) -> Result<(ModelOutput, Option<GenerationMetadata>)> {
+    if !pipeline.model().supports_generation_metadata() {
+        return Ok((pipeline.run(input, params)?, None));
+    }
+    let mut generation = GenerationStreamState::default();
+    let mut text_bytes = 0usize;
+    let mut chunks = Vec::new();
+    pipeline.run_stream(input, params, &mut |chunk: OutputChunk| {
+        generation
+            .observe(&chunk, params.max_tokens)
+            .map_err(anyhow::Error::msg)?;
+        if let OutputChunk::TextDelta(text) = &chunk {
+            if text.len() > MAX_TEXT_BYTES.saturating_sub(text_bytes) {
+                return Err(anyhow!("text output exceeded the byte limit"));
+            }
+            text_bytes += text.len();
+        }
+        if matches!(
+            chunk,
+            OutputChunk::TextDelta(_) | OutputChunk::TokenLogprobs(_)
+        ) {
+            chunks.push(chunk);
+        }
+        Ok(())
+    })?;
+    let mut output = ModelOutput::from(chunks);
+    if params.logprobs.is_some() && output.logprobs.is_none() {
+        output.logprobs = Some(Vec::new());
+    }
+    output.validate().map_err(anyhow::Error::msg)?;
+    Ok((output, generation.metadata()))
+}
+
+/// Serialize a buffered result. Generation metadata is an additive
+/// `generation` key so callers built against older libraries keep working.
+fn serialize_buffered_output(
+    output: &ModelOutput,
+    generation: Option<GenerationMetadata>,
+) -> serde_json::Result<Vec<u8>> {
+    let Some(generation) = generation else {
+        return serde_json::to_vec(output);
+    };
+    let mut value = serde_json::to_value(output)?;
+    if let serde_json::Value::Object(fields) = &mut value {
+        fields.insert("generation".to_string(), serde_json::to_value(generation)?);
+    }
+    serde_json::to_vec(&value)
 }
 
 /// A borrowed, length-delimited byte sequence used by ABI revision 2.
@@ -332,6 +391,19 @@ fn device_kind_from_name(name: &str) -> Option<DeviceKind> {
     }
 }
 
+/// Resolve a device selector for `engine`, including the `auto` selector used
+/// by default by the CLI and server. `auto` uses the shared backend registry
+/// policy, restricted to the devices the engine declares; explicit names keep
+/// their historical ABI behaviour and are not re-validated here.
+fn resolve_device_name(name: &str, engine: &dyn Engine) -> Result<DeviceKind, String> {
+    if name.eq_ignore_ascii_case("auto") {
+        return bloomai_engine::BackendRegistry::default()
+            .resolve_device_selector(name, &engine.supported_devices())
+            .map_err(|error| format!("Could not resolve device 'auto': {error}"));
+    }
+    device_kind_from_name(name).ok_or_else(|| format!("Unknown device kind: {name}"))
+}
+
 unsafe fn slice_as_utf8<'a>(
     value: BloomSlice,
     name: &str,
@@ -523,17 +595,18 @@ unsafe fn bloom_pipeline_load_impl(
             }
         };
 
-        let device = match device_kind_from_name(device_name_str) {
-            Some(device) => device,
-            None => {
-                write_error(
-                    &format!("Unknown device kind: {}", device_name_str),
-                    error_buffer,
-                    error_buffer_len,
-                );
-                return std::ptr::null_mut();
-            }
-        };
+        // Reject unknown selectors before the engine lookup so existing
+        // callers keep seeing the same diagnostic precedence.
+        if !device_name_str.eq_ignore_ascii_case("auto")
+            && device_kind_from_name(device_name_str).is_none()
+        {
+            write_error(
+                &format!("Unknown device kind: {}", device_name_str),
+                error_buffer,
+                error_buffer_len,
+            );
+            return std::ptr::null_mut();
+        }
 
         let engine = match ENGINE_REGISTRY.get(engine_name_str) {
             Ok(eng) => eng,
@@ -543,6 +616,14 @@ unsafe fn bloom_pipeline_load_impl(
                     error_buffer,
                     error_buffer_len,
                 );
+                return std::ptr::null_mut();
+            }
+        };
+
+        let device = match resolve_device_name(device_name_str, engine) {
+            Ok(device) => device,
+            Err(message) => {
+                write_error(&message, error_buffer, error_buffer_len);
                 return std::ptr::null_mut();
             }
         };
@@ -816,9 +897,9 @@ unsafe fn bloom_pipeline_run_impl(
             }
         };
 
-        match pipe.inner.run(input, &params) {
-            Ok(output) => {
-                let output_json = match serde_json::to_string(&output) {
+        match run_buffered(&pipe.inner, input, &params) {
+            Ok((output, generation)) => {
+                let output_json = match serialize_buffered_output(&output, generation) {
                     Ok(s) => s,
                     Err(e) => {
                         write_error(
@@ -966,7 +1047,7 @@ unsafe fn bloom_pipeline_run_v2_impl(
     };
 
     let pipe = unsafe { &*pipeline };
-    let result = match pipe.inner.run(input, &params) {
+    let (result, generation) = match run_buffered(&pipe.inner, input, &params) {
         Ok(value) => value,
         Err(error) => {
             unsafe {
@@ -979,7 +1060,7 @@ unsafe fn bloom_pipeline_run_v2_impl(
             return BLOOM_STATUS_INFERENCE_ERROR;
         }
     };
-    let result = match serde_json::to_vec(&result) {
+    let result = match serialize_buffered_output(&result, generation) {
         Ok(value) => value,
         Err(error) => {
             unsafe {
@@ -1854,6 +1935,226 @@ mod tests {
             Some(DeviceKind::Npu)
         );
         assert_eq!(super::device_kind_from_name("tpu"), None);
+    }
+
+    #[test]
+    fn auto_device_resolves_against_the_engine_declared_devices() {
+        let engine = super::ENGINE_REGISTRY.get("mock").unwrap();
+        // The mock engine only declares CPU, so `auto` must not select an
+        // accelerator even when the host exposes one.
+        for selector in ["auto", "AUTO"] {
+            assert_eq!(
+                super::resolve_device_name(selector, engine),
+                Ok(DeviceKind::Cpu)
+            );
+        }
+        assert_eq!(
+            super::resolve_device_name("metal", engine),
+            Ok(DeviceKind::Gpu)
+        );
+        assert_eq!(
+            super::resolve_device_name("tpu", engine),
+            Err("Unknown device kind: tpu".to_string())
+        );
+
+        let mut error_buffer = [0 as c_char; 256];
+        let as_slice = |value: &'static [u8]| BloomSlice {
+            data: value.as_ptr(),
+            len: value.len(),
+        };
+        let pipeline = unsafe {
+            bloom_pipeline_load_v2(
+                as_slice(b"."),
+                as_slice(b"mock"),
+                as_slice(b"auto"),
+                128,
+                error_buffer.as_mut_ptr(),
+                error_buffer.len(),
+            )
+        };
+        assert!(
+            !pipeline.is_null(),
+            "{}",
+            unsafe { CStr::from_ptr(error_buffer.as_ptr()) }.to_string_lossy()
+        );
+        assert_eq!(unsafe { &*pipeline }.inner.device(), DeviceKind::Cpu);
+        unsafe { super::bloom_pipeline_free(pipeline) };
+
+        let pipeline = unsafe {
+            bloom_pipeline_load_v2(
+                as_slice(b"."),
+                as_slice(b"mock"),
+                as_slice(b"tpu"),
+                128,
+                error_buffer.as_mut_ptr(),
+                error_buffer.len(),
+            )
+        };
+        assert!(pipeline.is_null());
+        let error = unsafe { CStr::from_ptr(error_buffer.as_ptr()) }.to_string_lossy();
+        assert_eq!(error, "Unknown device kind: tpu");
+    }
+
+    /// Emits exact accounting like the native Candle adapter: cumulative
+    /// usage before each token's text, then completion metadata, then End.
+    struct MetadataTestModel(super::EchoTextModel);
+
+    impl super::LoadedModel for MetadataTestModel {
+        fn metadata(&self) -> &bloomai_engine::ModelMetadata {
+            self.0.metadata()
+        }
+        fn supports_generation_metadata(&self) -> bool {
+            true
+        }
+        fn infer(
+            &self,
+            _: super::ModelInput,
+            _: &super::GenerationParams,
+        ) -> anyhow::Result<bloomai_engine::core::io::ModelOutput> {
+            anyhow::bail!("buffered metadata runs must consume the validated stream")
+        }
+        fn infer_stream(
+            &self,
+            _: super::ModelInput,
+            params: &super::GenerationParams,
+            sink: &mut dyn OutputSink,
+        ) -> anyhow::Result<()> {
+            // max_tokens == 2 exhausts the budget; anything larger ends on EOS
+            // (the EOS token is accepted and counted but has no text).
+            let words = ["你好", " Bloom"];
+            let generated = params.max_tokens.min(words.len());
+            for (index, word) in words.iter().take(generated).enumerate() {
+                sink.on_chunk(OutputChunk::TokenUsage {
+                    input_tokens: 3,
+                    output_tokens: index + 1,
+                })?;
+                sink.on_chunk(OutputChunk::TextDelta((*word).to_string()))?;
+            }
+            let (output_tokens, reason) = if generated == params.max_tokens {
+                (generated, bloomai_engine::GenerationFinishReason::Length)
+            } else {
+                sink.on_chunk(OutputChunk::TokenUsage {
+                    input_tokens: 3,
+                    output_tokens: generated + 1,
+                })?;
+                (generated + 1, bloomai_engine::GenerationFinishReason::Eos)
+            };
+            sink.on_chunk(OutputChunk::GenerationFinished(
+                bloomai_engine::GenerationMetadata {
+                    input_tokens: 3,
+                    output_tokens,
+                    reason,
+                },
+            ))?;
+            sink.on_chunk(OutputChunk::End)
+        }
+    }
+
+    struct MetadataTestEngine;
+
+    impl super::Engine for MetadataTestEngine {
+        fn name(&self) -> &'static str {
+            "metadata-test"
+        }
+        fn supported_modalities(&self) -> Vec<bloomai_core::Modality> {
+            super::MockEngine.supported_modalities()
+        }
+        fn supported_devices(&self) -> Vec<DeviceKind> {
+            super::MockEngine.supported_devices()
+        }
+        fn capability(&self) -> super::EngineCapability {
+            super::MockEngine.capability()
+        }
+        fn load(
+            &self,
+            _: &std::path::Path,
+            _: DeviceKind,
+        ) -> anyhow::Result<Box<dyn super::LoadedModel>> {
+            Ok(Box::new(MetadataTestModel(super::EchoTextModel::default())))
+        }
+    }
+
+    fn buffered_results(engine: &dyn super::Engine, max_tokens: usize) -> [serde_json::Value; 2] {
+        let inner = super::InferencePipeline::load_standalone(
+            engine,
+            DeviceKind::Cpu,
+            std::path::Path::new("."),
+        )
+        .unwrap();
+        let mut pipeline = super::BloomPipeline { inner };
+        let input = br#"{"Text":{"prompt":"hello"}}"#;
+        let params = format!(r#"{{"max_tokens":{max_tokens},"temperature":0.0,"top_p":1.0}}"#);
+        let mut error = [0 as c_char; 256];
+        let error_text = |error: &[c_char]| {
+            unsafe { CStr::from_ptr(error.as_ptr()) }
+                .to_string_lossy()
+                .into_owned()
+        };
+
+        let mut output = super::BloomOwnedBuffer::default();
+        let status = unsafe {
+            super::bloom_pipeline_run_v2(
+                &mut pipeline,
+                BloomSlice {
+                    data: input.as_ptr(),
+                    len: input.len(),
+                },
+                BloomSlice {
+                    data: params.as_ptr(),
+                    len: params.len(),
+                },
+                &mut output,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        assert_eq!(status, super::BLOOM_STATUS_OK, "{}", error_text(&error));
+        let v2 =
+            serde_json::from_slice(unsafe { std::slice::from_raw_parts(output.data, output.len) })
+                .unwrap();
+        unsafe { super::bloom_buffer_free(&mut output) };
+
+        let input = CString::new(input.as_slice()).unwrap();
+        let params = CString::new(params).unwrap();
+        let raw = unsafe {
+            super::bloom_pipeline_run(
+                &mut pipeline,
+                input.as_ptr(),
+                params.as_ptr(),
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        assert!(!raw.is_null(), "{}", error_text(&error));
+        let v1 = serde_json::from_str(&unsafe { CStr::from_ptr(raw) }.to_string_lossy()).unwrap();
+        unsafe { super::bloom_string_free(raw) };
+        [v1, v2]
+    }
+
+    #[test]
+    fn buffered_runs_report_additive_generation_metadata() {
+        for (max_tokens, text, output_tokens, reason) in [
+            (2, "你好 Bloom", 2, "length"),
+            (8, "你好 Bloom", 3, "eos"),
+            (1, "你好", 1, "length"),
+        ] {
+            for result in buffered_results(&MetadataTestEngine, max_tokens) {
+                assert_eq!(result["text"], text);
+                assert_eq!(
+                    result["generation"],
+                    serde_json::json!({
+                        "input_tokens": 3,
+                        "output_tokens": output_tokens,
+                        "reason": reason,
+                    })
+                );
+            }
+        }
+        // Legacy adapters keep the exact historical buffered output shape.
+        for result in buffered_results(&super::MockEngine, 8) {
+            assert_eq!(result["text"], "echo: hello");
+            assert!(result.get("generation").is_none(), "{result}");
+        }
     }
 
     #[test]

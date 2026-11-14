@@ -1,5 +1,9 @@
 # Capability continuation: logprobs, native tools and Metal — 2026-11-13
 
+The [2026-11-14 audit](completion-audit-2026-11-14.md) adds CLI logprobs and
+native reranking and corrects cross-layer execution issues. The remaining-work
+statements below describe this earlier snapshot.
+
 This continues the [package/IFB/client-history pass](capability-continuation-2026-11-13.md).
 It adds working token probabilities, native model/embedding tools and fresh
 Apple GPU execution evidence. The changes remain experimental within the

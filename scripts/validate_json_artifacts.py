@@ -664,7 +664,6 @@ def basic_validate() -> list[tuple[Path, str]]:
             or isinstance(score, bool)
             or not isinstance(score, (int, float))
             or not math.isfinite(score)
-            or not -1 <= score <= 1
             or (
                 previous is not None
                 and (score > previous[0] or (score == previous[0] and index <= previous[1]))
@@ -1061,6 +1060,7 @@ def jsonschema_validate() -> list[tuple[Path, str]]:
     for encoder_result_path in (
         ROOT / "examples/embedding-result.json",
         ROOT / "examples/rerank-result.json",
+        ROOT / "examples/cross-encoder-result.json",
     ):
         jsonschema.validate(load_json(encoder_result_path), encoder_result_schema)
         checked.append((encoder_result_path, "encoder-result-draft7"))

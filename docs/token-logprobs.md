@@ -3,8 +3,24 @@
 Bloom exposes selected-token log probabilities and bounded top alternatives on
 the direct CPU Candle text path. Chat Completions and legacy Completions support
 buffered and SSE responses, `n=1..8`, and legacy prompt arrays. Rust, JSON C ABI
-and Python callers can request the same native metadata. The CLI does not yet
-expose a logprobs flag.
+and Python callers can request the same native metadata. The CLI exposes
+`--logprobs N` (0–20 alternatives) with `--json` to retain the metadata:
+
+```bash
+bloom_infer --model /path/to/model.gguf --device cpu --prompt 'Hello' \
+  --max-tokens 16 --logprobs 2 --json
+bloom_infer --model /path/to/model.gguf --device cpu --prompt 'Hello' \
+  --max-tokens 16 --logprobs 2 --json --stream
+```
+
+Buffered output includes `ModelOutput.logprobs`; streaming emits native
+`TokenLogprobs` events alongside text and usage NDJSON. `infer.logprobs` in
+configuration and `logprobs` in a JSON prompt request use the same integer
+contract. Explicit CLI settings override configuration; JSON request settings
+override both. `infer.logprobs` only applies to `--json` runs, so a configured
+default does not break text, `-i`, `--bench`, `--inspect`, or `--list-engines`;
+an explicit `--logprobs` or JSON-request `logprobs` with non-JSON output is
+rejected rather than dropping metadata.
 
 ## Requests and responses
 
@@ -68,7 +84,11 @@ Sampled EOS has no selected-token record or text; EOS may still appear among
 top alternatives with empty special-token bytes. HTTP completion usage includes sampled EOS
 exactly once per stopped candidate, including first-token EOS and EOS at the
 last reserved token. A first-token EOS returns empty metadata/text, `stop`, and
-one completion token. Missing or inconsistent native usage fails closed.
+one completion token. Native `GenerationFinished` explicitly identifies EOS;
+no consumer infers EOS from a difference between text and usage counts. Missing
+or inconsistent native usage or termination metadata fails closed. The same
+accepted-token accounting applies to ordinary direct generation without
+logprobs; see [generation metadata](generation-metadata.md).
 
 ## Admission and resource limits
 

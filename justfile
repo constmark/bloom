@@ -83,7 +83,7 @@ tiny-model-runtime-test:
 
 # Download and verify all pinned trained packages, then gate native CPU
 # instruction following, semantic retrieval, and both public API adapters.
-trained-model-runtime-test: trained-qwen2-runtime-test trained-qwen3-runtime-test trained-llama-runtime-test trained-safetensors-runtime-test trained-embedding-runtime-test
+trained-model-runtime-test: trained-qwen2-runtime-test trained-qwen3-runtime-test trained-llama-runtime-test trained-safetensors-runtime-test trained-embedding-runtime-test trained-cross-encoder-runtime-test
 
 trained-qwen2-runtime-test:
     ./scripts/test_trained_qwen2_runtime.sh
@@ -99,6 +99,11 @@ trained-safetensors-runtime-test:
 
 trained-embedding-runtime-test:
     ./scripts/test_trained_embedding_runtime.sh
+
+# Verify trained classifier-head ranking, batch consistency, and task isolation.
+trained-cross-encoder-runtime-test:
+    python3 scripts/test_trained_cross_encoder_runtime.py
+    ./scripts/test_trained_cross_encoder_runtime.sh
 
 # Require the pinned OpenAI and Ollama clients during the tiny-model runtime gate.
 tiny-model-runtime-test-official:

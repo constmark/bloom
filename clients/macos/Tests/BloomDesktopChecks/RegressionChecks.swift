@@ -72,6 +72,7 @@ func runRegressionChecks() async throws {
     try await lifecycle.testConnectionEditsRequireNewReadinessAndIgnoreStaleResult()
     try await lifecycle.testCancelledConnectionCanBeRetried()
     try await lifecycle.testGenerationUsesConnectedClientSnapshot()
+    try await lifecycle.testLengthFinishMarksTruncationAndMaxTokensPersist()
     let conversations = ConversationChecks()
     try conversations.testFileStorageBoundsAndRecovery()
     try await conversations.testRestartSelectionDraftAndCredentialIsolation()
@@ -186,6 +187,7 @@ private final class ControlledClient: BloomAPITransport {
     var streamFinished: (() -> Void)?
     var pendingStreams: [CheckedContinuation<[ChatCompletionChunk], Error>] = []
     var requests: [[APIChatMessage]] = []
+    var requestedMaxTokens: [Int] = []
     var holdAfterChunks = false
     var chunksDelivered: (() -> Void)?
     var pendingCompletion: CheckedContinuation<Void, Never>?
@@ -204,8 +206,11 @@ private final class ControlledClient: BloomAPITransport {
         return try Self.ready()
     }
 
-    func streamChat(model: String, messages: [APIChatMessage], onChunk: (ChatCompletionChunk) -> Void) async throws {
+    func streamChat(
+        model: String, messages: [APIChatMessage], maxTokens: Int, onChunk: (ChatCompletionChunk) -> Void
+    ) async throws {
         requests.append(messages)
+        requestedMaxTokens.append(maxTokens)
         // Intentionally ignores cancellation to reproduce a late transport callback.
         defer { streamFinished?() }
         let chunks: [ChatCompletionChunk] = try await withCheckedThrowingContinuation {
@@ -325,6 +330,51 @@ private struct ChatViewModelChecks {
         client.streamFinished = { finished.signal() }
         client.pendingStreams[0].resume(returning: [])
         try await finished.wait()
+    }
+
+    @MainActor
+    func testLengthFinishMarksTruncationAndMaxTokensPersist() async throws {
+        let client = ControlledClient()
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let model = ChatViewModel(defaults: defaults, storage: MemoryConversationStore()) { _, _ in client }
+        expectEqual(model.maxTokens, GenerationSettings.defaultMaxTokens, "Default max tokens must stay 256")
+        model.maxTokens = 0
+        expectEqual(model.maxTokens, 1, "Max tokens must clamp to the lower bound")
+        model.maxTokens = 1_000_000
+        expectEqual(model.maxTokens, 32_768, "Max tokens must clamp to the upper bound")
+        model.maxTokens = 1_024
+        expectEqual(defaults.integer(forKey: GenerationSettings.maxTokensDefaultsKey), 1_024)
+        let relaunched = ChatViewModel(defaults: defaults, storage: MemoryConversationStore()) { _, _ in client }
+        expectEqual(relaunched.maxTokens, 1_024, "Max tokens must persist across launches")
+        defaults.set(99_999, forKey: GenerationSettings.maxTokensDefaultsKey)
+        let tampered = ChatViewModel(defaults: defaults, storage: MemoryConversationStore()) { _, _ in client }
+        expectEqual(tampered.maxTokens, 32_768, "Persisted max tokens must be re-validated")
+
+        await model.connect()
+        func chunk(_ text: String) throws -> ChatCompletionChunk {
+            try JSONDecoder().decode(ChatCompletionChunk.self, from: Data(text.utf8))
+        }
+        for (reason, truncated) in [("length", true), ("stop", false)] {
+            let started = AsyncSignal("\(reason) stream started")
+            let finished = AsyncSignal("\(reason) stream finished")
+            client.streamStarted = { started.signal() }
+            client.streamFinished = { finished.signal() }
+            model.draft = "explain \(reason)"
+            model.send()
+            try await started.wait()
+            client.pendingStreams.removeFirst().resume(returning: [
+                try chunk(#"{"choices":[{"index":0,"delta":{"content":"Partial"}}]}"#),
+                try chunk(#"{"choices":[{"index":0,"delta":{},"finish_reason":"\#(reason)"}]}"#),
+                try chunk(#"{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":1024,"total_tokens":1027}}"#),
+            ])
+            try await finished.wait()
+            while model.isGenerating { await Task.yield() }
+            expectEqual(model.metrics?.finishReason, reason)
+            expectEqual(model.metrics?.truncated, truncated, "Only finish_reason length marks truncation")
+            expectNil(model.errorMessage, "Truncation is a notice, not an error")
+        }
+        expectEqual(client.requestedMaxTokens, [1_024, 1_024], "The persisted setting must be sent")
     }
 
     func testCancelledConnectionCanBeRetried() async throws {
@@ -650,6 +700,10 @@ private final class FixtureProtocol: URLProtocol {
             body = Data(("data: {\r\ndata: \"id\":\"chat-1\",\"model\":\"tiny\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"中文\"}}]}\r\n\r\n"
                 + "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
                 + "data: [DONE]\r\n\r\n").utf8)
+        case "length":
+            body = Data(("data: {\"id\":\"chat-2\",\"model\":\"tiny\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"cut\"}}]}\n\n"
+                + "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n"
+                + "data: [DONE]\n\n").utf8)
         case "malformed-open-stream": body = Data("data: invalid JSON\n\n".utf8)
         case "truncated": body = Data("data: [DONE]\n".utf8)
         default: body = Data("data: [DONE]\n\n".utf8)
@@ -679,6 +733,22 @@ private func checkHTTPTransport() async throws {
         contents.append($0.choices.first?.delta.content ?? "")
     }
     expectEqual(contents, ["中文", ""])
+    var reasons: [String] = []
+    try await client("length").streamChat(model: "tiny", messages: [], maxTokens: 1) {
+        if let reason = $0.choices.first?.finishReason { reasons.append(reason) }
+    }
+    expectEqual(reasons, ["length"], "A length finish reason must reach the caller")
+    for invalid in [0, 32_769] {
+        do {
+            try await client("ready").streamChat(model: "tiny", messages: [], maxTokens: invalid) { _ in }
+            fatalError("Out-of-range max tokens must fail before network I/O")
+        } catch BloomClientError.requestLimitExceeded {}
+    }
+    let encoded = String(decoding: try JSONEncoder().encode(ChatCompletionRequest(
+        model: "tiny", messages: [], maxTokens: 2_048, temperature: GenerationSettings.temperature,
+        topP: GenerationSettings.topP, stream: true, streamOptions: .init(includeUsage: true)
+    )), as: UTF8.self)
+    expectTrue(encoded.contains("\"max_tokens\":2048"), "max_tokens must be sent")
     try await client("open-stream").streamChat(model: "tiny", messages: []) { _ in }
     try await expectTransportCancelled("/open-stream/v1/chat/completions")
     do {

@@ -273,6 +273,10 @@ pub struct ChatRequest {
     pub parallel_tool_calls: Option<bool>,
     #[serde(skip)]
     pub internal_request_id: Option<String>,
+    /// Set when the request declared legacy `functions`/`function_call`, so
+    /// replies use the legacy single `function_call` output shape.
+    #[serde(skip)]
+    pub legacy_function_calling: bool,
     #[serde(default, flatten)]
     pub extensions: BTreeMap<String, serde_json::Value>,
 }
@@ -1238,6 +1242,9 @@ mod tests {
 
         fn embed_batch(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
             self.native_batch_calls.fetch_add(1, Ordering::Relaxed);
+            if inputs.iter().any(|input| input.contains("backend fault")) {
+                return Err(anyhow!("simulated device fault"));
+            }
             Ok(inputs
                 .iter()
                 .map(|prompt| test_embedding_values(prompt))
@@ -1423,6 +1430,9 @@ mod tests {
         fn supports_logprobs(&self) -> bool {
             true
         }
+        fn supports_generation_metadata(&self) -> bool {
+            true
+        }
         fn infer(
             &self,
             _: ModelInput,
@@ -1442,11 +1452,52 @@ mod tests {
                 input_tokens: 1,
                 output_tokens: 0,
             })?;
+            if self.mode >= 5 {
+                let count = if self.mode == 6 { 3 } else { 4 };
+                sink.on_chunk(OutputChunk::TokenUsage {
+                    input_tokens: 1,
+                    output_tokens: count,
+                })?;
+                sink.on_chunk(OutputChunk::TextDelta(
+                    if self.mode == 6 {
+                        "visible STOP hidden"
+                    } else {
+                        "€"
+                    }
+                    .into(),
+                ))?;
+                let metadata = bloomai_engine::GenerationMetadata {
+                    input_tokens: 1,
+                    output_tokens: if self.mode == 11 { 3 } else { count },
+                    reason: if self.mode == 5 {
+                        bloomai_engine::GenerationFinishReason::Length
+                    } else {
+                        bloomai_engine::GenerationFinishReason::Stop
+                    },
+                };
+                if self.mode != 8 {
+                    sink.on_chunk(OutputChunk::GenerationFinished(metadata))?;
+                }
+                if self.mode == 9 {
+                    sink.on_chunk(OutputChunk::GenerationFinished(metadata))?;
+                }
+                if self.mode == 10 {
+                    sink.on_chunk(OutputChunk::TextDelta("late".into()))?;
+                }
+                return sink.on_chunk(OutputChunk::End);
+            }
             if self.mode == 3 {
                 sink.on_chunk(OutputChunk::TokenUsage {
                     input_tokens: 1,
                     output_tokens: 1,
                 })?;
+                sink.on_chunk(OutputChunk::GenerationFinished(
+                    bloomai_engine::GenerationMetadata {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        reason: bloomai_engine::GenerationFinishReason::Eos,
+                    },
+                ))?;
                 return sink.on_chunk(OutputChunk::End);
             }
             for (index, byte) in [0xe2, 0x82, 0xac].into_iter().enumerate() {
@@ -1454,7 +1505,9 @@ mod tests {
                     input_tokens: 1,
                     output_tokens: index + 1,
                 })?;
-                if self.mode != 2 {
+                if self.mode != 2
+                    && let Some(top_count) = params.logprobs
+                {
                     let token = bloomai_engine::TokenLogprob {
                         token_id: index as u32 + 100,
                         token: "�".into(),
@@ -1470,7 +1523,7 @@ mod tests {
                             logprob: -1.5,
                         },
                     ];
-                    top.truncate(params.logprobs.unwrap());
+                    top.truncate(top_count);
                     sink.on_chunk(OutputChunk::TokenLogprobs(bloomai_engine::TokenLogprobs {
                         token,
                         top_logprobs: top,
@@ -1484,6 +1537,13 @@ mod tests {
                 input_tokens: 1,
                 output_tokens: if self.mode == 4 { 5 } else { 4 },
             })?;
+            sink.on_chunk(OutputChunk::GenerationFinished(
+                bloomai_engine::GenerationMetadata {
+                    input_tokens: 1,
+                    output_tokens: 4,
+                    reason: bloomai_engine::GenerationFinishReason::Eos,
+                },
+            ))?;
             sink.on_chunk(OutputChunk::End)
         }
     }
@@ -1493,6 +1553,7 @@ mod tests {
         mode: u8,
         chat: bool,
         stream: bool,
+        choice_count: usize,
     ) -> (Arc<ServerState>, Response) {
         let (state, _receiver) = test_server_state(root.to_path_buf());
         let runtime =
@@ -1507,13 +1568,13 @@ mod tests {
         let response = tokio::time::timeout(Duration::from_secs(3), async {
             if chat {
                 handle_chat_completions(State(state.clone()), Json(serde_json::from_value(json!({
-                    "messages":[{"role":"user","content":"hello"}], "n":2, "max_tokens":4,
+                    "messages":[{"role":"user","content":"hello"}], "n":choice_count, "max_tokens":4,
                     "logprobs":true, "top_logprobs":2, "stream":stream,
                     "stream_options": if stream { json!({"include_usage":true}) } else { serde_json::Value::Null }
                 })).unwrap())).await
             } else {
                 handle_completions(State(state.clone()), Json(serde_json::from_value(json!({
-                    "prompt":["first","second"], "n":2, "max_tokens":4,
+                    "prompt": if choice_count == 1 { json!("first") } else { json!(["first","second"]) }, "n":choice_count, "max_tokens":4,
                     "logprobs":2, "stream":stream
                 })).unwrap())).await.into_response()
             }
@@ -1521,109 +1582,337 @@ mod tests {
         (state, response)
     }
 
+    async fn native_usage_request(
+        root: &Path,
+        mode: u8,
+        endpoint: &str,
+        stream: bool,
+        choices: usize,
+    ) -> (Arc<ServerState>, Response) {
+        let (state, _receiver) = test_server_state(root.to_path_buf());
+        let runtime = test_text_runtime_with_engine(
+            root.join("native-usage.fixture"),
+            &LogprobAuditEngine(mode),
+        );
+        state
+            .app
+            .runtime_pool
+            .write()
+            .await
+            .publish_default(runtime);
+        state.app.ready.store(true, Ordering::Release);
+        let mut body = match endpoint {
+            "chat" => {
+                json!({"messages":[{"role":"user","content":"hello"}],"max_tokens":4,"n":choices})
+            }
+            "completion" => {
+                json!({"prompt":if choices == 1 {json!("hello")} else {json!(["first","second"])},"max_tokens":4,"n":choices})
+            }
+            "responses" => json!({"input":"hello","max_output_tokens":4}),
+            _ => unreachable!(),
+        };
+        body["stream"] = json!(stream);
+        if stream && endpoint == "chat" {
+            body["stream_options"] = json!({"include_usage":true});
+        }
+        if mode == 6 {
+            body["stop"] = json!("STOP");
+        }
+        let response = match endpoint {
+            "chat" => {
+                handle_chat_completions(
+                    State(state.clone()),
+                    Json(serde_json::from_value(body).unwrap()),
+                )
+                .await
+            }
+            "completion" => handle_completions(
+                State(state.clone()),
+                Json(serde_json::from_value(body).unwrap()),
+            )
+            .await
+            .into_response(),
+            "responses" => {
+                handle_responses(
+                    State(state.clone()),
+                    Json(serde_json::from_value(body).unwrap()),
+                )
+                .await
+            }
+            _ => unreachable!(),
+        };
+        (state, response)
+    }
+
     #[tokio::test]
-    async fn logprobs_http_preserves_unicode_choices_and_exact_eos_usage() {
-        for mode in [0, 3] {
-            for chat in [true, false] {
+    async fn ordinary_native_http_preserves_accepted_usage_and_explicit_finish_reasons() {
+        for endpoint in ["chat", "completion", "responses"] {
+            for choices in [1, 2] {
+                if endpoint == "responses" && choices > 1 {
+                    continue;
+                }
+                for mode in [0, 3, 5, 6, 7] {
+                    // Responses does not expose the legacy custom stop parameter.
+                    if endpoint == "responses" && mode == 6 {
+                        continue;
+                    }
+                    for stream in [false, true] {
+                        let temp = tempfile::tempdir().unwrap();
+                        let (state, response) =
+                            native_usage_request(temp.path(), mode, endpoint, stream, choices)
+                                .await;
+                        assert_eq!(
+                            response.status(),
+                            axum::http::StatusCode::OK,
+                            "{endpoint} {mode}"
+                        );
+                        let bytes = tokio::time::timeout(
+                            Duration::from_secs(3),
+                            axum::body::to_bytes(response.into_body(), 1024 * 1024),
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                        let raw = String::from_utf8(bytes.to_vec()).unwrap();
+                        let frames = if stream {
+                            raw.lines()
+                                .filter_map(|line| line.strip_prefix("data: "))
+                                .filter(|line| *line != "[DONE]")
+                                .map(|line| {
+                                    serde_json::from_str::<serde_json::Value>(line).unwrap()
+                                })
+                                .collect::<Vec<_>>()
+                        } else {
+                            vec![serde_json::from_str::<serde_json::Value>(&raw).unwrap()]
+                        };
+                        assert!(
+                            frames.iter().all(|frame| frame
+                                .get("error")
+                                .is_none_or(serde_json::Value::is_null)),
+                            "{raw}"
+                        );
+                        let count = if mode == 3 {
+                            1
+                        } else if mode == 6 {
+                            3
+                        } else {
+                            4
+                        };
+                        let total = if endpoint == "completion" {
+                            choices * choices
+                        } else {
+                            choices
+                        };
+                        let input_count = if endpoint == "completion" { choices } else { 1 };
+                        let visible = if mode == 3 {
+                            ""
+                        } else if mode == 6 {
+                            "visible "
+                        } else {
+                            "€"
+                        };
+                        if endpoint == "responses" {
+                            let response = if stream {
+                                &frames.last().unwrap()["response"]
+                            } else {
+                                &frames[0]
+                            };
+                            assert_eq!(response["usage"]["output_tokens"], count, "{raw}");
+                            assert_eq!(response["usage"]["input_tokens"], 1, "{raw}");
+                            assert_eq!(
+                                response["status"],
+                                if mode == 5 { "incomplete" } else { "completed" },
+                                "{raw}"
+                            );
+                        } else {
+                            if !stream || endpoint == "chat" {
+                                let usage =
+                                    frames.iter().find_map(|frame| frame.get("usage")).unwrap();
+                                assert_eq!(usage["completion_tokens"], count * total, "{raw}");
+                                assert_eq!(usage["prompt_tokens"], input_count, "{raw}");
+                            }
+                            let mut texts = vec![String::new(); total];
+                            let mut reasons = vec![None; total];
+                            for frame in &frames {
+                                for choice in frame["choices"].as_array().unwrap() {
+                                    let index = choice["index"].as_u64().unwrap() as usize;
+                                    let text = if endpoint == "chat" {
+                                        choice[if stream { "delta" } else { "message" }]["content"]
+                                            .as_str()
+                                    } else {
+                                        choice["text"].as_str()
+                                    };
+                                    texts[index].push_str(text.unwrap_or_default());
+                                    if let Some(reason) = choice["finish_reason"].as_str() {
+                                        reasons[index] = Some(reason.to_string());
+                                    }
+                                }
+                            }
+                            assert!(texts.iter().all(|text| text == visible), "{raw}");
+                            assert!(
+                                reasons.iter().all(|reason| reason.as_deref()
+                                    == Some(if mode == 5 { "length" } else { "stop" })),
+                                "{raw}"
+                            );
+                        }
+                        assert_eq!(state.app.semaphore.available_permits(), 1);
+                        assert!(state.app.cancellations.is_empty());
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_http_metadata_failures_never_publish_success_or_usage() {
+        for endpoint in ["chat", "completion", "responses"] {
+            for mode in [8, 9, 10, 11] {
                 for stream in [false, true] {
                     let temp = tempfile::tempdir().unwrap();
                     let (state, response) =
-                        logprob_audit_request(temp.path(), mode, chat, stream).await;
-                    assert_eq!(response.status(), axum::http::StatusCode::OK);
-                    let raw = tokio::time::timeout(
+                        native_usage_request(temp.path(), mode, endpoint, stream, 1).await;
+                    assert_eq!(
+                        response.status(),
+                        if stream {
+                            axum::http::StatusCode::OK
+                        } else {
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                        }
+                    );
+                    let bytes = tokio::time::timeout(
                         Duration::from_secs(3),
                         axum::body::to_bytes(response.into_body(), 1024 * 1024),
                     )
                     .await
                     .unwrap()
                     .unwrap();
-                    let raw = String::from_utf8(raw.to_vec()).unwrap();
-                    let frames = if stream {
-                        assert_eq!(raw.matches("data: [DONE]").count(), 1);
-                        raw.lines()
-                            .filter_map(|l| l.strip_prefix("data: "))
-                            .filter(|l| *l != "[DONE]")
-                            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
-                            .collect::<Vec<_>>()
-                    } else {
-                        vec![serde_json::from_str::<serde_json::Value>(&raw).unwrap()]
-                    };
-                    let total = if chat { 2 } else { 4 };
-                    let mut texts = vec![String::new(); total];
-                    let mut metadata = vec![0usize; total];
-                    let mut bytes = vec![Vec::<u8>::new(); total];
-                    let mut ended = vec![false; total];
-                    let mut usage = None;
-                    for frame in frames {
-                        assert!(frame.get("error").is_none(), "{frame}");
-                        if frame.get("usage").is_some() {
-                            usage = Some(frame["usage"].clone());
-                        }
-                        for choice in frame["choices"].as_array().unwrap() {
-                            let i = choice["index"].as_u64().unwrap() as usize;
-                            assert!(!ended[i]);
-                            texts[i].push_str(
-                                if chat {
-                                    choice[if stream { "delta" } else { "message" }]["content"]
-                                        .as_str()
-                                } else {
-                                    choice["text"].as_str()
-                                }
-                                .unwrap_or_default(),
-                            );
-                            if let Some(lp) = choice.get("logprobs") {
-                                if chat {
-                                    for record in lp["content"].as_array().unwrap() {
-                                        metadata[i] += 1;
-                                        bytes[i].extend(
-                                            record["bytes"]
+                    let raw = String::from_utf8(bytes.to_vec()).unwrap();
+                    assert!(raw.contains("error"), "{raw}");
+                    assert!(!raw.contains("\"completion_tokens\""), "{raw}");
+                    assert!(!raw.contains("\"finish_reason\":\"stop\""), "{raw}");
+                    assert!(!raw.contains("response.completed"), "{raw}");
+                    assert!(!raw.contains("response.incomplete"), "{raw}");
+                    assert_eq!(state.app.semaphore.available_permits(), 1);
+                    assert!(state.app.cancellations.is_empty());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn logprobs_http_preserves_unicode_choices_and_exact_eos_usage() {
+        for choice_count in [1, 2] {
+            for mode in [0, 3] {
+                for chat in [true, false] {
+                    for stream in [false, true] {
+                        let temp = tempfile::tempdir().unwrap();
+                        let (state, response) =
+                            logprob_audit_request(temp.path(), mode, chat, stream, choice_count)
+                                .await;
+                        assert_eq!(response.status(), axum::http::StatusCode::OK);
+                        let raw = tokio::time::timeout(
+                            Duration::from_secs(3),
+                            axum::body::to_bytes(response.into_body(), 1024 * 1024),
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                        let raw = String::from_utf8(raw.to_vec()).unwrap();
+                        let frames = if stream {
+                            assert_eq!(raw.matches("data: [DONE]").count(), 1);
+                            raw.lines()
+                                .filter_map(|l| l.strip_prefix("data: "))
+                                .filter(|l| *l != "[DONE]")
+                                .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+                                .collect::<Vec<_>>()
+                        } else {
+                            vec![serde_json::from_str::<serde_json::Value>(&raw).unwrap()]
+                        };
+                        let total = if choice_count == 1 {
+                            1
+                        } else if chat {
+                            2
+                        } else {
+                            4
+                        };
+                        let mut texts = vec![String::new(); total];
+                        let mut metadata = vec![0usize; total];
+                        let mut bytes = vec![Vec::<u8>::new(); total];
+                        let mut ended = vec![false; total];
+                        let mut usage = None;
+                        for frame in frames {
+                            assert!(frame.get("error").is_none(), "{frame}");
+                            if frame.get("usage").is_some() {
+                                usage = Some(frame["usage"].clone());
+                            }
+                            for choice in frame["choices"].as_array().unwrap() {
+                                let i = choice["index"].as_u64().unwrap() as usize;
+                                assert!(!ended[i]);
+                                texts[i].push_str(
+                                    if chat {
+                                        choice[if stream { "delta" } else { "message" }]["content"]
+                                            .as_str()
+                                    } else {
+                                        choice["text"].as_str()
+                                    }
+                                    .unwrap_or_default(),
+                                );
+                                if let Some(lp) = choice.get("logprobs") {
+                                    if chat {
+                                        for record in lp["content"].as_array().unwrap() {
+                                            metadata[i] += 1;
+                                            bytes[i].extend(
+                                                record["bytes"]
+                                                    .as_array()
+                                                    .unwrap()
+                                                    .iter()
+                                                    .map(|v| v.as_u64().unwrap() as u8),
+                                            );
+                                            assert_eq!(
+                                                record["top_logprobs"].as_array().unwrap().len(),
+                                                2
+                                            );
+                                        }
+                                    } else {
+                                        let length = lp["tokens"].as_array().unwrap().len();
+                                        metadata[i] += length;
+                                        for field in
+                                            ["token_logprobs", "text_offset", "top_logprobs"]
+                                        {
+                                            assert_eq!(lp[field].as_array().unwrap().len(), length);
+                                        }
+                                        assert!(
+                                            lp["text_offset"]
                                                 .as_array()
                                                 .unwrap()
                                                 .iter()
-                                                .map(|v| v.as_u64().unwrap() as u8),
-                                        );
-                                        assert_eq!(
-                                            record["top_logprobs"].as_array().unwrap().len(),
-                                            2
+                                                .all(|v| *v == 0)
                                         );
                                     }
-                                } else {
-                                    let length = lp["tokens"].as_array().unwrap().len();
-                                    metadata[i] += length;
-                                    for field in ["token_logprobs", "text_offset", "top_logprobs"] {
-                                        assert_eq!(lp[field].as_array().unwrap().len(), length);
-                                    }
-                                    assert!(
-                                        lp["text_offset"]
-                                            .as_array()
-                                            .unwrap()
-                                            .iter()
-                                            .all(|v| *v == 0)
-                                    );
+                                }
+                                if !choice["finish_reason"].is_null() {
+                                    assert_eq!(choice["finish_reason"], "stop");
+                                    ended[i] = true;
                                 }
                             }
-                            if !choice["finish_reason"].is_null() {
-                                assert_eq!(choice["finish_reason"], "stop");
-                                ended[i] = true;
+                        }
+                        assert!(ended.iter().all(|v| *v));
+                        assert!(metadata.iter().all(|n| *n == if mode == 3 { 0 } else { 3 }));
+                        assert!(texts.iter().all(|s| s == if mode == 3 { "" } else { "€" }));
+                        if chat {
+                            for (raw, text) in bytes.iter().zip(&texts) {
+                                assert_eq!(raw, text.as_bytes());
                             }
                         }
-                    }
-                    assert!(ended.iter().all(|v| *v));
-                    assert!(metadata.iter().all(|n| *n == if mode == 3 { 0 } else { 3 }));
-                    assert!(texts.iter().all(|s| s == if mode == 3 { "" } else { "€" }));
-                    if chat {
-                        for (raw, text) in bytes.iter().zip(&texts) {
-                            assert_eq!(raw, text.as_bytes());
+                        if chat || !stream {
+                            assert_eq!(
+                                usage.unwrap()["completion_tokens"],
+                                total * if mode == 3 { 1 } else { 4 }
+                            );
                         }
+                        assert_eq!(state.app.semaphore.available_permits(), 1);
+                        assert!(state.app.cancellations.is_empty());
                     }
-                    if chat || !stream {
-                        assert_eq!(
-                            usage.unwrap()["completion_tokens"],
-                            total * if mode == 3 { 1 } else { 4 }
-                        );
-                    }
-                    assert_eq!(state.app.semaphore.available_permits(), 1);
-                    assert!(state.app.cancellations.is_empty());
                 }
             }
         }
@@ -1635,7 +1924,7 @@ mod tests {
             for stream in [false, true] {
                 let temp = tempfile::tempdir().unwrap();
                 let (state, response) =
-                    logprob_audit_request(temp.path(), mode, true, stream).await;
+                    logprob_audit_request(temp.path(), mode, true, stream, 2).await;
                 assert_eq!(
                     response.status(),
                     if stream {
@@ -2262,6 +2551,43 @@ mod tests {
                 .unwrap_err()
                 .contains("must appear before")
         );
+    }
+
+    #[test]
+    fn chat_json_schema_treats_null_annotations_as_absent() {
+        for annotations in [
+            json!({"strict": null}),
+            json!({"description": null}),
+            json!({"description": null, "strict": null}),
+        ] {
+            let mut json_schema = json!({"name": "answer", "schema": {"type": "object"}});
+            json_schema
+                .as_object_mut()
+                .unwrap()
+                .extend(annotations.as_object().unwrap().clone());
+            let format = serde_json::from_value::<ResponseFormat>(json!({
+                "type": "json_schema",
+                "json_schema": json_schema
+            }))
+            .unwrap();
+            assert!(matches!(
+                helpers::response_format_mode(Some(&format)).unwrap(),
+                ResponseFormatMode::JsonSchema(_)
+            ));
+        }
+        for annotations in [json!({"strict": "yes"}), json!({"description": 3})] {
+            let mut json_schema = json!({"name": "answer", "schema": {"type": "object"}});
+            json_schema
+                .as_object_mut()
+                .unwrap()
+                .extend(annotations.as_object().unwrap().clone());
+            let format = serde_json::from_value::<ResponseFormat>(json!({
+                "type": "json_schema",
+                "json_schema": json_schema
+            }))
+            .unwrap();
+            assert!(helpers::response_format_mode(Some(&format)).is_err());
+        }
     }
 
     #[test]
@@ -3036,7 +3362,7 @@ mod tests {
                 "model": "tiny.gguf",
                 "choices": [{
                     "index": 0,
-                    "delta": {"role": "assistant"},
+                    "delta": {"role": "assistant", "content": ""},
                     "finish_reason": null
                 }]
             }))
@@ -3064,10 +3390,20 @@ mod tests {
                                 "function": {"name": "lookup", "arguments": "{\"city\":\"Berlin\"}"}
                             }
                         ]},
-                        "finish_reason": "tool_calls"
+                        "finish_reason": null
                     }]
                 }))
                 .unwrap(),
+        );
+        assert!(
+            adapter
+                .ingest_chat_payload(json!({
+                    "id": "resp-function-stream", "object": "chat.completion.chunk",
+                    "created": 20_u64, "model": "tiny.gguf",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+                }))
+                .unwrap()
+                .is_empty()
         );
         assert!(
             adapter
@@ -10494,9 +10830,9 @@ mod tests {
         invalid = valid.clone();
         invalid.top_n = Some(0);
         assert!(validate_rerank_request(&invalid).is_err());
-        invalid = valid.clone();
-        invalid.top_n = Some(3);
-        assert!(validate_rerank_request(&invalid).is_err());
+        let mut oversized = valid.clone();
+        oversized.top_n = Some(3);
+        validate_rerank_request(&oversized).unwrap();
         invalid = valid;
         invalid.query = "x".repeat(MAX_RERANK_QUERY_CHARS);
         invalid.documents = vec![
@@ -10506,6 +10842,77 @@ mod tests {
         ];
         invalid.top_n = None;
         assert!(validate_rerank_request(&invalid).is_err());
+    }
+
+    #[tokio::test]
+    async fn rerank_top_n_above_the_document_count_returns_every_document() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, _) = test_server_state_with_embedding_runtime(temp.path().to_path_buf()).await;
+        let app = Router::new()
+            .route("/rerank", post(handle_rerank))
+            .with_state(Arc::clone(&state));
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/rerank")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "model": "test-embed-model",
+                            "query": "local AI runtime",
+                            "documents": ["banana orchard", "local AI runtime"],
+                            "top_n": 5
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let results = body["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2, "{body}");
+        assert_eq!(results[0]["index"], 1);
+    }
+
+    #[tokio::test]
+    async fn embedding_backend_failures_are_retryable_server_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, _) = test_server_state_with_embedding_runtime(temp.path().to_path_buf()).await;
+        let app = Router::new()
+            .route("/embeddings", post(handle_embeddings))
+            .with_state(Arc::clone(&state));
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/embeddings")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({"model": "test-embed-model", "input": "backend fault"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["error"]["type"], "internal_error");
     }
 
     #[tokio::test]
@@ -11204,7 +11611,11 @@ mod tests {
                             1
                         );
                     }
-                    let total = count * if completion { 2 } else { 1 };
+                    let total = if invalid_second {
+                        2
+                    } else {
+                        count * if completion { 2 } else { 1 }
+                    };
                     assert_eq!(
                         *seeds.lock().unwrap(),
                         (0..total)
@@ -11216,6 +11627,146 @@ mod tests {
                     assert_eq!(state.app.semaphore.available_permits(), 1);
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_function_requests_use_legacy_reply_shapes_and_history() {
+        let schema = json!({
+            "type": "object", "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"], "additionalProperties": false
+        });
+        let single = json!({"type": "function_calls", "calls": [
+            {"name": "lookup", "arguments": {"ok": true}}
+        ]})
+        .to_string();
+        let parallel = json!({"type": "function_calls", "calls": [
+            {"name": "lookup", "arguments": {"ok": true}},
+            {"name": "lookup", "arguments": {"ok": false}}
+        ]})
+        .to_string();
+        for (count, stream, output) in [
+            (1_usize, false, &single),
+            (2, false, &single),
+            (1, true, &single),
+            (2, true, &single),
+            (1, false, &parallel),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let (state, _receiver) = test_server_state(temp.path().to_path_buf());
+            let runtime = test_text_runtime_with_engine(
+                temp.path().join("choices.fixture"),
+                &ChoiceAuditEngine {
+                    seeds: Arc::new(std::sync::Mutex::new(Vec::new())),
+                    fail_at: None,
+                    outputs: Some(vec![output.clone()]),
+                },
+            );
+            state
+                .app
+                .runtime_pool
+                .write()
+                .await
+                .publish_default(Arc::clone(&runtime));
+            state.app.ready.store(true, Ordering::Release);
+            let payload = json!({
+                "messages": [
+                    {"role": "user", "content": "Look it up"},
+                    {"role": "assistant", "content": null,
+                        "function_call": {"name": "lookup", "arguments": "{\"ok\":false}"}},
+                    {"role": "function", "name": "lookup", "content": "not found"},
+                    {"role": "user", "content": "Try again"}
+                ],
+                "functions": [{"name": "lookup", "parameters": schema}],
+                "function_call": "auto",
+                "n": count,
+                "stream": stream,
+                "max_tokens": 8
+            });
+            let response = handle_chat_completions(
+                State(Arc::clone(&state)),
+                Json(serde_json::from_value(payload).unwrap()),
+            )
+            .await;
+            let status = response.status();
+            let raw = String::from_utf8(
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    axum::body::to_bytes(response.into_body(), usize::MAX),
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .to_vec(),
+            )
+            .unwrap();
+            assert!(!raw.contains("tool_calls"), "{raw}");
+            assert!(!raw.contains("function_calls"), "private protocol leaked");
+            if output == &parallel {
+                // Legacy requests force single-call mode.
+                assert_eq!(
+                    status,
+                    axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                    "{raw}"
+                );
+                let body: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                assert_eq!(body["error"]["type"], "invalid_tool_call");
+                continue;
+            }
+            assert_eq!(status, axum::http::StatusCode::OK, "{raw}");
+            let mut calls = vec![None; count];
+            let mut reasons = vec![None; count];
+            if stream {
+                assert_eq!(raw.matches("data: [DONE]").count(), 1);
+                for frame in raw
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter(|data| *data != "[DONE]")
+                    .map(|data| serde_json::from_str::<serde_json::Value>(data).unwrap())
+                {
+                    assert!(frame.get("error").is_none(), "{frame}");
+                    for choice in frame["choices"].as_array().unwrap() {
+                        let index = choice["index"].as_u64().unwrap() as usize;
+                        assert!(
+                            choice["delta"]["content"]
+                                .as_str()
+                                .is_none_or(str::is_empty)
+                        );
+                        if let Some(call) = choice["delta"].get("function_call") {
+                            assert!(calls[index].replace(call.clone()).is_none());
+                        }
+                        if !choice["finish_reason"].is_null() {
+                            reasons[index] = Some(choice["finish_reason"].clone());
+                        }
+                    }
+                }
+            } else {
+                let body: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                let choices = body["choices"].as_array().unwrap();
+                assert_eq!(choices.len(), count);
+                for (index, choice) in choices.iter().enumerate() {
+                    assert_eq!(choice["index"], index);
+                    assert_eq!(choice["message"]["role"], "assistant");
+                    assert!(choice["message"]["content"].is_null(), "{body}");
+                    calls[index] = Some(choice["message"]["function_call"].clone());
+                    reasons[index] = Some(choice["finish_reason"].clone());
+                }
+            }
+            for (call, reason) in calls.iter().zip(&reasons) {
+                let call = call
+                    .as_ref()
+                    .expect("every candidate returns a function_call");
+                assert_eq!(call["name"], "lookup");
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(call["arguments"].as_str().unwrap())
+                        .unwrap(),
+                    json!({"ok": true})
+                );
+                assert_eq!(call.as_object().unwrap().len(), 2, "{call}");
+                assert_eq!(reason.as_ref().unwrap(), "function_call");
+            }
+            assert_eq!(runtime.active_request_leases.load(Ordering::Acquire), 0);
+            assert_eq!(state.app.semaphore.available_permits(), 1);
         }
     }
 
@@ -11749,33 +12300,146 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_multi_choice_stream_cancels_and_drains_worker() {
-        let temp = tempfile::tempdir().unwrap();
-        let chunks = Arc::new(AtomicU64::new(0));
-        let state =
-            test_server_state_with_text_runtime(temp.path().to_path_buf(), Arc::clone(&chunks))
-                .await;
-        let payload: ChatRequest = serde_json::from_value(json!({
-            "messages": [{"role": "user", "content": "Continue"}],
-            "stream": true, "n": 8, "max_tokens": 8
-        }))
-        .unwrap();
-        let response = handle_chat_completions(State(Arc::clone(&state)), Json(payload)).await;
-        assert_eq!(response.status(), axum::http::StatusCode::OK);
-        drop(response);
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while state.app.semaphore.available_permits() != 1 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+    async fn direct_single_choice_fails_closed_and_withholds_invalid_structured_text() {
+        for chat in [true, false] {
+            for stream in [true, false] {
+                for mode in [
+                    "worker-error",
+                    "invalid-schema",
+                    "invalid-tools",
+                    "oversize",
+                ] {
+                    if !chat && mode == "invalid-tools" {
+                        continue;
+                    }
+                    let temp = tempfile::tempdir().unwrap();
+                    let (state, _receiver) = test_server_state(temp.path().to_path_buf());
+                    let seeds = Arc::new(std::sync::Mutex::new(Vec::new()));
+                    let runtime = test_text_runtime_with_engine(
+                        temp.path().join("single.fixture"),
+                        &ChoiceAuditEngine {
+                            seeds: Arc::clone(&seeds),
+                            fail_at: (mode == "worker-error").then_some(0),
+                            // JSON escaping exceeds the aggregate 16 MiB limit
+                            // while the source chunk stays below the native 8 MiB cap.
+                            outputs: Some(vec![if mode == "oversize" {
+                                "\u{0001}".repeat(3 * 1024 * 1024)
+                            } else {
+                                "private invalid output".into()
+                            }]),
+                        },
+                    );
+                    state
+                        .app
+                        .runtime_pool
+                        .write()
+                        .await
+                        .publish_default(Arc::clone(&runtime));
+                    state.app.ready.store(true, Ordering::Release);
+                    let mut payload = if chat {
+                        json!({"messages":[{"role":"user","content":"hello"}],"stream_options":{"include_usage":true}})
+                    } else {
+                        json!({"prompt":"hello"})
+                    };
+                    payload["stream"] = json!(stream);
+                    payload["max_tokens"] = json!(8);
+                    if mode == "invalid-schema" {
+                        payload["response_format"] = json!({"type":"json_object"});
+                    } else if mode == "invalid-tools" {
+                        payload["tools"] = json!([{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]);
+                        payload["tool_choice"] = json!("required");
+                    }
+                    let response = if chat {
+                        handle_chat_completions(
+                            State(state.clone()),
+                            Json(serde_json::from_value(payload).unwrap()),
+                        )
+                        .await
+                    } else {
+                        handle_completions(
+                            State(state.clone()),
+                            Json(serde_json::from_value(payload).unwrap()),
+                        )
+                        .await
+                        .into_response()
+                    };
+                    let status = response.status();
+                    let raw = String::from_utf8(
+                        tokio::time::timeout(
+                            Duration::from_secs(5),
+                            axum::body::to_bytes(response.into_body(), 1024 * 1024),
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .to_vec(),
+                    )
+                    .unwrap();
+                    if stream {
+                        assert_eq!(status, axum::http::StatusCode::OK);
+                        assert_eq!(raw.matches("data: [DONE]").count(), 1);
+                        assert!(!raw.contains("\"finish_reason\":\""), "{mode}: {raw}");
+                    } else {
+                        assert!(
+                            status.is_client_error() || status.is_server_error(),
+                            "{mode}: {raw}"
+                        );
+                    }
+                    assert!(raw.contains("\"error\""), "{mode}: {raw}");
+                    assert!(!raw.contains("\"usage\""), "{mode}: {raw}");
+                    if matches!(mode, "invalid-schema" | "invalid-tools") {
+                        assert!(!raw.contains("private invalid output"), "{mode}: {raw}");
+                    }
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while state.app.semaphore.available_permits() != 1 {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    assert_eq!(seeds.lock().unwrap().len(), 1);
+                    assert_eq!(runtime.active_request_leases.load(Ordering::Acquire), 0);
+                    assert!(state.app.cancellations.is_empty());
+                    assert_eq!(
+                        state.app.metrics.requests_completed.load(Ordering::Relaxed),
+                        0
+                    );
+                    assert_eq!(state.app.metrics.requests_failed.load(Ordering::Relaxed), 1);
+                }
             }
-        })
-        .await
-        .unwrap();
-        assert!(state.app.cancellations.is_empty());
-        assert_eq!(
-            state.app.metrics.requests_completed.load(Ordering::Relaxed),
-            0
-        );
-        assert_eq!(state.app.metrics.requests_failed.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_multi_choice_stream_cancels_and_drains_worker() {
+        for choice_count in [1, 8] {
+            let temp = tempfile::tempdir().unwrap();
+            let chunks = Arc::new(AtomicU64::new(0));
+            let state =
+                test_server_state_with_text_runtime(temp.path().to_path_buf(), Arc::clone(&chunks))
+                    .await;
+            let payload: ChatRequest = serde_json::from_value(json!({
+                "messages": [{"role": "user", "content": "Continue"}],
+                "stream": true, "n": choice_count, "max_tokens": 8
+            }))
+            .unwrap();
+            let response = handle_chat_completions(State(Arc::clone(&state)), Json(payload)).await;
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            drop(response);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while state.app.semaphore.available_permits() != 1 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(state.app.cancellations.is_empty());
+            assert_eq!(
+                state.app.metrics.requests_completed.load(Ordering::Relaxed),
+                0
+            );
+            assert_eq!(state.app.metrics.requests_failed.load(Ordering::Relaxed), 1);
+        }
     }
 
     #[tokio::test]
@@ -11828,6 +12492,23 @@ mod tests {
                 let mut usage = None;
                 if stream {
                     assert_eq!(raw.matches("data: [DONE]").count(), 1);
+                    let mut identities = std::collections::BTreeSet::new();
+                    for line in raw
+                        .lines()
+                        .filter_map(|line| line.strip_prefix("data: "))
+                        .filter(|value| *value != "[DONE]")
+                    {
+                        let frame: serde_json::Value = serde_json::from_str(line).unwrap();
+                        identities
+                            .insert((frame["object"].to_string(), frame["created"].to_string()));
+                    }
+                    let expected = if chat {
+                        "\"chat.completion.chunk\""
+                    } else {
+                        "\"text_completion\""
+                    };
+                    assert_eq!(identities.len(), 1, "{identities:?}");
+                    assert_eq!(identities.first().unwrap().0, expected);
                     for line in raw
                         .lines()
                         .filter_map(|line| line.strip_prefix("data: "))
@@ -13572,6 +14253,25 @@ mod tests {
         request.params.max_tokens = 128;
         request.params.response_format = Some(bloomai_core::ResponseFormat::JsonObject);
         assert!(validate_multimodal_request(&request).is_err());
+        request.params.response_format = None;
+        for invalid in [
+            bloomai_engine::InferenceParams {
+                top_k: Some(0),
+                ..request.params.clone()
+            },
+            bloomai_engine::InferenceParams {
+                presence_penalty: 50.0,
+                ..request.params.clone()
+            },
+            bloomai_engine::InferenceParams {
+                logprobs: Some(99),
+                ..request.params.clone()
+            },
+        ] {
+            let mut invalid_request = request.clone();
+            invalid_request.params = invalid;
+            assert!(validate_multimodal_request(&invalid_request).is_err());
+        }
 
         request = test_multimodal_request(vec![DataBlock::AudioPcm {
             samples: vec![1.1],

@@ -31,7 +31,7 @@ static site or embed it in the server binary.
 - Task-aware generation, live speech-to-text, or embedding/rerank workspace selection from readiness v3
 - Browser microphone capture with bounded 16 kHz mono PCM windows, live ASR partials, final-window flushing, and copyable transcripts
 - Bounded embedding batches with optional dimensions and compact normalized-vector summaries
-- Bounded bi-encoder reranking with exact document and stable-order response validation
+- Bounded bi-encoder and cross-encoder reranking with exact document and stable-order response validation; rerank-only models open the ranking workspace with the unsupported embeddings tab disabled
 - Complete per-result clipboard copy and versioned embedding/rerank JSON downloads
 - Authenticated bounded Models probe with an explicit API-key-required state
 - Connection test and live readiness/loading status with the validated server version
@@ -303,6 +303,9 @@ OpenAI endpoints for a final stream usage chunk, allowing Bloom to also show
 server-reported prompt and completion tokens plus completion throughput. Servers
 that omit usage and Bloom's current multimodal stream still retain timing without
 inventing token counts. Partial responses are labeled `Stopped` or `Failed`.
+A completed response whose server `finish_reason` is `length` (or whose native
+multimodal stream reports a `length` generation finish) shows a visible
+"Response truncated at the token limit" note; it is informational, not an error.
 These bounded diagnostics persist with browser-local history. Portable version
 2 archives retain only the exact assistant execution model needed for
 cross-model continuation safety; timing, token usage, request IDs, and the rest
@@ -365,7 +368,7 @@ streaming task aborts its fetch and cancels its body reader.
 Non-streaming API reads are bounded independently. General browser control
 responses have a 16 MiB maximum success budget. Source inspection is limited to
 16 KiB; readiness, restore, and import responses to 64 KiB; runtime diagnostics
-and model preflight to 256 KiB; the signed index to 512 KiB; reranking to 2 MiB;
+and model preflight to 256 KiB; the signed index to 512 KiB; reranking to 6 MiB;
 and embeddings to 32 MiB with at most 1,048,576 total float values.
 It treats `Content-Length` only as an early admission check, also counts raw and
 decoded bytes, cancels an over-budget reader, limits error bodies to 64 KiB, and
@@ -399,7 +402,9 @@ complete JSON float array. Each ranking card can copy its index, score, and
 document as JSON. Batch downloads retain the exact submitted input or query,
 model, token usage, indices, and complete validated results under a versioned
 object identity. Export encoding is independently bounded to 40 MiB for
-embeddings and 4 MiB for reranking; clipboard payloads are capped at 1 MiB.
+embeddings and 6 MiB for reranking; clipboard payloads are capped at 1 MiB.
+The reranking response/export bounds include worst-case JSON escaping of the
+complete admitted 768 KiB input while retaining exact document identities.
 Results are not persisted automatically. See the
 [encoder result export guide](../docs/encoder-result-export.md).
 

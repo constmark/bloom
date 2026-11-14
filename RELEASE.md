@@ -72,6 +72,11 @@ cargo test --locked -p bloomai-server --example sign_model_index
   --require-deterministic-metadata
 ```
 
+Packaging requires an empty destination and never deletes prior artifacts.
+Set `BLOOM_RELEASE_DIR=/path/to/new-run` when `release-artifacts/` already
+contains evidence. Archive publication uses `--no-overwrite`, checksum creation
+is exclusive, and symlink package roots or archive destinations are rejected.
+
 The archive-validator regression suite mutates packaged readiness identity,
 protocol ranges, ready-state invariants, and schema versions. The standalone
 validator must reject each mutation and must parse the actual bundled v3

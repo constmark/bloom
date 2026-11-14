@@ -186,6 +186,22 @@ struct APIChatMessage: Codable {
     let content: String
 }
 
+/// Bounds and defaults for user-adjustable generation settings.
+enum GenerationSettings {
+    static let defaultMaxTokens = 256
+    static let maxTokensRange = 1 ... 32_768
+    static let maxTokensDefaultsKey = "bloom.maxTokens"
+    static let temperature = 0.7
+    static let topP = 0.9
+
+    static func clampedMaxTokens(_ value: Int) -> Int {
+        min(max(value, maxTokensRange.lowerBound), maxTokensRange.upperBound)
+    }
+}
+
+/// OpenAI-compatible finish reason for a response that hit `max_tokens`.
+let lengthFinishReason = "length"
+
 struct ChatCompletionRequest: Encodable {
     let model: String
     let messages: [APIChatMessage]

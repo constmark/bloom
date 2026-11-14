@@ -2176,6 +2176,7 @@ fn ollama_chat_request(
             tool_choice: None,
             parallel_tool_calls: None,
             internal_request_id: None,
+            legacy_function_calling: false,
             extensions: ollama_sampling_extensions(&options),
         },
         image,
@@ -2243,6 +2244,7 @@ fn ollama_generate_request(
             tool_choice: None,
             parallel_tool_calls: None,
             internal_request_id: None,
+            legacy_function_calling: false,
             extensions: ollama_sampling_extensions(&options),
         },
         image,
@@ -3216,6 +3218,7 @@ struct OllamaMultimodalStreamState {
     events: usize,
     output_bytes: usize,
     buffered: String,
+    accounting: crate::openai_vision::MultimodalGenerationAccounting,
 }
 
 impl OllamaMultimodalStreamState {
@@ -3232,6 +3235,7 @@ impl OllamaMultimodalStreamState {
             events: 0,
             output_bytes: 0,
             buffered: String::new(),
+            accounting: Default::default(),
         }
     }
 
@@ -3299,6 +3303,9 @@ impl OllamaMultimodalStreamState {
             if !chunk["Metrics"].is_object() {
                 return Err("the internal multimodal stream emitted invalid metrics".to_string());
             }
+            return Ok(None);
+        }
+        if self.accounting.observe(chunk)? {
             return Ok(None);
         }
         let text = if let Some(text) = chunk.get("TextDelta") {
@@ -3405,7 +3412,24 @@ impl OllamaMultimodalStreamState {
                 OllamaOutputKind::Generate => payload["response"] = json!(self.buffered),
             }
         }
-        add_ollama_terminal_without_usage(&mut payload, self.started.elapsed())?;
+        match self.accounting.usage() {
+            Some((prompt_tokens, completion_tokens)) => {
+                let mut usage = serde_json::Map::new();
+                usage.insert("prompt_tokens".to_string(), json!(prompt_tokens));
+                usage.insert("completion_tokens".to_string(), json!(completion_tokens));
+                usage.insert(
+                    "total_tokens".to_string(),
+                    json!(prompt_tokens.saturating_add(completion_tokens)),
+                );
+                add_ollama_terminal_fields(
+                    &mut payload,
+                    self.accounting.finish_reason(),
+                    &usage,
+                    self.started.elapsed(),
+                )?;
+            }
+            None => add_ollama_terminal_without_usage(&mut payload, self.started.elapsed())?,
+        }
         Ok(payload)
     }
 }
@@ -4608,6 +4632,41 @@ mod tests {
             .ingest(event(serde_json::Value::Null), false)
             .unwrap();
         assert!(missing_end.finish(false).is_err());
+    }
+
+    #[test]
+    fn multimodal_native_metadata_reports_ollama_length_and_counts() {
+        let event = |chunk: serde_json::Value| {
+            json!({
+                "id": "mms-2",
+                "object": "multimodal.chunk",
+                "created": 1_700_000_000_u64,
+                "model": "internal-vision",
+                "chunk": chunk
+            })
+        };
+        for (reason, expected) in [("length", "length"), ("eos", "stop")] {
+            let mut state = OllamaMultimodalStreamState::new(
+                OllamaOutputKind::Generate,
+                Instant::now(),
+                "vision".to_string(),
+            );
+            for chunk in [
+                serde_json::Value::Null,
+                json!({"TokenUsage": {"input_tokens": 4, "output_tokens": 0}}),
+                json!({"TextDelta": "a"}),
+                json!({"TokenUsage": {"input_tokens": 4, "output_tokens": 3}}),
+                json!({"GenerationFinished": {"input_tokens": 4, "output_tokens": 3, "reason": reason}}),
+                json!("End"),
+            ] {
+                state.ingest(event(chunk), true).unwrap();
+            }
+            let payload = state.finish(true).unwrap();
+            assert_eq!(payload["done_reason"], expected);
+            assert_eq!(payload["prompt_eval_count"], 4);
+            assert_eq!(payload["eval_count"], 3);
+            assert_eq!(payload["response"], "a");
+        }
     }
 
     #[test]

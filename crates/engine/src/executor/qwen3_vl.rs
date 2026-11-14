@@ -1233,6 +1233,10 @@ impl Qwen3VLModel {
     }
 }
 
+/// Bounded decoder budget; requests above it are rejected rather than
+/// silently truncated with a misleading finish reason.
+const MAX_QWEN3_VL_OUTPUT_TOKENS: usize = 4096;
+
 impl LoadedModel for Qwen3VLModel {
     fn actual_device(&self) -> Option<DeviceKind> {
         Some(if self.device.is_cpu() {
@@ -1244,6 +1248,10 @@ impl LoadedModel for Qwen3VLModel {
 
     fn metadata(&self) -> &ModelMetadata {
         &self.metadata
+    }
+
+    fn supports_generation_metadata(&self) -> bool {
+        true
     }
 
     fn infer(&self, input: ModelInput, params: &GenerationParams) -> Result<ModelOutput> {
@@ -1284,6 +1292,10 @@ impl LoadedModel for Qwen3VLModel {
         anyhow::ensure!(
             params.logprobs.is_none(),
             "this backend does not support token logprobs"
+        );
+        anyhow::ensure!(
+            (1..=MAX_QWEN3_VL_OUTPUT_TOKENS).contains(&params.max_tokens),
+            "Qwen3-VL generation supports between 1 and {MAX_QWEN3_VL_OUTPUT_TOKENS} output tokens"
         );
         let (prompt, image_bytes) = match input {
             ModelInput::Text { prompt } => (prompt, None),
@@ -1336,26 +1348,35 @@ impl LoadedModel for Qwen3VLModel {
         }
         inner.current_prefix = token_ids.clone();
 
-        let mut logits_processor = candle_transformers::generation::LogitsProcessor::new(
-            params.seed.unwrap_or(42),
-            Some(params.temperature),
-            Some(params.top_p),
-        );
+        let mut logits_processor = super::candle::generation_logits_processor(params);
 
         let mut all_tokens = token_ids.clone();
         let mut prev_text = String::new();
 
-        let mut current_ids = token_ids.clone();
-        let mut logits = self.forward_pass(&mut inner, &current_ids, img_bytes_ref, 0)?;
-        let mut next_token = logits_processor.sample(&logits)?;
+        let input_tokens = token_ids.len();
+        sink.on_chunk(crate::io::OutputChunk::TokenUsage {
+            input_tokens,
+            output_tokens: 0,
+        })?;
+        let logits = self.forward_pass(&mut inner, &token_ids, img_bytes_ref, 0)?;
+        let mut next_token =
+            super::candle::sample_generation_token(&mut logits_processor, &logits, params, &[])?;
 
         let eos_token_id = 151645;
-        let max_tokens = params.max_tokens.min(4096);
-        let mut steps = 0;
         let (_, initial_next_pos) = get_rope_index(&token_ids, grid_dims);
         let mut start_pos = initial_next_pos;
-
-        while next_token != eos_token_id && steps < max_tokens {
+        let mut output_tokens = 0;
+        let reason = loop {
+            // Sampled EOS is an accepted output token, matching native text
+            // generation metadata; it is never decoded into visible text.
+            output_tokens += 1;
+            sink.on_chunk(crate::io::OutputChunk::TokenUsage {
+                input_tokens,
+                output_tokens,
+            })?;
+            if next_token == eos_token_id {
+                break crate::GenerationFinishReason::Eos;
+            }
             all_tokens.push(next_token);
             inner.current_prefix.push(next_token);
 
@@ -1370,15 +1391,26 @@ impl LoadedModel for Qwen3VLModel {
                 }
                 prev_text = text;
             }
+            if output_tokens == params.max_tokens {
+                break crate::GenerationFinishReason::Length;
+            }
 
-            steps += 1;
-
-            current_ids = vec![next_token];
-            logits = self.forward_pass(&mut inner, &current_ids, None, start_pos)?;
-            next_token = logits_processor.sample(&logits)?;
+            let logits = self.forward_pass(&mut inner, &[next_token], None, start_pos)?;
+            next_token = super::candle::sample_generation_token(
+                &mut logits_processor,
+                &logits,
+                params,
+                &all_tokens[token_ids.len()..],
+            )?;
             start_pos += 1;
-        }
-
+        };
+        sink.on_chunk(crate::io::OutputChunk::GenerationFinished(
+            crate::GenerationMetadata {
+                input_tokens,
+                output_tokens,
+                reason,
+            },
+        ))?;
         sink.on_chunk(crate::io::OutputChunk::End)?;
         Ok(())
     }

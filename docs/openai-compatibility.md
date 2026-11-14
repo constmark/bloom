@@ -161,7 +161,18 @@ Custom tools, hosted/built-in tools, namespaces, allowed-tool subsets, and
 combining an active tool choice with `response_format` are not supported. Chat
 Completions normalize the deprecated `functions` and `function_call` request
 fields into the same bounded function tools; legacy Completions keep those
-fields fail-closed. The public shapes
+fields fail-closed. A Chat request that declares `functions` or `function_call`
+gets the legacy reply contract: at most one call (`parallel_tool_calls: true`
+is rejected), returned as `message.function_call` or `delta.function_call`
+(`{name, arguments}`) with `content: null` and `finish_reason: "function_call"`,
+including for `n` > 1. Mixing `functions`/`function_call` with
+`tools`/`tool_choice` is rejected. Legacy history is accepted: an assistant
+`function_call` and the immediately following
+`{"role":"function","name":...,"content":"..."}` result are rewritten into an
+equivalent tool call and `role: "tool"` result with ID
+`call_legacy_<message index>`, then validated like modern history; an unpaired,
+unnamed, name-mismatched, or non-string-content function message is rejected.
+Ollama endpoints and the Responses API are unaffected. The public shapes
 and call/result lifecycle follow the
 [OpenAI function-calling guide](https://developers.openai.com/api/docs/guides/function-calling)
 and
@@ -374,7 +385,8 @@ the same native BERT microbatch or scalar fallback described above. Sentence
 encoders produce finite cosine relevance scores from -1 through 1; detected
 BERT cross-encoders use their native classifier-head scores. Both paths sort
 descending, and equal scores retain original document-index order. `top_n`
-is enforced before response construction, response IDs are
+must be positive; values above the document count return every document, as
+Cohere, Jina and vLLM do. It is enforced before response construction, response IDs are
 process-unique, and usage reports the tokenizer-backed total across the query
 and every document.
 

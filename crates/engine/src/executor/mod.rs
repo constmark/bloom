@@ -1,5 +1,11 @@
 //! Inference engine implementations.
 
+/// Temperatures at or below this value select the argmax token. Every
+/// sampler and speculative verifier shares it so the direct and batched
+/// paths agree on which requests are greedy.
+#[cfg(feature = "candle-engine")]
+pub(crate) const GREEDY_TEMPERATURE: f64 = 1e-6;
+
 #[cfg(feature = "candle-engine")]
 pub mod batch_executor;
 #[cfg(feature = "candle-engine")]

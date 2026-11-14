@@ -32,6 +32,9 @@ pub(crate) struct ToolConfig {
     pub(crate) tools: Vec<FunctionTool>,
     pub(crate) choice: ToolChoiceMode,
     pub(crate) parallel: bool,
+    /// Replies use the legacy single `function_call` shape instead of
+    /// `tool_calls`; always paired with `parallel == false`.
+    pub(crate) legacy_functions: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -66,11 +69,18 @@ pub(crate) struct HistoricalToolCall {
 pub(crate) fn chat_tool_config(
     request: &ChatRequest,
 ) -> std::result::Result<Option<ToolConfig>, String> {
-    tool_config_from_chat_fields(
+    let config = tool_config_from_chat_fields(
         request.tools.as_ref(),
         request.tool_choice.as_ref(),
         request.parallel_tool_calls,
-    )
+    )?;
+    Ok(config.map(|mut config| {
+        if request.legacy_function_calling {
+            config.legacy_functions = true;
+            config.parallel = false;
+        }
+        config
+    }))
 }
 
 /// Translate the legacy Chat Completions `functions`/`function_call` fields
@@ -80,10 +90,14 @@ pub(crate) fn chat_tool_config(
 /// The translation happens before extension admission so legacy clients get
 /// the same schema validation, private protocol, and output checks as modern
 /// clients. Conflicting legacy and modern fields fail closed instead of
-/// choosing one silently.
+/// choosing one silently. Requests that declare legacy fields are marked so
+/// replies use the legacy single `function_call` shape, and legacy history
+/// (`assistant.function_call` plus `role: "function"` results) is rewritten
+/// into equivalent `tool_calls`/`role: "tool"` entries with deterministic IDs.
 pub(crate) fn normalize_legacy_function_fields(
     mut request: ChatRequest,
 ) -> std::result::Result<ChatRequest, String> {
+    normalize_legacy_function_messages(&mut request.messages)?;
     let legacy_functions = request
         .extensions
         .remove("functions")
@@ -105,12 +119,35 @@ pub(crate) fn normalize_legacy_function_fields(
                 .to_string(),
         );
     }
+    if legacy_choice.is_some() && has_modern_tools {
+        return Err(
+            "function_call cannot be combined with tools; use tool_choice with tools or function_call with functions."
+                .to_string(),
+        );
+    }
     if legacy_choice.is_some() && request.tool_choice.is_some() {
         return Err(
             "function_call cannot be combined with tool_choice; send one function selection format."
                 .to_string(),
         );
     }
+    let declares_functions = legacy_functions
+        .as_ref()
+        .is_some_and(|value| value.as_array().is_none_or(|items| !items.is_empty()));
+    if declares_functions && request.tool_choice.is_some() {
+        return Err(
+            "functions cannot be combined with tool_choice; use function_call with functions."
+                .to_string(),
+        );
+    }
+    if request.parallel_tool_calls == Some(true) {
+        return Err(
+            "parallel_tool_calls cannot be enabled with legacy functions; the legacy function_call format returns at most one call."
+                .to_string(),
+        );
+    }
+    request.parallel_tool_calls = Some(false);
+    request.legacy_function_calling = true;
 
     if let Some(functions) = legacy_functions {
         let functions = functions
@@ -127,6 +164,107 @@ pub(crate) fn normalize_legacy_function_fields(
         request.tool_choice = Some(legacy_function_call_to_tool_choice(&choice)?);
     }
     Ok(request)
+}
+
+/// Rewrite legacy function-calling history into the modern representation
+/// before message validation. Each `assistant.function_call` becomes a single
+/// `tool_calls` entry with ID `call_legacy_<message index>`, and the
+/// immediately following `role: "function"` result becomes a `role: "tool"`
+/// message referencing that ID. Malformed or unpaired legacy entries fail
+/// closed; the normal tool-history validator still enforces the remaining
+/// pairing, bounds, and argument rules.
+fn normalize_legacy_function_messages(
+    messages: &mut [ChatCompletionMessage],
+) -> std::result::Result<(), String> {
+    let mut pending_call: Option<(String, String)> = None;
+    for (index, message) in messages.iter_mut().enumerate() {
+        match message.role.as_str() {
+            "assistant" => {
+                pending_call = None;
+                let Some(call) = message
+                    .extensions
+                    .remove("function_call")
+                    .filter(|value| !value.is_null())
+                else {
+                    continue;
+                };
+                if message.extensions.get("tool_calls").is_some_and(|value| {
+                    !value.is_null() && value.as_array().is_none_or(|items| !items.is_empty())
+                }) {
+                    return Err(format!(
+                        "assistant message at index {index} cannot contain both function_call and tool_calls."
+                    ));
+                }
+                let scope = format!("assistant function_call at message index {index}");
+                let object = call
+                    .as_object()
+                    .ok_or_else(|| format!("{scope} must be an object."))?;
+                reject_non_null_fields(object, &["name", "arguments"], &scope)?;
+                let name = object
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| format!("{scope} requires string field `name`."))?;
+                validate_tool_name(name, "assistant function_call name")?;
+                let arguments = object
+                    .get("arguments")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| format!("{scope} arguments must be a JSON string."))?;
+                let id = format!("call_legacy_{index}");
+                message.extensions.insert(
+                    "tool_calls".to_string(),
+                    json!([{
+                        "id": id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": arguments}
+                    }]),
+                );
+                pending_call = Some((id, name.to_string()));
+            }
+            "function" => {
+                if let Some(field) = message
+                    .extensions
+                    .iter()
+                    .find(|(field, value)| !value.is_null() && field.as_str() != "name")
+                    .map(|(field, _)| field)
+                {
+                    return Err(format!(
+                        "function message at index {index} contains unsupported field {:?}.",
+                        reported_extension_field(field)
+                    ));
+                }
+                let name = message
+                    .extensions
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        format!("function message at index {index} requires string field `name`.")
+                    })?
+                    .to_string();
+                validate_tool_name(&name, "function message name")?;
+                if !message.content.is_string() {
+                    return Err(format!(
+                        "function message at index {index} content must be a string."
+                    ));
+                }
+                let (id, expected_name) = pending_call.take().ok_or_else(|| {
+                    format!(
+                        "function message at index {index} must immediately follow an assistant function_call."
+                    )
+                })?;
+                if name != expected_name {
+                    return Err(format!(
+                        "function message at index {index} names {name:?}, but the preceding assistant function_call named {expected_name:?}."
+                    ));
+                }
+                message.role = "tool".to_string();
+                message
+                    .extensions
+                    .insert("tool_call_id".to_string(), json!(id));
+            }
+            _ => pending_call = None,
+        }
+    }
+    Ok(())
 }
 
 fn legacy_function_call_to_tool_choice(
@@ -186,6 +324,7 @@ fn tool_config_from_chat_fields(
         tools,
         choice,
         parallel: parallel_tool_calls.unwrap_or(true),
+        legacy_functions: false,
     }))
 }
 
@@ -630,14 +769,36 @@ pub(crate) fn parse_chat_output(
     }
 }
 
+/// Whether replies for this tool configuration use the legacy `function_call`
+/// shape. Plain-text requests (no active tools) never do.
+pub(crate) fn legacy_function_output(tool_config: Option<&ToolConfig>) -> bool {
+    tool_config.is_some_and(|config| config.legacy_functions)
+}
+
+/// Legacy Chat Completions return exactly one `function_call` object. Bloom
+/// forces single-call mode for legacy requests, so only the first validated
+/// call can exist.
+fn legacy_function_call_json(calls: &[ParsedToolCall]) -> serde_json::Value {
+    calls.first().map_or(
+        serde_json::Value::Null,
+        |call| json!({"name": call.name, "arguments": call.arguments}),
+    )
+}
+
 pub(crate) fn chat_output_message(
     request_id: &str,
     output: &ParsedChatOutput,
+    legacy: bool,
 ) -> serde_json::Value {
     match output {
         ParsedChatOutput::Message(content) => json!({
             "role": "assistant",
             "content": content
+        }),
+        ParsedChatOutput::ToolCalls(calls) if legacy => json!({
+            "role": "assistant",
+            "content": null,
+            "function_call": legacy_function_call_json(calls)
         }),
         ParsedChatOutput::ToolCalls(calls) => json!({
             "role": "assistant",
@@ -647,30 +808,19 @@ pub(crate) fn chat_output_message(
     }
 }
 
-/// Namespace tool identities by candidate while retaining the established
-/// single-choice/first-choice IDs. Put the candidate prefix first so the
-/// bounded ID suffix cannot truncate away its uniqueness.
-pub(crate) fn chat_output_message_for_choice(
-    request_id: &str,
-    choice_index: usize,
-    output: &ParsedChatOutput,
-) -> serde_json::Value {
-    if choice_index == 0 {
-        chat_output_message(request_id, output)
-    } else {
-        chat_output_message(&format!("choice{choice_index}_{request_id}"), output)
-    }
-}
-
 /// Construct a validated streaming delta with candidate-scoped call IDs and
 /// per-message tool indices. The public stream ID remains shared by choices.
 pub(crate) fn chat_output_delta_for_choice(
     request_id: &str,
     choice_index: usize,
     output: &ParsedChatOutput,
+    legacy: bool,
 ) -> serde_json::Value {
     match output {
         ParsedChatOutput::Message(content) => json!({"content": content}),
+        ParsedChatOutput::ToolCalls(calls) if legacy => {
+            json!({"function_call": legacy_function_call_json(calls)})
+        }
         ParsedChatOutput::ToolCalls(calls) => {
             let identity = if choice_index == 0 {
                 request_id.to_string()
@@ -686,13 +836,21 @@ pub(crate) fn chat_output_finish_reason(
     output: &ParsedChatOutput,
     completion_tokens: usize,
     max_tokens: usize,
+    legacy: bool,
 ) -> &'static str {
     if completion_tokens >= max_tokens {
         "length"
-    } else if matches!(output, ParsedChatOutput::ToolCalls(_)) {
-        "tool_calls"
     } else {
-        "stop"
+        chat_output_stop_reason(output, legacy)
+    }
+}
+
+/// Finish reason for a candidate that ended naturally (EOS/stop).
+pub(crate) fn chat_output_stop_reason(output: &ParsedChatOutput, legacy: bool) -> &'static str {
+    match output {
+        ParsedChatOutput::ToolCalls(_) if legacy => "function_call",
+        ParsedChatOutput::ToolCalls(_) => "tool_calls",
+        ParsedChatOutput::Message(_) => "stop",
     }
 }
 
@@ -703,6 +861,7 @@ pub(crate) fn chat_tool_output_chunk(
     output: &ParsedChatOutput,
     completion_tokens: usize,
     max_tokens: usize,
+    legacy: bool,
 ) -> Event {
     json_event(chat_tool_output_payload(
         request_id,
@@ -711,6 +870,7 @@ pub(crate) fn chat_tool_output_chunk(
         output,
         completion_tokens,
         max_tokens,
+        legacy,
     ))
 }
 
@@ -721,9 +881,10 @@ pub(crate) fn chat_tool_output_payload(
     output: &ParsedChatOutput,
     completion_tokens: usize,
     max_tokens: usize,
+    legacy: bool,
 ) -> serde_json::Value {
-    let finish_reason = chat_output_finish_reason(output, completion_tokens, max_tokens);
-    let delta = chat_output_delta_for_choice(&request_id, 0, output);
+    let finish_reason = chat_output_finish_reason(output, completion_tokens, max_tokens, legacy);
+    let delta = chat_output_delta_for_choice(&request_id, 0, output, legacy);
     json!({
         "id": request_id,
         "object": "chat.completion.chunk",
@@ -1059,6 +1220,169 @@ mod tests {
     }
 
     #[test]
+    fn legacy_function_requests_are_marked_single_call_and_reject_mixing() {
+        let normalized = normalize_legacy_function_fields(request(json!({
+            "messages": [{"role": "user", "content": "x"}],
+            "functions": [{"name": "lookup"}]
+        })))
+        .unwrap();
+        assert!(normalized.legacy_function_calling);
+        assert_eq!(normalized.parallel_tool_calls, Some(false));
+        let config = chat_tool_config(&normalized).unwrap().unwrap();
+        assert!(config.legacy_functions);
+        assert!(!config.parallel);
+        assert!(legacy_function_output(Some(&config)));
+
+        let modern = normalize_legacy_function_fields(request(json!({
+            "messages": [{"role": "user", "content": "x"}],
+            "tools": [{"type": "function", "function": {"name": "lookup"}}]
+        })))
+        .unwrap();
+        assert!(!modern.legacy_function_calling);
+        assert!(!chat_tool_config(&modern).unwrap().unwrap().legacy_functions);
+
+        for invalid in [
+            json!({
+                "messages": [],
+                "tools": [{"type": "function", "function": {"name": "lookup"}}],
+                "function_call": {"name": "lookup"}
+            }),
+            json!({
+                "messages": [],
+                "functions": [{"name": "lookup"}],
+                "tool_choice": "auto"
+            }),
+            json!({
+                "messages": [],
+                "functions": [{"name": "lookup"}],
+                "parallel_tool_calls": true
+            }),
+        ] {
+            assert!(normalize_legacy_function_fields(request(invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_function_history_is_rewritten_to_bounded_tool_history() {
+        let normalized = normalize_legacy_function_fields(request(json!({
+            "messages": [
+                {"role": "user", "content": "Weather?"},
+                {"role": "assistant", "content": null, "function_call": {
+                    "name": "get_weather", "arguments": "{\"city\":\"Paris\"}"
+                }},
+                {"role": "function", "name": "get_weather", "content": "15 C"},
+                {"role": "assistant", "content": "It is 15 C."},
+                {"role": "user", "content": "And Rome?"},
+                {"role": "assistant", "content": null, "function_call": {
+                    "name": "get_weather", "arguments": "{\"city\":\"Rome\"}"
+                }},
+                {"role": "function", "name": "get_weather", "content": "20 C"}
+            ],
+            "functions": [{"name": "get_weather"}]
+        })))
+        .unwrap();
+        let messages = &normalized.messages;
+        assert_eq!(
+            messages[1].extensions["tool_calls"][0]["id"],
+            "call_legacy_1"
+        );
+        assert!(!messages[1].extensions.contains_key("function_call"));
+        assert_eq!(messages[2].role, "tool");
+        assert_eq!(messages[2].extensions["tool_call_id"], "call_legacy_1");
+        assert_eq!(messages[6].extensions["tool_call_id"], "call_legacy_5");
+        validate_chat_request_compatibility(&normalized).unwrap();
+        let history = normalize_chat_messages(messages).unwrap();
+        assert!(history[1].content.contains("requested_function_calls"));
+        assert!(history[2].content.contains("call_legacy_1"));
+        assert!(history[2].content.contains("untrusted data"));
+
+        let call = json!({"role": "assistant", "content": null, "function_call": {
+            "name": "lookup", "arguments": "{}"
+        }});
+        for invalid_messages in [
+            // A function result without a preceding function_call.
+            json!([{"role": "function", "name": "lookup", "content": "x"}]),
+            // A function result separated from its call.
+            json!([call, {"role": "user", "content": "x"},
+                {"role": "function", "name": "lookup", "content": "x"}]),
+            // Name is required and must match the call.
+            json!([call, {"role": "function", "content": "x"}]),
+            json!([call, {"role": "function", "name": "other", "content": "x"}]),
+            // Content must be a string; unknown fields fail closed.
+            json!([call, {"role": "function", "name": "lookup", "content": null}]),
+            json!([call, {"role": "function", "name": "lookup", "content": "x",
+                "tool_call_id": "call_legacy_0"}]),
+            // Malformed assistant function_call records.
+            json!([{"role": "assistant", "content": null, "function_call": {"arguments": "{}"}}]),
+            json!([{"role": "assistant", "content": null,
+                "function_call": {"name": "lookup", "arguments": {}}}]),
+            json!([{"role": "assistant", "content": null,
+                "function_call": {"name": "lookup", "arguments": "{}", "extra": 1}}]),
+            json!([{"role": "assistant", "content": null,
+                "function_call": {"name": "lookup", "arguments": "{}"},
+                "tool_calls": [{"id": "call_1", "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"}}]}]),
+        ] {
+            assert!(
+                normalize_legacy_function_fields(request(json!({"messages": invalid_messages})))
+                    .is_err(),
+                "{invalid_messages}"
+            );
+        }
+
+        // Rewritten calls still require a matching result downstream.
+        let unanswered =
+            normalize_legacy_function_fields(request(json!({"messages": [call]}))).unwrap();
+        assert!(normalize_chat_messages(&unanswered.messages).is_err());
+    }
+
+    #[test]
+    fn legacy_tool_outputs_map_to_function_call_shapes() {
+        let output = ParsedChatOutput::ToolCalls(vec![ParsedToolCall {
+            name: "get_weather".to_string(),
+            arguments: r#"{"city":"Paris"}"#.to_string(),
+        }]);
+        let message = chat_output_message("chatcmpl-example", &output, true);
+        assert_eq!(
+            message,
+            json!({
+                "role": "assistant",
+                "content": null,
+                "function_call": {"name": "get_weather", "arguments": r#"{"city":"Paris"}"#}
+            })
+        );
+        assert_eq!(
+            chat_output_finish_reason(&output, 2, 8, true),
+            "function_call"
+        );
+        assert_eq!(chat_output_finish_reason(&output, 8, 8, true), "length");
+        assert_eq!(
+            chat_output_finish_reason(&ParsedChatOutput::Message("hi".into()), 2, 8, true),
+            "stop"
+        );
+
+        let stream = chat_tool_output_payload(
+            "chatcmpl-example".to_string(),
+            "tiny.gguf".to_string(),
+            12,
+            &output,
+            2,
+            8,
+            true,
+        );
+        assert_eq!(stream["choices"][0]["finish_reason"], "function_call");
+        assert_eq!(
+            stream["choices"][0]["delta"],
+            json!({"function_call": {"name": "get_weather", "arguments": r#"{"city":"Paris"}"#}})
+        );
+        assert!(
+            chat_output_delta_for_choice("chatcmpl-example", 1, &output, true)
+                .get("tool_calls")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn tool_config_rejects_undefined_and_unsupported_tools() {
         for value in [
             json!({"messages": [{"role": "user", "content": "x"}], "tool_choice": "auto"}),
@@ -1230,7 +1554,7 @@ mod tests {
             name: "get_weather".to_string(),
             arguments: r#"{"city":"Paris"}"#.to_string(),
         }]);
-        let message = chat_output_message("chatcmpl-example", &output);
+        let message = chat_output_message("chatcmpl-example", &output, false);
         assert!(message["content"].is_null());
         assert_eq!(message["tool_calls"][0]["id"], "call_example_0");
         assert_eq!(message["tool_calls"][0]["type"], "function");
@@ -1238,8 +1562,11 @@ mod tests {
             message["tool_calls"][0]["function"]["arguments"],
             r#"{"city":"Paris"}"#
         );
-        assert_eq!(chat_output_finish_reason(&output, 2, 8), "tool_calls");
-        assert_eq!(chat_output_finish_reason(&output, 8, 8), "length");
+        assert_eq!(
+            chat_output_finish_reason(&output, 2, 8, false),
+            "tool_calls"
+        );
+        assert_eq!(chat_output_finish_reason(&output, 8, 8, false), "length");
 
         let stream = chat_tool_output_payload(
             "chatcmpl-example".to_string(),
@@ -1248,6 +1575,7 @@ mod tests {
             &output,
             2,
             8,
+            false,
         );
         assert_eq!(stream["object"], "chat.completion.chunk");
         assert_eq!(stream["choices"][0]["finish_reason"], "tool_calls");

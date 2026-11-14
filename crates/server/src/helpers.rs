@@ -1721,26 +1721,28 @@ impl ResponsesStreamAdapter {
             self.tool_calls = Some(tool_calls);
         }
         if let Some(delta) = choice.pointer("/delta/content") {
-            if self.tool_calls.is_some() {
-                return Err(
-                    "The internal chat stream mixed function-call and text output.".to_string(),
-                );
-            }
             let delta = delta.as_str().ok_or_else(|| {
                 "The internal chat stream emitted non-text delta content.".to_string()
             })?;
-            if self.output_text.len().saturating_add(delta.len())
-                > MAX_RESPONSES_STREAM_OUTPUT_BYTES
-            {
-                return Err(format!(
-                    "The Responses stream output exceeds the {MAX_RESPONSES_STREAM_OUTPUT_BYTES} byte limit."
-                ));
-            }
-            self.output_text.push_str(delta);
-            if !self.text_output_opened {
-                events.extend(self.text_opening_events()?);
-            }
+            // A role announcement may carry empty content before the model
+            // chooses text or tools. It does not create a text output item.
             if !delta.is_empty() {
+                if self.tool_calls.is_some() {
+                    return Err(
+                        "The internal chat stream mixed function-call and text output.".to_string(),
+                    );
+                }
+                if self.output_text.len().saturating_add(delta.len())
+                    > MAX_RESPONSES_STREAM_OUTPUT_BYTES
+                {
+                    return Err(format!(
+                        "The Responses stream output exceeds the {MAX_RESPONSES_STREAM_OUTPUT_BYTES} byte limit."
+                    ));
+                }
+                self.output_text.push_str(delta);
+                if !self.text_output_opened {
+                    events.extend(self.text_opening_events()?);
+                }
                 events.push(self.named_event(
                     "response.output_text.delta",
                     json!({
@@ -2548,7 +2550,7 @@ fn extract_json_schema(
     }
     if wrapper
         .get("description")
-        .is_some_and(|value| !valid_schema_annotation(value))
+        .is_some_and(|value| !value.is_null() && !valid_schema_annotation(value))
     {
         return Err(
             "response_format json_schema.description must be a bounded string.".to_string(),
@@ -2556,7 +2558,7 @@ fn extract_json_schema(
     }
     if wrapper
         .get("strict")
-        .is_some_and(|value| !value.is_boolean())
+        .is_some_and(|value| !value.is_null() && !value.is_boolean())
     {
         return Err("response_format json_schema.strict must be a boolean.".to_string());
     }
@@ -2984,11 +2986,10 @@ pub(crate) fn validate_rerank_request(payload: &RerankRequest) -> std::result::R
             "Rerank must contain between 1 and {MAX_RERANK_DOCUMENTS} documents."
         ));
     }
-    if payload
-        .top_n
-        .is_some_and(|top_n| top_n == 0 || top_n > payload.documents.len())
-    {
-        return Err("top_n must be between 1 and the number of submitted documents.".to_string());
+    // Larger values return every document, matching Cohere, Jina and vLLM;
+    // the route clamps before ranking so bounded internals keep their checks.
+    if payload.top_n == Some(0) {
+        return Err("top_n must be greater than zero.".to_string());
     }
     let mut content_bytes = 0_usize;
     add_request_content_bytes(

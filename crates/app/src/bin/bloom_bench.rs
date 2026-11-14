@@ -11,32 +11,19 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
 
 use anyhow::{Result, anyhow};
-use bloomai_core::{BenchmarkResult, DType, GenerationParams};
+use bloomai_app::text_metrics::TextTokenCounter;
+use bloomai_core::{BenchmarkResult, GenerationParams};
 use clap::parser::ValueSource;
 use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
 
-#[cfg(feature = "candle-engine")]
-use bloomai_engine::executor::candle::CandleEngine;
-use bloomai_engine::executor::coreml::CoreMlEngine;
-use bloomai_engine::executor::funasr::FunASREngine;
-use bloomai_engine::executor::intel_npu::IntelNpuEngine;
-use bloomai_engine::executor::laya::LayaEngine;
-use bloomai_engine::executor::llamacpp::LlamaCppEngine;
-use bloomai_engine::executor::longcat_image_edit::LongCatImageEditEngine;
-use bloomai_engine::executor::mlx::MlxEngine;
-use bloomai_engine::executor::npu_tts::NpuTtsEngine;
-use bloomai_engine::executor::onnx::OnnxRuntimeEngine;
-use bloomai_engine::executor::openvino::OpenVINOEngine;
-#[cfg(feature = "candle-engine")]
-use bloomai_engine::executor::qwen3_vl::Qwen3VLEngine;
-use bloomai_engine::executor::vulkan::VulkanEngine;
-#[cfg(feature = "candle-engine")]
-use bloomai_engine::executor::wan::WanEngine;
+use bloomai_app::{
+    SUPPORTED_ENGINES_HINT, build_engine_registry, parse_cli_dtype, select_backend_name,
+    validate_cli_model_task,
+};
 use bloomai_engine::{
-    EngineRegistry, InferencePipeline, MemoryEstimate, ModelInput,
-    model_manifest_supports_embeddings,
+    InferencePipeline, MemoryEstimate, ModelInput, model_manifest_supports_embeddings,
 };
 
 /// Extended benchmark result with additional timing and hardware metrics.
@@ -164,7 +151,7 @@ struct Args {
     #[arg(long, default_value = "auto")]
     device: String,
 
-    /// Precision to load the model with: f32, f16, bf16.
+    /// Precision to load the model with: f32, f16, bf16, q4, q8.
     #[arg(long)]
     dtype: Option<String>,
 
@@ -256,7 +243,13 @@ fn parse_args() -> Result<(Args, ArgMatches)> {
 
 fn apply_config(args: &mut Args, matches: &ArgMatches, config: &bloomai_app::BenchConfig) {
     apply_config_option!(args, matches, config, model);
-    apply_config_value!(args, matches, config, prompt);
+    // `--prompt` and `--prompts-file` are one input choice: naming either on
+    // the CLI must not let a config `prompts_file` (which is read first)
+    // silently replace the prompt the user typed.
+    if should_use_config(matches, "prompt") && should_use_config(matches, "prompts_file") {
+        apply_config_value!(args, matches, config, prompt);
+        apply_config_option!(args, matches, config, prompts_file);
+    }
     apply_config_value!(args, matches, config, backend);
     apply_config_value!(args, matches, config, device);
     apply_config_option!(args, matches, config, dtype);
@@ -265,7 +258,6 @@ fn apply_config(args: &mut Args, matches: &ArgMatches, config: &bloomai_app::Ben
     apply_config_value!(args, matches, config, repetitions);
     apply_config_value!(args, matches, config, warmup);
     apply_config_value!(args, matches, config, context_size);
-    apply_config_option!(args, matches, config, prompts_file);
     apply_config_value!(args, matches, config, speculative);
     apply_config_option!(args, matches, config, draft_model);
     apply_config_value!(args, matches, config, num_speculative_tokens);
@@ -335,70 +327,14 @@ fn main() -> Result<()> {
         ));
     }
 
-    let mut registry = EngineRegistry::default();
-    #[cfg(feature = "candle-engine")]
-    registry.register("candle", Box::new(CandleEngine));
-    registry.register("openvino", Box::new(OpenVINOEngine));
-    registry.register("funasr", Box::new(FunASREngine));
-    registry.register("laya", Box::new(LayaEngine));
-    #[cfg(feature = "candle-engine")]
-    registry.register("qwen3_vl", Box::new(Qwen3VLEngine));
-    registry.register("intel-npu", Box::new(IntelNpuEngine));
-    registry.register("npu-tts", Box::new(NpuTtsEngine));
-    registry.register("onnxruntime", Box::new(OnnxRuntimeEngine));
-    registry.register("coreml", Box::new(CoreMlEngine));
-    registry.register("mlx", Box::new(MlxEngine));
-    registry.register("vulkan", Box::new(VulkanEngine));
-    registry.register("longcat", Box::new(LongCatImageEditEngine));
-    registry.register("llamacpp", Box::new(LlamaCppEngine));
-    #[cfg(feature = "candle-engine")]
-    registry.register("wan", Box::new(WanEngine));
+    validate_cli_model_task("bloom_bench", &manifest)?;
 
-    let backend_name = if args.backend == "candle" {
-        let has_format = |format| manifest.files.iter().any(|file| file.format == format);
-        // Auto-select engine based on manifest family and details
-        let is_qwen_vl = manifest.family == bloomai_core::ModelFamily::Qwen
-            && (manifest.id.to_lowercase().contains("vl")
-                || manifest
-                    .parameters
-                    .get("model_type")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.contains("vl"))
-                    .unwrap_or(false));
-        if is_qwen_vl {
-            "qwen3_vl"
-        } else if has_format(bloomai_core::ModelFormat::Onnx) {
-            "onnxruntime"
-        } else if has_format(bloomai_core::ModelFormat::OpenVinoIr) {
-            "openvino"
-        } else if has_format(bloomai_core::ModelFormat::CoreMl) {
-            "coreml"
-        } else if has_format(bloomai_core::ModelFormat::Mlx) {
-            "mlx"
-        } else if has_format(bloomai_core::ModelFormat::VulkanSpirv) {
-            "vulkan"
-        } else if matches!(&manifest.family, bloomai_core::ModelFamily::Custom(c) if c == "longcat-image-edit")
-        {
-            "longcat"
-        } else if manifest.family == bloomai_core::ModelFamily::FunAsr {
-            "funasr"
-        } else if matches!(&manifest.family, bloomai_core::ModelFamily::Custom(c) if c == "laya") {
-            "laya"
-        } else if matches!(&manifest.family, bloomai_core::ModelFamily::Custom(c) if c == "wan") {
-            "wan"
-        } else {
-            "candle"
-        }
-    } else {
-        args.backend.as_str()
-    };
-
-    let engine = registry.get(backend_name).map_err(|e| {
-        anyhow!(
-            "{}. Supported engines are: candle, laya, openvino, funasr, qwen3_vl, longcat, intel-npu, npu-tts, onnxruntime, coreml, mlx, llamacpp, wan.",
-            e
-        )
-    })?;
+    // Share bloom_infer's routing so both tools measure the same engine.
+    let registry = build_engine_registry();
+    let backend_name = select_backend_name(None, &args.backend, &args.speculative, &manifest);
+    let engine = registry
+        .get(&backend_name)
+        .map_err(|e| anyhow!("{e}. Supported engines are: {SUPPORTED_ENGINES_HINT}."))?;
     let device_kind = bloomai_engine::BackendRegistry::default()
         .resolve_device_selector(&args.device, &engine.supported_devices())
         .map_err(|error| anyhow!("could not resolve device '{}': {error}", args.device))?;
@@ -528,7 +464,7 @@ fn main() -> Result<()> {
         for rep in 0..args.repetitions {
             let infer_start = Instant::now();
             let first_token_time: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
-            let generated_text = Arc::new(Mutex::new(String::new()));
+            let token_counter = Arc::new(Mutex::new(TextTokenCounter::default()));
             // Per-run speculative counters, populated from the engine's
             // `OutputChunk::Metrics` chunk. The engine only emits this chunk
             // when speculative decoding is enabled, so these stay at zero
@@ -536,12 +472,17 @@ fn main() -> Result<()> {
             let run_draft_tokens: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
             let run_accepted_tokens: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
 
-            let output = Arc::clone(&generated_text);
+            let output = Arc::clone(&token_counter);
             let ftt = Arc::clone(&first_token_time);
             let rd = Arc::clone(&run_draft_tokens);
             let ra = Arc::clone(&run_accepted_tokens);
 
+            let maximum_tokens = params.max_tokens;
             pipeline.run_stream(input.clone(), &params, &mut move |chunk| {
+                output
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .observe(&chunk, maximum_tokens)?;
                 match chunk {
                     bloomai_engine::io::OutputChunk::TextDelta(text) => {
                         if text.is_empty() {
@@ -551,10 +492,6 @@ fn main() -> Result<()> {
                         if ftt_guard.is_none() {
                             *ftt_guard = Some(Instant::now());
                         }
-                        output
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .push_str(&text);
                     }
                     bloomai_engine::io::OutputChunk::Metrics {
                         speculative_draft_tokens,
@@ -596,11 +533,10 @@ fn main() -> Result<()> {
             }
 
             let duration = infer_start.elapsed();
-            let output_text = generated_text
+            let generated = token_counter
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            let generated = pipeline.tokenize(&output_text)?.len();
+                .count(&pipeline)?;
             let ttft = first_token_time
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -778,12 +714,7 @@ fn main() -> Result<()> {
     let dtype_label = args
         .dtype
         .as_deref()
-        .and_then(|s| match s.to_lowercase().as_str() {
-            "f32" | "float32" => Some(DType::F32),
-            "f16" | "float16" => Some(DType::F16),
-            "bf16" | "bfloat16" => Some(DType::BF16),
-            _ => None,
-        })
+        .and_then(parse_cli_dtype)
         .or_else(|| {
             memory_breakdown
                 .as_ref()
@@ -809,7 +740,7 @@ fn main() -> Result<()> {
         duration_secs: avg_duration,
         timestamp: chrono_now(),
         notes: Some(format!(
-            "Warmup runs: {}, repetitions: {}, prompts: {}, throughput_stddev: {:.2}, token_count=loaded_model_tokenizer, peak_memory={}",
+            "Warmup runs: {}, repetitions: {}, prompts: {}, throughput_stddev: {:.2}, token_count=native_usage_or_complete_output_tokenizer, peak_memory={}",
             args.warmup,
             args.repetitions,
             prompts.len(),
@@ -955,7 +886,33 @@ fn percentile(samples: &[f64], quantile: f64) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::percentile;
+    use super::{Args, PathBuf, apply_config, percentile};
+    use clap::{CommandFactory, FromArgMatches};
+
+    #[test]
+    fn cli_prompt_choice_suppresses_both_config_prompt_sources() {
+        let config = bloomai_app::BenchConfig {
+            prompt: Some("from config".into()),
+            prompts_file: Some(PathBuf::from("config-prompts.txt")),
+            ..Default::default()
+        };
+        let parse = |argv: &[&str]| {
+            let matches = Args::command()
+                .try_get_matches_from(std::iter::once("bloom_bench").chain(argv.iter().copied()))
+                .unwrap();
+            let mut args = Args::from_arg_matches(&matches).unwrap();
+            apply_config(&mut args, &matches, &config);
+            args
+        };
+        let args = parse(&["--prompt", "from cli"]);
+        assert_eq!(args.prompt, "from cli");
+        assert_eq!(args.prompts_file, None);
+        let args = parse(&["--prompts-file", "cli-prompts.txt"]);
+        assert_eq!(args.prompts_file, Some(PathBuf::from("cli-prompts.txt")));
+        let args = parse(&[]);
+        assert_eq!(args.prompt, "from config");
+        assert_eq!(args.prompts_file, config.prompts_file);
+    }
 
     #[test]
     fn percentile_interpolates_and_rejects_empty_samples() {

@@ -48,7 +48,8 @@ cargo run --bin bloom_infer -- \
 
 For inference, set `BLOOM_ONNX_PYTHON` or `BLOOM_PYTHON` when Python is not on
 `PATH`. `BLOOM_ONNX_EXECUTION_PROVIDER=CUDA|OpenVINO|CPU` selects the provider;
-the bridge falls back to CPU only when that provider is unavailable. The first
+unknown, unavailable, or internally downgraded providers fail explicitly. GPU
+and NPU sessions disable CPU fallback. The first
 model input is populated from the request and the first output is returned as
 text or flattened numeric logits. Model loading first invokes the bridge with
 `--probe --model-path PATH --device DEVICE --provider PROVIDER`; it must create
@@ -56,11 +57,27 @@ the session with the requested execution provider and print
 `{"ok":true,"device":"...","provider":"..."}`. Inference then writes one
 serialized `ModelInput` object to stdin and expects one `ModelOutput` object on
 stdout (at minimum, `text` and `logits`; omitted optional fields default to
-`null`). Models that require a tokenizer or multiple named inputs should
-provide a custom `BLOOM_ONNX_SCRIPT` implementing both parts of this contract.
+`null`). The generic numeric path preserves signed and unsigned integer dtypes,
+boolean 0/1 tensors, floating types and scalar shapes. Fractional integer values,
+overflow, incompatible shapes, unsupported types and nonfinite outputs fail
+before a successful response; numeric outputs must fit Bloom's float32 contract.
+String tensors require text and byte-string outputs are decoded as UTF-8.
+Explicitly configured embedding packages use the bundled tokenizer, named
+input IDs/masks, pooling and exact usage path. Other models requiring a tokenizer
+or multiple named inputs need a custom `BLOOM_ONNX_SCRIPT` implementing both
+parts of this contract.
 The bridge retains at most 64 MiB of stdout and 64 KiB of stderr while
 draining both pipes, and aborts after ten minutes by default. Set
 `BLOOM_ONNX_TIMEOUT_SECS` to a value from 1 to 3600 to change the deadline.
+
+The maintained CPU bridge gates use generated ONNX graphs, without downloading
+models or claiming accelerator coverage:
+
+```bash
+python3 -m pip install -r requirements/onnx-runtime-test.txt
+python3 scripts/test_onnxruntime_infer.py
+python3 scripts/test_onnx_embedding.py
+```
 
 ## llama.cpp
 

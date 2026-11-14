@@ -1861,15 +1861,99 @@ impl Drop for PrefixStateGuard<'_> {
 #[path = "candle/logprobs.rs"]
 mod logprobs;
 
+/// Direct-path sampler shared by native Candle text and vision decoders.
+pub(crate) fn generation_logits_processor(
+    params: &GenerationParams,
+) -> candle_transformers::generation::LogitsProcessor {
+    CandleTextModel::logits_processor(params)
+}
+
+/// Sample one token with penalties, logit bias, top-k and nucleus applied.
+/// `generated` contains only accepted output tokens, never prompt tokens.
+pub(crate) fn sample_generation_token(
+    logits_processor: &mut candle_transformers::generation::LogitsProcessor,
+    logits: &Tensor,
+    params: &GenerationParams,
+    generated: &[u32],
+) -> Result<u32> {
+    CandleTextModel::sample_with_penalties(logits_processor, logits, params, generated)
+}
+
 impl CandleTextModel {
-    fn sample_with_penalties(
+    /// Build the direct-path sampler. Top-k with top-p is realized by
+    /// `sample_with_penalties` masking before Candle's nucleus step.
+    pub(crate) fn logits_processor(
+        params: &GenerationParams,
+    ) -> candle_transformers::generation::LogitsProcessor {
+        use candle_transformers::generation::Sampling;
+        let sampling = if params.temperature <= super::GREEDY_TEMPERATURE {
+            Sampling::ArgMax
+        } else if let Some(top_k) = params.top_k {
+            if params.top_p < 1.0 {
+                // Candle's TopKThenTopP compares p with the unnormalized
+                // top-k mass. `sample_with_penalties` masks to top-k first
+                // so nucleus selection uses the renormalized distribution,
+                // matching the batch sampler and common serving engines.
+                Sampling::TopP {
+                    p: params.top_p,
+                    temperature: params.temperature,
+                }
+            } else {
+                Sampling::TopK {
+                    k: top_k,
+                    temperature: params.temperature,
+                }
+            }
+        } else if params.top_p < 1.0 {
+            Sampling::TopP {
+                p: params.top_p,
+                temperature: params.temperature,
+            }
+        } else {
+            Sampling::All {
+                temperature: params.temperature,
+            }
+        };
+        candle_transformers::generation::LogitsProcessor::from_sampling(
+            params.seed.unwrap_or(42),
+            sampling,
+        )
+    }
+
+    pub(crate) fn sample_with_penalties(
         logits_processor: &mut candle_transformers::generation::LogitsProcessor,
         logits: &Tensor,
         params: &GenerationParams,
         history: &[u32],
     ) -> Result<u32> {
         let adjusted = Self::adjusted_logits(logits, params, history)?;
+        let adjusted = match params.top_k {
+            Some(top_k)
+                if params.temperature > super::GREEDY_TEMPERATURE
+                    && params.top_p > 0.0
+                    && params.top_p < 1.0 =>
+            {
+                Self::mask_to_top_k(&adjusted, top_k)?
+            }
+            _ => adjusted,
+        };
         Ok(logits_processor.sample(&adjusted)?)
+    }
+
+    /// Keep exactly the `top_k` largest logits, setting all others to
+    /// negative infinity so a following nucleus step renormalizes over them.
+    fn mask_to_top_k(logits: &Tensor, top_k: usize) -> Result<Tensor> {
+        let mut values = logits.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+        if top_k == 0 || top_k >= values.len() {
+            return Ok(logits.clone());
+        }
+        let mut order: Vec<usize> = (0..values.len()).collect();
+        order.select_nth_unstable_by(top_k - 1, |&a, &b| values[b].total_cmp(&values[a]));
+        for &index in &order[top_k..] {
+            values[index] = f32::NEG_INFINITY;
+        }
+        let len = values.len();
+        Ok(Tensor::from_vec(values, len, logits.device())?)
     }
 
     fn adjusted_logits(
@@ -2654,18 +2738,32 @@ impl CandleTextModel {
         all_tokens: &[u32],
         prompt_len: usize,
         prev_text: &mut String,
+        terminal: bool,
         sink: &mut dyn crate::model::OutputSink,
     ) -> Result<()> {
         let text = self
             .tokenizer
             .decode(&all_tokens[prompt_len..], true)
             .map_err(|e| anyhow!("tokenizer decode error: {}", e))?;
-        if text != *prev_text {
-            let new_text = text.strip_prefix(prev_text.as_str()).unwrap_or(&text);
-            if !new_text.is_empty() {
-                sink.on_chunk(crate::io::OutputChunk::TextDelta(new_text.to_string()))?;
-            }
-            *prev_text = text;
+        anyhow::ensure!(
+            text.len() <= crate::io::MAX_TEXT_BYTES,
+            "decoded output exceeds the text byte limit"
+        );
+        // A byte-level token may end in the middle of a UTF-8 character.
+        // Tokenizers temporarily decodes that tail as U+FFFD; publishing it
+        // makes the next decode rewrite already emitted text. Hold only the
+        // unstable tail and flush the tokenizer's exact policy at completion.
+        let stable = if terminal {
+            text.as_str()
+        } else {
+            text.trim_end_matches('\u{fffd}')
+        };
+        let new_text = stable
+            .strip_prefix(prev_text.as_str())
+            .ok_or_else(|| anyhow!("tokenizer rewrote previously emitted text"))?;
+        if !new_text.is_empty() {
+            sink.on_chunk(crate::io::OutputChunk::TextDelta(new_text.to_string()))?;
+            *prev_text = stable.to_string();
         }
         Ok(())
     }
@@ -2737,6 +2835,10 @@ impl crate::batching::BatchModel for CandleTextModel {
 }
 
 impl LoadedModel for CandleTextModel {
+    fn supports_generation_metadata(&self) -> bool {
+        !self.is_embedding_model() && !self.is_cross_encoder_model()
+    }
+
     fn actual_device(&self) -> Option<DeviceKind> {
         Some(if self.device.is_cpu() {
             DeviceKind::Cpu
@@ -2860,10 +2962,12 @@ impl LoadedModel for CandleTextModel {
     fn infer(&self, input: ModelInput, params: &GenerationParams) -> Result<ModelOutput> {
         let mut text_parts = Vec::new();
         let mut logprob_records = Vec::new();
+        let mut embeddings = Vec::new();
         self.infer_stream(input, params, &mut |chunk: crate::io::OutputChunk| {
             match chunk {
                 crate::io::OutputChunk::TextDelta(delta) => text_parts.push(delta),
                 crate::io::OutputChunk::TokenLogprobs(record) => logprob_records.push(record),
+                crate::io::OutputChunk::Embedding(values) => embeddings.extend(values),
                 _ => {}
             }
             Ok(())
@@ -2876,7 +2980,7 @@ impl LoadedModel for CandleTextModel {
         Ok(ModelOutput {
             text,
             logprobs: params.logprobs.map(|_| logprob_records),
-            logits: None,
+            logits: (!embeddings.is_empty()).then_some(embeddings),
             image: None,
             audio: None,
             video: None,
@@ -3110,38 +3214,7 @@ impl CandleTextModel {
             input_tokens: token_ids.len(),
             output_tokens: 0,
         })?;
-        let mut logits_processor = {
-            use candle_transformers::generation::Sampling;
-            let sampling = if params.temperature <= 1e-7 {
-                Sampling::ArgMax
-            } else if let Some(top_k) = params.top_k {
-                if params.top_p < 1.0 {
-                    Sampling::TopKThenTopP {
-                        k: top_k,
-                        p: params.top_p,
-                        temperature: params.temperature,
-                    }
-                } else {
-                    Sampling::TopK {
-                        k: top_k,
-                        temperature: params.temperature,
-                    }
-                }
-            } else if params.top_p < 1.0 {
-                Sampling::TopP {
-                    p: params.top_p,
-                    temperature: params.temperature,
-                }
-            } else {
-                Sampling::All {
-                    temperature: params.temperature,
-                }
-            };
-            candle_transformers::generation::LogitsProcessor::from_sampling(
-                params.seed.unwrap_or(42),
-                sampling,
-            )
-        };
+        let mut logits_processor = Self::logits_processor(params);
 
         *current_prefix_guard = token_ids.clone();
 
@@ -3204,6 +3277,12 @@ impl CandleTextModel {
                     .as_mut()
                     .ok_or_else(|| anyhow!("model is not loaded"))?
                     .forward(&input_ids, start_pos + i)?;
+                // Prompt replay fills KV only. Sampling intermediate suffix
+                // positions advances the request RNG without generating any
+                // output, making a fixed seed depend on cache warmth.
+                if i + 1 != suffix.len() {
+                    continue;
+                }
                 let logits = Self::logits_for_last_position(logits)?;
                 trace_logits(&logits)?;
                 let filtered = if let Some(ref fmt) = params.response_format {
@@ -3225,7 +3304,7 @@ impl CandleTextModel {
                     &mut logits_processor,
                     &filtered,
                     params,
-                    &all_tokens,
+                    &all_tokens[token_ids.len()..],
                 )?;
             }
             start_pos += suffix.len();
@@ -3252,12 +3331,22 @@ impl CandleTextModel {
             if params.logprobs.is_some() {
                 first_logprob_logits = Some(filtered.clone());
             }
-            next_token =
-                Self::sample_with_penalties(&mut logits_processor, &filtered, params, &all_tokens)?;
+            next_token = Self::sample_with_penalties(
+                &mut logits_processor,
+                &filtered,
+                params,
+                &all_tokens[token_ids.len()..],
+            )?;
             start_pos += token_ids.len();
         }
         drop(_span_prefill);
 
+        let mut accepted_output_tokens = 1;
+        let mut finish_reason = if self.eos_token_ids.contains(&next_token) {
+            crate::GenerationFinishReason::Eos
+        } else {
+            crate::GenerationFinishReason::Length
+        };
         sink.on_chunk(crate::io::OutputChunk::TokenUsage {
             input_tokens: token_ids.len(),
             output_tokens: 1,
@@ -3270,7 +3359,7 @@ impl CandleTextModel {
                         .ok_or_else(|| anyhow!("missing prefill logits"))?,
                     next_token,
                     params,
-                    &all_tokens,
+                    &all_tokens[token_ids.len()..],
                     sink,
                 )?;
             }
@@ -3281,7 +3370,13 @@ impl CandleTextModel {
             }
 
             if logprob_emitter.is_none() {
-                self.decode_and_emit_delta(&all_tokens, token_ids.len(), &mut prev_text, sink)?;
+                self.decode_and_emit_delta(
+                    &all_tokens,
+                    token_ids.len(),
+                    &mut prev_text,
+                    false,
+                    sink,
+                )?;
             }
 
             let mut generated = 1usize;
@@ -3302,7 +3397,7 @@ impl CandleTextModel {
                         _ => 0,
                     };
                     let proposed_with_logits: Vec<(u32, Vec<f32>)> = if draft_budget > 0 {
-                        if params.temperature > 1e-6 {
+                        if params.temperature > super::GREEDY_TEMPERATURE {
                             strategy.propose_with_logits(
                                 &all_tokens,
                                 draft_budget,
@@ -3344,7 +3439,8 @@ impl CandleTextModel {
                         // temperature is non-zero. Otherwise fall back to
                         // greedy exact-match verification, which only
                         // accepts draft tokens that equal the target argmax.
-                        let (accepted, correction_token) = if params.temperature > 1e-6
+                        let (accepted, correction_token) = if params.temperature
+                            > super::GREEDY_TEMPERATURE
                             && has_draft_logits
                         {
                             let verifier_vecs = Self::verifier_logits_to_vecs(&verifier_logits)?;
@@ -3386,19 +3482,22 @@ impl CandleTextModel {
                             current_prefix_guard.extend_from_slice(accepted_tokens);
                             strategy.update_context(accepted_tokens);
                             generated += accepted_output;
+                            accepted_output_tokens = generated;
                             sink.on_chunk(crate::io::OutputChunk::TokenUsage {
                                 input_tokens: token_ids.len(),
-                                output_tokens: generated,
+                                output_tokens: accepted_output_tokens,
                             })?;
                             self.decode_and_emit_delta(
                                 &all_tokens,
                                 token_ids.len(),
                                 &mut prev_text,
+                                false,
                                 sink,
                             )?;
                         }
 
                         if eos_index.is_some() {
+                            finish_reason = crate::GenerationFinishReason::Eos;
                             // The verifier forwarded draft tokens beyond EOS.
                             // Do not advertise that physical cache as a reusable
                             // prefix; the next request must reset it completely.
@@ -3462,15 +3561,17 @@ impl CandleTextModel {
                                 &mut logits_processor,
                                 &filtered,
                                 params,
-                                &all_tokens,
+                                &all_tokens[token_ids.len()..],
                             )?
                         };
 
+                        accepted_output_tokens = generated + 1;
                         sink.on_chunk(crate::io::OutputChunk::TokenUsage {
                             input_tokens: token_ids.len(),
-                            output_tokens: generated + 1,
+                            output_tokens: accepted_output_tokens,
                         })?;
                         if self.eos_token_ids.contains(&next_tok) {
+                            finish_reason = crate::GenerationFinishReason::Eos;
                             break;
                         }
 
@@ -3482,6 +3583,7 @@ impl CandleTextModel {
                             &all_tokens,
                             token_ids.len(),
                             &mut prev_text,
+                            false,
                             sink,
                         )?;
                         continue;
@@ -3515,20 +3617,28 @@ impl CandleTextModel {
                     &mut logits_processor,
                     &filtered,
                     params,
-                    &all_tokens,
+                    &all_tokens[token_ids.len()..],
                 )?;
                 start_pos += 1;
 
+                accepted_output_tokens = generated + 1;
                 sink.on_chunk(crate::io::OutputChunk::TokenUsage {
                     input_tokens: token_ids.len(),
-                    output_tokens: generated + 1,
+                    output_tokens: accepted_output_tokens,
                 })?;
                 if self.eos_token_ids.contains(&next_tok) {
+                    finish_reason = crate::GenerationFinishReason::Eos;
                     break;
                 }
 
                 if let Some(emitter) = &mut logprob_emitter {
-                    emitter.emit(&filtered, next_tok, params, &all_tokens, sink)?;
+                    emitter.emit(
+                        &filtered,
+                        next_tok,
+                        params,
+                        &all_tokens[token_ids.len()..],
+                        sink,
+                    )?;
                 }
                 all_tokens.push(next_tok);
                 current_prefix_guard.push(next_tok);
@@ -3538,14 +3648,29 @@ impl CandleTextModel {
                 generated += 1;
 
                 if logprob_emitter.is_none() {
-                    self.decode_and_emit_delta(&all_tokens, token_ids.len(), &mut prev_text, sink)?;
+                    self.decode_and_emit_delta(
+                        &all_tokens,
+                        token_ids.len(),
+                        &mut prev_text,
+                        false,
+                        sink,
+                    )?;
                 }
             }
         }
 
         if let Some(emitter) = &logprob_emitter {
             emitter.finish()?;
+        } else {
+            self.decode_and_emit_delta(&all_tokens, token_ids.len(), &mut prev_text, true, sink)?;
         }
+        sink.on_chunk(crate::OutputChunk::GenerationFinished(
+            crate::GenerationMetadata {
+                input_tokens: token_ids.len(),
+                output_tokens: accepted_output_tokens,
+                reason: finish_reason,
+            },
+        ))?;
         let compute_ms = start_time.elapsed().as_millis() as u64;
         let spec_mode = speculative_mode;
         let spec_acceptance_rate = if total_draft_tokens > 0 {
@@ -3576,6 +3701,12 @@ impl CandleTextModel {
             current_prefix_guard.clear();
             tracing::info!("Model weights released from runtime memory (OnDemand).");
         } else {
+            // The final sampled token is not in KV until another forward
+            // pass consumes it. A length-limited completion must not claim
+            // that unconsumed token as a reusable physical prefix. EOS and
+            // speculative replay may leave all visible tokens consumed; use
+            // the actual forward position in every case.
+            current_prefix_guard.truncate(start_pos);
             tracing::debug!(
                 "Keeping model weights resident (strategy: {:?}).",
                 self.residency_strategy

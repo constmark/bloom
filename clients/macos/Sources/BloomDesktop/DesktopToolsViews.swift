@@ -88,7 +88,7 @@ struct DesktopEmbeddingsView: View {
     @Environment(\.dismiss) private var dismiss
 
     private var available: Bool {
-        chat.connectionState == .ready && chat.modelTasks.contains("embedding") && !tools.isManaging
+        chat.connectionState == .ready && chat.modelTasks.contains("embedding") && !tools.isManaging && !tools.isReranking
     }
 
     var body: some View {
@@ -126,7 +126,7 @@ struct DesktopEmbeddingsView: View {
             }
             if let result = tools.embeddingResult {
                 HStack {
-                    Text("\(result.data.count) vectors · \(result.data.first?.embedding.count ?? 0) dimensions · tokens: \(result.usage.prompt_tokens.map(String.init) ?? "unavailable")")
+                    Text("\(result.data.count) vectors · \(result.data.first?.embedding.count ?? 0) dimensions · tokens: \(result.usage.prompt_tokens)")
                         .font(.caption)
                     Spacer()
                     Button("Copy JSON") {
@@ -164,6 +164,94 @@ struct DesktopEmbeddingsView: View {
         panel.nameFieldStringValue = "bloom-embeddings.json"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do { try result.jsonData().write(to: url, options: .atomic); exportError = nil }
+        catch { exportError = error.localizedDescription }
+    }
+}
+
+struct DesktopRerankView: View {
+    @ObservedObject var tools: DesktopToolsViewModel
+    @ObservedObject var chat: ChatViewModel
+    @State private var exportError: String?
+    @Environment(\.dismiss) private var dismiss
+
+    private var available: Bool {
+        chat.connectionState == .ready && chat.modelTasks.contains("rerank")
+            && !tools.isManaging && !tools.isEmbedding
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Document reranking").font(.title2.bold())
+                Spacer()
+                Button("Done") { dismiss() }.keyboardShortcut(.cancelAction)
+            }
+            Text(chat.modelName ?? "No active model").font(.headline)
+            if !available {
+                Text("Load a model that supports reranking from Local models, then Connect.")
+                    .foregroundStyle(.secondary)
+            }
+            TextField("Query", text: $tools.rerankQuery)
+                .textFieldStyle(.roundedBorder).disabled(tools.isReranking)
+                .accessibilityLabel("Reranking query")
+            Text("One document per line · 1–256 documents · query and documents at most 768 KiB total")
+                .font(.caption)
+            TextEditor(text: $tools.rerankDocuments)
+                .font(.body).frame(minHeight: 120, maxHeight: 180)
+                .border(Color.secondary.opacity(0.3)).disabled(tools.isReranking)
+                .accessibilityLabel("Reranking documents")
+            HStack {
+                Text("Results")
+                TextField("All documents", text: $tools.rerankTopN)
+                    .frame(width: 140).textFieldStyle(.roundedBorder).disabled(tools.isReranking)
+                Spacer()
+                if tools.isReranking {
+                    ProgressView().controlSize(.small)
+                    Button("Cancel") { tools.cancelReranking() }
+                } else {
+                    Button("Rank documents") {
+                        if let model = chat.modelName { tools.rerank(model: model) }
+                    }.disabled(!available)
+                }
+            }
+            if let result = tools.rerankResult {
+                HStack {
+                    Text("\(result.results.count) results · tokens: \(result.usage.prompt_tokens)").font(.caption)
+                    Spacer()
+                    Button("Copy JSON") {
+                        do {
+                            let text = String(decoding: try result.jsonData(query: tools.rerankResultQuery), as: UTF8.self)
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(text, forType: .string)
+                            exportError = nil
+                        } catch { exportError = error.localizedDescription }
+                    }
+                    Button("Save JSON…") { export(result) }
+                }
+                Text("Query: \(tools.rerankResultQuery)").font(.caption).lineLimit(2)
+                List(result.results) { row in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Document \(row.index + 1) · score \(String(format: "%.6f", row.relevance_score))")
+                            .font(.headline)
+                        Text(row.document.text).lineLimit(4).textSelection(.enabled)
+                    }
+                }
+            } else { Spacer() }
+            if let error = tools.rerankError ?? exportError {
+                Label(error, systemImage: "exclamationmark.triangle").foregroundStyle(.orange).textSelection(.enabled)
+            }
+            Text("Query, documents and scores stay out of conversation history. JSON exports include the original query and ranked documents. Cancel stops the client request.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        .padding(22).frame(minWidth: 700, minHeight: 610)
+    }
+
+    private func export(_ result: DesktopRerankResult) {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.json]
+        panel.nameFieldStringValue = "bloom-rerank.json"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do { try result.jsonData(query: tools.rerankResultQuery).write(to: url, options: .atomic); exportError = nil }
         catch { exportError = error.localizedDescription }
     }
 }

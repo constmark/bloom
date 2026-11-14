@@ -48,9 +48,11 @@ const MAX_AUTH_PROBE_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_RESIDENT_MODELS: usize = 16;
 const MAX_EMBEDDING_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_EMBEDDING_VALUES: usize = 1_048_576;
-const MAX_RERANK_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+// The 768 KiB input budget can expand sixfold when JSON escapes control
+// characters. Include the complete admitted documents plus bounded metadata.
+const MAX_RERANK_RESPONSE_BYTES: usize = 6 * 1024 * 1024;
 const MAX_EMBEDDING_EXPORT_BYTES: usize = 40 * 1024 * 1024;
-const MAX_RERANK_EXPORT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_RERANK_EXPORT_BYTES: usize = 6 * 1024 * 1024;
 const MAX_ENCODER_CLIPBOARD_BYTES: usize = 1024 * 1024;
 const READINESS_SCHEMA_VERSION: u32 = 3;
 const READINESS_PROTOCOL_VERSION: u32 = 3;
@@ -2417,7 +2419,20 @@ pub enum StreamUpdate {
     Model(String),
     TextDelta(String),
     Usage(ChatUsage),
+    /// The validated terminal reason for the single choice, such as `stop`,
+    /// `length` (token limit reached), or `content_filter`.
+    FinishReason(String),
 }
+
+impl StreamUpdate {
+    /// Whether this update reports that generation stopped at the token limit.
+    pub fn is_length_finish(&self) -> bool {
+        matches!(self, Self::FinishReason(reason) if reason == FINISH_REASON_LENGTH)
+    }
+}
+
+/// OpenAI-compatible finish reason for a generation that hit `max_tokens`.
+pub const FINISH_REASON_LENGTH: &str = "length";
 
 /// Exact token counts returned by a compatible streaming chat endpoint.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -2865,7 +2880,6 @@ fn decode_rerank_response(
         if item.index >= documents.len()
             || !seen.insert(item.index)
             || !item.relevance_score.is_finite()
-            || !(-1.0..=1.0).contains(&item.relevance_score)
             || previous.is_some_and(|(score, index)| {
                 item.relevance_score > score
                     || (item.relevance_score == score && item.index <= index)
@@ -2959,7 +2973,6 @@ fn validate_embedding_batch_for_export(batch: &EmbeddingBatch) -> Result<(), Str
 fn validate_rerank_result_for_export(result: &RerankResult) -> Result<(), String> {
     if result.index >= MAX_RERANK_DOCUMENTS
         || !result.relevance_score.is_finite()
-        || !(-1.0..=1.0).contains(&result.relevance_score)
         || result.document.is_empty()
         || result.document.trim() != result.document
         || result.document.chars().count() > MAX_RERANK_DOCUMENT_CHARS
@@ -3070,7 +3083,7 @@ pub fn encode_rerank_export(batch: &RerankBatch) -> Result<String, String> {
         .map_err(|error| format!("failed to encode rerank export: {error}"))?;
     json.push('\n');
     if json.len() > MAX_RERANK_EXPORT_BYTES {
-        return Err("Rerank export exceeds the 4 MiB download limit.".to_string());
+        return Err("Rerank export exceeds the 6 MiB download limit.".to_string());
     }
     Ok(json)
 }
@@ -5097,12 +5110,14 @@ struct TextStreamState {
 }
 
 impl TextStreamState {
-    fn observe(&mut self, chunk: &serde_json::Value) -> Result<(), ChatStreamError> {
+    /// Validates one chunk and returns its finish reason when it terminates the choice.
+    fn observe(&mut self, chunk: &serde_json::Value) -> Result<Option<String>, ChatStreamError> {
         let invalid = || ChatStreamError::Request("invalid stream choice or terminal state".into());
         let usage = chunk.get("usage").is_some_and(|value| !value.is_null());
         if usage && self.received_usage {
             return Err(invalid());
         }
+        let mut finish_reason = None;
         let choices = chunk
             .get("choices")
             .and_then(serde_json::Value::as_array)
@@ -5136,14 +5151,16 @@ impl TextStreamState {
                 return Err(invalid());
             }
             if let Some(reason) = choice.get("finish_reason").filter(|value| !value.is_null()) {
-                if !matches!(reason.as_str(), Some("stop" | "length" | "content_filter")) {
+                let reason = reason.as_str().ok_or_else(invalid)?;
+                if !matches!(reason, "stop" | FINISH_REASON_LENGTH | "content_filter") {
                     return Err(invalid());
                 }
                 self.finished = true;
+                finish_reason = Some(reason.to_string());
             }
         }
         self.received_usage |= usage;
-        Ok(())
+        Ok(finish_reason)
     }
 
     fn finish(&self) -> Result<(), ChatStreamError> {
@@ -5203,7 +5220,7 @@ where
     } else {
         None
     };
-    stream_state.observe(&chunk)?;
+    let finish_reason = stream_state.observe(&chunk)?;
     if let Some(usage) = usage {
         on_update(StreamUpdate::Usage(usage));
     }
@@ -5216,6 +5233,9 @@ where
     {
         append_stream_delta(accumulated, delta, MAX_STREAM_OUTPUT_BYTES)?;
         on_update(StreamUpdate::TextDelta(delta.to_string()));
+    }
+    if let Some(reason) = finish_reason {
+        on_update(StreamUpdate::FinishReason(reason));
     }
     Ok(false)
 }
@@ -5270,6 +5290,24 @@ where
     if let Some(delta) = delta {
         append_stream_delta(accumulated, delta, MAX_STREAM_OUTPUT_BYTES)?;
         on_update(StreamUpdate::TextDelta(delta.to_string()));
+    }
+    // Native multimodal streams forward the engine's `GenerationFinished`
+    // metadata; map its token-limit reason onto the OpenAI vocabulary.
+    if let Some(reason) = chunk
+        .and_then(|chunk| chunk.get("GenerationFinished"))
+        .and_then(|finished| finished.get("reason"))
+        .and_then(serde_json::Value::as_str)
+    {
+        let reason = match reason {
+            "length" => FINISH_REASON_LENGTH,
+            "eos" | "stop" => "stop",
+            _ => {
+                return Err(ChatStreamError::Request(
+                    "invalid multimodal generation finish reason".to_string(),
+                ));
+            }
+        };
+        on_update(StreamUpdate::FinishReason(reason.to_string()));
     }
     Ok(false)
 }
@@ -6666,6 +6704,92 @@ mod tests {
     }
 
     #[test]
+    fn stream_frame_carries_length_finish_reason() {
+        let mut updates = Vec::new();
+        let mut accumulated = String::new();
+        let mut observed_model = None;
+        let mut observed_request_id = None;
+        let mut state = TextStreamState::default();
+        let finished = process_sse_frame(
+            r#"data: {"id":"chatcmpl-1","model":"tiny.gguf","choices":[{"index":0,"delta":{"content":"cut"},"finish_reason":"length"}]}"#,
+            "tiny.gguf",
+            &mut state,
+            &mut observed_model,
+            &mut observed_request_id,
+            &mut accumulated,
+            &mut |update| updates.push(update),
+        )
+        .unwrap();
+
+        assert!(!finished);
+        assert_eq!(accumulated, "cut");
+        assert_eq!(
+            updates,
+            vec![
+                StreamUpdate::Model("tiny.gguf".into()),
+                StreamUpdate::RequestId("chatcmpl-1".into()),
+                StreamUpdate::TextDelta("cut".into()),
+                StreamUpdate::FinishReason("length".into()),
+            ]
+        );
+        assert!(updates.last().unwrap().is_length_finish());
+        state.finish().unwrap();
+    }
+
+    #[test]
+    fn text_stream_returns_terminal_finish_reasons() {
+        for reason in ["stop", "length", "content_filter"] {
+            let chunk =
+                serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":reason}]});
+            assert_eq!(
+                TextStreamState::default()
+                    .observe(&chunk)
+                    .unwrap()
+                    .as_deref(),
+                Some(reason)
+            );
+        }
+        let delta = serde_json::json!({"choices":[{"index":0,"delta":{"content":"a"},"finish_reason":null}]});
+        assert_eq!(TextStreamState::default().observe(&delta).unwrap(), None);
+        assert!(!StreamUpdate::FinishReason("stop".into()).is_length_finish());
+        assert!(!StreamUpdate::TextDelta("length".into()).is_length_finish());
+    }
+
+    #[test]
+    fn multimodal_frame_maps_generation_finished_reason() {
+        for (engine_reason, expected) in [("length", "length"), ("eos", "stop"), ("stop", "stop")] {
+            let mut updates = Vec::new();
+            let frame = format!(
+                r#"data: {{"id":"mms-1","model":"vision.gguf","chunk":{{"GenerationFinished":{{"input_tokens":3,"output_tokens":8,"reason":"{engine_reason}"}}}}}}"#
+            );
+            process_multimodal_frame(
+                &frame,
+                "vision.gguf",
+                &mut None,
+                &mut None,
+                &mut String::new(),
+                &mut |update| updates.push(update),
+            )
+            .unwrap();
+            assert_eq!(
+                updates.last(),
+                Some(&StreamUpdate::FinishReason(expected.into()))
+            );
+        }
+        assert!(
+            process_multimodal_frame(
+                r#"data: {"id":"mms-1","model":"vision.gguf","chunk":{"GenerationFinished":{"input_tokens":3,"output_tokens":8,"reason":"bogus"}}}"#,
+                "vision.gguf",
+                &mut None,
+                &mut None,
+                &mut String::new(),
+                &mut |_| {},
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn stream_frame_rejects_inconsistent_usage_metadata() {
         let error = process_sse_frame(
             r#"data: {"id":"chatcmpl-1","model":"tiny.gguf","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":4,"total_tokens":15}}"#,
@@ -7690,6 +7814,77 @@ mod tests {
             )
             .unwrap_err()
             .contains("does not match")
+        );
+    }
+
+    #[test]
+    fn cross_encoder_scores_round_trip_without_cosine_clipping() {
+        let response = serde_json::json!({
+            "id": "rerank-cross", "object": "rerank", "model": "cross-encoder",
+            "results": [
+                {"index": 1, "relevance_score": 9.25, "document": {"text": "relevant"}},
+                {"index": 0, "relevance_score": -4.5, "document": {"text": "irrelevant"}}
+            ], "usage": {"prompt_tokens": 12, "total_tokens": 12}
+        });
+        let mut batch = decode_rerank_response(
+            &response.to_string(),
+            "cross-encoder",
+            "query",
+            &["irrelevant".into(), "relevant".into()],
+            2,
+        )
+        .unwrap();
+        let export: serde_json::Value =
+            serde_json::from_str(&encode_rerank_export(&batch).unwrap()).unwrap();
+        assert_eq!(export["results"][0]["relevance_score"], 9.25);
+        assert_eq!(export["results"][1]["relevance_score"], -4.5);
+        assert!(
+            rerank_result_clipboard_text(&batch.results[1])
+                .unwrap()
+                .contains("-4.5")
+        );
+        for score in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            batch.results[0].relevance_score = score;
+            assert!(encode_rerank_export(&batch).is_err());
+            assert!(rerank_result_clipboard_text(&batch.results[0]).is_err());
+        }
+    }
+
+    #[test]
+    fn rerank_round_trips_maximum_admitted_json_escaped_documents() {
+        let document = format!("x{}x", "\u{0001}".repeat(MAX_RERANK_DOCUMENT_CHARS - 3));
+        let (query, documents, top_n) =
+            prepare_rerank_input("abc", &vec![document; 3].join("\n"), 3).unwrap();
+        assert_eq!(
+            query.len() + documents.iter().map(String::len).sum::<usize>(),
+            MAX_RERANK_CONTENT_BYTES
+        );
+        let response = serde_json::json!({
+            "id": "rerank-escaped", "object": "rerank", "model": "encoder",
+            "results": documents.iter().enumerate().map(|(index, document)| {
+                serde_json::json!({"index": index, "relevance_score": 0.5, "document": {"text": document}})
+            }).collect::<Vec<_>>(),
+            "usage": {"prompt_tokens": 12, "total_tokens": 12}
+        }).to_string();
+        assert!(response.len() > 4 * 1024 * 1024);
+        let decoded =
+            decode_rerank_response(&response, "encoder", &query, &documents, top_n).unwrap();
+        let exported = encode_rerank_export(&decoded).unwrap();
+        assert!(exported.len() > 4 * 1024 * 1024);
+        let artifact: serde_json::Value = serde_json::from_str(&exported).unwrap();
+        assert_eq!(artifact["query"], query);
+        for (index, document) in documents.iter().enumerate() {
+            assert_eq!(artifact["results"][index]["document"], *document);
+        }
+        assert!(
+            decode_rerank_response(
+                &" ".repeat(MAX_RERANK_RESPONSE_BYTES + 1),
+                "encoder",
+                &query,
+                &documents,
+                top_n
+            )
+            .is_err()
         );
     }
 
